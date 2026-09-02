@@ -11,6 +11,8 @@ htmlcov/
 !.env.example
 snapshots/
 .build-venv/
+.installer-build-venv/
+.installer-build-venv-new-*/
 .venv/
 venv/
 node_modules/
