@@ -1,5 +1,6 @@
 """Thread-safe application service behind the localhost user interface."""
 
+from collections import OrderedDict
 from collections.abc import Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -21,6 +22,7 @@ from ._app_support import (
 from .dashboard import build_league_dashboard
 from .engine_bundle import EngineBundle, load_engine_bundle, save_engine_bundle
 from .league_search import LeagueSearchOutcome, LeagueSearchProgress, ResumableLeagueTradeSearch
+from .player_outlook import build_player_outlook
 from .roster_adjustment import (
     MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY,
     PreparedRosterAdjuster,
@@ -63,6 +65,7 @@ from .xlsx_export import export_trade_workbook
 
 
 _MAX_DASHBOARD_SCENARIOS = 10_000
+_MAX_PLAYER_OUTLOOK_CACHE_SIZE = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +247,8 @@ class LocalAppService:
         self._jobs: dict[str, _SearchJob] = {}
         self._dashboard_cache: dict[str, dict[str, object]] = {}
         self._dashboard_futures: dict[str, Future[dict[str, object]]] = {}
+        self._player_outlook_cache: OrderedDict[str, dict[str, object]] = OrderedDict()
+        self._player_outlook_futures: dict[str, Future[dict[str, object]]] = {}
         self._collections = WeeklyCollectionJobs(
             self.data_directory,
             self.bundle_directory,
@@ -324,6 +329,43 @@ class LocalAppService:
             with self._lock:
                 if self._dashboard_futures.get(bundle_id) is future:
                     del self._dashboard_futures[bundle_id]
+
+    def player_outlook(self, bundle_id: str) -> dict[str, object]:
+        """Return one coalesced, bounded-cache player outlook by immutable bundle ID."""
+
+        with self._lock:
+            cached = self._player_outlook_cache.get(bundle_id)
+            if cached is not None:
+                self._player_outlook_cache.move_to_end(bundle_id)
+                return cached
+            future = self._player_outlook_futures.get(bundle_id)
+            owns_calculation = future is None
+            if owns_calculation:
+                future = Future()
+                self._player_outlook_futures[bundle_id] = future
+        assert future is not None
+        if not owns_calculation:
+            return future.result()
+
+        try:
+            outlook = build_player_outlook(
+                load_engine_bundle(self._bundle_path(bundle_id))
+            )
+        except BaseException as error:
+            future.set_exception(error)
+            raise
+        else:
+            with self._lock:
+                self._player_outlook_cache[bundle_id] = outlook
+                self._player_outlook_cache.move_to_end(bundle_id)
+                while len(self._player_outlook_cache) > _MAX_PLAYER_OUTLOOK_CACHE_SIZE:
+                    self._player_outlook_cache.popitem(last=False)
+            future.set_result(outlook)
+            return outlook
+        finally:
+            with self._lock:
+                if self._player_outlook_futures.get(bundle_id) is future:
+                    del self._player_outlook_futures[bundle_id]
 
     def _bundle_readiness(self, bundles) -> dict[str, object]:
         ready_count = sum(row.get("status") == "ready" for row in bundles)

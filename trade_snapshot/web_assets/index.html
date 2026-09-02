@@ -9,6 +9,7 @@
   <title>Fantasy Trade Evaluator</title>
   <link rel="stylesheet" href="/styles.css">
   <link rel="stylesheet" href="/dashboard.css">
+  <link rel="stylesheet" href="/player_lab.css">
 </head>
 <body>
   <header class="topbar">
@@ -185,9 +186,60 @@
       </div>
     </section>
 
+    <section id="playerLabPanel" class="panel player-lab-panel" aria-labelledby="playerLabHeading">
+      <div class="section-heading">
+        <div><span class="step">3</span><h2 id="playerLabHeading">Player Lab</h2></div>
+        <p>Inspect every rostered player and captured waiver candidate without leaving the local app.</p>
+      </div>
+
+      <div id="playerLabEmpty" class="player-lab-state" aria-live="polite">
+        Select a ready week to inspect player projections and source evidence.
+      </div>
+      <div id="playerLabLoading" class="player-lab-state player-lab-loading hidden" aria-live="polite">
+        <span class="player-lab-spinner" aria-hidden="true"></span>
+        <span>Preparing the player-level projection evidence…</span>
+      </div>
+      <div id="playerLabContent" class="player-lab-content hidden">
+        <div id="playerLabFreshness" class="player-lab-freshness" aria-label="Projection source freshness"></div>
+
+        <div class="player-lab-filters" role="search" aria-label="Filter the Player Lab">
+          <label class="player-lab-search"><span>Find a player</span><input id="playerLabSearch" type="search" autocomplete="off" placeholder="Name, NFL team, or fantasy team"></label>
+          <label><span>Owner</span><select id="playerLabOwnerFilter"><option value="all">All teams and available</option></select></label>
+          <label><span>Position</span><select id="playerLabPositionFilter"><option value="all">All positions</option></select></label>
+          <label><span>Sort by</span><select id="playerLabSort"><option value="remaining_points">Remaining points</option><option value="weekly_ecr">Weekly ECR</option><option value="rest_of_season_ecr">ROS ECR</option><option value="disagreement">Provider disagreement</option><option value="name">Player name</option></select></label>
+        </div>
+
+        <p id="playerLabCount" class="player-lab-count" aria-live="polite"></p>
+        <div class="player-lab-layout">
+          <div class="table-wrap player-lab-master-wrap" role="region" aria-label="Scrollable Player Lab results" tabindex="0">
+            <table class="player-lab-master">
+              <caption class="player-lab-sr-only">Players with ownership, remaining projections, ECR, and source coverage</caption>
+              <thead><tr><th>Player</th><th>Team / status</th><th>Pos</th><th>ROS pts</th><th>Avg active</th><th>Weekly ECR</th><th>ROS ECR</th><th>Sources</th></tr></thead>
+              <tbody id="playerLabTableBody"></tbody>
+            </table>
+          </div>
+
+          <article class="player-lab-detail-card" aria-labelledby="playerLabDetailHeading">
+            <h3 id="playerLabDetailHeading" class="player-lab-sr-only">Selected player details</h3>
+            <div id="playerLabDetail" class="player-lab-detail" aria-live="polite"></div>
+            <div class="player-lab-grid-heading"><h4>Weekly breakdown</h4><p>Ensemble alongside every retained provider value</p></div>
+            <p class="player-lab-coverage-note">Usable sources include direct weekly values and disclosed rest-of-season allocations. “All-direct” excludes every locally allocated value.</p>
+            <div class="table-wrap player-lab-weekly-wrap" role="region" aria-label="Scrollable weekly projection breakdown" tabindex="0">
+              <table class="player-lab-weekly">
+                <caption class="player-lab-sr-only">Weekly ensemble and provider projections for the selected player</caption>
+                <thead><tr id="playerLabProviderHead"></tr></thead>
+                <tbody id="playerLabWeeklyBody"></tbody>
+              </table>
+            </div>
+            <div id="playerLabRosSources" class="player-lab-ros-sources"></div>
+          </article>
+        </div>
+      </div>
+    </section>
+
     <section class="panel">
       <div class="section-heading">
-        <div><span class="step">3</span><h2>Choose the search</h2></div>
+        <div><span class="step">4</span><h2>Choose the search</h2></div>
         <p>Counts are exact before the run starts. Playoff simulations happen only after the fast power filter.</p>
       </div>
       <form id="searchForm">
@@ -299,7 +351,7 @@
 
     <section id="progressPanel" class="panel hidden">
       <div class="section-heading">
-        <div><span class="step">4</span><h2>Search progress</h2></div>
+        <div><span class="step">5</span><h2>Search progress</h2></div>
         <p id="progressText">Preparing the shared season simulation…</p>
       </div>
       <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
@@ -308,7 +360,7 @@
 
     <section id="resultsPanel" class="panel hidden">
       <div class="section-heading results-heading">
-        <div><span class="step">5</span><h2>Best local results</h2></div>
+        <div><span class="step">6</span><h2>Best local results</h2></div>
         <button id="exportButton" class="primary">Download Excel workbook</button>
       </div>
       <p id="resultsNote" class="results-note"></p>
@@ -332,6 +384,7 @@
   <footer>All candidate scoring and season simulation run on this computer. Weekly source evidence stays in the selected bundle.</footer>
   <script src="/dashboard_charts.js" defer></script>
   <script src="/dashboard_ui.js" defer></script>
+  <script src="/player_lab_ui.js" defer></script>
   <script src="/three_way_ui.js" defer></script>
   <script src="/trade_filter_ui.js" defer></script>
   <script src="/app.js" defer></script>

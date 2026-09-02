@@ -87,6 +87,18 @@ class LocalServerTests(unittest.TestCase):
         status, _, _ = self.request("GET", dashboard_path, token=False)
         self.assertEqual(status, 403)
 
+        player_outlook_path = f"/api/bundles/{bundle.bundle_id}/player-outlook"
+        status, _, raw = self.request("GET", player_outlook_path)
+        player_outlook = json.loads(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(player_outlook["bundle_id"], bundle.bundle_id)
+        self.assertEqual(
+            len(player_outlook["players"]),
+            len({row.canonical_player_id for row in bundle.projections}),
+        )
+        status, _, _ = self.request("GET", player_outlook_path, token=False)
+        self.assertEqual(status, 403)
+
         status, _, raw = self.request(
             "POST", "/api/searches/estimate", value=payload(bundle.bundle_id)
         )
@@ -203,6 +215,10 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b"Every result requires all three teams", page)
         self.assertIn(b'id="resultsHeaderRow"', page)
         self.assertIn(b'id="dashboardPanel"', page)
+        self.assertIn(b'id="playerLabPanel"', page)
+        self.assertIn(b'id="playerLabSearch"', page)
+        self.assertIn(b'id="playerLabTableBody"', page)
+        self.assertIn(b'id="playerLabWeeklyBody"', page)
         self.assertIn(b'id="contenderChart"', page)
         self.assertIn(b'id="finishHeatmap"', page)
         self.assertIn(b'id="positionHeatmap"', page)
@@ -213,8 +229,10 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b'aria-label="Scrollable final rank probability table"', page)
         self.assertIn(b'src="/dashboard_charts.js"', page)
         self.assertIn(b'src="/dashboard_ui.js"', page)
+        self.assertIn(b'src="/player_lab_ui.js"', page)
         self.assertLess(page.index(b'/dashboard_charts.js'), page.index(b'/dashboard_ui.js'))
         self.assertLess(page.index(b'/dashboard_ui.js'), page.index(b'/app.js'))
+        self.assertLess(page.index(b'/player_lab_ui.js'), page.index(b'/app.js'))
         self.assertLess(page.index(b'/three_way_ui.js'), page.index(b'/app.js'))
         self.assertNotIn(b'id="expectedTeamCount"', page)
 
@@ -258,6 +276,29 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b"replacement?.focus()", dashboard_ui)
         self.assertIn(b"bindHorizontalScroll(container)", dashboard_ui)
         self.assertNotIn(b"innerHTML", dashboard_ui)
+
+        status, headers, player_lab_ui = self.request(
+            "GET", "/player_lab_ui.js", token=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/javascript", headers["Content-Type"])
+        self.assertIn(b"window.PlayerLabUi", player_lab_ui)
+        self.assertIn(b"AbortController", player_lab_ui)
+        self.assertIn(b"player-outlook", player_lab_ui)
+        self.assertIn(b"not_retained", player_lab_ui)
+        self.assertIn(b"maximumFractionDigits: 3", player_lab_ui)
+        self.assertIn(b"Exact stored value", player_lab_ui)
+        self.assertIn(b"Exact stored weight", player_lab_ui)
+        self.assertIn(b"direct_source_count", player_lab_ui)
+        self.assertNotIn(b"innerHTML", player_lab_ui)
+
+        status, headers, player_lab_styles = self.request(
+            "GET", "/player_lab.css", token=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/css", headers["Content-Type"])
+        self.assertIn(b".player-lab-layout", player_lab_styles)
+        self.assertIn(b"@media", player_lab_styles)
 
         status, headers, three_way = self.request("GET", "/three_way_ui.js", token=False)
         self.assertEqual(status, 200)
