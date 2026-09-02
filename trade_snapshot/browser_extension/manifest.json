@@ -1,0 +1,76 @@
+{
+  "manifest_version": 3,
+  "name": "Fantasy Trade Evaluator Browser Bridge",
+  "version": "0.1.0",
+  "description": "Uses one ordinary-browser tab for explicitly paired Fantasy Trade Evaluator scans.",
+  "minimum_chrome_version": "111",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "https://fantasypros.com/*",
+    "https://www.fantasypros.com/*",
+    "https://fantasy.espn.com/*",
+    "https://lm-api-reads.fantasy.espn.com/*",
+    "https://football.fantasysports.yahoo.com/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "action": {
+    "default_title": "Fantasy Trade Evaluator Browser Bridge",
+    "default_popup": "popup/popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://127.0.0.1/*",
+        "http://localhost/*"
+      ],
+      "js": [
+        "protocol.js",
+        "local_bridge.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://fantasypros.com/*",
+        "https://www.fantasypros.com/*",
+        "https://fantasy.espn.com/*",
+        "https://football.fantasysports.yahoo.com/*"
+      ],
+      "js": [
+        "single_page_main.js",
+        "collectors/analyzer_main.js",
+        "collectors/ecr_main.js",
+        "collectors/league_main.js",
+        "collectors/espn_main.js",
+        "main_dispatcher.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://fantasypros.com/*",
+        "https://www.fantasypros.com/*",
+        "https://fantasy.espn.com/*",
+        "https://football.fantasysports.yahoo.com/*"
+      ],
+      "js": [
+        "protocol.js",
+        "collectors/page.js",
+        "collectors/projection.js",
+        "collectors/yahoo.js",
+        "scan_agent.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'"
+  }
+}

@@ -1,0 +1,292 @@
+"""Parse identity and numeric rows from strict captured projection tables."""
+
+from dataclasses import dataclass
+from math import isfinite
+import re
+from urllib.parse import urlsplit
+
+from .capture_schema import CaptureProvider, GenericTableArtifact
+from .identity import IdentityRegistry
+from .positions import CANONICAL_PLAYER_POSITIONS, normalize_player_position
+
+
+_PLAYER_HEADERS = {"PLAYER", "PLAYERS", "PLAYER NAME", "ATHLETE", "NAME"}
+_POSITION_HEADERS = {"POS", "POSITION"}
+_TEAM_HEADERS = {"TEAM", "TM"}
+_OPPONENT_HEADERS = {"OPP", "OPPONENT"}
+_STATUS_HEADERS = {"STATUS", "BYE"}
+_POINT_HEADER_TIERS = (
+    {"FPTS", "FAN PTS", "FANTASY POINTS"},
+    {"PROJ", "PROJECTED"},
+    {"PTS", "POINTS"},
+)
+_POSITIONS = CANONICAL_PLAYER_POSITIONS
+_MISSING = {"", "-", "--", "—", "N/A", "NA"}
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionArtifactRow:
+    identity_provider: str
+    provider_player_id: str
+    display_name: str
+    position: str
+    nfl_team_id: str
+    projected_fantasy_points: float | None
+    raw_projected_stats: tuple[tuple[str, float], ...]
+    is_bye: bool
+    opponent_team_id: str | None
+    is_home: bool | None
+
+
+def projection_artifact_rows(
+    artifact: GenericTableArtifact,
+    *,
+    known_registry: IdentityRegistry | None = None,
+) -> tuple[ProjectionArtifactRow, ...]:
+    if not isinstance(artifact, GenericTableArtifact):
+        raise ValueError("artifact must be a GenericTableArtifact")
+    if known_registry is not None and not isinstance(known_registry, IdentityRegistry):
+        raise ValueError("known_registry must be an IdentityRegistry or None")
+    rows = []
+    seen = set()
+    for table in artifact.tables:
+        headers = tuple(_header(cell.text) for cell in table.rows[0])
+        player_index = _one_index(headers, _PLAYER_HEADERS, "player")
+        points_index = _points_index(headers)
+        position_index = _optional_index(headers, _POSITION_HEADERS, "position")
+        team_index = _optional_index(headers, _TEAM_HEADERS, "team")
+        opponent_index = _optional_index(headers, _OPPONENT_HEADERS, "opponent")
+        status_indices = tuple(
+            index for index, header in enumerate(headers) if header in _STATUS_HEADERS
+        )
+        excluded = {
+            player_index,
+            points_index,
+            *(() if position_index is None else (position_index,)),
+            *(() if team_index is None else (team_index,)),
+            *(() if opponent_index is None else (opponent_index,)),
+            *status_indices,
+        }
+        stat_indices = _stat_indices(headers, excluded)
+        for cells in table.rows[1:]:
+            identity_provider, link_id, is_team_link = _provider_link(
+                artifact.provider, cells[player_index].links[0]
+            )
+            known = (
+                None
+                if known_registry is None or is_team_link
+                else known_registry.lookup(identity_provider, link_id)
+            )
+            name, position, team = _player_metadata(
+                cells[player_index].text,
+                None if position_index is None else cells[position_index].text,
+                None if team_index is None else cells[team_index].text,
+                artifact,
+                known,
+            )
+            if is_team_link:
+                if position != "DST" or team == "FA":
+                    raise ValueError(
+                        "Yahoo team identity links are valid only for an NFL team defense"
+                    )
+                provider_id = f"dst:{team}"
+            else:
+                provider_id = link_id
+            key = identity_provider, provider_id
+            if key in seen:
+                raise ValueError("projection artifact repeats a provider player ID")
+            seen.add(key)
+            statuses = " ".join(cells[index].text for index in status_indices).upper()
+            opponent, is_home = (
+                (None, None)
+                if opponent_index is None
+                else _opponent(cells[opponent_index].text)
+            )
+            stats = tuple(
+                (headers[index].lower().replace(" ", "_"), value)
+                for index in stat_indices
+                if (value := _optional_number(cells[index].text)) is not None
+            )
+            rows.append(
+                ProjectionArtifactRow(
+                    identity_provider=identity_provider,
+                    provider_player_id=provider_id,
+                    display_name=name,
+                    position=position,
+                    nfl_team_id=team,
+                    projected_fantasy_points=_optional_number(cells[points_index].text),
+                    raw_projected_stats=stats,
+                    is_bye=bool(re.search(r"\bBYE\b", statuses)),
+                    opponent_team_id=opponent,
+                    is_home=is_home,
+                )
+            )
+    if not rows:
+        raise ValueError("projection artifact contains no player rows")
+    return tuple(sorted(rows, key=lambda row: (row.identity_provider, row.provider_player_id)))
+
+
+def _player_metadata(player_text, position_text, team_text, artifact, known):
+    explicit_position = (
+        normalize_position(position_text)
+        if position_text and position_text.strip()
+        else None
+    )
+    scope = tuple(
+        value for value in artifact.position_scope if value not in {"ALL", "FLX", "IDP"}
+    )
+    position = explicit_position or (scope[0] if len(scope) == 1 else None)
+    team = _team(team_text) if team_text and team_text.strip() else None
+    parsed = _parse_player_cell(player_text, position, team)
+    if parsed is not None:
+        name, parsed_position, parsed_team = parsed
+        position = position or parsed_position
+        team = team or parsed_team
+    elif known is not None:
+        name = known.display_name
+        position = position or normalize_position(known.position)
+        team = team or _team(known.nfl_team_id)
+    else:
+        raise ValueError("projection player row lacks exact name/position/team metadata")
+    if position is None or team is None:
+        raise ValueError("projection player row lacks exact position or NFL team")
+    return name, position, team
+
+
+def _parse_player_cell(value, expected_position, expected_team):
+    text = re.sub(r"\s+", " ", value).strip()
+    if not text:
+        return None
+    positions = [re.escape(expected_position)] if expected_position else [
+        r"D\s*/\s*ST", "DST", "DEF", "QB", "RB", "FB", "WR", "TE", "K", "PK",
+        "DL", "DE", "DT", "NT", "EDGE", "LB", "ILB", "OLB", "MLB", "DB", "CB",
+        "S", "FS", "SS", "IDP"
+    ]
+    position_pattern = "(?:" + "|".join(positions) + ")"
+    team_pattern = re.escape(expected_team) if expected_team else r"[A-Z]{2,3}|FA"
+    patterns = (
+        rf"^(?P<name>.+?)\s+(?P<team>{team_pattern})\s*(?:-|·|,)?\s*(?P<pos>{position_pattern})$",
+        rf"^(?P<name>.+?)\s+(?P<pos>{position_pattern})\s*(?:-|·|,)?\s*(?P<team>{team_pattern})$",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return (
+                match.group("name").strip(),
+                normalize_position(match.group("pos")),
+                _team(match.group("team")),
+            )
+    if expected_position and expected_team:
+        for suffix in (expected_team, expected_position):
+            match = re.fullmatch(
+                rf"(?P<name>.+?)\s+{re.escape(suffix)}", text, flags=re.IGNORECASE
+            )
+            if match:
+                return match.group("name").strip(), expected_position, expected_team
+        return text, expected_position, expected_team
+    return None
+
+
+def _provider_link(provider, link):
+    path = urlsplit(link).path
+    patterns = {
+        CaptureProvider.ESPN: ("espn", r"^/nfl/player/_/id/([0-9]+)(?:/[^/]*)?/?$"),
+        CaptureProvider.YAHOO: ("yahoo", r"^/nfl/players/([0-9]+)/?$"),
+        CaptureProvider.FANTASYPROS: (
+            "fantasypros_projection", r"^/nfl/players/([a-z0-9-]+)\.php$"
+        ),
+    }
+    identity_provider, pattern = patterns[provider]
+    match = re.fullmatch(pattern, path, flags=re.IGNORECASE)
+    if match is not None:
+        return identity_provider, match.group(1), False
+    if provider is CaptureProvider.YAHOO:
+        team = re.fullmatch(
+            r"^/nfl/teams/([a-z0-9]+(?:-[a-z0-9]+)*)/?$",
+            path,
+            flags=re.IGNORECASE,
+        )
+        if team is not None:
+            return "yahoo", team.group(1).casefold(), True
+    raise ValueError("projection link does not contain a supported public identity")
+
+
+def _points_index(headers):
+    for choices in _POINT_HEADER_TIERS:
+        matches = [index for index, header in enumerate(headers) if header in choices]
+        if len(matches) > 1:
+            raise ValueError("projection table has ambiguous fantasy-point columns")
+        if matches:
+            return matches[0]
+    raise ValueError("projection table has no fantasy-point projection column")
+
+
+def _stat_indices(headers, excluded):
+    result, names = [], set()
+    for index, header in enumerate(headers):
+        if index in excluded:
+            continue
+        name = header.lower().replace(" ", "_")
+        if name in names:
+            raise ValueError("projection table contains duplicate stat headers")
+        names.add(name)
+        result.append(index)
+    return tuple(result)
+
+
+def _one_index(headers, choices, label):
+    matches = [index for index, header in enumerate(headers) if header in choices]
+    if len(matches) != 1:
+        raise ValueError(f"projection table must contain exactly one {label} column")
+    return matches[0]
+
+
+def _optional_index(headers, choices, label):
+    matches = [index for index, header in enumerate(headers) if header in choices]
+    if len(matches) > 1:
+        raise ValueError(f"projection table contains duplicate {label} columns")
+    return matches[0] if matches else None
+
+
+def _opponent(value):
+    text = value.strip().upper()
+    if text in _MISSING or text == "BYE":
+        return None, None
+    match = re.fullmatch(r"(?:(@)|(?:VS\.?\s*))?([A-Z]{2,3})", text)
+    if match is None:
+        return None, None
+    is_home = False if match.group(1) else True if text.startswith("VS") else None
+    return _team(match.group(2)), is_home
+
+
+def _optional_number(value):
+    text = value.strip().upper()
+    if text in _MISSING:
+        return None
+    if not re.fullmatch(r"[+-]?(?:[0-9]+(?:,[0-9]{3})*|[0-9]*\.[0-9]+)", text):
+        return None
+    number = float(text.replace(",", ""))
+    return number if isfinite(number) else None
+
+
+def normalize_position(value):
+    return normalize_player_position(value, require_supported=True)
+
+
+def _team(value):
+    normalized = value.strip().upper()
+    normalized = {"JAC": "JAX", "WAS": "WSH", "LA": "LAR"}.get(normalized, normalized)
+    if not re.fullmatch(r"[A-Z]{2,3}|FA", normalized):
+        raise ValueError(f"invalid NFL team abbreviation {value!r}")
+    return normalized
+
+
+def _header(value):
+    return re.sub(r"[^A-Z0-9]+", " ", value.upper()).strip()
+
+
+__all__ = (
+    "ProjectionArtifactRow",
+    "normalize_position",
+    "projection_artifact_rows",
+)

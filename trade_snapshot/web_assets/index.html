@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#071014">
+  <meta name="app-token" content="__APP_TOKEN__">
+  <title>Fantasy Trade Evaluator</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">LOCAL FANTASY LAB</p>
+      <h1>Trade Evaluator</h1>
+      <p class="subtitle">Find trades that improve both teams without repeatedly calling a website.</p>
+    </div>
+    <div id="health" class="status-pill">Starting…</div>
+  </header>
+
+  <main>
+    <div id="errorBanner" class="error-banner hidden" role="alert"></div>
+
+    <section class="panel source-panel">
+      <div class="section-heading">
+        <div><span class="step">1</span><h2>Weekly data</h2></div>
+        <p>Collect each source once. Every trade search afterward stays on this computer.</p>
+      </div>
+
+      <div class="browser-bridge" aria-live="polite">
+        <div>
+          <div class="bridge-title"><span id="extensionDot" class="bridge-dot"></span><strong id="extensionStatus">Checking browser extension…</strong></div>
+          <p id="extensionHelp">The extension reads the league pages in the browser where you are already signed in. It never exports your cookies.</p>
+          <p id="extensionPairCode" class="pair-code hidden"></p>
+        </div>
+        <div class="bridge-actions">
+          <a class="button-link secondary" href="/browser-extension.zip" download>Download extension</a>
+          <button id="connectExtensionButton" type="button" class="primary">Connect extension</button>
+        </div>
+      </div>
+      <details class="extension-setup">
+        <summary>First-time extension setup</summary>
+        <ol>
+          <li>Download the extension and extract the ZIP to a folder you will keep.</li>
+          <li>Open <strong>chrome://extensions</strong> in Chrome, turn on <strong>Developer mode</strong>, and choose <strong>Load unpacked</strong>.</li>
+          <li>Select the extracted folder—the one containing <strong>manifest.json</strong>—then return here and click <strong>Connect extension</strong>.</li>
+          <li>Open the extension from Chrome’s Extensions menu, confirm that its four-character code matches the code shown here, and choose <strong>Pair with app</strong>.</li>
+          <li>Before scanning, sign in to FantasyPros, ESPN, and Yahoo normally in this same browser, then close those sign-in tabs.</li>
+        </ol>
+        <p>Microsoft Edge works too: use <strong>edge://extensions</strong> and the same steps.</p>
+      </details>
+
+      <form id="collectionForm" class="collection-form">
+        <div class="collection-grid">
+          <label><span>Season</span><input id="collectionSeason" type="number" min="2012" max="9999" required></label>
+          <label><span>Current week</span><input id="collectionWeek" type="number" min="1" max="25" value="1" required></label>
+          <label><span>Scoring</span><select id="collectionScoring"><option value="PPR">PPR</option><option value="HALF">Half PPR</option><option value="STD">Standard</option></select></label>
+          <label class="wide-field"><span>ESPN league link <small>(recommended)</small></span><input id="hostLeagueUrl" type="url" placeholder="Paste any page inside this ESPN Fantasy Football league"></label>
+          <label class="wide-field"><span>Yahoo league or player-list link</span><input id="yahooProjectionUrl" type="url" placeholder="League home, numeric team, Players, or Player List page" required></label>
+        </div>
+        <div class="collection-actions">
+          <label class="check"><input id="includeFutureWeekly" type="checkbox"><span>Try every future week too (advanced; all three sites must publish it)</span></label>
+          <label class="check surrogate-consent"><input id="allowSurrogatePower" type="checkbox"><span>If exact replication fails, publish a <strong>SURROGATE</strong> weekly engine. Its power scores are approximations and will never be labeled exact.</span></label>
+          <div class="action-row compact-actions">
+            <button id="collectButton" type="submit" class="primary">Scan league &amp; collect</button>
+            <button id="cancelCollectionButton" type="button" class="danger hidden">Stop collection</button>
+          </div>
+        </div>
+        <p class="field-help">League size, every team, and every roster are detected from your signed-in FantasyPros league and cross-checked against ESPN. Paste ESPN League Home—or any page inside that fantasy-football league; only its numeric league ID is retained. Yahoo links may be league home, numeric team, Players, or Player List pages; the app safely switches Yahoo to All Players. The extension reuses one scan tab in your regular browser and closes it when collection finishes.</p>
+      </form>
+
+      <div id="collectionProgress" class="collection-progress hidden" aria-live="polite">
+        <div class="progress-track"><div id="collectionProgressBar" class="progress-bar"></div></div>
+        <p id="collectionProgressText">Preparing weekly collection…</p>
+        <div id="signInPrompt" class="sign-in-prompt hidden">
+          <span id="signInPromptText">Finish signing in on the extension’s scan tab.</span>
+          <button id="confirmSignInButton" type="button" class="secondary">I’m signed in — continue</button>
+        </div>
+      </div>
+
+      <div class="source-grid">
+        <label class="file-card">
+          <span>Or import a weekly bundle</span>
+          <small>Portable JSON previously created by this app</small>
+          <input id="bundleFile" type="file" accept="application/json,.json">
+        </label>
+        <label>
+          <span>Ready week</span>
+          <select id="bundleSelect"><option value="">No weekly bundle yet</option></select>
+        </label>
+        <div>
+          <div id="readiness" class="readiness not-ready" aria-live="polite">Checking weekly readiness…</div>
+          <div id="bundleSummary" class="bundle-summary">Import or collect a weekly bundle to begin.</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="section-heading">
+        <div><span class="step">2</span><h2>Choose the search</h2></div>
+        <p>Counts are exact before the run starts. Playoff simulations happen only after the fast power filter.</p>
+      </div>
+      <form id="searchForm">
+        <div class="form-grid identity-grid">
+          <label><span>Your team</span><select id="primaryTeam" required></select></label>
+          <label><span>Other teams</span><select id="counterparties" multiple size="5"></select><small>Select specific teams, or leave all unselected to search every other team.</small></label>
+        </div>
+
+        <fieldset class="package-filters">
+          <legend>Package contents <small>(optional)</small></legend>
+          <p class="filter-intro">Turn on either side independently. Player and position rules are combined when both are used.</p>
+          <div class="package-filter-grid">
+            <section class="package-filter-card" data-filter-side="outgoing">
+              <label class="check filter-toggle"><input id="outgoingFilterEnabled" type="checkbox"><span>Filter players you give</span></label>
+              <div class="package-filter-controls" id="outgoingFilterControls">
+                <label><span>Player rule</span><select id="outgoingPlayerMode"><option value="any">Any players</option><option value="include">Must include all selected</option><option value="only">Exactly the selected players</option><option value="exclude">Exclude all selected</option></select></label>
+                <label><span>Find a player</span><input id="outgoingPlayerSearch" type="search" placeholder="Type a player name"></label>
+                <div id="outgoingPlayerChoices" class="filter-choice-list" role="group" aria-label="Players you give"></div>
+                <label><span>Position rule</span><select id="outgoingPositionMode"><option value="any">Any positions</option><option value="include">Must include each selected</option><option value="only">Only the selected positions</option><option value="exclude">Exclude the selected positions</option></select></label>
+                <div id="outgoingPositionChoices" class="position-choices" role="group" aria-label="Positions you give"></div>
+              </div>
+            </section>
+
+            <section class="package-filter-card" data-filter-side="incoming">
+              <label class="check filter-toggle"><input id="incomingFilterEnabled" type="checkbox"><span>Filter players you receive</span></label>
+              <div class="package-filter-controls" id="incomingFilterControls">
+                <label><span>Player rule</span><select id="incomingPlayerMode"><option value="any">Any players</option><option value="include">Must include all selected</option><option value="only">Exactly the selected players</option><option value="exclude">Exclude all selected</option></select></label>
+                <label><span>Find a player</span><input id="incomingPlayerSearch" type="search" placeholder="Type a player name or team"></label>
+                <div id="incomingPlayerChoices" class="filter-choice-list" role="group" aria-label="Players you receive"></div>
+                <label><span>Position rule</span><select id="incomingPositionMode"><option value="any">Any positions</option><option value="include">Must include each selected</option><option value="only">Only the selected positions</option><option value="exclude">Exclude the selected positions</option></select></label>
+                <div id="incomingPositionChoices" class="position-choices" role="group" aria-label="Positions you receive"></div>
+              </div>
+            </section>
+          </div>
+        </fieldset>
+
+        <div class="rule-grid">
+          <fieldset>
+            <legend>Package sizes</legend>
+            <div class="two-up">
+              <label><span>Minimum you send</span><input id="minOutgoing" type="number" min="1" value="1"></label>
+              <label><span>Maximum you send</span><input id="maxOutgoing" type="number" min="1" value="6"></label>
+              <label><span>Minimum you receive</span><input id="minIncoming" type="number" min="1" value="1"></label>
+              <label><span>Maximum you receive</span><input id="maxIncoming" type="number" min="1" value="6"></label>
+              <label><span>Maximum total players</span><input id="maxTotal" type="number" min="2" value="12"></label>
+              <label><span>Maximum side imbalance</span><input id="maxImbalance" type="number" min="0" value="1"></label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Filters and accuracy</legend>
+            <label class="check"><input id="balancedOnly" type="checkbox"><span>Only equal-size swaps</span></label>
+            <label class="check"><input id="skipSmall" type="checkbox" checked><span>Skip trades FantasyPros already covers (3 or fewer per side)</span></label>
+            <label class="check"><input id="noDrops" type="checkbox" checked><span>Do not force either team to drop a player</span></label>
+            <label id="surrogateSearchConsentRow" class="check surrogate-consent hidden"><input id="acceptSurrogateSearch" type="checkbox"><span>I understand this selected week uses <strong>SURROGATE</strong> power, which affects trade filtering and is not an exact FantasyPros result.</span></label>
+            <label><span>Minimum power change for each team</span><input id="powerFloor" type="number" step="0.1" value="-5"></label>
+            <label><span>Season simulations per candidate</span><input id="scenarioCount" type="number" min="100" max="1000000" step="100" value="10000"></label>
+          </fieldset>
+        </div>
+
+        <div class="action-row">
+          <button id="estimateButton" type="button" class="secondary">Count combinations</button>
+          <button id="startButton" type="submit" class="primary">Start local search</button>
+          <button id="cancelButton" type="button" class="danger hidden">Stop safely</button>
+        </div>
+      </form>
+      <div id="estimate" class="estimate">Choose a ready week, then count the combinations.</div>
+    </section>
+
+    <section id="progressPanel" class="panel hidden">
+      <div class="section-heading">
+        <div><span class="step">3</span><h2>Search progress</h2></div>
+        <p id="progressText">Preparing the shared season simulation…</p>
+      </div>
+      <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
+      <div id="progressStats" class="stat-row"></div>
+    </section>
+
+    <section id="resultsPanel" class="panel hidden">
+      <div class="section-heading results-heading">
+        <div><span class="step">4</span><h2>Best local results</h2></div>
+        <button id="exportButton" class="primary">Download Excel workbook</button>
+      </div>
+      <p id="resultsNote" class="results-note"></p>
+      <h3 class="table-title">League outlook before any trade</h3>
+      <div class="table-wrap outlook-table">
+        <table>
+          <thead><tr><th>Projected finish</th><th>Team</th><th>Current record</th><th>Expected final record</th><th>Make playoffs</th></tr></thead>
+          <tbody id="outlookBody"></tbody>
+        </table>
+      </div>
+      <h3 class="table-title">Qualified trades</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Other team</th><th>You give</th><th>You receive</th><th>Automatic roster moves</th><th>Your power</th><th>Their power</th><th>Your playoff</th><th>Their playoff</th><th>Power evidence</th></tr></thead>
+          <tbody id="resultsBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer>All candidate scoring and season simulation run on this computer. Weekly source evidence stays in the selected bundle.</footer>
+  <script src="/app.js" defer></script>
+</body>
+</html>

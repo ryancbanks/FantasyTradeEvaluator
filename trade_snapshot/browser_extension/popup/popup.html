@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#101827">
+  <title>Fantasy Trade Evaluator Browser Bridge</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <p class="eyebrow">Fantasy Trade Evaluator</p>
+    <h1>Browser Bridge</h1>
+    <div class="status-row">
+      <span id="status-dot" class="dot" aria-hidden="true"></span>
+      <strong id="status">Checking…</strong>
+    </div>
+    <p id="detail" class="detail">Reading the local connection state.</p>
+    <p id="pair-hint" class="hint" hidden></p>
+    <div id="pair-actions" class="actions" hidden>
+      <button id="accept" class="primary" type="button">Pair with app</button>
+      <button id="reject" type="button">Reject</button>
+    </div>
+    <div id="connected-actions" class="actions" hidden>
+      <button id="disconnect" type="button">Disconnect</button>
+    </div>
+    <p class="privacy">Pairing is temporary. Provider sign-in stays in this browser; the extension never reads or sends browser cookies or site storage.</p>
+  </main>
+  <script src="../protocol.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

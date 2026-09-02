@@ -1,0 +1,517 @@
+"""Loopback-only HTTP server for the non-technical local application."""
+
+from hmac import compare_digest
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.resources import files
+from io import BytesIO
+import json
+from functools import lru_cache
+from pathlib import Path
+import re
+from secrets import token_urlsafe
+import shutil
+from threading import Event, Lock, Thread, Timer
+from time import monotonic
+from urllib.parse import unquote, urlsplit
+import webbrowser
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
+
+from ._app_support import default_data_directory
+from .app_service import LocalAppService, LocalSearchRequest
+from .extension_bridge import (
+    COMMAND_RESULT_MAX_BYTES,
+    PAIR_REQUEST_MAX_BYTES,
+    SESSION_TOKEN_HEADER,
+    BridgeAuthenticationError,
+    BridgePayloadError,
+    BridgeProtocolError,
+    BridgeStaleCommandError,
+    BridgeStateError,
+    ExtensionCommandBridge,
+)
+from .weekly_collection import WeeklyCollectionRequest, WeeklyCollectionWorkflow
+
+
+_JOB_PATH = re.compile(r"^/api/searches/([0-9a-f]{32})$")
+_JOB_ACTION_PATH = re.compile(r"^/api/searches/([0-9a-f]{32})/(cancel|export|results)$")
+_COLLECTION_PATH = re.compile(r"^/api/weekly-collections/([0-9a-f]{32})$")
+_COLLECTION_CANCEL_PATH = re.compile(
+    r"^/api/weekly-collections/([0-9a-f]{32})/cancel$"
+)
+_COLLECTION_SIGN_IN_PATH = re.compile(
+    r"^/api/weekly-collections/([0-9a-f]{32})/sign-in$"
+)
+_EXPORT_PATH = re.compile(r"^/api/exports/([^/]+\.xlsx)$")
+_STATIC = {
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/styles.css": ("styles.css", "text/css; charset=utf-8"),
+}
+_MAX_JSON_BYTES = 256 * 1024 * 1024
+_EXTENSION_ROOT = "/api/browser-extension/v1"
+
+
+class LocalAppHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = False
+
+    def __init__(
+        self,
+        address,
+        service: LocalAppService,
+        extension_bridge: ExtensionCommandBridge | None = None,
+    ):
+        self.app_service = service
+        self.extension_bridge = extension_bridge or ExtensionCommandBridge()
+        self.app_token = token_urlsafe(32)
+        self._lifecycle_lock = Lock()
+        self._lifecycle_changed = Event()
+        self._created_at = monotonic()
+        self._last_browser_ping: float | None = None
+        self._browser_close_requested: float | None = None
+        self._lifecycle_started = False
+        super().__init__(address, LocalAppRequestHandler)
+
+    @property
+    def app_url(self) -> str:
+        return f"http://127.0.0.1:{self.server_address[1]}/"
+
+    def browser_ping(self) -> None:
+        with self._lifecycle_lock:
+            self._last_browser_ping = monotonic()
+            self._browser_close_requested = None
+        self._lifecycle_changed.set()
+
+    def browser_close(self) -> None:
+        with self._lifecycle_lock:
+            self._browser_close_requested = monotonic()
+        self._lifecycle_changed.set()
+
+    def start_browser_lifecycle(
+        self,
+        *,
+        launch_timeout: float = 120.0,
+        idle_timeout: float = 180.0,
+        close_grace: float = 2.0,
+    ) -> Thread:
+        if min(launch_timeout, idle_timeout, close_grace) <= 0:
+            raise ValueError("browser lifecycle timeouts must be positive")
+        with self._lifecycle_lock:
+            if self._lifecycle_started:
+                raise RuntimeError("browser lifecycle is already running")
+            self._lifecycle_started = True
+        monitor = Thread(
+            target=self._monitor_browser,
+            args=(launch_timeout, idle_timeout, close_grace),
+            name="browser-lifecycle",
+            daemon=True,
+        )
+        monitor.start()
+        return monitor
+
+    def _monitor_browser(
+        self, launch_timeout: float, idle_timeout: float, close_grace: float
+    ) -> None:
+        while True:
+            now = monotonic()
+            with self._lifecycle_lock:
+                ping = self._last_browser_ping
+                close = self._browser_close_requested
+            expired = (
+                close is not None and now - close >= close_grace
+            ) or (
+                ping is None and now - self._created_at >= launch_timeout
+            ) or (
+                ping is not None and now - ping >= idle_timeout
+            )
+            if expired:
+                self.shutdown()
+                return
+            self._lifecycle_changed.wait(timeout=min(close_grace, 1.0))
+            self._lifecycle_changed.clear()
+
+
+class LocalAppRequestHandler(BaseHTTPRequestHandler):
+    server: LocalAppHTTPServer
+    protocol_version = "HTTP/1.1"
+    server_version = "FantasyTradeEvaluator"
+    sys_version = ""
+
+    def do_GET(self) -> None:
+        self._dispatch(self._get)
+
+    def do_POST(self) -> None:
+        self._dispatch(self._post)
+
+    def do_OPTIONS(self) -> None:
+        self._json(HTTPStatus.METHOD_NOT_ALLOWED, {"error": "Cross-origin requests are not allowed."})
+
+    def log_message(self, _format: str, *_args) -> None:
+        return
+
+    def _dispatch(self, operation) -> None:
+        try:
+            if not self._valid_host():
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid local host header."})
+                return
+            operation()
+        except (ValueError, json.JSONDecodeError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+        except (FileNotFoundError, KeyError):
+            self._json(HTTPStatus.NOT_FOUND, {"error": "The requested local item was not found."})
+        except BridgeAuthenticationError as error:
+            self._json(HTTPStatus.FORBIDDEN, {"error": str(error)})
+        except (BridgeProtocolError, BridgePayloadError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+        except (BridgeStateError, BridgeStaleCommandError) as error:
+            self._json(HTTPStatus.CONFLICT, {"error": str(error)})
+        except RuntimeError as error:
+            self._json(HTTPStatus.CONFLICT, {"error": str(error)})
+        except PermissionError as error:
+            self._json(HTTPStatus.FORBIDDEN, {"error": str(error)})
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
+        except Exception:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Unexpected local application error."})
+
+    def _get(self) -> None:
+        path = urlsplit(self.path).path
+        if path == "/":
+            template = _asset("index.html").decode("utf-8")
+            body = template.replace("__APP_TOKEN__", self.server.app_token).encode("utf-8")
+            self._bytes(HTTPStatus.OK, body, "text/html; charset=utf-8")
+            return
+        if path in _STATIC:
+            filename, content_type = _STATIC[path]
+            self._bytes(HTTPStatus.OK, _asset(filename), content_type)
+            return
+        if path == "/browser-extension.zip":
+            self._bytes(
+                HTTPStatus.OK,
+                _extension_archive(),
+                "application/zip",
+                disposition='attachment; filename="FantasyTradeEvaluator-Browser-Extension.zip"',
+            )
+            return
+        self._require_token()
+        if path == "/api/health":
+            self._json(HTTPStatus.OK, {"status": "ready", "version": "0.1.0"})
+            return
+        if path == "/api/bundles":
+            self._json(HTTPStatus.OK, self.server.app_service.bundle_catalog())
+            return
+        if path == "/api/browser-extension/status":
+            self._json(HTTPStatus.OK, self.server.extension_bridge.public_status())
+            return
+        matched = _COLLECTION_PATH.fullmatch(path)
+        if matched:
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.weekly_collection(matched.group(1)),
+            )
+            return
+        matched = _JOB_PATH.fullmatch(path)
+        if matched:
+            self._json(HTTPStatus.OK, self.server.app_service.job(matched.group(1)))
+            return
+        matched = _JOB_ACTION_PATH.fullmatch(path)
+        if matched and matched.group(2) == "results":
+            self._json(HTTPStatus.OK, self.server.app_service.job_results(matched.group(1)))
+            return
+        matched = _EXPORT_PATH.fullmatch(path)
+        if matched:
+            self._download(unquote(matched.group(1)))
+            return
+        self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+
+    def _post(self) -> None:
+        path = urlsplit(self.path).path
+        if path.startswith(_EXTENSION_ROOT + "/"):
+            self._extension_post(path)
+            return
+        self._require_token()
+        if path == "/api/browser-extension/pairing":
+            self._require_empty_body()
+            self._json(
+                HTTPStatus.CREATED,
+                self.server.extension_bridge.create_pairing(),
+            )
+            return
+        if path == "/api/bundles/import":
+            summary = self.server.app_service.import_bundle(self._read_json())
+            self._json(HTTPStatus.CREATED, summary)
+            return
+        if path == "/api/weekly-collections":
+            request = WeeklyCollectionRequest.from_payload(
+                self._read_json(max_bytes=32 * 1024)
+            )
+            self._json(
+                HTTPStatus.ACCEPTED,
+                self.server.app_service.start_weekly_collection(request),
+            )
+            return
+        if path in {"/api/searches", "/api/searches/estimate"}:
+            request = LocalSearchRequest.from_payload(self._read_json(max_bytes=1024 * 1024))
+            if path.endswith("/estimate"):
+                self._json(HTTPStatus.OK, self.server.app_service.estimate_search(request))
+            else:
+                self._json(HTTPStatus.ACCEPTED, self.server.app_service.start_search(request))
+            return
+        if path == "/api/session/ping":
+            self._require_empty_body()
+            self.server.browser_ping()
+            self._json(HTTPStatus.OK, {"status": "active"})
+            return
+        if path == "/api/session/close":
+            self._require_empty_body()
+            self.server.browser_close()
+            self._json(HTTPStatus.OK, {"status": "closing"})
+            return
+        matched = _JOB_ACTION_PATH.fullmatch(path)
+        if matched and matched.group(2) == "cancel":
+            self._require_empty_body()
+            self._json(HTTPStatus.OK, self.server.app_service.cancel_job(matched.group(1)))
+            return
+        if matched and matched.group(2) == "export":
+            self._require_empty_body()
+            self._json(HTTPStatus.CREATED, self.server.app_service.export_job(matched.group(1)))
+            return
+        matched = _COLLECTION_CANCEL_PATH.fullmatch(path)
+        if matched:
+            self._require_empty_body()
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.cancel_weekly_collection(matched.group(1)),
+            )
+            return
+        matched = _COLLECTION_SIGN_IN_PATH.fullmatch(path)
+        if matched:
+            self._require_empty_body()
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.confirm_weekly_collection_sign_in(
+                    matched.group(1)
+                ),
+            )
+            return
+        self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+
+    def _extension_post(self, path: str) -> None:
+        bridge = self.server.extension_bridge
+        if path == _EXTENSION_ROOT + "/pair":
+            value = self._read_json(max_bytes=PAIR_REQUEST_MAX_BYTES)
+            if not isinstance(value, dict) or set(value) != {
+                "pair_code", "protocol_version", "capabilities", "extension_version"
+            }:
+                raise ValueError("extension pairing fields are invalid")
+            self._json(
+                HTTPStatus.OK,
+                bridge.connect(
+                    value["pair_code"],
+                    value["protocol_version"],
+                    value["capabilities"],
+                    value["extension_version"],
+                ),
+            )
+            return
+
+        token = self.headers.get(SESSION_TOKEN_HEADER, "")
+        if path == _EXTENSION_ROOT + "/poll":
+            value = self._read_json(max_bytes=1024)
+            if not isinstance(value, dict) or set(value) != {"wait_seconds"}:
+                raise ValueError("extension poll fields are invalid")
+            self._json(HTTPStatus.OK, bridge.poll(token, value["wait_seconds"]))
+            return
+        if path == _EXTENSION_ROOT + "/result":
+            value = self._read_json(max_bytes=COMMAND_RESULT_MAX_BYTES + 4096)
+            if not isinstance(value, dict) or "command_id" not in value:
+                raise ValueError("extension result fields are invalid")
+            keys = set(value)
+            if keys == {"command_id", "result"}:
+                response = bridge.complete(
+                    token, value["command_id"], result=value["result"]
+                )
+            elif keys == {"command_id", "error"}:
+                response = bridge.complete(
+                    token, value["command_id"], error=value["error"]
+                )
+            else:
+                raise ValueError("extension result fields are invalid")
+            self._json(HTTPStatus.OK, response)
+            return
+        if path == _EXTENSION_ROOT + "/disconnect":
+            value = self._read_json(max_bytes=64)
+            if value != {}:
+                raise ValueError("extension disconnect body must be an empty object")
+            self._json(HTTPStatus.OK, bridge.disconnect(token))
+            return
+        self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+
+    def _valid_host(self) -> bool:
+        host = self.headers.get("Host", "")
+        expected_port = str(self.server.server_address[1])
+        if host.count(":") > 1:
+            return False
+        hostname, separator, port = host.partition(":")
+        return hostname in {"127.0.0.1", "localhost"} and (
+            not separator or port == expected_port
+        )
+
+    def _require_token(self) -> None:
+        supplied = self.headers.get("X-FTE-Token", "")
+        if not compare_digest(supplied, self.server.app_token):
+            raise PermissionError("missing local application token")
+
+    def _read_json(self, *, max_bytes: int = _MAX_JSON_BYTES):
+        content_type = self.headers.get("Content-Type", "").partition(";")[0].strip().lower()
+        if content_type != "application/json":
+            raise ValueError("Content-Type must be application/json")
+        length = self._content_length(max_bytes)
+        if length == 0:
+            raise ValueError("JSON request body cannot be empty")
+        raw = self.rfile.read(length)
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("JSON request body must be UTF-8") from None
+        return json.loads(text, parse_constant=_reject_constant, object_pairs_hook=_unique_object)
+
+    def _require_empty_body(self) -> None:
+        if self._content_length(0) != 0:
+            raise ValueError("request body must be empty")
+
+    def _content_length(self, maximum: int) -> int:
+        raw = self.headers.get("Content-Length")
+        if raw is None:
+            raise ValueError("Content-Length is required")
+        try:
+            length = int(raw)
+        except ValueError:
+            raise ValueError("Content-Length is invalid") from None
+        if length < 0 or length > maximum:
+            raise ValueError("request body is too large")
+        return length
+
+    def _json(self, status: HTTPStatus, value: object) -> None:
+        body = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        self._bytes(status, body, "application/json; charset=utf-8")
+
+    def _bytes(self, status, body: bytes, content_type: str, *, disposition=None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if disposition is not None:
+            self.send_header("Content-Disposition", disposition)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _download(self, filename: str) -> None:
+        path = self.server.app_service.export_path(filename)
+        self.send_response(HTTPStatus.OK)
+        self.send_header(
+            "Content-Type",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        self.send_header("Content-Length", str(path.stat().st_size))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+        self.end_headers()
+        with path.open("rb") as source:
+            shutil.copyfileobj(source, self.wfile, length=1024 * 1024)
+
+
+def create_local_server(
+    data_directory: str | Path | None = None,
+    *,
+    port: int = 0,
+    weekly_collection_workflow: WeeklyCollectionWorkflow | None = None,
+    extension_bridge: ExtensionCommandBridge | None = None,
+) -> LocalAppHTTPServer:
+    if type(port) is not int or not 0 <= port <= 65535:
+        raise ValueError("port must be an integer between 0 and 65535")
+    service = LocalAppService(
+        data_directory or default_data_directory(),
+        weekly_collection_workflow=weekly_collection_workflow,
+    )
+    return LocalAppHTTPServer(
+        ("127.0.0.1", port), service, extension_bridge=extension_bridge
+    )
+
+
+def serve_local_app(
+    data_directory: str | Path | None = None,
+    *,
+    port: int = 0,
+    open_browser: bool = True,
+    weekly_collection_workflow: WeeklyCollectionWorkflow | None = None,
+    extension_bridge: ExtensionCommandBridge | None = None,
+) -> None:
+    server = create_local_server(
+        data_directory,
+        port=port,
+        weekly_collection_workflow=weekly_collection_workflow,
+        extension_bridge=extension_bridge,
+    )
+    if open_browser:
+        server.start_browser_lifecycle()
+        Timer(0.25, lambda: webbrowser.open(server.app_url)).start()
+    try:
+        server.serve_forever(poll_interval=0.25)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.extension_bridge.close()
+        server.server_close()
+
+
+def _asset(name: str) -> bytes:
+    return files("trade_snapshot.web_assets").joinpath(name).read_bytes()
+
+
+@lru_cache(maxsize=1)
+def _extension_archive() -> bytes:
+    """Build a deterministic load-unpacked extension archive from packaged resources."""
+
+    root = files("trade_snapshot.browser_extension")
+    entries = []
+    allowed_suffixes = {".css", ".html", ".js", ".json", ".md"}
+
+    def collect(directory, prefix=""):
+        for child in directory.iterdir():
+            name = f"{prefix}{child.name}"
+            if child.is_dir():
+                if child.name != "__pycache__":
+                    collect(child, name + "/")
+            elif Path(child.name).suffix.casefold() in allowed_suffixes:
+                entries.append((name, child.read_bytes()))
+
+    collect(root)
+    if not any(name == "manifest.json" for name, _ in entries):
+        raise RuntimeError("packaged browser extension is incomplete")
+    target = BytesIO()
+    with ZipFile(target, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
+        for name, body in sorted(entries):
+            info = ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
+            info.compress_type = ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            archive.writestr(info, body)
+    return target.getvalue()
+
+
+def _reject_constant(value: str):
+    raise ValueError(f"non-finite JSON constant {value}")
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result

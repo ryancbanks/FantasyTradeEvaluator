@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools==84.0.0", "wheel==0.48.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fantasy-trade-evaluator"
+version = "0.1.0"
+description = "Local, weekly NFL trade evaluation and playoff simulation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "XlsxWriter==3.2.9",
+]
+
+[project.scripts]
+fantasy-trade-evaluator = "trade_snapshot.app_launcher:main"
+fantasy-trade-snapshot = "trade_snapshot.__main__:main"
+
+[project.optional-dependencies]
+build = ["PyInstaller==6.22.2"]
+browser-test = [
+    "playwright==1.62.0",
+    "greenlet==3.5.5",
+    "pyee==13.0.1",
+    "typing_extensions==4.16.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["trade_snapshot*"]
+
+[tool.setuptools.package-data]
+"trade_snapshot.web_assets" = ["*.html", "*.css", "*.js"]
+"trade_snapshot.browser_extension" = [
+    "*.json", "*.js", "*.md", "collectors/*.js", "popup/*.html", "popup/*.css", "popup/*.js"
+]

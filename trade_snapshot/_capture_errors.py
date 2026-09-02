@@ -1,0 +1,27 @@
+"""Sanitized browser-capture exceptions shared across process boundaries."""
+
+
+class BrowserCaptureError(RuntimeError):
+    """Sanitized failure at the browser-capture boundary."""
+
+
+class BrowserCaptureDependencyError(BrowserCaptureError):
+    """The optional browser runtime is unavailable."""
+
+
+class BrowserCaptureCancelled(BrowserCaptureError):
+    """The caller cancelled collection."""
+
+
+class BrowserCaptureTimeout(BrowserCaptureError):
+    """An operation or complete run exceeded its deadline."""
+
+
+class YahooScoringError(BrowserCaptureError):
+    """Yahoo league scoring could not be safely verified or did not match."""
+
+
+__all__ = (
+    "BrowserCaptureCancelled", "BrowserCaptureDependencyError", "BrowserCaptureError",
+    "BrowserCaptureTimeout", "YahooScoringError",
+)

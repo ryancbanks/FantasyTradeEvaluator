@@ -1,0 +1,746 @@
+"use strict";
+
+const token = document.querySelector('meta[name="app-token"]').content;
+const $ = id => document.getElementById(id);
+let bundles = [];
+let activeJob = null;
+let activeCollection = null;
+let collectionAvailable = false;
+let extensionConnected = false;
+let extensionPairing = false;
+let extensionPairAcknowledged = false;
+let extensionPairFailure = null;
+let extensionPairHint = null;
+const heartbeatInterval = 20000;
+const extensionProtocolVersion = 1;
+
+async function api(path, options = {}) {
+  const headers = new Headers(options.headers || {});
+  headers.set("X-FTE-Token", token);
+  if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  const response = await fetch(path, {...options, headers});
+  const type = response.headers.get("Content-Type") || "";
+  const value = type.includes("application/json") ? await response.json() : await response.blob();
+  if (!response.ok) throw new Error(value.error || `Request failed (${response.status})`);
+  return value;
+}
+
+async function pingLifecycle() {
+  try { await api("/api/session/ping", {method: "POST", body: ""}); }
+  catch (_) { /* The regular health and job requests own visible error reporting. */ }
+}
+
+window.addEventListener("pagehide", event => {
+  if (event.persisted) return;
+  fetch("/api/session/close", {
+    method: "POST",
+    headers: {"X-FTE-Token": token},
+    body: "",
+    keepalive: true
+  }).catch(() => {});
+});
+setInterval(pingLifecycle, heartbeatInterval);
+
+window.addEventListener("message", event => {
+  const value = event.data;
+  if (event.source !== window || event.origin !== window.location.origin ||
+      !value || typeof value !== "object" || Array.isArray(value) ||
+      value.source !== "fantasy-trade-evaluator-extension" ||
+      value.protocol_version !== extensionProtocolVersion ||
+      typeof value.type !== "string") return;
+  if (value.type === "bridge.ready") return;
+  if (value.type === "pair.pending") {
+    extensionPairAcknowledged = true;
+    return;
+  }
+  if (value.type === "pair.accepted") {
+    extensionPairAcknowledged = true;
+    void refreshExtensionStatus();
+    return;
+  }
+  if (value.type === "pair.rejected" || value.type === "pair.expired") {
+    extensionPairFailure = "The extension did not accept this connection. Try Connect extension again.";
+    return;
+  }
+  if (value.type === "session.closed") void refreshExtensionStatus();
+});
+
+function showError(error) {
+  const banner = $("errorBanner");
+  banner.textContent = error instanceof Error ? error.message : String(error);
+  banner.classList.remove("hidden");
+  window.scrollTo({top: 0, behavior: "smooth"});
+}
+
+function clearError() { $("errorBanner").classList.add("hidden"); }
+function selectedValues(element) { return [...element.selectedOptions].map(option => option.value); }
+function numberValue(id, nullable = false) {
+  const value = $(id).value.trim();
+  return nullable && value === "" ? null : Number(value);
+}
+function compactNumber(value) { return new Intl.NumberFormat(undefined, {maximumFractionDigits: 0}).format(value); }
+function percent(value) { return new Intl.NumberFormat(undefined, {style: "percent", minimumFractionDigits: 1, maximumFractionDigits: 1}).format(value); }
+function signed(value, asPercent = false) {
+  const text = asPercent ? percent(Math.abs(value)) : Math.abs(value).toFixed(1);
+  return `${value >= 0 ? "+" : "−"}${text}`;
+}
+
+function currentBundle() {
+  return bundles.find(item => item.bundle_id === $("bundleSelect").value) || null;
+}
+
+function checkedValues(containerId) {
+  return [...$(containerId).querySelectorAll('input[type="checkbox"]:checked')]
+    .map(input => input.value);
+}
+
+function activeCounterpartyTeams(bundle) {
+  const selected = new Set(selectedValues($("counterparties")));
+  return bundle.teams.filter(team =>
+    team.team_id !== $("primaryTeam").value && (!selected.size || selected.has(team.team_id))
+  );
+}
+
+function renderPlayerChoices(side, teams) {
+  const container = $(`${side}PlayerChoices`);
+  const selected = new Set(checkedValues(`${side}PlayerChoices`));
+  container.replaceChildren();
+  for (const team of teams) {
+    if (teams.length > 1) {
+      const heading = document.createElement("div");
+      heading.className = "filter-team-label";
+      heading.textContent = team.name;
+      container.append(heading);
+    }
+    for (const player of team.players) {
+      const label = document.createElement("label");
+      label.className = "filter-choice";
+      label.dataset.search = `${player.name} ${team.name} ${player.positions.join(" ")}`.toLowerCase();
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.value = player.player_id;
+      checkbox.dataset.teamId = team.team_id;
+      checkbox.checked = selected.has(player.player_id);
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked && $(`${side}PlayerMode`).value === "any") {
+          $(`${side}PlayerMode`).value = "include";
+        }
+      });
+      const text = document.createElement("span");
+      text.textContent = player.positions.length
+        ? `${player.name} · ${player.positions.join("/")}`
+        : player.name;
+      label.append(checkbox, text);
+      container.append(label);
+    }
+  }
+  if (!container.children.length) {
+    const empty = document.createElement("p");
+    empty.className = "filter-empty";
+    empty.textContent = "No players are available for this side.";
+    container.append(empty);
+  }
+  filterPlayerChoices(side);
+}
+
+function renderPositionChoices(side, positions) {
+  const container = $(`${side}PositionChoices`);
+  const selected = new Set(checkedValues(`${side}PositionChoices`));
+  container.replaceChildren();
+  for (const position of positions) {
+    const label = document.createElement("label");
+    label.className = "filter-choice position-choice";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.value = position;
+    checkbox.checked = selected.has(position);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked && $(`${side}PositionMode`).value === "any") {
+        $(`${side}PositionMode`).value = "include";
+      }
+    });
+    const text = document.createElement("span");
+    text.textContent = position;
+    label.append(checkbox, text);
+    container.append(label);
+  }
+  if (!container.children.length) {
+    const empty = document.createElement("p");
+    empty.className = "filter-empty";
+    empty.textContent = "No roster positions are available for this side.";
+    container.append(empty);
+  }
+}
+
+function filterPlayerChoices(side) {
+  const query = $(`${side}PlayerSearch`).value.trim().toLowerCase();
+  const container = $(`${side}PlayerChoices`);
+  for (const choice of container.querySelectorAll(".filter-choice")) {
+    choice.hidden = Boolean(query) && !choice.dataset.search.includes(query);
+  }
+  for (const heading of container.querySelectorAll(".filter-team-label")) {
+    let row = heading.nextElementSibling;
+    let hasVisiblePlayer = false;
+    while (row && !row.classList.contains("filter-team-label")) {
+      if (row.classList.contains("filter-choice") && !row.hidden) hasVisiblePlayer = true;
+      row = row.nextElementSibling;
+    }
+    heading.hidden = !hasVisiblePlayer;
+  }
+}
+
+function setPackageFilterEnabled(side) {
+  const enabled = $(`${side}FilterEnabled`).checked;
+  const controls = $(`${side}FilterControls`);
+  controls.classList.toggle("disabled", !enabled);
+  for (const control of controls.querySelectorAll("input, select")) control.disabled = !enabled;
+}
+
+function populatePackageFilters() {
+  const bundle = currentBundle();
+  if (!bundle) {
+    for (const side of ["outgoing", "incoming"]) {
+      renderPlayerChoices(side, []);
+      renderPositionChoices(side, []);
+      setPackageFilterEnabled(side);
+    }
+    return;
+  }
+  const primary = bundle.teams.find(team => team.team_id === $("primaryTeam").value);
+  const incomingTeams = activeCounterpartyTeams(bundle);
+  const outgoingTeams = primary ? [primary] : [];
+  renderPlayerChoices("outgoing", outgoingTeams);
+  renderPlayerChoices("incoming", incomingTeams);
+  for (const [side, teams] of [["outgoing", outgoingTeams], ["incoming", incomingTeams]]) {
+    const positions = [...new Set(
+      teams.flatMap(team => team.players.flatMap(player => player.positions))
+    )].sort();
+    renderPositionChoices(side, positions);
+    setPackageFilterEnabled(side);
+  }
+}
+
+function packageFilterPayload(side) {
+  if (!$(`${side}FilterEnabled`).checked) return null;
+  const sideLabel = side === "outgoing" ? "players you give" : "players you receive";
+  const playerMode = $(`${side}PlayerMode`).value;
+  const positionMode = $(`${side}PositionMode`).value;
+  const playerIds = playerMode === "any" ? [] : checkedValues(`${side}PlayerChoices`);
+  const positions = positionMode === "any" ? [] : checkedValues(`${side}PositionChoices`);
+  if (playerMode !== "any" && !playerIds.length) {
+    throw new Error(`Choose at least one player for the ${sideLabel} rule.`);
+  }
+  if (side === "incoming" && ["include", "only"].includes(playerMode)) {
+    const owners = new Set(
+      [...$(`${side}PlayerChoices`).querySelectorAll('input[type="checkbox"]:checked')]
+        .map(input => input.dataset.teamId)
+    );
+    if (owners.size > 1) {
+      throw new Error("Players that must appear together need to be on the same other team.");
+    }
+  }
+  if (positionMode !== "any" && !positions.length) {
+    throw new Error(`Choose at least one position for the ${sideLabel} rule.`);
+  }
+  if (!playerIds.length && !positions.length) return null;
+  return {
+    player_ids: playerIds,
+    player_mode: playerIds.length ? playerMode : null,
+    positions,
+    position_mode: positions.length ? positionMode : null
+  };
+}
+
+function renderExtensionStatus(status) {
+  extensionConnected = status && status.state === "paired";
+  const pairing = extensionPairing;
+  $("extensionDot").classList.toggle("connected", extensionConnected);
+  $("extensionStatus").textContent = extensionConnected
+    ? `Browser extension connected${status.extension_version ? ` · ${status.extension_version}` : ""}`
+    : pairing
+      ? "Approve pairing in the extension…"
+      : "Browser extension not connected";
+  $("extensionHelp").textContent = extensionConnected
+    ? "Ready to scan through one temporary tab in this signed-in browser. Cookies never leave the browser."
+    : pairing
+      ? "Open Chrome’s Extensions menu, choose Fantasy Trade Evaluator Browser Bridge, and click Pair with app."
+    : "Install the downloaded extension once, then click Connect extension before collecting weekly data.";
+  $("connectExtensionButton").disabled = extensionConnected || pairing;
+  $("connectExtensionButton").textContent = extensionConnected ? "Connected" : pairing ? "Waiting for approval" : "Connect extension";
+  const pairCode = $("extensionPairCode");
+  const showPairCode = pairing && typeof extensionPairHint === "string";
+  pairCode.textContent = showPairCode
+    ? `Pairing code ends in ${extensionPairHint} — confirm the same code in the extension.`
+    : "";
+  pairCode.classList.toggle("hidden", !showPairCode);
+  if (!activeCollection) $("collectButton").disabled = !collectionAvailable || !extensionConnected;
+}
+
+async function refreshExtensionStatus() {
+  try {
+    const status = await api("/api/browser-extension/status");
+    renderExtensionStatus(status);
+    return status;
+  } catch (_) {
+    renderExtensionStatus(null);
+    return null;
+  }
+}
+
+async function connectExtension() {
+  clearError();
+  const button = $("connectExtensionButton");
+  button.disabled = true;
+  extensionPairAcknowledged = false;
+  extensionPairFailure = null;
+  extensionPairHint = null;
+  try {
+    const offer = await api("/api/browser-extension/pairing", {method: "POST", body: ""});
+    extensionPairHint = offer.pair_code.slice(-4);
+    window.postMessage({
+      source: "fantasy-trade-evaluator-app",
+      protocol_version: extensionProtocolVersion,
+      type: "pair.request",
+      app_origin: window.location.origin,
+      pair_code: offer.pair_code
+    }, window.location.origin);
+    extensionPairing = true;
+    renderExtensionStatus({state: "pairing"});
+    const deadline = Date.now() + Math.min(120000, offer.expires_in_seconds * 1000);
+    const detectionDeadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+      if (extensionPairFailure) throw new Error(extensionPairFailure);
+      const status = await refreshExtensionStatus();
+      if (status && status.state === "paired") {
+        extensionPairing = false;
+        extensionPairHint = null;
+        renderExtensionStatus(status);
+        return;
+      }
+      if (!extensionPairAcknowledged && Date.now() >= detectionDeadline) {
+        throw new Error(
+          "The browser extension was not detected. Install or reload it, refresh this page, and try Connect extension again."
+        );
+      }
+    }
+    throw new Error("The pairing request expired. Try Connect extension again.");
+  } catch (error) {
+    extensionPairing = false;
+    extensionPairAcknowledged = false;
+    extensionPairFailure = null;
+    extensionPairHint = null;
+    button.disabled = false;
+    await refreshExtensionStatus();
+    showError(error);
+  }
+}
+
+async function refreshBundles(selectId = null) {
+  const response = await api("/api/bundles");
+  const previous = $("bundleSelect").value;
+  bundles = response.bundles.filter(item => item.status === "ready");
+  collectionAvailable = response.readiness.collection_available;
+  renderReadiness(response.readiness);
+  const select = $("bundleSelect");
+  select.replaceChildren(new Option(bundles.length ? "Choose a ready week" : "No weekly bundle yet", ""));
+  for (const bundle of bundles) {
+    const mode = bundle.power_engine_mode === "surrogate" ? " · SURROGATE" : " · exact method";
+    const option = new Option(`${bundle.season} · Week ${bundle.week} · ${bundle.team_count} teams${mode}`, bundle.bundle_id);
+    select.add(option);
+  }
+  select.disabled = bundles.length === 0;
+  select.value = selectId || previous;
+  if (!select.value && bundles.length === 1 && bundles[0].power_engine_mode !== "surrogate") {
+    select.value = bundles[0].bundle_id;
+  }
+  $("collectButton").disabled = !collectionAvailable || !extensionConnected || Boolean(activeCollection);
+  $("collectButton").title = collectionAvailable ? "" : "Import a complete weekly bundle in this build.";
+  changeBundle();
+}
+
+function renderReadiness(readiness) {
+  const row = $("readiness");
+  row.textContent = readiness.message;
+  row.className = `readiness ${readiness.ready ? "ready" : "not-ready"}`;
+}
+
+function renderBundle() {
+  const bundle = currentBundle();
+  const primary = $("primaryTeam");
+  const others = $("counterparties");
+  primary.replaceChildren();
+  others.replaceChildren();
+  if (!bundle) {
+    $("bundleSummary").textContent = "Import or collect a weekly bundle to begin.";
+    $("bundleSummary").classList.remove("surrogate-warning");
+    $("estimateButton").disabled = true;
+    $("startButton").disabled = true;
+    $("surrogateSearchConsentRow").classList.add("hidden");
+    $("acceptSurrogateSearch").checked = false;
+    populatePackageFilters();
+    return;
+  }
+  for (const team of bundle.teams) {
+    primary.add(new Option(team.name, team.team_id));
+    others.add(new Option(team.name, team.team_id));
+  }
+  const surrogate = bundle.power_engine_mode === "surrogate";
+  const summary = $("bundleSummary");
+  if (surrogate) {
+    const error = bundle.methodology.holdout_max_absolute_score_error;
+    const match = percent(bundle.methodology.holdout_display_match_rate);
+    summary.textContent = `${bundle.season} week ${bundle.week} · ${bundle.team_count} teams · SURROGATE / APPROXIMATE POWER · Blind max score error ${error}; display match ${match}. ${bundle.power_engine_notice}`;
+    summary.classList.add("surrogate-warning");
+  } else {
+    const sizes = bundle.methodology.validated_balanced_package_sizes.join(", ");
+    summary.textContent = `${bundle.season} week ${bundle.week} · ${bundle.team_count} teams · exact FantasyPros-power evidence: balanced ${sizes}-player packages without adds/drops; other shapes are labeled extrapolated`;
+    summary.classList.remove("surrogate-warning");
+  }
+  $("surrogateSearchConsentRow").classList.toggle("hidden", !surrogate);
+  $("acceptSurrogateSearch").checked = false;
+  $("estimateButton").disabled = Boolean(activeCollection);
+  $("startButton").disabled = Boolean(activeCollection);
+  syncCounterparties();
+}
+
+function changeBundle() {
+  clearError();
+  activeJob = null;
+  $("progressPanel").classList.add("hidden");
+  $("resultsPanel").classList.add("hidden");
+  $("progressBar").style.width = "0%";
+  $("progressStats").textContent = "";
+  $("estimate").textContent = "Choose a ready week, then count the combinations.";
+  renderBundle();
+}
+
+function syncCounterparties() {
+  const own = $("primaryTeam").value;
+  for (const option of $("counterparties").options) {
+    option.disabled = option.value === own;
+    if (option.disabled) option.selected = false;
+  }
+  populatePackageFilters();
+}
+
+function requestPayload() {
+  if (!$("bundleSelect").value) throw new Error("Choose a ready weekly bundle first.");
+  return {
+    bundle_id: $("bundleSelect").value,
+    primary_team_id: $("primaryTeam").value,
+    counterparty_team_ids: selectedValues($("counterparties")),
+    min_outgoing: numberValue("minOutgoing"),
+    max_outgoing: numberValue("maxOutgoing"),
+    min_incoming: numberValue("minIncoming"),
+    max_incoming: numberValue("maxIncoming"),
+    max_total_players: numberValue("maxTotal", true),
+    max_imbalance: numberValue("maxImbalance", true),
+    balanced_only: $("balancedOnly").checked,
+    skip_fantasypros_small_trades: $("skipSmall").checked,
+    locked_player_ids: [],
+    require_no_drops: $("noDrops").checked,
+    outgoing_filter: packageFilterPayload("outgoing"),
+    incoming_filter: packageFilterPayload("incoming"),
+    minimum_power_delta: numberValue("powerFloor"),
+    checkpoint_interval: 1000,
+    scenario_count: numberValue("scenarioCount"),
+    seed: 20260901,
+    allow_surrogate_power: $("acceptSurrogateSearch").checked
+  };
+}
+
+function collectionPayload() {
+  const hostLeagueUrl = $("hostLeagueUrl").value.trim();
+  const yahooProjectionUrl = $("yahooProjectionUrl").value.trim();
+  return {
+    season: numberValue("collectionSeason"),
+    week: numberValue("collectionWeek"),
+    scoring: $("collectionScoring").value,
+    host_league_url: hostLeagueUrl || null,
+    yahoo_projection_league_url: yahooProjectionUrl || null,
+    include_future_weekly: $("includeFutureWeekly").checked,
+    allow_surrogate_power: $("allowSurrogatePower").checked
+  };
+}
+
+async function startCollection(event) {
+  event.preventDefault();
+  clearError();
+  try {
+    if (!extensionConnected) throw new Error("Connect the browser extension before scanning the league.");
+    const job = await api("/api/weekly-collections", {
+      method: "POST",
+      body: JSON.stringify(collectionPayload())
+    });
+    activeCollection = job.job_id;
+    setCollectionRunning(true);
+    renderCollectionProgress(job);
+    await pollCollection();
+  } catch (error) {
+    setCollectionRunning(false);
+    showError(error);
+  }
+}
+
+async function pollCollection() {
+  while (activeCollection) {
+    let job;
+    try { job = await api(`/api/weekly-collections/${activeCollection}`); }
+    catch (error) { showError(error); break; }
+    renderCollectionProgress(job);
+    if (!["queued", "running"].includes(job.status)) {
+      const selectedBundle = job.bundle_id;
+      activeCollection = null;
+      setCollectionRunning(false);
+      if (job.status === "complete") await refreshBundles(selectedBundle);
+      else if (job.status === "failed") showError(job.error || "No new weekly bundle was published.");
+      else $("collectionProgressText").textContent = "Collection stopped safely. No incomplete week was published.";
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  activeCollection = null;
+  setCollectionRunning(false);
+}
+
+function renderCollectionProgress(job) {
+  $("collectionProgress").classList.remove("hidden");
+  const progress = job.progress;
+  const pct = progress ? Math.min(100, progress.fraction * 100) : 0;
+  $("collectionProgressBar").style.width = `${pct}%`;
+  $("collectionProgressText").textContent = progress
+    ? `${progress.message} · ${pct.toFixed(0)}%`
+    : "Weekly collection is waiting to start…";
+  const pending = job.sign_in && job.sign_in.pending_provider;
+  const labels = {fantasypros: "FantasyPros", espn: "ESPN", yahoo: "Yahoo"};
+  $("signInPrompt").classList.toggle("hidden", !pending);
+  if (pending) {
+    $("signInPromptText").textContent = `If needed, finish signing in to ${labels[pending] || pending} on the extension’s scan tab, then continue.`;
+    $("confirmSignInButton").disabled = false;
+  }
+}
+
+function setCollectionRunning(running) {
+  $("cancelCollectionButton").classList.toggle("hidden", !running);
+  for (const element of $("collectionForm").elements) {
+    if (element.id !== "cancelCollectionButton") element.disabled = running;
+  }
+  $("collectButton").disabled = running || !collectionAvailable || !extensionConnected;
+  $("estimateButton").disabled = running || !$("bundleSelect").value;
+  $("startButton").disabled = running || !$("bundleSelect").value;
+  if (!running) $("signInPrompt").classList.add("hidden");
+}
+
+async function confirmCollectionSignIn() {
+  if (!activeCollection) return;
+  const button = $("confirmSignInButton");
+  button.disabled = true;
+  try {
+    await api(`/api/weekly-collections/${activeCollection}/sign-in`, {
+      method: "POST",
+      body: ""
+    });
+    $("signInPrompt").classList.add("hidden");
+  } catch (error) {
+    button.disabled = false;
+    showError(error);
+  }
+}
+
+async function cancelCollection() {
+  if (!activeCollection) return;
+  $("collectionProgressText").textContent = "Stopping safely after the current collection step…";
+  try {
+    await api(`/api/weekly-collections/${activeCollection}/cancel`, {method: "POST", body: ""});
+  } catch (error) { showError(error); }
+}
+
+async function estimate() {
+  clearError();
+  try {
+    const value = await api("/api/searches/estimate", {method: "POST", body: JSON.stringify(requestPayload())});
+    const caution = value.candidate_count > 10000000 ? " This is a very large run; tighten a size or imbalance filter first." : "";
+    $("estimate").textContent = `${compactNumber(value.candidate_count)} combinations counted exactly across ${value.pair_count} team matchups.${caution}`;
+  } catch (error) { showError(error); }
+}
+
+async function startSearch(event) {
+  event.preventDefault();
+  clearError();
+  try {
+    const job = await api("/api/searches", {method: "POST", body: JSON.stringify(requestPayload())});
+    activeJob = job.job_id;
+    $("progressPanel").classList.remove("hidden");
+    $("resultsPanel").classList.add("hidden");
+    $("cancelButton").classList.remove("hidden");
+    $("startButton").disabled = true;
+    $("collectButton").disabled = true;
+    $("bundleSelect").disabled = true;
+    await pollJob();
+  } catch (error) {
+    $("startButton").disabled = false;
+    $("collectButton").disabled = !collectionAvailable || !extensionConnected;
+    $("bundleSelect").disabled = bundles.length === 0;
+    showError(error);
+  }
+}
+
+async function pollJob() {
+  while (activeJob) {
+    let job;
+    try { job = await api(`/api/searches/${activeJob}`); }
+    catch (error) {
+      $("startButton").disabled = false;
+      $("collectButton").disabled = !collectionAvailable || !extensionConnected;
+      $("bundleSelect").disabled = bundles.length === 0;
+      $("cancelButton").classList.add("hidden");
+      showError(error);
+      return;
+    }
+    renderProgress(job);
+    if (!["queued", "running"].includes(job.status)) {
+      $("startButton").disabled = false;
+      $("collectButton").disabled = !collectionAvailable || !extensionConnected;
+      $("bundleSelect").disabled = bundles.length === 0;
+      $("cancelButton").classList.add("hidden");
+      if (job.status === "complete") await loadResults();
+      else if (job.status === "failed") showError(job.error || "The search failed.");
+      else $("progressText").textContent = "Stopped safely. Start again later to resume from this checkpoint.";
+      break;
+    }
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+}
+
+function renderProgress(job) {
+  const progress = job.progress;
+  if (!progress) {
+    $("progressText").textContent = "Preparing the shared season simulation…";
+    return;
+  }
+  const pct = Math.min(100, progress.completion_fraction * 100);
+  $("progressBar").style.width = `${pct}%`;
+  $("progressText").textContent = `${pct.toFixed(1)}% complete${progress.current_counterparty_team_id ? ` · current team ${progress.current_counterparty_team_id}` : ""}`;
+  $("progressStats").textContent = `${compactNumber(progress.examined_candidate_count)} of ${compactNumber(progress.total_candidate_count)} combinations · ${compactNumber(progress.qualified_trade_count)} passed power · ${compactNumber(progress.mutual_playoff_gain_count)} improve both playoff chances`;
+}
+
+async function loadResults() {
+  const value = await api(`/api/searches/${activeJob}/results`);
+  const outlookBody = $("outlookBody");
+  outlookBody.replaceChildren();
+  for (const row of value.team_outlook) {
+    const tr = document.createElement("tr");
+    const currentRecord = `${row.current_wins}-${row.current_losses}${row.current_ties ? `-${row.current_ties}` : ""}`;
+    const finalRecord = `${row.expected_final_wins.toFixed(1)}-${row.expected_final_losses.toFixed(1)}${row.expected_final_ties ? `-${row.expected_final_ties.toFixed(1)}` : ""}`;
+    const cells = [
+      row.projected_finish.toFixed(1),
+      row.team_name,
+      currentRecord,
+      finalRecord,
+      `${(row.playoff_probability * 100).toFixed(1)}%`
+    ];
+    cells.forEach((cell, index) => {
+      const td = document.createElement("td");
+      td.textContent = cell;
+      if (index === 4) td.className = "probability";
+      tr.append(td);
+    });
+    outlookBody.append(tr);
+  }
+  const body = $("resultsBody");
+  body.replaceChildren();
+  for (const row of value.rows) {
+    const tr = document.createElement("tr");
+    if (row.mutual_gain) tr.className = "mutual-row";
+    const moves = [
+      row.your_adds.length ? `You add: ${row.your_adds.join("; ")}` : "",
+      row.your_drops.length ? `You drop: ${row.your_drops.join("; ")}` : "",
+      row.their_adds.length ? `They add: ${row.their_adds.join("; ")}` : "",
+      row.their_drops.length ? `They drop: ${row.their_drops.join("; ")}` : ""
+    ].filter(Boolean).join(" · ") || "None";
+    const cells = [
+      row.other_team,
+      row.give.join("; "),
+      row.receive.join("; "),
+      moves,
+      signed(row.your_power_delta),
+      signed(row.their_power_delta),
+      signed(row.your_playoff_delta, true),
+      signed(row.their_playoff_delta, true),
+      row.power_methodology_status
+    ];
+    cells.forEach((value, index) => {
+      const td = document.createElement("td");
+      td.textContent = value;
+      if (index >= 4 && index <= 7) td.className = String(value).startsWith("+") ? "gain" : "loss";
+      tr.append(td);
+    });
+    body.append(tr);
+  }
+  const powerNotice = value.power_engine_mode === "surrogate"
+    ? ` SURROGATE POWER: ${value.power_engine_notice}`
+    : "";
+  $("resultsNote").textContent = `Showing ${value.shown_count} of ${value.total_count} qualified trades, with mutual gains first.${powerNotice}`;
+  $("resultsPanel").classList.remove("hidden");
+}
+
+async function cancelSearch() {
+  if (!activeJob) return;
+  try { await api(`/api/searches/${activeJob}/cancel`, {method: "POST", body: ""}); }
+  catch (error) { showError(error); }
+}
+
+async function exportWorkbook() {
+  clearError();
+  try {
+    const result = await api(`/api/searches/${activeJob}/export`, {method: "POST", body: ""});
+    const blob = await api(`/api/exports/${encodeURIComponent(result.filename)}`);
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = result.filename;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  } catch (error) { showError(error); }
+}
+
+$("bundleFile").addEventListener("change", async event => {
+  clearError();
+  const file = event.target.files[0];
+  if (!file) return;
+  try {
+    const record = JSON.parse(await file.text());
+    const summary = await api("/api/bundles/import", {method: "POST", body: JSON.stringify(record)});
+    await refreshBundles(summary.bundle_id);
+  } catch (error) { showError(error); }
+});
+$("bundleSelect").addEventListener("change", changeBundle);
+$("primaryTeam").addEventListener("change", syncCounterparties);
+$("counterparties").addEventListener("change", populatePackageFilters);
+for (const side of ["outgoing", "incoming"]) {
+  $(`${side}FilterEnabled`).addEventListener("change", () => setPackageFilterEnabled(side));
+  $(`${side}PlayerSearch`).addEventListener("input", () => filterPlayerChoices(side));
+}
+$("connectExtensionButton").addEventListener("click", connectExtension);
+$("collectionForm").addEventListener("submit", startCollection);
+$("cancelCollectionButton").addEventListener("click", cancelCollection);
+$("confirmSignInButton").addEventListener("click", confirmCollectionSignIn);
+$("estimateButton").addEventListener("click", estimate);
+$("searchForm").addEventListener("submit", startSearch);
+$("cancelButton").addEventListener("click", cancelSearch);
+$("exportButton").addEventListener("click", exportWorkbook);
+
+(async () => {
+  try {
+    $("collectionSeason").value = String(new Date().getFullYear());
+    await pingLifecycle();
+    await api("/api/health");
+    $("health").textContent = "App running locally";
+    await refreshExtensionStatus();
+    await refreshBundles();
+    setInterval(refreshExtensionStatus, 5000);
+  } catch (error) {
+    $("health").textContent = "Needs attention";
+    showError(error);
+  }
+})();

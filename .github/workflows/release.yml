@@ -1,0 +1,155 @@
+name: Build desktop releases
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-latest
+            python_arch: x64
+            installer: windows
+          - name: macOS Intel
+            runner: macos-15-intel
+            python_arch: x64
+            installer: macos
+          - name: macOS Apple silicon
+            runner: macos-15
+            python_arch: arm64
+            installer: macos
+          - name: Linux x64
+            runner: ubuntu-22.04
+            python_arch: x64
+            installer: linux
+          - name: Linux ARM64
+            runner: ubuntu-22.04-arm
+            python_arch: arm64
+            installer: linux
+    runs-on: ${{ matrix.runner }}
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: "0"
+      PLAYWRIGHT_SKIP_BROWSER_GC: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12.13"
+          architecture: ${{ matrix.python_arch }}
+          cache: pip
+      - name: Verify release tag matches project version
+        if: github.ref_type == 'tag'
+        run: python release_build.py --check-tag "${{ github.ref_name }}"
+      - name: Install application and builder
+        run: >-
+          python -m pip install --disable-pip-version-check
+          ".[build,browser-test]"
+      - name: Install source-test Chromium and Linux libraries
+        if: matrix.installer == 'linux'
+        run: python -m playwright install --with-deps --no-shell chromium
+      - name: Install source-test Chromium
+        if: matrix.installer != 'linux'
+        run: python -m playwright install --no-shell chromium
+      - name: Run test suite
+        run: python -m unittest discover -s tests -v
+      - name: Smoke installed wheel outside the checkout
+        run: python packaging/smoke_wheel.py
+      - name: Install Inno Setup
+        if: matrix.installer == 'windows'
+        shell: pwsh
+        run: |
+          $uri = 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe'
+          $installer = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+          Invoke-WebRequest -Uri $uri -OutFile $installer
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne 'Valid' -or
+              $signature.SignerCertificate.Subject -notmatch 'Pyrsys B\.V\.') {
+            throw 'Inno Setup Authenticode verification failed'
+          }
+          $process = Start-Process -FilePath $installer -WindowStyle Hidden -Wait -PassThru `
+            -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER'
+          if ($process.ExitCode -ne 0) { exit $process.ExitCode }
+      - name: Configure macOS signing and notarization
+        if: matrix.installer == 'macos'
+        shell: bash
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          required=(MACOS_SIGN_IDENTITY MACOS_CERTIFICATE_BASE64 \
+            MACOS_CERTIFICATE_PASSWORD APPLE_ID APPLE_TEAM_ID APPLE_APP_PASSWORD)
+          configured=0
+          for name in "${required[@]}"; do
+            if [ -n "${!name:-}" ]; then configured=$((configured + 1)); fi
+          done
+          if [ "$configured" -eq 0 ]; then
+            echo "No Apple credentials configured; building an unsigned development DMG."
+            exit 0
+          fi
+          if [ "$configured" -ne "${#required[@]}" ]; then
+            echo "macOS signing secrets must be configured as a complete set." >&2
+            exit 2
+          fi
+          keychain="$RUNNER_TEMP/fte-signing.keychain-db"
+          certificate="$RUNNER_TEMP/fte-signing.p12"
+          keychain_password=$(openssl rand -hex 32)
+          printf '%s' "$MACOS_CERTIFICATE_BASE64" | base64 -D > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security default-keychain -s "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security import "$certificate" -k "$keychain" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$keychain_password" "$keychain"
+          identities=$(security find-identity -v -p codesigning "$keychain")
+          printf '%s\n' "$identities"
+          if ! grep -F -- "$MACOS_SIGN_IDENTITY" <<< "$identities"; then
+            echo "Configured macOS signing identity was not imported." >&2
+            exit 2
+          fi
+          xcrun notarytool store-credentials fantasy-trade-evaluator-notary \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD"
+          rm -f "$certificate"
+          echo "MACOS_SIGN_IDENTITY=$MACOS_SIGN_IDENTITY" >> "$GITHUB_ENV"
+          echo "MACOS_NOTARY_PROFILE=fantasy-trade-evaluator-notary" >> "$GITHUB_ENV"
+      - name: Build native release
+        run: python release_build.py
+      - name: Smoke finished installer or disk image
+        run: python packaging/smoke_native_release.py release
+      - name: Remove temporary macOS signing keychain
+        if: always() && matrix.installer == 'macos'
+        shell: bash
+        run: |
+          keychain="$RUNNER_TEMP/fte-signing.keychain-db"
+          rm -f "$RUNNER_TEMP/fte-signing.p12"
+          if [ -f "$keychain" ]; then security delete-keychain "$keychain"; fi
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: fantasy-trade-evaluator-${{ matrix.installer }}-${{ matrix.python_arch }}
+          path: |
+            release/*.exe
+            release/*.zip
+            release/*.dmg
+            release/*.tar.gz
+            release/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
