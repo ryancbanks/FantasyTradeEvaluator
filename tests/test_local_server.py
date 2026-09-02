@@ -73,6 +73,20 @@ class LocalServerTests(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertEqual(summary["bundle_id"], bundle.bundle_id)
 
+        dashboard_path = f"/api/bundles/{bundle.bundle_id}/dashboard"
+        status, _, raw = self.request("GET", dashboard_path)
+        dashboard = json.loads(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(dashboard["bundle_id"], bundle.bundle_id)
+        self.assertEqual(dashboard["championship_model"]["status"], "modeled_estimate")
+        self.assertEqual(len(dashboard["teams"]), 2)
+        self.assertAlmostEqual(
+            sum(row["championship_probability"] for row in dashboard["teams"]),
+            1.0,
+        )
+        status, _, _ = self.request("GET", dashboard_path, token=False)
+        self.assertEqual(status, 403)
+
         status, _, raw = self.request(
             "POST", "/api/searches/estimate", value=payload(bundle.bundle_id)
         )
@@ -188,6 +202,19 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b"always extrapolated", page)
         self.assertIn(b"Every result requires all three teams", page)
         self.assertIn(b'id="resultsHeaderRow"', page)
+        self.assertIn(b'id="dashboardPanel"', page)
+        self.assertIn(b'id="contenderChart"', page)
+        self.assertIn(b'id="finishHeatmap"', page)
+        self.assertIn(b'id="positionHeatmap"', page)
+        self.assertIn(b'class="table-wrap dashboard-table-wrap" role="region"', page)
+        self.assertIn(b'class="dashboard-sr-only">Projected league standings', page)
+        self.assertIn(b'aria-labelledby="titleRaceHeading"', page)
+        self.assertIn(b'aria-label="Scrollable weekly scoring chart" tabindex="0"', page)
+        self.assertIn(b'aria-label="Scrollable final rank probability table"', page)
+        self.assertIn(b'src="/dashboard_charts.js"', page)
+        self.assertIn(b'src="/dashboard_ui.js"', page)
+        self.assertLess(page.index(b'/dashboard_charts.js'), page.index(b'/dashboard_ui.js'))
+        self.assertLess(page.index(b'/dashboard_ui.js'), page.index(b'/app.js'))
         self.assertLess(page.index(b'/three_way_ui.js'), page.index(b'/app.js'))
         self.assertNotIn(b'id="expectedTeamCount"', page)
 
@@ -199,6 +226,38 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b".team-impact-cell", stylesheet)
         self.assertIn(b".roster-adjustment-warning", stylesheet)
         self.assertNotIn(b"color-scheme: light", stylesheet)
+
+        status, headers, dashboard_styles = self.request(
+            "GET", "/dashboard.css", token=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/css", headers["Content-Type"])
+        self.assertIn(b".dashboard-grid", dashboard_styles)
+        self.assertIn(b"prefers-reduced-motion", dashboard_styles)
+        self.assertIn(b"#weeklyScoringChart svg { min-width: 720px; }", dashboard_styles)
+        self.assertIn(b".heatmap-wrap:focus-visible", dashboard_styles)
+
+        status, headers, charts = self.request(
+            "GET", "/dashboard_charts.js", token=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/javascript", headers["Content-Type"])
+        self.assertIn(b"window.DashboardCharts", charts)
+        self.assertIn(b'role: "img"', charts)
+
+        status, headers, dashboard_ui = self.request(
+            "GET", "/dashboard_ui.js", token=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/javascript", headers["Content-Type"])
+        self.assertIn(b"window.DashboardUi", dashboard_ui)
+        self.assertIn(b"AbortController", dashboard_ui)
+        self.assertIn(b"championship_model", dashboard_ui)
+        self.assertIn(b'"<0.1%"', dashboard_ui)
+        self.assertIn(b'rowHeader.scope = "row"', dashboard_ui)
+        self.assertIn(b"replacement?.focus()", dashboard_ui)
+        self.assertIn(b"bindHorizontalScroll(container)", dashboard_ui)
+        self.assertNotIn(b"innerHTML", dashboard_ui)
 
         status, headers, three_way = self.request("GET", "/three_way_ui.js", token=False)
         self.assertEqual(status, 200)

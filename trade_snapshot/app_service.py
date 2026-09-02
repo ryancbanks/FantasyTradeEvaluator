@@ -1,6 +1,7 @@
 """Thread-safe application service behind the localhost user interface."""
 
 from collections.abc import Mapping
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from ._app_support import (
     three_way_search_result_record,
     workbook_sources,
 )
+from .dashboard import build_league_dashboard
 from .engine_bundle import EngineBundle, load_engine_bundle, save_engine_bundle
 from .league_search import LeagueSearchOutcome, LeagueSearchProgress, ResumableLeagueTradeSearch
 from .roster_adjustment import (
@@ -58,6 +60,9 @@ from .workbook_model import (
     workbook_trade_rows,
 )
 from .xlsx_export import export_trade_workbook
+
+
+_MAX_DASHBOARD_SCENARIOS = 10_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +242,8 @@ class LocalAppService:
             directory.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
         self._jobs: dict[str, _SearchJob] = {}
+        self._dashboard_cache: dict[str, dict[str, object]] = {}
+        self._dashboard_futures: dict[str, Future[dict[str, object]]] = {}
         self._collections = WeeklyCollectionJobs(
             self.data_directory,
             self.bundle_directory,
@@ -264,6 +271,59 @@ class LocalAppService:
     def bundle_catalog(self) -> dict[str, object]:
         bundles = self.list_bundles()
         return {"bundles": bundles, "readiness": self._bundle_readiness(bundles)}
+
+    def league_dashboard(self, bundle_id: str) -> dict[str, object]:
+        """Return one deterministic league outlook, cached by immutable bundle ID."""
+
+        with self._lock:
+            cached = self._dashboard_cache.get(bundle_id)
+            if cached is not None:
+                return cached
+            future = self._dashboard_futures.get(bundle_id)
+            owns_calculation = future is None
+            if owns_calculation:
+                future = Future()
+                self._dashboard_futures[bundle_id] = future
+        assert future is not None
+        if not owns_calculation:
+            return future.result()
+
+        try:
+            bundle = load_engine_bundle(self._bundle_path(bundle_id))
+            source_config = bundle.scenario_config
+            dashboard_config = (
+                source_config
+                if source_config.scenario_count <= _MAX_DASHBOARD_SCENARIOS
+                else CorrelatedScenarioConfig(
+                    _MAX_DASHBOARD_SCENARIOS,
+                    source_config.seed,
+                    source_config.loadings,
+                )
+            )
+            baseline = prepare_season_baseline(
+                bundle.state,
+                bundle.rosters,
+                bundle.projections,
+                bundle.eligibilities,
+                dashboard_config,
+            )
+            dashboard = build_league_dashboard(
+                bundle,
+                baseline.season_projection,
+                baseline.scenarios,
+            )
+        except BaseException as error:
+            future.set_exception(error)
+            raise
+        else:
+            with self._lock:
+                self._dashboard_cache[bundle_id] = dashboard
+            future.set_result(dashboard)
+            return dashboard
+        finally:
+            with self._lock:
+                if self._dashboard_futures.get(bundle_id) is future:
+                    del self._dashboard_futures[bundle_id]
 
     def _bundle_readiness(self, bundles) -> dict[str, object]:
         ready_count = sum(row.get("status") == "ready" for row in bundles)

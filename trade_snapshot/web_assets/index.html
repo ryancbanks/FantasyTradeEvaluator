@@ -8,6 +8,7 @@
   <meta name="app-token" content="__APP_TOKEN__">
   <title>Fantasy Trade Evaluator</title>
   <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/dashboard.css">
 </head>
 <body>
   <header class="topbar">
@@ -96,9 +97,97 @@
       </div>
     </section>
 
+    <section id="dashboardPanel" class="panel dashboard-panel" aria-labelledby="dashboardHeading">
+      <div class="section-heading dashboard-heading">
+        <div><span class="step">2</span><h2 id="dashboardHeading">League dashboard</h2></div>
+        <p>Power, standings, playoff paths, and roster trends from the selected weekly model.</p>
+      </div>
+
+      <div id="dashboardEmpty" class="dashboard-state" aria-live="polite">
+        Select a ready week to calculate the league outlook.
+      </div>
+      <div id="dashboardLoading" class="dashboard-state dashboard-loading hidden" aria-live="polite">
+        <span class="dashboard-spinner" aria-hidden="true"></span>
+        <span>Running the shared league simulation locally…</span>
+      </div>
+      <div id="dashboardContent" class="dashboard-content hidden">
+        <div class="dashboard-toolbar">
+          <div>
+            <p class="dashboard-kicker">WEEKLY LEAGUE INTELLIGENCE</p>
+            <h3 id="dashboardTitle">League outlook</h3>
+            <p id="dashboardSubtitle" class="dashboard-subtitle"></p>
+          </div>
+          <label class="dashboard-team-picker">
+            <span>Explore one team</span>
+            <select id="dashboardTeamSelect"></select>
+          </label>
+        </div>
+
+        <div id="dashboardKpis" class="dashboard-kpis" aria-label="League summary"></div>
+
+        <div class="dashboard-table-heading">
+          <div>
+            <h3>League command center</h3>
+            <p>A complete league view without starting a trade search.</p>
+          </div>
+          <div class="dashboard-legend"><span class="legend-dot direct"></span>Season simulation <span class="legend-dot modeled"></span>Disclosed title model</div>
+        </div>
+        <div class="table-wrap dashboard-table-wrap" role="region" aria-label="Projected league standings; scroll horizontally for all columns" tabindex="0">
+          <table class="dashboard-table">
+            <caption class="dashboard-sr-only">Projected league standings with power, record, playoff, and modeled title outlooks</caption>
+            <thead>
+              <tr><th>Projected</th><th>Team</th><th>Power</th><th>Current</th><th>Expected final</th><th>Movement</th><th>Playoffs</th><th>Title</th></tr>
+            </thead>
+            <tbody id="dashboardStandingsBody"></tbody>
+          </table>
+        </div>
+
+        <div class="dashboard-grid">
+          <article class="dashboard-card" aria-labelledby="titleRaceHeading">
+            <div class="chart-heading"><div><p class="chart-number">01</p><h3 id="titleRaceHeading">Championship race</h3></div><p>Modeled title share</p></div>
+            <div id="titleRaceChart" class="chart-body"></div>
+          </article>
+          <article class="dashboard-card" aria-labelledby="contenderHeading">
+            <div class="chart-heading"><div><p class="chart-number">02</p><h3 id="contenderHeading">Contender map</h3></div><p>Power vs. playoff odds</p></div>
+            <div id="contenderChart" class="chart-body chart-svg" role="region" aria-label="Scrollable contender chart" tabindex="0"></div>
+          </article>
+          <article class="dashboard-card" aria-labelledby="momentumHeading">
+            <div class="chart-heading"><div><p class="chart-number">03</p><h3 id="momentumHeading">Standings momentum</h3></div><p>Current to projected rank</p></div>
+            <div id="standingsMovementChart" class="chart-body"></div>
+          </article>
+          <article class="dashboard-card" aria-labelledby="scheduleHeading">
+            <div class="chart-heading"><div><p class="chart-number">04</p><h3 id="scheduleHeading">Schedule gauntlet</h3></div><p>Hardest remaining first</p></div>
+            <div id="scheduleChart" class="chart-body"></div>
+          </article>
+          <article class="dashboard-card dashboard-card-wide" aria-labelledby="weeklyScoringHeading">
+            <div class="chart-heading"><div><p class="chart-number">05</p><h3 id="weeklyScoringHeading">Weekly scoring runway</h3></div><p id="weeklyChartLabel">Selected team vs. league</p></div>
+            <div id="weeklyScoringChart" class="chart-body chart-svg" role="region" aria-label="Scrollable weekly scoring chart" tabindex="0"></div>
+          </article>
+          <article class="dashboard-card dashboard-card-wide" aria-labelledby="finishMapHeading">
+            <div class="chart-heading"><div><p class="chart-number">06</p><h3 id="finishMapHeading">Finish probability map</h3></div><p>Chance of every final rank</p></div>
+            <div id="finishHeatmap" class="chart-body heatmap-wrap" role="region" aria-label="Scrollable final rank probability table" tabindex="0"></div>
+          </article>
+          <article class="dashboard-card dashboard-card-wide" aria-labelledby="seedMapHeading">
+            <div class="chart-heading"><div><p class="chart-number">07</p><h3 id="seedMapHeading">Playoff seed paths</h3></div><p>Qualification paths by seed</p></div>
+            <div id="seedHeatmap" class="chart-body heatmap-wrap" role="region" aria-label="Scrollable playoff seed probability table" tabindex="0"></div>
+          </article>
+          <article class="dashboard-card dashboard-card-wide" aria-labelledby="positionEdgeHeading">
+            <div class="chart-heading"><div><p class="chart-number">08</p><h3 id="positionEdgeHeading">Position-room edge</h3></div><p>Rest-of-season roster projection percentile</p></div>
+            <div id="positionHeatmap" class="chart-body heatmap-wrap" role="region" aria-label="Scrollable position projection percentile table" tabindex="0"></div>
+          </article>
+          <article class="dashboard-card dashboard-card-wide" aria-labelledby="scoringProfileHeading">
+            <div class="chart-heading"><div><p class="chart-number">09</p><h3 id="scoringProfileHeading">Scoring profile</h3></div><p>Points for vs. points allowed per game</p></div>
+            <div id="pointsProfileChart" class="chart-body chart-svg" role="region" aria-label="Scrollable scoring profile chart" tabindex="0"></div>
+          </article>
+        </div>
+
+        <p id="dashboardMethodNote" class="dashboard-method-note"></p>
+      </div>
+    </section>
+
     <section class="panel">
       <div class="section-heading">
-        <div><span class="step">2</span><h2>Choose the search</h2></div>
+        <div><span class="step">3</span><h2>Choose the search</h2></div>
         <p>Counts are exact before the run starts. Playoff simulations happen only after the fast power filter.</p>
       </div>
       <form id="searchForm">
@@ -210,7 +299,7 @@
 
     <section id="progressPanel" class="panel hidden">
       <div class="section-heading">
-        <div><span class="step">3</span><h2>Search progress</h2></div>
+        <div><span class="step">4</span><h2>Search progress</h2></div>
         <p id="progressText">Preparing the shared season simulation…</p>
       </div>
       <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
@@ -219,7 +308,7 @@
 
     <section id="resultsPanel" class="panel hidden">
       <div class="section-heading results-heading">
-        <div><span class="step">4</span><h2>Best local results</h2></div>
+        <div><span class="step">5</span><h2>Best local results</h2></div>
         <button id="exportButton" class="primary">Download Excel workbook</button>
       </div>
       <p id="resultsNote" class="results-note"></p>
@@ -241,6 +330,8 @@
   </main>
 
   <footer>All candidate scoring and season simulation run on this computer. Weekly source evidence stays in the selected bundle.</footer>
+  <script src="/dashboard_charts.js" defer></script>
+  <script src="/dashboard_ui.js" defer></script>
   <script src="/three_way_ui.js" defer></script>
   <script src="/trade_filter_ui.js" defer></script>
   <script src="/app.js" defer></script>

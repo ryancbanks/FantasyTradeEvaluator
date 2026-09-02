@@ -35,6 +35,7 @@ from .weekly_collection import WeeklyCollectionRequest, WeeklyCollectionWorkflow
 
 _JOB_PATH = re.compile(r"^/api/searches/([0-9a-f]{32})$")
 _JOB_ACTION_PATH = re.compile(r"^/api/searches/([0-9a-f]{32})/(cancel|export|results)$")
+_DASHBOARD_PATH = re.compile(r"^/api/bundles/(engine_[0-9a-f]{64})/dashboard$")
 _COLLECTION_PATH = re.compile(r"^/api/weekly-collections/([0-9a-f]{32})$")
 _COLLECTION_CANCEL_PATH = re.compile(
     r"^/api/weekly-collections/([0-9a-f]{32})/cancel$"
@@ -45,6 +46,9 @@ _COLLECTION_SIGN_IN_PATH = re.compile(
 _EXPORT_PATH = re.compile(r"^/api/exports/([^/]+\.xlsx)$")
 _STATIC = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
+    "/dashboard_charts.js": ("dashboard_charts.js", "text/javascript; charset=utf-8"),
+    "/dashboard_ui.js": ("dashboard_ui.js", "text/javascript; charset=utf-8"),
     "/trade_filter_ui.js": ("trade_filter_ui.js", "text/javascript; charset=utf-8"),
     "/three_way_ui.js": ("three_way_ui.js", "text/javascript; charset=utf-8"),
     "/styles.css": ("styles.css", "text/css; charset=utf-8"),
@@ -201,6 +205,13 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/bundles":
             self._json(HTTPStatus.OK, self.server.app_service.bundle_catalog())
+            return
+        matched = _DASHBOARD_PATH.fullmatch(path)
+        if matched:
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.league_dashboard(matched.group(1)),
+            )
             return
         if path == "/api/browser-extension/status":
             self._json(HTTPStatus.OK, self.server.extension_bridge.public_status())

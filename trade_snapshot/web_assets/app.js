@@ -293,6 +293,7 @@ function changeBundle() {
   $("estimate").textContent = "Choose a ready week, then count the combinations.";
   threeTeamEstimateSignature = null;
   renderBundle();
+  void DashboardUi.setBundle(currentBundle(), {request: api, onError: showError});
 }
 
 function syncCounterparties() {

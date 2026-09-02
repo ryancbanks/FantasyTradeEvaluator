@@ -1,5 +1,7 @@
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event
 import time
 from types import SimpleNamespace
 import unittest
@@ -58,6 +60,96 @@ def wait_for_job(service, job_id):
 
 
 class LocalAppServiceTests(unittest.TestCase):
+    def test_league_dashboard_is_available_without_a_search_and_cached(self):
+        bundle = engine_bundle()
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            first = service.league_dashboard(bundle.bundle_id)
+            with patch(
+                "trade_snapshot.app_service.build_league_dashboard",
+                side_effect=AssertionError("cached dashboard must not be rebuilt"),
+            ):
+                second = service.league_dashboard(bundle.bundle_id)
+
+        self.assertIs(first, second)
+        self.assertEqual(first["bundle_id"], bundle.bundle_id)
+        self.assertEqual(first["scenario_count"], bundle.scenario_config.scenario_count)
+        self.assertEqual(len(first["teams"]), len(bundle.state.teams))
+        self.assertEqual(first["championship_model"]["status"], "modeled_estimate")
+        self.assertAlmostEqual(
+            sum(row["championship_probability"] for row in first["teams"]),
+            1.0,
+        )
+        self.assertTrue(
+            all(
+                row["championship_probability"] <= row["playoff_probability"]
+                for row in first["teams"]
+            )
+        )
+
+    def test_league_dashboard_uses_a_bounded_deterministic_scenario_prefix(self):
+        bundle = engine_bundle()
+        with TemporaryDirectory() as directory, patch(
+            "trade_snapshot.app_service._MAX_DASHBOARD_SCENARIOS", 2
+        ):
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            dashboard = service.league_dashboard(bundle.bundle_id)
+
+        self.assertEqual(dashboard["scenario_count"], 2)
+        self.assertEqual(
+            dashboard["scenario_sampling"],
+            {
+                "bundle_scenario_count": 5,
+                "dashboard_scenario_count": 2,
+                "capped": True,
+                "policy": "deterministic_prefix",
+                "methodology": (
+                    "Dashboard calculations use the first 2 deterministic draws "
+                    "from the bundle's 5-scenario stream to keep the automatic "
+                    "local view responsive."
+                ),
+            },
+        )
+
+    def test_concurrent_dashboard_requests_share_one_calculation(self):
+        bundle = engine_bundle()
+        calculation_started = Event()
+        release_calculation = Event()
+        second_started = Event()
+
+        from trade_snapshot.dashboard import build_league_dashboard as build
+
+        def delayed_build(*args):
+            calculation_started.set()
+            self.assertTrue(release_calculation.wait(5))
+            return build(*args)
+
+        def second_request(service):
+            second_started.set()
+            return service.league_dashboard(bundle.bundle_id)
+
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            with patch(
+                "trade_snapshot.app_service.build_league_dashboard",
+                side_effect=delayed_build,
+            ) as mocked_build, ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(service.league_dashboard, bundle.bundle_id)
+                self.assertTrue(calculation_started.wait(5))
+                second = pool.submit(second_request, service)
+                self.assertTrue(second_started.wait(5))
+                time.sleep(0.02)
+                self.assertFalse(second.done())
+                release_calculation.set()
+                first_result = first.result(timeout=5)
+                second_result = second.result(timeout=5)
+
+        self.assertIs(first_result, second_result)
+        mocked_build.assert_called_once()
+
     def test_three_team_service_counts_runs_and_presents_every_participant(self):
         space, prepared, baseline, _ = three_way_components()
         bundle = SimpleNamespace(
