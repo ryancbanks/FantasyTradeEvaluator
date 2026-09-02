@@ -49,7 +49,9 @@ No league key, cookie, request header, or private response body is retained in t
 
 ## Validation-gated FantasyPros methodology mode
 
-The local evaluator recomputes a trade by changing two rosters and solving a small maximum-weight roster-role assignment. It never calls FantasyPros for an ordinary candidate after the role formula is calibrated. A weekly refresh captures current ECR/projections and reapplies the frozen formula to every player locally.
+The local evaluator recomputes an ordinary trade by changing two rosters and solving a small maximum-weight roster-role assignment. It can also apply one simultaneous three-team agreement by moving each selected player from the original owner to either other participant, then rescoring all three resulting rosters. It never calls FantasyPros for a candidate after the role formula is calibrated. A weekly refresh captures current ECR/projections and reapplies the frozen formula to every player locally.
+
+Three-team agreements are outside the current FantasyPros attestation because its held-out analyzer evidence covers two-team packages only. An exact weekly formula therefore labels three-team power as `extrapolated`; a surrogate weekly formula labels it `surrogate_extrapolated`. This limitation is disclosed before a three-team run, not only in its results. Playoff probabilities remain fully local in either case and reuse the same scenario draws for the before and after league states. If roster adjustments are allowed and multiple teams need scarce free agents, teams reserve their locally optimal replacements in ascending team-ID order from the players still available. The app, result payload, and workbook disclose that deterministic allocation policy.
 
 The initial calibration evidence must contain:
 
@@ -107,6 +109,6 @@ Required outputs per team are current standing, expected final record, expected 
 2. Revalidate or recalibrate the FantasyPros power formula against blind ordinary-power holdouts.
 3. Fuse the player-week projection ensemble and solve legal lineups.
 4. Build the shared record, standings, and playoff scenarios.
-5. Enumerate and checkpoint the requested local trade space lazily.
-6. Apply the fast local power gate, then recompute playoff outcomes only for survivors.
-7. Present team outlook and mutual-gain trades in the localhost GUI and `.xlsx` export.
+5. Enumerate and checkpoint the requested local trade space lazily. Three-team enumeration uses exact subtree counts so it can seek to a checkpoint without replaying preceding candidates.
+6. Apply the fast local power gate to every participant, then recompute playoff outcomes only for survivors.
+7. Present team outlook and trades where every participant gains in the localhost GUI and `.xlsx` export.

@@ -1,12 +1,15 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from tests.test_engine_bundle import engine_bundle
+from tests.test_three_way_search import components as three_way_components
 from tests.test_surrogate_disclosure import surrogate_bundle
 from trade_snapshot.app_service import LocalAppService, LocalSearchRequest
+from trade_snapshot.three_way_search import ThreeWaySearchOutcome
 
 
 def payload(bundle_id):
@@ -42,6 +45,125 @@ def wait_for_job(service, job_id):
 
 
 class LocalAppServiceTests(unittest.TestCase):
+    def test_three_team_service_counts_runs_and_presents_every_participant(self):
+        space, prepared, baseline, _ = three_way_components()
+        bundle = SimpleNamespace(
+            methodology_mode="exact",
+            state=baseline.state,
+            rosters=baseline.scenarios.rosters,
+            projections=baseline.scenarios.projections,
+            eligibilities=baseline.scenarios.eligibilities,
+            scenario_config=baseline.scenarios.config,
+            strength_model=prepared.model,
+            player_names={player_id: player_id.upper() for player_id in prepared.model.players},
+        )
+        request_payload = payload("engine_" + "1" * 64)
+        request_payload.update(
+            {
+                "trade_format": "three_team",
+                "primary_team_id": "a",
+                "counterparty_team_ids": ["c", "b"],
+                "max_total_players": 3,
+                "require_no_drops": False,
+            }
+        )
+        request = LocalSearchRequest.from_payload(request_payload)
+
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            with patch.object(
+                service, "_bundle_path", return_value=Path(directory) / "bundle.json"
+            ), patch("trade_snapshot.app_service.load_engine_bundle", return_value=bundle):
+                estimate = service.estimate_search(request)
+                started = service.start_search(request)
+                finished = wait_for_job(service, started["job_id"])
+                self.assertEqual(finished["status"], "complete", finished)
+                preview = service.job_results(started["job_id"])
+                with patch(
+                    "trade_snapshot.three_way_xlsx.MAX_THREE_WAY_EXPORT_ROWS", 0
+                ), patch.object(
+                    ThreeWaySearchOutcome,
+                    "results",
+                    side_effect=AssertionError("results must not materialize"),
+                ), self.assertRaisesRegex(ValueError, "at most 0"):
+                    service.export_job(started["job_id"])
+
+        self.assertEqual(estimate["candidate_count_text"], str(space.candidate_count))
+        self.assertEqual(estimate["participant_team_ids"], ["a", "b", "c"])
+        self.assertEqual(finished["status"], "complete")
+        self.assertEqual(finished["trade_format"], "three_team")
+        self.assertEqual(
+            finished["progress"]["total_candidate_count_text"],
+            str(space.candidate_count),
+        )
+        self.assertEqual(preview["trade_format"], "three_team")
+        self.assertIn("ascending team-ID order", estimate["free_agent_allocation_policy"])
+        self.assertEqual(
+            preview["free_agent_allocation_policy"],
+            estimate["free_agent_allocation_policy"],
+        )
+        self.assertEqual(preview["total_count_text"], str(space.candidate_count))
+        self.assertEqual(len(preview["rows"]), space.candidate_count)
+        self.assertTrue(
+            all(
+                {impact["team_id"] for impact in row["team_impacts"]}
+                == {"a", "b", "c"}
+                for row in preview["rows"]
+            )
+        )
+        self.assertEqual(
+            {row["power_methodology_status"] for row in preview["rows"]},
+            {"extrapolated"},
+        )
+
+    def test_three_team_request_is_explicit_canonical_and_does_not_change_legacy_identity(self):
+        bundle = engine_bundle()
+        legacy_payload = payload(bundle.bundle_id)
+        explicit_two = dict(legacy_payload, trade_format="two_team")
+        legacy = LocalSearchRequest.from_payload(legacy_payload)
+        explicit = LocalSearchRequest.from_payload(explicit_two)
+        self.assertEqual(legacy.request_id, explicit.request_id)
+        self.assertNotIn("trade_format", legacy.to_record())
+
+        three_payload = dict(
+            legacy_payload,
+            trade_format="three_team",
+            counterparty_team_ids=["z-team", "a-team"],
+        )
+        three = LocalSearchRequest.from_payload(three_payload)
+        self.assertEqual(three.counterparty_team_ids, ("a-team", "z-team"))
+        self.assertEqual(three.to_record()["trade_format"], "three_team")
+        reversed_partners = LocalSearchRequest.from_payload(
+            dict(three_payload, counterparty_team_ids=["a-team", "z-team"])
+        )
+        self.assertEqual(three.request_id, reversed_partners.request_id)
+
+    def test_three_team_request_requires_two_partners_and_cannot_skip_small_trades(self):
+        bundle = engine_bundle()
+        with self.assertRaisesRegex(ValueError, "trade_format"):
+            LocalSearchRequest.from_payload(
+                dict(payload(bundle.bundle_id), trade_format=["three_team"])
+            )
+        for partners in ([], ["other"], ["a", "b", "c"]):
+            with self.subTest(partners=partners):
+                with self.assertRaisesRegex(ValueError, "exactly two partner"):
+                    LocalSearchRequest.from_payload(
+                        dict(
+                            payload(bundle.bundle_id),
+                            trade_format="three_team",
+                            counterparty_team_ids=partners,
+                        )
+                    )
+        with self.assertRaisesRegex(ValueError, "must be false"):
+            LocalSearchRequest.from_payload(
+                dict(
+                    payload(bundle.bundle_id),
+                    trade_format="three_team",
+                    counterparty_team_ids=["a", "b"],
+                    skip_fantasypros_small_trades=True,
+                )
+            )
+
     def test_import_search_resume_and_excel_export_end_to_end(self):
         bundle = engine_bundle()
         with TemporaryDirectory() as directory:

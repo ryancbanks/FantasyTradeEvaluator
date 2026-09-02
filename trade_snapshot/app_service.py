@@ -14,16 +14,33 @@ from ._app_support import (
     bundle_summary,
     search_result_record,
     string_array,
+    three_way_search_result_record,
     workbook_sources,
 )
 from .engine_bundle import EngineBundle, load_engine_bundle, save_engine_bundle
 from .league_search import LeagueSearchOutcome, LeagueSearchProgress, ResumableLeagueTradeSearch
+from .roster_adjustment import (
+    MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY,
+    PreparedRosterAdjuster,
+)
 from .scenario_config import CorrelatedScenarioConfig
 from .search_runner import TradeSearchSettings
 from .surrogate_disclosure import SURROGATE_QUALITY_GATE
 from .trade_filters import TradeFilterMode, TradePackageFilter
 from .trade_impact import PreparedSeasonBaseline, prepare_season_baseline
 from .trade_space import TeamRoster, TradeConstraints, TradeSpace
+from .three_way_trade import ThreeWayTradeSpace
+from .three_way_search import (
+    PreparedThreeWayTrade,
+    ResumableThreeWayTradeSearch,
+    ThreeWaySearchOutcome,
+    ThreeWaySearchProgress,
+)
+from .three_way_workbook import ThreeWayExportProvenance, three_way_workbook_rows
+from .three_way_xlsx import (
+    export_three_way_trade_workbook,
+    require_three_way_exportable_count,
+)
 from .weekly_collection import (
     WeeklyCollectionJobs,
     WeeklyCollectionRequest,
@@ -47,6 +64,7 @@ class LocalSearchRequest:
     scenario_count: int
     seed: int
     allow_surrogate_power: bool = False
+    trade_format: str = "two_team"
     request_id: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -69,11 +87,20 @@ class LocalSearchRequest:
             raise ValueError("seed is outside the portable integer range")
         if not isinstance(self.allow_surrogate_power, bool):
             raise ValueError("allow_surrogate_power must be a boolean")
+        if not isinstance(self.trade_format, str) or self.trade_format not in {
+            "two_team",
+            "three_team",
+        }:
+            raise ValueError("trade_format must be two_team or three_team")
+        if self.trade_format == "three_team":
+            if len(counterparties) != 2:
+                raise ValueError("three-team trades require exactly two partner teams")
+            counterparties = tuple(sorted(counterparties))
         object.__setattr__(self, "counterparty_team_ids", counterparties)
         object.__setattr__(self, "request_id", content_id("app-search", self.to_record()))
 
     def to_record(self) -> dict[str, object]:
-        return {
+        record = {
             "bundle_id": self.bundle_id,
             "counterparty_team_ids": list(self.counterparty_team_ids),
             "primary_team_id": self.primary_team_id,
@@ -83,6 +110,9 @@ class LocalSearchRequest:
             "settings": self.settings.to_record(),
             "trade_constraints": self.constraints.to_record(),
         }
+        if self.trade_format == "three_team":
+            record["trade_format"] = self.trade_format
+        return record
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "LocalSearchRequest":
@@ -105,22 +135,34 @@ class LocalSearchRequest:
             "scenario_count",
             "seed",
         }
+        optional_keys = {
+            "allow_surrogate_power",
+            "outgoing_filter",
+            "incoming_filter",
+            "trade_format",
+        }
         if (
             not isinstance(payload, Mapping)
             or not keys <= set(payload)
-            or not set(payload) <= keys | {
-                "allow_surrogate_power",
-                "outgoing_filter",
-                "incoming_filter",
-            }
+            or not set(payload) <= keys | optional_keys
         ):
             raise ValueError("search request fields are invalid")
+        trade_format = payload.get("trade_format", "two_team")
+        if not isinstance(trade_format, str) or trade_format not in {
+            "two_team",
+            "three_team",
+        }:
+            raise ValueError("trade_format must be two_team or three_team")
         counterparties = string_array("counterparty_team_ids", payload["counterparty_team_ids"])
         locked = string_array("locked_player_ids", payload["locked_player_ids"])
         skip_small = boolean(
             "skip_fantasypros_small_trades",
             payload["skip_fantasypros_small_trades"],
         )
+        if trade_format == "three_team" and skip_small:
+            raise ValueError(
+                "skip_fantasypros_small_trades must be false for three-team trades"
+            )
         excluded = (
             frozenset((left, right) for left in range(1, 4) for right in range(1, 4))
             if skip_small
@@ -153,6 +195,7 @@ class LocalSearchRequest:
             ),
             scenario_count=payload["scenario_count"],
             seed=payload["seed"],
+            trade_format=trade_format,
             allow_surrogate_power=boolean(
                 "allow_surrogate_power", payload.get("allow_surrogate_power", False)
             ),
@@ -164,9 +207,9 @@ class _SearchJob:
     job_id: str
     request: LocalSearchRequest
     status: str = "queued"
-    progress: LeagueSearchProgress | None = None
+    progress: LeagueSearchProgress | ThreeWaySearchProgress | None = None
     error: str | None = None
-    outcome: LeagueSearchOutcome | None = None
+    outcome: LeagueSearchOutcome | ThreeWaySearchOutcome | None = None
     baseline: PreparedSeasonBaseline | None = None
     cancel: Event = field(default_factory=Event)
 
@@ -300,6 +343,31 @@ class LocalAppService:
             player_id: player.eligible_positions
             for player_id, player in bundle.strength_model.players.items()
         }
+        if request.trade_format == "three_team":
+            space = ThreeWayTradeSpace(
+                (
+                    primary,
+                    *(by_team[team_id] for team_id in selected),
+                ),
+                request.constraints,
+                eligible_positions_by_player=eligible_positions,
+            )
+            count = space.candidate_count
+            return {
+                "trade_format": "three_team",
+                "agreement_count": 1,
+                "candidate_count": count if count <= SAFE_INTEGER else None,
+                "candidate_count_text": str(count),
+                "participant_team_ids": [
+                    request.primary_team_id,
+                    *request.counterparty_team_ids,
+                ],
+                "free_agent_allocation_policy": (
+                    None
+                    if request.constraints.require_no_drops
+                    else MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
+                ),
+            }
         pairs = tuple(
             {
                 "counterparty_team_id": team_id,
@@ -312,9 +380,12 @@ class LocalAppService:
             }
             for team_id in selected
         )
+        count = sum(row["candidate_count"] for row in pairs)
         return {
+            "trade_format": "two_team",
             "pair_count": len(pairs),
-            "candidate_count": sum(row["candidate_count"] for row in pairs),
+            "candidate_count": count,
+            "candidate_count_text": str(count),
             "pairs": pairs,
         }
 
@@ -342,6 +413,18 @@ class LocalAppService:
                 raise RuntimeError("search results are not ready")
             request, outcome, baseline = job.request, job.outcome, job.baseline
         bundle = load_engine_bundle(self._bundle_path(request.bundle_id))
+        if request.trade_format == "three_team":
+            return three_way_search_result_record(
+                outcome,
+                bundle,
+                baseline.season_projection,
+                limit,
+                free_agent_allocation_policy=(
+                    None
+                    if request.constraints.require_no_drops
+                    else MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
+                ),
+            )
         return search_result_record(outcome, bundle, baseline.season_projection, limit)
 
     def export_job(self, job_id: str) -> dict[str, object]:
@@ -352,62 +435,58 @@ class LocalAppService:
             request, outcome, baseline = job.request, job.outcome, job.baseline
         bundle = load_engine_bundle(self._bundle_path(request.bundle_id))
         team_names = {row.team_id: row.name for row in bundle.state.teams}
+        if request.trade_format == "three_team":
+            require_three_way_exportable_count(
+                outcome.progress.power_qualified_count
+            )
+            rows = three_way_workbook_rows(
+                outcome.results(),
+                team_names,
+                bundle.player_names,
+                bundle.methodology_mode,
+            )
+            filename = f"three-team-trade-results-{request.request_id}.xlsx"
+            path = export_three_way_trade_workbook(
+                self.export_directory / filename,
+                _workbook_context(bundle, baseline, request),
+                ThreeWayExportProvenance.from_records(
+                    request_id=request.request_id,
+                    search_run_id=outcome.progress.run_id,
+                    participant_team_ids=(
+                        request.primary_team_id,
+                        *request.counterparty_team_ids,
+                    ),
+                    participant_team_names=tuple(
+                        team_names[team_id]
+                        for team_id in (
+                            request.primary_team_id,
+                            *request.counterparty_team_ids,
+                        )
+                    ),
+                    total_candidate_count=outcome.progress.total_candidate_count,
+                    seed=request.seed,
+                    trade_constraint_record=request.constraints.to_record(),
+                    power_settings_record=request.settings.to_record(),
+                    free_agent_allocation_policy=(
+                        None
+                        if request.constraints.require_no_drops
+                        else MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
+                    ),
+                ),
+                rows,
+                team_outlook_rows(bundle.state, baseline.season_projection),
+            )
+            return {"filename": path.name, "trade_count": len(rows)}
         rows = workbook_trade_rows(
             outcome,
             team_names,
             bundle.player_names,
             bundle.methodology_evidence,
         )
-        methodology = bundle.methodology_evidence
-        context = TradeWorkbookContext(
-            snapshot_id=bundle.state.snapshot_id,
-            strength_model_id=bundle.strength_model.model_id,
-            scenario_run_id=baseline.scenarios.run_id,
-            primary_team_id=request.primary_team_id,
-            primary_team_name=team_names[request.primary_team_id],
-            generated_at=datetime.now(timezone.utc),
-            minimum_power_delta=request.settings.minimum_displayed_power_delta,
-            scenario_count=request.scenario_count,
-            power_engine_mode=bundle.methodology_mode,
-            calibration_status=bundle.strength_model.calibration.status.value,
-            methodology_evidence_kind=(
-                "exact_attestation"
-                if bundle.methodology_mode == "exact"
-                else "surrogate_disclosure"
-            ),
-            methodology_record_id=(
-                bundle.methodology_attestation.attestation_id
-                if bundle.methodology_mode == "exact"
-                else bundle.surrogate_disclosure.disclosure_id
-            ),
-            formula_id=methodology.formula_id,
-            formula_source_fit_id=methodology.formula_source_fit_id,
-            methodology_fingerprint_id=(
-                methodology.methodology_fingerprint.fingerprint_id
-            ),
-            formula_action=methodology.formula_decision.action.value,
-            methodology_current_evidence_id=methodology.current_evidence_id,
-            methodology_quality_gate=(
-                "exact_attestation_v1"
-                if bundle.methodology_mode == "exact"
-                else SURROGATE_QUALITY_GATE
-            ),
-            methodology_holdout_count=methodology.current_holdout_count,
-            holdout_max_absolute_score_error=(
-                methodology.calibration_diagnostics.max_absolute_score_error
-            ),
-            holdout_display_match_rate=(
-                methodology.calibration_diagnostics.display_match_rate
-            ),
-            exact_balanced_package_sizes=(
-                methodology.validated_balanced_package_sizes
-            ),
-            sources=workbook_sources(bundle),
-        )
         filename = f"trade-results-{request.request_id}.xlsx"
         path = export_trade_workbook(
             self.export_directory / filename,
-            context,
+            _workbook_context(bundle, baseline, request),
             rows,
             team_outlook_rows(bundle.state, baseline.season_projection),
         )
@@ -438,20 +517,54 @@ class LocalAppService:
                 bundle.eligibilities,
                 config,
             )
-            search = ResumableLeagueTradeSearch(
-                bundle.rosters,
-                job.request.primary_team_id,
-                bundle.strength_model,
-                baseline,
-                job.request.constraints,
-                job.request.settings,
-                counterparty_team_ids=(job.request.counterparty_team_ids or None),
-            )
-            outcome = search.run(
-                self.search_directory / job.request.request_id,
-                on_progress=lambda progress: self._set_job(job, progress=progress),
-                should_cancel=job.cancel.is_set,
-            )
+            if job.request.trade_format == "three_team":
+                by_team, primary, selected = _search_scope(bundle, job.request)
+                space = ThreeWayTradeSpace(
+                    (primary, *(by_team[team_id] for team_id in selected)),
+                    job.request.constraints,
+                    eligible_positions_by_player={
+                        player_id: player.eligible_positions
+                        for player_id, player in bundle.strength_model.players.items()
+                    },
+                )
+                adjuster = (
+                    None
+                    if job.request.constraints.require_no_drops
+                    else PreparedRosterAdjuster(bundle.strength_model, bundle.rosters)
+                )
+                prepared = PreparedThreeWayTrade(
+                    bundle.strength_model,
+                    space.rosters,
+                    adjuster,
+                )
+                search = ResumableThreeWayTradeSearch(
+                    space,
+                    prepared,
+                    baseline,
+                    job.request.settings,
+                )
+                run_directory = self.search_directory / job.request.request_id
+                run_directory.mkdir(parents=True, exist_ok=True)
+                outcome = search.run(
+                    run_directory / "three-team.sqlite3",
+                    on_progress=lambda progress: self._set_job(job, progress=progress),
+                    should_cancel=job.cancel.is_set,
+                )
+            else:
+                search = ResumableLeagueTradeSearch(
+                    bundle.rosters,
+                    job.request.primary_team_id,
+                    bundle.strength_model,
+                    baseline,
+                    job.request.constraints,
+                    job.request.settings,
+                    counterparty_team_ids=(job.request.counterparty_team_ids or None),
+                )
+                outcome = search.run(
+                    self.search_directory / job.request.request_id,
+                    on_progress=lambda progress: self._set_job(job, progress=progress),
+                    should_cancel=job.cancel.is_set,
+                )
             status = "cancelled" if outcome.progress.cancelled else "complete"
             self._set_job(job, status=status, progress=outcome.progress, outcome=outcome, baseline=baseline)
         except Exception as error:
@@ -479,25 +592,126 @@ class LocalAppService:
     @staticmethod
     def _job_record(job: _SearchJob) -> dict[str, object]:
         progress = job.progress
+        if isinstance(progress, ThreeWaySearchProgress):
+            progress_record = {
+                "pair_count": 1,
+                "completed_pair_count": int(
+                    not progress.cancelled
+                    and progress.next_candidate_index
+                    == progress.total_candidate_count
+                ),
+                "current_counterparty_team_id": None,
+                "examined_candidate_count": (
+                    progress.next_candidate_index
+                    if progress.next_candidate_index <= SAFE_INTEGER
+                    else None
+                ),
+                "examined_candidate_count_text": str(progress.next_candidate_index),
+                "total_candidate_count": (
+                    progress.total_candidate_count
+                    if progress.total_candidate_count <= SAFE_INTEGER
+                    else None
+                ),
+                "total_candidate_count_text": str(progress.total_candidate_count),
+                "qualified_trade_count": (
+                    progress.power_qualified_count
+                    if progress.power_qualified_count <= SAFE_INTEGER
+                    else None
+                ),
+                "qualified_trade_count_text": str(progress.power_qualified_count),
+                "mutual_playoff_gain_count": (
+                    progress.all_playoff_gain_count
+                    if progress.all_playoff_gain_count <= SAFE_INTEGER
+                    else None
+                ),
+                "mutual_playoff_gain_count_text": str(
+                    progress.all_playoff_gain_count
+                ),
+                "completion_fraction": progress.completion_fraction,
+                "cancelled": progress.cancelled,
+            }
+        elif progress is not None:
+            progress_record = {
+                "pair_count": progress.pair_count,
+                "completed_pair_count": progress.completed_pair_count,
+                "current_counterparty_team_id": progress.current_counterparty_team_id,
+                "examined_candidate_count": progress.examined_candidate_count,
+                "examined_candidate_count_text": str(
+                    progress.examined_candidate_count
+                ),
+                "total_candidate_count": progress.total_candidate_count,
+                "total_candidate_count_text": str(progress.total_candidate_count),
+                "qualified_trade_count": progress.qualified_trade_count,
+                "qualified_trade_count_text": str(progress.qualified_trade_count),
+                "mutual_playoff_gain_count": progress.mutual_playoff_gain_count,
+                "mutual_playoff_gain_count_text": str(
+                    progress.mutual_playoff_gain_count
+                ),
+                "completion_fraction": progress.completion_fraction,
+                "cancelled": progress.cancelled,
+            }
+        else:
+            progress_record = None
         return {
             "job_id": job.job_id,
             "request_id": job.request.request_id,
             "status": job.status,
             "error": job.error,
-            "progress": None
-            if progress is None
-            else {
-                "pair_count": progress.pair_count,
-                "completed_pair_count": progress.completed_pair_count,
-                "current_counterparty_team_id": progress.current_counterparty_team_id,
-                "examined_candidate_count": progress.examined_candidate_count,
-                "total_candidate_count": progress.total_candidate_count,
-                "qualified_trade_count": progress.qualified_trade_count,
-                "mutual_playoff_gain_count": progress.mutual_playoff_gain_count,
-                "completion_fraction": progress.completion_fraction,
-                "cancelled": progress.cancelled,
-            },
+            "trade_format": job.request.trade_format,
+            "progress": progress_record,
         }
+
+
+def _workbook_context(
+    bundle: EngineBundle,
+    baseline: PreparedSeasonBaseline,
+    request: LocalSearchRequest,
+) -> TradeWorkbookContext:
+    methodology = bundle.methodology_evidence
+    team_names = {row.team_id: row.name for row in bundle.state.teams}
+    return TradeWorkbookContext(
+        snapshot_id=bundle.state.snapshot_id,
+        strength_model_id=bundle.strength_model.model_id,
+        scenario_run_id=baseline.scenarios.run_id,
+        primary_team_id=request.primary_team_id,
+        primary_team_name=team_names[request.primary_team_id],
+        generated_at=datetime.now(timezone.utc),
+        minimum_power_delta=request.settings.minimum_displayed_power_delta,
+        scenario_count=request.scenario_count,
+        power_engine_mode=bundle.methodology_mode,
+        calibration_status=bundle.strength_model.calibration.status.value,
+        methodology_evidence_kind=(
+            "exact_attestation"
+            if bundle.methodology_mode == "exact"
+            else "surrogate_disclosure"
+        ),
+        methodology_record_id=(
+            bundle.methodology_attestation.attestation_id
+            if bundle.methodology_mode == "exact"
+            else bundle.surrogate_disclosure.disclosure_id
+        ),
+        formula_id=methodology.formula_id,
+        formula_source_fit_id=methodology.formula_source_fit_id,
+        methodology_fingerprint_id=(
+            methodology.methodology_fingerprint.fingerprint_id
+        ),
+        formula_action=methodology.formula_decision.action.value,
+        methodology_current_evidence_id=methodology.current_evidence_id,
+        methodology_quality_gate=(
+            "exact_attestation_v1"
+            if bundle.methodology_mode == "exact"
+            else SURROGATE_QUALITY_GATE
+        ),
+        methodology_holdout_count=methodology.current_holdout_count,
+        holdout_max_absolute_score_error=(
+            methodology.calibration_diagnostics.max_absolute_score_error
+        ),
+        holdout_display_match_rate=(
+            methodology.calibration_diagnostics.display_match_rate
+        ),
+        exact_balanced_package_sizes=methodology.validated_balanced_package_sizes,
+        sources=workbook_sources(bundle),
+    )
 
 
 def _require_surrogate_consent(
@@ -555,11 +769,18 @@ def _search_scope(
         primary = by_team[request.primary_team_id]
     except KeyError:
         raise ValueError("primary_team_id is not present in the weekly bundle") from None
-    selected = request.counterparty_team_ids or tuple(
-        team.team_id
-        for team in bundle.state.teams
-        if team.team_id != request.primary_team_id
+    selected = (
+        request.counterparty_team_ids
+        if request.trade_format == "three_team"
+        else request.counterparty_team_ids
+        or tuple(
+            team.team_id
+            for team in bundle.state.teams
+            if team.team_id != request.primary_team_id
+        )
     )
+    if request.trade_format == "three_team" and len(selected) != 2:
+        raise ValueError("three-team trades require exactly two partner teams")
     if request.primary_team_id in selected or not set(selected).issubset(by_team):
         raise ValueError("counterparty selection contains an invalid team")
 
@@ -583,7 +804,7 @@ def _search_scope(
             raise ValueError(
                 "players you receive must belong to a selected other team"
             )
-        if incoming_filter.player_mode in {
+        if request.trade_format == "two_team" and incoming_filter.player_mode in {
             TradeFilterMode.INCLUDE,
             TradeFilterMode.ONLY,
         } and len(

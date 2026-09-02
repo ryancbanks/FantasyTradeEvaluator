@@ -11,6 +11,10 @@ let extensionPairing = false;
 let extensionPairAcknowledged = false;
 let extensionPairFailure = null;
 let extensionPairHint = null;
+let threeTeamEstimateSignature = null;
+let searchRunning = false;
+let activeSearchFormat = "two_team";
+let activeSearchTeamIds = [];
 const heartbeatInterval = 20000;
 const extensionProtocolVersion = 1;
 
@@ -78,7 +82,12 @@ function numberValue(id, nullable = false) {
   const value = $(id).value.trim();
   return nullable && value === "" ? null : Number(value);
 }
-function compactNumber(value) { return new Intl.NumberFormat(undefined, {maximumFractionDigits: 0}).format(value); }
+function compactNumber(value) {
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    return new Intl.NumberFormat(undefined, {maximumFractionDigits: 0}).format(BigInt(value));
+  }
+  return new Intl.NumberFormat(undefined, {maximumFractionDigits: 0}).format(value);
+}
 function percent(value) { return new Intl.NumberFormat(undefined, {style: "percent", minimumFractionDigits: 1, maximumFractionDigits: 1}).format(value); }
 function signed(value, asPercent = false) {
   const text = asPercent ? percent(Math.abs(value)) : Math.abs(value).toFixed(1);
@@ -89,15 +98,27 @@ function currentBundle() {
   return bundles.find(item => item.bundle_id === $("bundleSelect").value) || null;
 }
 
+function tradeFormat() {
+  return document.querySelector('input[name="tradeFormat"]:checked')?.value || "two_team";
+}
+
+function isThreeTeam() { return ThreeWayUi.isSelected(); }
+
+function selectedCounterpartyIds() {
+  if (!isThreeTeam()) return selectedValues($("counterparties"));
+  return ThreeWayUi.selectedCounterpartyIds(currentBundle());
+}
+
 function checkedValues(containerId) {
   return [...$(containerId).querySelectorAll('input[type="checkbox"]:checked')]
     .map(input => input.value);
 }
 
 function activeCounterpartyTeams(bundle) {
-  const selected = new Set(selectedValues($("counterparties")));
+  const selected = new Set(selectedCounterpartyIds());
   return bundle.teams.filter(team =>
-    team.team_id !== $("primaryTeam").value && (!selected.size || selected.has(team.team_id))
+    team.team_id !== $("primaryTeam").value &&
+      (isThreeTeam() ? selected.has(team.team_id) : (!selected.size || selected.has(team.team_id)))
   );
 }
 
@@ -230,7 +251,7 @@ function packageFilterPayload(side) {
   if (playerMode !== "any" && !playerIds.length) {
     throw new Error(`Choose at least one player for the ${sideLabel} rule.`);
   }
-  if (side === "incoming" && ["include", "only"].includes(playerMode)) {
+  if (!isThreeTeam() && side === "incoming" && ["include", "only"].includes(playerMode)) {
     const owners = new Set(
       [...$(`${side}PlayerChoices`).querySelectorAll('input[type="checkbox"]:checked')]
         .map(input => input.dataset.teamId)
@@ -375,10 +396,13 @@ function renderBundle() {
     $("bundleSummary").textContent = "Import or collect a weekly bundle to begin.";
     $("bundleSummary").classList.remove("surrogate-warning");
     $("estimateButton").disabled = true;
-    $("startButton").disabled = true;
     $("surrogateSearchConsentRow").classList.add("hidden");
     $("acceptSurrogateSearch").checked = false;
+    threeTeamEstimateSignature = null;
+    ThreeWayUi.syncPartnerOptions(null, "");
+    ThreeWayUi.syncFormatControls(null);
     populatePackageFilters();
+    updateSearchStartButton();
     return;
   }
   for (const team of bundle.teams) {
@@ -400,8 +424,9 @@ function renderBundle() {
   $("surrogateSearchConsentRow").classList.toggle("hidden", !surrogate);
   $("acceptSurrogateSearch").checked = false;
   $("estimateButton").disabled = Boolean(activeCollection);
-  $("startButton").disabled = Boolean(activeCollection);
   syncCounterparties();
+  ThreeWayUi.syncFormatControls(bundle);
+  updateSearchStartButton();
 }
 
 function changeBundle() {
@@ -412,6 +437,7 @@ function changeBundle() {
   $("progressBar").style.width = "0%";
   $("progressStats").textContent = "";
   $("estimate").textContent = "Choose a ready week, then count the combinations.";
+  threeTeamEstimateSignature = null;
   renderBundle();
 }
 
@@ -421,15 +447,22 @@ function syncCounterparties() {
     option.disabled = option.value === own;
     if (option.disabled) option.selected = false;
   }
+  ThreeWayUi.syncPartnerOptions(currentBundle(), own);
   populatePackageFilters();
 }
 
 function requestPayload() {
   if (!$("bundleSelect").value) throw new Error("Choose a ready weekly bundle first.");
+  const format = tradeFormat();
+  const partnerSlots = ThreeWayUi.selectedPartnerSlots();
+  if (format === "three_team" && (partnerSlots.length !== 2 || new Set(partnerSlots).size !== 2)) {
+    throw new Error("Choose two different partner teams for the three-team trade.");
+  }
   return {
+    trade_format: format,
     bundle_id: $("bundleSelect").value,
     primary_team_id: $("primaryTeam").value,
-    counterparty_team_ids: selectedValues($("counterparties")),
+    counterparty_team_ids: selectedCounterpartyIds(),
     min_outgoing: numberValue("minOutgoing"),
     max_outgoing: numberValue("maxOutgoing"),
     min_incoming: numberValue("minIncoming"),
@@ -437,7 +470,7 @@ function requestPayload() {
     max_total_players: numberValue("maxTotal", true),
     max_imbalance: numberValue("maxImbalance", true),
     balanced_only: $("balancedOnly").checked,
-    skip_fantasypros_small_trades: $("skipSmall").checked,
+    skip_fantasypros_small_trades: format === "two_team" && $("skipSmall").checked,
     locked_player_ids: [],
     require_no_drops: $("noDrops").checked,
     outgoing_filter: packageFilterPayload("outgoing"),
@@ -448,6 +481,28 @@ function requestPayload() {
     seed: 20260901,
     allow_surrogate_power: $("acceptSurrogateSearch").checked
   };
+}
+
+function searchConfigurationSignature(payload = null) {
+  try { return JSON.stringify(payload || requestPayload()); }
+  catch (_) { return null; }
+}
+
+function updateSearchStartButton() {
+  const bundleReady = Boolean(currentBundle());
+  const estimateCurrent = !isThreeTeam() || (
+    threeTeamEstimateSignature !== null &&
+    threeTeamEstimateSignature === searchConfigurationSignature()
+  );
+  $("startButton").disabled = !bundleReady || Boolean(activeCollection) || searchRunning || !estimateCurrent;
+}
+
+function invalidateSearchEstimate() {
+  threeTeamEstimateSignature = null;
+  if (isThreeTeam() && currentBundle()) {
+    $("estimate").textContent = "Count this specific three-team search before starting it.";
+  }
+  updateSearchStartButton();
 }
 
 function collectionPayload() {
@@ -528,7 +583,7 @@ function setCollectionRunning(running) {
   }
   $("collectButton").disabled = running || !collectionAvailable || !extensionConnected;
   $("estimateButton").disabled = running || !$("bundleSelect").value;
-  $("startButton").disabled = running || !$("bundleSelect").value;
+  updateSearchStartButton();
   if (!running) $("signInPrompt").classList.add("hidden");
 }
 
@@ -559,27 +614,57 @@ async function cancelCollection() {
 async function estimate() {
   clearError();
   try {
-    const value = await api("/api/searches/estimate", {method: "POST", body: JSON.stringify(requestPayload())});
-    const caution = value.candidate_count > 10000000 ? " This is a very large run; tighten a size or imbalance filter first." : "";
-    $("estimate").textContent = `${compactNumber(value.candidate_count)} combinations counted exactly across ${value.pair_count} team matchups.${caution}`;
-  } catch (error) { showError(error); }
+    const payload = requestPayload();
+    const signature = searchConfigurationSignature(payload);
+    const value = await api("/api/searches/estimate", {method: "POST", body: JSON.stringify(payload)});
+    const candidateCount = ThreeWayUi.exactCandidateCount(value);
+    if (signature !== searchConfigurationSignature()) {
+      updateSearchStartButton();
+      return;
+    }
+    const caution = candidateCount > 10000000n
+      ? " This is a very large run; tighten a size or imbalance filter first."
+      : "";
+    if (payload.trade_format === "three_team") {
+      const adjustmentPolicy = value.free_agent_allocation_policy
+        ? ` Automatic roster adjustment policy: ${value.free_agent_allocation_policy}`
+        : "";
+      $("estimate").textContent = `${compactNumber(candidateCount)} combinations counted exactly for this three-team agreement.${caution}${adjustmentPolicy}`;
+      threeTeamEstimateSignature = signature;
+    } else {
+      $("estimate").textContent = `${compactNumber(candidateCount)} combinations counted exactly across ${value.pair_count} team matchups.${caution}`;
+    }
+    updateSearchStartButton();
+  } catch (error) {
+    threeTeamEstimateSignature = null;
+    updateSearchStartButton();
+    showError(error);
+  }
 }
 
 async function startSearch(event) {
   event.preventDefault();
   clearError();
   try {
-    const job = await api("/api/searches", {method: "POST", body: JSON.stringify(requestPayload())});
+    const payload = requestPayload();
+    if (payload.trade_format === "three_team" && threeTeamEstimateSignature !== searchConfigurationSignature(payload)) {
+      throw new Error("Count this specific three-team search before starting it.");
+    }
+    searchRunning = true;
+    activeSearchFormat = payload.trade_format;
+    activeSearchTeamIds = [payload.primary_team_id, ...payload.counterparty_team_ids];
+    updateSearchStartButton();
+    const job = await api("/api/searches", {method: "POST", body: JSON.stringify(payload)});
     activeJob = job.job_id;
     $("progressPanel").classList.remove("hidden");
     $("resultsPanel").classList.add("hidden");
     $("cancelButton").classList.remove("hidden");
-    $("startButton").disabled = true;
     $("collectButton").disabled = true;
     $("bundleSelect").disabled = true;
     await pollJob();
   } catch (error) {
-    $("startButton").disabled = false;
+    searchRunning = false;
+    updateSearchStartButton();
     $("collectButton").disabled = !collectionAvailable || !extensionConnected;
     $("bundleSelect").disabled = bundles.length === 0;
     showError(error);
@@ -591,7 +676,8 @@ async function pollJob() {
     let job;
     try { job = await api(`/api/searches/${activeJob}`); }
     catch (error) {
-      $("startButton").disabled = false;
+      searchRunning = false;
+      updateSearchStartButton();
       $("collectButton").disabled = !collectionAvailable || !extensionConnected;
       $("bundleSelect").disabled = bundles.length === 0;
       $("cancelButton").classList.add("hidden");
@@ -600,7 +686,8 @@ async function pollJob() {
     }
     renderProgress(job);
     if (!["queued", "running"].includes(job.status)) {
-      $("startButton").disabled = false;
+      searchRunning = false;
+      updateSearchStartButton();
       $("collectButton").disabled = !collectionAvailable || !extensionConnected;
       $("bundleSelect").disabled = bundles.length === 0;
       $("cancelButton").classList.add("hidden");
@@ -621,8 +708,65 @@ function renderProgress(job) {
   }
   const pct = Math.min(100, progress.completion_fraction * 100);
   $("progressBar").style.width = `${pct}%`;
-  $("progressText").textContent = `${pct.toFixed(1)}% complete${progress.current_counterparty_team_id ? ` · current team ${progress.current_counterparty_team_id}` : ""}`;
-  $("progressStats").textContent = `${compactNumber(progress.examined_candidate_count)} of ${compactNumber(progress.total_candidate_count)} combinations · ${compactNumber(progress.qualified_trade_count)} passed power · ${compactNumber(progress.mutual_playoff_gain_count)} improve both playoff chances`;
+  const threeTeam = activeSearchFormat === "three_team";
+  const current = threeTeam
+    ? " · selected three-team agreement"
+    : progress.current_counterparty_team_id
+      ? ` · current team ${progress.current_counterparty_team_id}`
+      : "";
+  const examined = progress.examined_candidate_count_text ?? progress.examined_candidate_count;
+  const total = progress.total_candidate_count_text ?? progress.total_candidate_count;
+  const qualified = progress.qualified_trade_count_text ?? progress.qualified_trade_count;
+  const mutual = progress.mutual_playoff_gain_count_text ?? progress.mutual_playoff_gain_count;
+  const gainLabel = threeTeam ? "improve all three playoff chances" : "improve both playoff chances";
+  $("progressText").textContent = `${pct.toFixed(1)}% complete${current}`;
+  $("progressStats").textContent = `${compactNumber(examined)} of ${compactNumber(total)} combinations · ${compactNumber(qualified)} passed power · ${compactNumber(mutual)} ${gainLabel}`;
+}
+
+function setResultHeaders(labels) {
+  const row = $("resultsHeaderRow");
+  row.replaceChildren();
+  for (const label of labels) {
+    const heading = document.createElement("th");
+    heading.textContent = label;
+    row.append(heading);
+  }
+}
+
+function renderTwoTeamTradeRows(rows) {
+  setResultHeaders([
+    "Other team", "You give", "You receive", "Automatic roster moves",
+    "Your power", "Their power", "Your playoff", "Their playoff", "Power evidence"
+  ]);
+  const body = $("resultsBody");
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    if (row.mutual_gain) tr.className = "mutual-row";
+    const moves = [
+      row.your_adds.length ? `You add: ${row.your_adds.join("; ")}` : "",
+      row.your_drops.length ? `You drop: ${row.your_drops.join("; ")}` : "",
+      row.their_adds.length ? `They add: ${row.their_adds.join("; ")}` : "",
+      row.their_drops.length ? `They drop: ${row.their_drops.join("; ")}` : ""
+    ].filter(Boolean).join(" · ") || "None";
+    const cells = [
+      row.other_team,
+      row.give.join("; "),
+      row.receive.join("; "),
+      moves,
+      signed(row.your_power_delta),
+      signed(row.their_power_delta),
+      signed(row.your_playoff_delta, true),
+      signed(row.their_playoff_delta, true),
+      row.power_methodology_status
+    ];
+    cells.forEach((value, index) => {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      if (index >= 4 && index <= 7) cell.className = String(value).startsWith("+") ? "gain" : "loss";
+      tr.append(cell);
+    });
+    body.append(tr);
+  }
 }
 
 async function loadResults() {
@@ -650,38 +794,26 @@ async function loadResults() {
   }
   const body = $("resultsBody");
   body.replaceChildren();
-  for (const row of value.rows) {
-    const tr = document.createElement("tr");
-    if (row.mutual_gain) tr.className = "mutual-row";
-    const moves = [
-      row.your_adds.length ? `You add: ${row.your_adds.join("; ")}` : "",
-      row.your_drops.length ? `You drop: ${row.your_drops.join("; ")}` : "",
-      row.their_adds.length ? `They add: ${row.their_adds.join("; ")}` : "",
-      row.their_drops.length ? `They drop: ${row.their_drops.join("; ")}` : ""
-    ].filter(Boolean).join(" · ") || "None";
-    const cells = [
-      row.other_team,
-      row.give.join("; "),
-      row.receive.join("; "),
-      moves,
-      signed(row.your_power_delta),
-      signed(row.their_power_delta),
-      signed(row.your_playoff_delta, true),
-      signed(row.their_playoff_delta, true),
-      row.power_methodology_status
-    ];
-    cells.forEach((value, index) => {
-      const td = document.createElement("td");
-      td.textContent = value;
-      if (index >= 4 && index <= 7) td.className = String(value).startsWith("+") ? "gain" : "loss";
-      tr.append(td);
-    });
-    body.append(tr);
+  const threeTeam = value.trade_format === "three_team";
+  if (threeTeam) {
+    ThreeWayUi.renderTradeRows(
+      value.rows,
+      activeSearchTeamIds,
+      currentBundle(),
+      {signed, percent}
+    );
   }
+  else renderTwoTeamTradeRows(value.rows);
   const powerNotice = value.power_engine_mode === "surrogate"
     ? ` SURROGATE POWER: ${value.power_engine_notice}`
+    : threeTeam
+      ? ` POWER NOTICE: ${value.power_engine_notice}`
+      : "";
+  const gainLabel = threeTeam ? "trades improving all three teams first" : "mutual gains first";
+  const adjustmentPolicy = value.free_agent_allocation_policy
+    ? ` Automatic roster adjustment policy: ${value.free_agent_allocation_policy}`
     : "";
-  $("resultsNote").textContent = `Showing ${value.shown_count} of ${value.total_count} qualified trades, with mutual gains first.${powerNotice}`;
+  $("resultsNote").textContent = `Showing ${compactNumber(value.shown_count)} of ${compactNumber(value.total_count_text ?? value.total_count)} qualified trades, with ${gainLabel}.${powerNotice}${adjustmentPolicy}`;
   $("resultsPanel").classList.remove("hidden");
 }
 
@@ -704,6 +836,22 @@ async function exportWorkbook() {
   } catch (error) { showError(error); }
 }
 
+function changeTradeFormat() {
+  ThreeWayUi.syncFormatControls(currentBundle());
+  ThreeWayUi.syncPartnerOptions(currentBundle(), $("primaryTeam").value);
+  populatePackageFilters();
+}
+
+function changeThreeTeamPartner(side) {
+  ThreeWayUi.syncPartnerOptions(currentBundle(), $("primaryTeam").value, side);
+  populatePackageFilters();
+}
+
+function searchConfigurationChanged(event) {
+  if (["outgoingPlayerSearch", "incomingPlayerSearch"].includes(event.target.id)) return;
+  invalidateSearchEstimate();
+}
+
 $("bundleFile").addEventListener("change", async event => {
   clearError();
   const file = event.target.files[0];
@@ -717,6 +865,12 @@ $("bundleFile").addEventListener("change", async event => {
 $("bundleSelect").addEventListener("change", changeBundle);
 $("primaryTeam").addEventListener("change", syncCounterparties);
 $("counterparties").addEventListener("change", populatePackageFilters);
+for (const option of document.querySelectorAll('input[name="tradeFormat"]')) {
+  option.addEventListener("change", changeTradeFormat);
+}
+$("partnerTeamA").addEventListener("change", () => changeThreeTeamPartner("a"));
+$("partnerTeamB").addEventListener("change", () => changeThreeTeamPartner("b"));
+$("noDrops").addEventListener("change", () => ThreeWayUi.syncFormatControls(currentBundle()));
 for (const side of ["outgoing", "incoming"]) {
   $(`${side}FilterEnabled`).addEventListener("change", () => setPackageFilterEnabled(side));
   $(`${side}PlayerSearch`).addEventListener("input", () => filterPlayerChoices(side));
@@ -726,6 +880,8 @@ $("collectionForm").addEventListener("submit", startCollection);
 $("cancelCollectionButton").addEventListener("click", cancelCollection);
 $("confirmSignInButton").addEventListener("click", confirmCollectionSignIn);
 $("estimateButton").addEventListener("click", estimate);
+$("searchForm").addEventListener("input", searchConfigurationChanged);
+$("searchForm").addEventListener("change", searchConfigurationChanged);
 $("searchForm").addEventListener("submit", startSearch);
 $("cancelButton").addEventListener("click", cancelSearch);
 $("exportButton").addEventListener("click", exportWorkbook);
