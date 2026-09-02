@@ -10,6 +10,11 @@ from .trade_space import TeamRoster, TradeCandidate
 
 
 ROSTER_ADJUSTMENT_ALGORITHM = "post-trade-optimal-replacement-v3"
+MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY = (
+    "When automatic roster adjustments are allowed, each team's drops are "
+    "optimized locally and scarce free-agent replacements are reserved in "
+    "ascending team-ID order from the players still available."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +144,56 @@ class PreparedRosterAdjuster:
         )
         return TradeRosterAdjustment(primary_after, counterparty_after)
 
+    def adjust_teams(
+        self,
+        changes: Iterable[
+            tuple[TeamRoster, Iterable[str], Iterable[str]]
+        ],
+    ) -> tuple[TeamRosterAdjustment, ...]:
+        """Balance one simultaneous transfer across two or more league teams.
+
+        Each row contains the before roster, players sent, and players received.
+        Teams reserve free agents in canonical team-ID order, then results are
+        returned in caller order. This makes one transaction independent of
+        which participant was selected as the primary team.
+        """
+
+        normalized = _validated_team_changes(self, changes)
+        available_free_agents = self.free_agent_ids
+        by_team = {}
+        for roster, outgoing, incoming in sorted(
+            normalized, key=lambda row: row[0].team_id
+        ):
+            outgoing_set = set(outgoing)
+            raw_players = tuple(
+                player for player in roster.player_ids if player not in outgoing_set
+            ) + incoming
+            adjusted = self._balance(
+                roster,
+                raw_players,
+                capacity_exempt_player_ids=(
+                    roster.capacity_exempt_player_ids.difference(outgoing_set)
+                ),
+                protected=set(incoming),
+                free_agent_ids=available_free_agents,
+            )
+            additions = set(adjusted.added_player_ids)
+            available_free_agents = tuple(
+                player_id
+                for player_id in available_free_agents
+                if player_id not in additions
+            )
+            by_team[roster.team_id] = adjusted
+        adjustments = tuple(by_team[roster.team_id] for roster, _, _ in normalized)
+        owned_after = tuple(
+            player_id
+            for adjustment in adjustments
+            for player_id in adjustment.roster.player_ids
+        )
+        if len(set(owned_after)) != len(owned_after):
+            raise ValueError("simultaneous adjustment assigned one player twice")
+        return adjustments
+
     def _balance(
         self,
         before,
@@ -146,6 +201,7 @@ class PreparedRosterAdjuster:
         *,
         capacity_exempt_player_ids,
         protected,
+        free_agent_ids=None,
     ) -> TeamRosterAdjustment:
         players = list(raw_players)
         capacity_exempt = frozenset(capacity_exempt_player_ids)
@@ -159,7 +215,11 @@ class PreparedRosterAdjuster:
         players = [player for player in players if player not in set(dropped)]
         active_count = len(players) - len(capacity_exempt)
         needed = max(0, before.active_size - active_count)
-        additions = self._optimal_additions(players, needed)
+        additions = self._optimal_additions(
+            players,
+            needed,
+            free_agent_ids=free_agent_ids,
+        )
         players.extend(additions)
         if len(players) - len(capacity_exempt) > before.roster_cap:
             raise ValueError("adjusted roster exceeds its roster cap")
@@ -184,11 +244,12 @@ class PreparedRosterAdjuster:
             self.model,
         )
 
-    def _optimal_additions(self, players, count):
+    def _optimal_additions(self, players, count, *, free_agent_ids=None):
         if count == 0:
             return ()
+        pool = self.free_agent_ids if free_agent_ids is None else tuple(free_agent_ids)
         candidates = tuple(
-            player for player in self.free_agent_ids if player not in players
+            player for player in pool if player not in players
         )
         available_count = min(count, len(candidates))
         if available_count == 0:
@@ -268,6 +329,42 @@ def _best_package(packages, roster_for_package, model):
     if best_package is None:
         raise AssertionError("replacement package search produced no candidates")
     return best_package
+
+
+def _validated_team_changes(adjuster, values):
+    rows = tuple(values)
+    if len(rows) < 2:
+        raise ValueError("changes must contain at least two teams")
+    result = []
+    seen_teams = set()
+    all_outgoing = []
+    all_incoming = []
+    for row in rows:
+        if not isinstance(row, tuple) or len(row) != 3:
+            raise ValueError("each team change must contain roster, sent, and received")
+        roster, outgoing_values, incoming_values = row
+        if not isinstance(roster, TeamRoster):
+            raise ValueError("team changes must contain TeamRoster values")
+        adjuster._require_roster(roster)
+        if roster.team_id in seen_teams:
+            raise ValueError("team changes contain a duplicate team")
+        seen_teams.add(roster.team_id)
+        outgoing = _ids("sent player IDs", outgoing_values)
+        incoming = _ids("received player IDs", incoming_values)
+        if not set(outgoing).issubset(roster.player_ids):
+            raise ValueError("sent players must belong to their source team")
+        if set(incoming).intersection(roster.player_ids):
+            raise ValueError("received players cannot already belong to the team")
+        result.append((roster, outgoing, incoming))
+        all_outgoing.extend(outgoing)
+        all_incoming.extend(incoming)
+    if (
+        len(set(all_outgoing)) != len(all_outgoing)
+        or len(set(all_incoming)) != len(all_incoming)
+        or set(all_outgoing) != set(all_incoming)
+    ):
+        raise ValueError("simultaneous transfers must conserve unique player ownership")
+    return tuple(result)
 
 
 def _ids(name, values):

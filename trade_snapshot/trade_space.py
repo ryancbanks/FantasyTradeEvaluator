@@ -3,10 +3,13 @@ from dataclasses import dataclass, field
 from typing import Iterator
 
 from .trade_filters import (
+    TRADE_FILTER_EXPRESSION_SEMANTICS_VERSION,
     TRADE_FILTER_SEMANTICS_VERSION,
+    TradeFilterExpression,
+    TradePackageExpression,
     TradePackageFilter,
-    TradePackagePool as _TradePackagePool,
 )
+from .trade_package_enumeration import TradePackagePool as _TradePackagePool
 
 
 PlayerId = str
@@ -78,8 +81,8 @@ class TradeConstraints:
     excluded_size_pairs: frozenset[tuple[int, int]] = field(default_factory=frozenset)
     locked_player_ids: frozenset[PlayerId] = field(default_factory=frozenset)
     require_no_drops: bool = False
-    outgoing_filter: TradePackageFilter | None = None
-    incoming_filter: TradePackageFilter | None = None
+    outgoing_filter: TradePackageExpression | None = None
+    incoming_filter: TradePackageExpression | None = None
 
     def __post_init__(self) -> None:
         _require_int("min_outgoing", self.min_outgoing, minimum=1)
@@ -114,10 +117,16 @@ class TradeConstraints:
         for name in ("outgoing_filter", "incoming_filter"):
             package_filter = getattr(self, name)
             if package_filter is not None and not isinstance(
-                package_filter, TradePackageFilter
+                package_filter, (TradePackageFilter, TradeFilterExpression)
             ):
-                raise ValueError(f"{name} must be a TradePackageFilter or null")
-            if package_filter is not None and not package_filter.active:
+                raise ValueError(
+                    f"{name} must be a TradePackageFilter, "
+                    "TradeFilterExpression, or null"
+                )
+            if (
+                isinstance(package_filter, TradePackageFilter)
+                and not package_filter.active
+            ):
                 package_filter = None
             object.__setattr__(self, name, package_filter)
         object.__setattr__(self, "excluded_size_pairs", excluded)
@@ -151,7 +160,15 @@ class TradeConstraints:
         if active_filters:
             record.update(active_filters)
             record["package_filter_semantics_version"] = (
-                TRADE_FILTER_SEMANTICS_VERSION
+                TRADE_FILTER_EXPRESSION_SEMANTICS_VERSION
+                if any(
+                    isinstance(package_filter, TradeFilterExpression)
+                    for package_filter in (
+                        self.outgoing_filter,
+                        self.incoming_filter,
+                    )
+                )
+                else TRADE_FILTER_SEMANTICS_VERSION
             )
         return record
 

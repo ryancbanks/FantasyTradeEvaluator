@@ -201,9 +201,15 @@ from .trade_impact import (
     project_roster_change,
 )
 from .trade_filters import (
+    TRADE_FILTER_EXPRESSION_SEMANTICS_VERSION,
     TRADE_FILTER_SEMANTICS_VERSION,
+    TradeFilterExpression,
     TradeFilterMode,
+    TradeFilterOperator,
+    TradePackageExpression,
     TradePackageFilter,
+    iter_trade_filter_leaves,
+    parse_trade_filter,
 )
 from .trade_space import TeamRoster, TradeCandidate, TradeConstraints, TradeSpace
 from .waiver_pool import (
@@ -350,8 +356,12 @@ __all__ = (
     "TeamStrengthChange",
     "TeamWeekScore",
     "TradeCandidate",
+    "TradeFilterExpression",
     "TradeFilterMode",
+    "TradeFilterOperator",
+    "TradePackageExpression",
     "TradePackageFilter",
+    "TRADE_FILTER_EXPRESSION_SEMANTICS_VERSION",
     "TRADE_FILTER_SEMANTICS_VERSION",
     "TradeWorkbookContext",
     "TradeSearchOutcome",
@@ -363,6 +373,8 @@ __all__ = (
     "TradeStrengthResult",
     "TradeStrengthPrefilter",
     "TradeRosterAdjustment",
+    "iter_trade_filter_leaves",
+    "parse_trade_filter",
     "Tiebreaker",
     "UnresolvedTieError",
     "UnsupportedTiebreakerError",

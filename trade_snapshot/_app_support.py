@@ -11,8 +11,10 @@ from .engine_bundle import EngineBundle
 from .league_search import LeagueSearchOutcome
 from .positions import CANONICAL_PLAYER_POSITIONS
 from .projection_io import projection_to_record
+from .roster_adjustment import MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
 from .season import SeasonProjection
 from .surrogate_disclosure import SURROGATE_NOTICE, SURROGATE_QUALITY_GATE
+from .three_way_search import ThreeWaySearchOutcome
 from .workbook_model import WorkbookSource
 from .workbook_model import team_outlook_rows, workbook_trade_rows
 
@@ -68,6 +70,9 @@ def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
             "Exact within the attested balanced-package scope; other shapes are extrapolated."
             if exact
             else SURROGATE_NOTICE
+        ),
+        "three_team_free_agent_allocation_policy": (
+            MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
         ),
         "methodology": {
             "mode": bundle.methodology_mode,
@@ -174,21 +179,7 @@ def search_result_record(
             if bundle.methodology_mode == "surrogate"
             else "Exact only inside the attested trade scope."
         ),
-        "team_outlook": [
-            {
-                "team_id": row.team_id,
-                "team_name": row.team_name,
-                "current_wins": row.current_wins,
-                "current_losses": row.current_losses,
-                "current_ties": row.current_ties,
-                "expected_final_wins": row.expected_final_wins,
-                "expected_final_losses": row.expected_final_losses,
-                "expected_final_ties": row.expected_final_ties,
-                "projected_finish": row.mean_rank,
-                "playoff_probability": row.playoff_probability,
-            }
-            for row in outlook
-        ],
+        "team_outlook": _team_outlook_records(outlook),
         "rows": [
             {
                 "other_team": row.counterparty_team_name,
@@ -209,6 +200,120 @@ def search_result_record(
             for row in rows[:limit]
         ],
     }
+
+
+def three_way_search_result_record(
+    outcome: ThreeWaySearchOutcome,
+    bundle: EngineBundle,
+    projection: SeasonProjection,
+    limit: int,
+    *,
+    free_agent_allocation_policy: str | None = None,
+) -> dict[str, object]:
+    """Present a bounded, name-resolved preview of a three-team search."""
+
+    if not isinstance(outcome, ThreeWaySearchOutcome):
+        raise ValueError("outcome must be a ThreeWaySearchOutcome")
+    team_names = {row.team_id: row.name for row in bundle.state.teams}
+    results = outcome.results(limit)
+    try:
+        rows = [
+            {
+                "candidate_index": str(result.candidate_index),
+                "transfers": [
+                    {
+                        "from_team_id": transfer.source_team_id,
+                        "from_team_name": team_names[transfer.source_team_id],
+                        "to_team_id": transfer.destination_team_id,
+                        "to_team_name": team_names[transfer.destination_team_id],
+                        "players": [
+                            {
+                                "player_id": player_id,
+                                "name": bundle.player_names[player_id],
+                            }
+                            for player_id in transfer.player_ids
+                        ],
+                    }
+                    for transfer in result.transfers
+                ],
+                "team_impacts": [
+                    {
+                        "team_id": impact.team_id,
+                        "team_name": team_names[impact.team_id],
+                        "give": [
+                            bundle.player_names[player_id]
+                            for player_id in impact.sent_player_ids
+                        ],
+                        "receive": [
+                            bundle.player_names[player_id]
+                            for player_id in impact.received_player_ids
+                        ],
+                        "adds": [
+                            bundle.player_names[player_id]
+                            for player_id in impact.added_player_ids
+                        ],
+                        "drops": [
+                            bundle.player_names[player_id]
+                            for player_id in impact.dropped_player_ids
+                        ],
+                        "power_delta": impact.display_power_delta,
+                        "playoff_before": impact.playoff_before / 100,
+                        "playoff_after": impact.playoff_after / 100,
+                        "playoff_delta": impact.playoff_delta / 100,
+                    }
+                    for impact in result.team_results
+                ],
+                "all_teams_gain": result.all_teams_gain,
+                "combined_playoff_delta": result.combined_playoff_delta / 100,
+                "power_methodology_status": (
+                    "extrapolated"
+                    if bundle.methodology_mode == "exact"
+                    else "surrogate_extrapolated"
+                ),
+            }
+            for result in results
+        ]
+    except KeyError as error:
+        raise ValueError(f"missing display name for ID {error.args[0]!r}") from None
+    return {
+        "trade_format": "three_team",
+        "total_count": (
+            outcome.progress.power_qualified_count
+            if outcome.progress.power_qualified_count <= (1 << 53) - 1
+            else None
+        ),
+        "total_count_text": str(outcome.progress.power_qualified_count),
+        "shown_count": len(rows),
+        "power_engine_mode": bundle.methodology_mode,
+        "power_engine_notice": (
+            SURROGATE_NOTICE
+            if bundle.methodology_mode == "surrogate"
+            else "Three-team power is extrapolated beyond the attested two-team scope."
+        ),
+        "free_agent_allocation_policy": free_agent_allocation_policy,
+        "team_outlook": _team_outlook_records(
+            team_outlook_rows(bundle.state, projection)
+        ),
+        "rows": rows,
+    }
+
+
+def _team_outlook_records(outlook) -> list[dict[str, object]]:
+    return [
+        {
+            "team_id": row.team_id,
+            "team_name": row.team_name,
+            "current_wins": row.current_wins,
+            "current_losses": row.current_losses,
+            "current_ties": row.current_ties,
+            "expected_final_wins": row.expected_final_wins,
+            "expected_final_losses": row.expected_final_losses,
+            "expected_final_ties": row.expected_final_ties,
+            "projected_finish": row.mean_rank,
+            "playoff_probability": row.playoff_probability,
+        }
+        for row in outlook
+    ]
 
 
 def string_array(name: str, value: object) -> tuple[str, ...]:

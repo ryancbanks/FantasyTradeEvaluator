@@ -45,6 +45,8 @@ _COLLECTION_SIGN_IN_PATH = re.compile(
 _EXPORT_PATH = re.compile(r"^/api/exports/([^/]+\.xlsx)$")
 _STATIC = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/trade_filter_ui.js": ("trade_filter_ui.js", "text/javascript; charset=utf-8"),
+    "/three_way_ui.js": ("three_way_ui.js", "text/javascript; charset=utf-8"),
     "/styles.css": ("styles.css", "text/css; charset=utf-8"),
 }
 _MAX_JSON_BYTES = 256 * 1024 * 1024

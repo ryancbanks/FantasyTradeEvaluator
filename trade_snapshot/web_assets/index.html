@@ -102,34 +102,72 @@
         <p>Counts are exact before the run starts. Playoff simulations happen only after the fast power filter.</p>
       </div>
       <form id="searchForm">
+        <fieldset class="trade-format-picker">
+          <legend>Trade format</legend>
+          <div class="trade-format-options" role="radiogroup" aria-describedby="tradeFormatHelp">
+            <label class="format-option"><input id="twoTeamFormat" name="tradeFormat" type="radio" value="two_team" checked><span><strong>Two-team</strong><small>Search one or more opponents</small></span></label>
+            <label class="format-option"><input id="threeTeamFormat" name="tradeFormat" type="radio" value="three_team"><span><strong>Three-team</strong><small>Search one selected three-team agreement</small></span></label>
+          </div>
+          <p id="tradeFormatHelp" class="field-help">Two-team mode searches each selected opponent independently.</p>
+        </fieldset>
+
         <div class="form-grid identity-grid">
           <label><span>Your team</span><select id="primaryTeam" required></select></label>
-          <label><span>Other teams</span><select id="counterparties" multiple size="5"></select><small>Select specific teams, or leave all unselected to search every other team.</small></label>
+          <label id="twoTeamCounterpartyField"><span>Other teams</span><select id="counterparties" multiple size="5"></select><small>Select specific teams, or leave all unselected to search every other team.</small></label>
+          <div id="threeTeamPartners" class="three-team-partners hidden">
+            <label><span>Partner team A</span><select id="partnerTeamA"><option value="">Choose a team</option></select></label>
+            <label><span>Partner team B</span><select id="partnerTeamB"><option value="">Choose a team</option></select></label>
+            <small>Choose two different teams. Every result requires all three teams to send and receive at least one player.</small>
+          </div>
         </div>
 
         <fieldset class="package-filters">
           <legend>Package contents <small>(optional)</small></legend>
-          <p class="filter-intro">Turn on either side independently. Player and position rules are combined when both are used.</p>
+          <p class="filter-intro">Turn on either side independently. Within a rule, player and position requirements are combined. Multiple rules are evaluated from top to bottom, so the connector on each new rule combines it with the result above.</p>
           <div class="package-filter-grid">
             <section class="package-filter-card" data-filter-side="outgoing">
               <label class="check filter-toggle"><input id="outgoingFilterEnabled" type="checkbox"><span>Filter players you give</span></label>
               <div class="package-filter-controls" id="outgoingFilterControls">
-                <label><span>Player rule</span><select id="outgoingPlayerMode"><option value="any">Any players</option><option value="include">Must include all selected</option><option value="only">Exactly the selected players</option><option value="exclude">Exclude all selected</option></select></label>
-                <label><span>Find a player</span><input id="outgoingPlayerSearch" type="search" placeholder="Type a player name"></label>
-                <div id="outgoingPlayerChoices" class="filter-choice-list" role="group" aria-label="Players you give"></div>
-                <label><span>Position rule</span><select id="outgoingPositionMode"><option value="any">Any positions</option><option value="include">Must include each selected</option><option value="only">Only the selected positions</option><option value="exclude">Exclude the selected positions</option></select></label>
-                <div id="outgoingPositionChoices" class="position-choices" role="group" aria-label="Positions you give"></div>
+                <div id="outgoingFilterClauses" class="filter-clauses">
+                  <section class="filter-clause" data-filter-clause>
+                    <label class="filter-connector hidden"><span>Combine with result above</span><select data-filter-role="connector"><option value="and">AND — both</option><option value="or">OR — either or both</option><option value="xor">XOR — exactly one</option></select></label>
+                    <div class="filter-clause-heading">
+                      <strong data-filter-role="rule-label">Rule 1</strong>
+                      <label class="check filter-not"><input id="outgoingFilterNot" data-filter-role="not" type="checkbox"><span>NOT <small>(invert rule)</small></span></label>
+                      <button class="danger compact hidden" data-filter-action="remove" type="button">Remove</button>
+                    </div>
+                    <label><span>Player rule</span><select id="outgoingPlayerMode" data-filter-role="player-mode"><option value="any">Any players</option><option value="include">Must include all selected</option><option value="only">Exactly the selected players</option><option value="exclude">Exclude all selected</option></select></label>
+                    <label><span>Find a player</span><input id="outgoingPlayerSearch" data-filter-role="player-search" type="search" placeholder="Type a player name"></label>
+                    <div id="outgoingPlayerChoices" class="filter-choice-list" data-filter-role="player-choices" role="group" aria-label="Players you give in rule 1"></div>
+                    <label><span>Position rule</span><select id="outgoingPositionMode" data-filter-role="position-mode"><option value="any">Any positions</option><option value="include">Must include each selected</option><option value="only">Only the selected positions</option><option value="exclude">Exclude the selected positions</option></select></label>
+                    <div id="outgoingPositionChoices" class="position-choices" data-filter-role="position-choices" role="group" aria-label="Positions you give in rule 1"></div>
+                  </section>
+                </div>
+                <button id="outgoingAddFilterClause" class="secondary add-filter-clause" data-filter-action="add" type="button">+ Add another rule</button>
+                <p class="filter-evaluation-help">NOT applies to one rule. AND, OR, and XOR combine each new rule with everything above it.</p>
               </div>
             </section>
 
             <section class="package-filter-card" data-filter-side="incoming">
               <label class="check filter-toggle"><input id="incomingFilterEnabled" type="checkbox"><span>Filter players you receive</span></label>
               <div class="package-filter-controls" id="incomingFilterControls">
-                <label><span>Player rule</span><select id="incomingPlayerMode"><option value="any">Any players</option><option value="include">Must include all selected</option><option value="only">Exactly the selected players</option><option value="exclude">Exclude all selected</option></select></label>
-                <label><span>Find a player</span><input id="incomingPlayerSearch" type="search" placeholder="Type a player name or team"></label>
-                <div id="incomingPlayerChoices" class="filter-choice-list" role="group" aria-label="Players you receive"></div>
-                <label><span>Position rule</span><select id="incomingPositionMode"><option value="any">Any positions</option><option value="include">Must include each selected</option><option value="only">Only the selected positions</option><option value="exclude">Exclude the selected positions</option></select></label>
-                <div id="incomingPositionChoices" class="position-choices" role="group" aria-label="Positions you receive"></div>
+                <div id="incomingFilterClauses" class="filter-clauses">
+                  <section class="filter-clause" data-filter-clause>
+                    <label class="filter-connector hidden"><span>Combine with result above</span><select data-filter-role="connector"><option value="and">AND — both</option><option value="or">OR — either or both</option><option value="xor">XOR — exactly one</option></select></label>
+                    <div class="filter-clause-heading">
+                      <strong data-filter-role="rule-label">Rule 1</strong>
+                      <label class="check filter-not"><input id="incomingFilterNot" data-filter-role="not" type="checkbox"><span>NOT <small>(invert rule)</small></span></label>
+                      <button class="danger compact hidden" data-filter-action="remove" type="button">Remove</button>
+                    </div>
+                    <label><span>Player rule</span><select id="incomingPlayerMode" data-filter-role="player-mode"><option value="any">Any players</option><option value="include">Must include all selected</option><option value="only">Exactly the selected players</option><option value="exclude">Exclude all selected</option></select></label>
+                    <label><span>Find a player</span><input id="incomingPlayerSearch" data-filter-role="player-search" type="search" placeholder="Type a player name or team"></label>
+                    <div id="incomingPlayerChoices" class="filter-choice-list" data-filter-role="player-choices" role="group" aria-label="Players you receive in rule 1"></div>
+                    <label><span>Position rule</span><select id="incomingPositionMode" data-filter-role="position-mode"><option value="any">Any positions</option><option value="include">Must include each selected</option><option value="only">Only the selected positions</option><option value="exclude">Exclude the selected positions</option></select></label>
+                    <div id="incomingPositionChoices" class="position-choices" data-filter-role="position-choices" role="group" aria-label="Positions you receive in rule 1"></div>
+                  </section>
+                </div>
+                <button id="incomingAddFilterClause" class="secondary add-filter-clause" data-filter-action="add" type="button">+ Add another rule</button>
+                <p class="filter-evaluation-help">NOT applies to one rule. AND, OR, and XOR combine each new rule with everything above it.</p>
               </div>
             </section>
           </div>
@@ -139,10 +177,10 @@
           <fieldset>
             <legend>Package sizes</legend>
             <div class="two-up">
-              <label><span>Minimum you send</span><input id="minOutgoing" type="number" min="1" value="1"></label>
-              <label><span>Maximum you send</span><input id="maxOutgoing" type="number" min="1" value="6"></label>
-              <label><span>Minimum you receive</span><input id="minIncoming" type="number" min="1" value="1"></label>
-              <label><span>Maximum you receive</span><input id="maxIncoming" type="number" min="1" value="6"></label>
+              <label><span id="minOutgoingLabel">Minimum you send</span><input id="minOutgoing" type="number" min="1" value="1"></label>
+              <label><span id="maxOutgoingLabel">Maximum you send</span><input id="maxOutgoing" type="number" min="1" value="6"></label>
+              <label><span id="minIncomingLabel">Minimum you receive</span><input id="minIncoming" type="number" min="1" value="1"></label>
+              <label><span id="maxIncomingLabel">Maximum you receive</span><input id="maxIncoming" type="number" min="1" value="6"></label>
               <label><span>Maximum total players</span><input id="maxTotal" type="number" min="2" value="12"></label>
               <label><span>Maximum side imbalance</span><input id="maxImbalance" type="number" min="0" value="1"></label>
             </div>
@@ -151,13 +189,15 @@
           <fieldset>
             <legend>Filters and accuracy</legend>
             <label class="check"><input id="balancedOnly" type="checkbox"><span>Only equal-size swaps</span></label>
-            <label class="check"><input id="skipSmall" type="checkbox" checked><span>Skip trades FantasyPros already covers (3 or fewer per side)</span></label>
-            <label class="check"><input id="noDrops" type="checkbox" checked><span>Do not force either team to drop a player</span></label>
+            <label id="skipSmallRow" class="check"><input id="skipSmall" type="checkbox" checked><span>Skip trades FantasyPros already covers (3 or fewer per side)</span></label>
+            <label class="check"><input id="noDrops" type="checkbox" checked><span id="noDropsLabel">Do not force either team to drop a player</span></label>
             <label id="surrogateSearchConsentRow" class="check surrogate-consent hidden"><input id="acceptSurrogateSearch" type="checkbox"><span>I understand this selected week uses <strong>SURROGATE</strong> power, which affects trade filtering and is not an exact FantasyPros result.</span></label>
             <label><span>Minimum power change for each team</span><input id="powerFloor" type="number" step="0.1" value="-5"></label>
             <label><span>Season simulations per candidate</span><input id="scenarioCount" type="number" min="100" max="1000000" step="100" value="10000"></label>
           </fieldset>
         </div>
+        <p id="threeTeamRulesHelp" class="field-help three-team-rules hidden">In three-team mode, size, balance, imbalance, power, and no-drop rules apply to every team. Maximum total players counts each player moved once. Count combinations before starting. Three-team power is always extrapolated beyond the attested two-team trade shapes; a surrogate week is surrogate-extrapolated.</p>
+        <p id="freeAgentAllocationHelp" class="field-help roster-adjustment-warning hidden">Automatic roster adjustments are enabled. <span id="freeAgentAllocationPolicy"></span></p>
 
         <div class="action-row">
           <button id="estimateButton" type="button" class="secondary">Count combinations</button>
@@ -193,7 +233,7 @@
       <h3 class="table-title">Qualified trades</h3>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Other team</th><th>You give</th><th>You receive</th><th>Automatic roster moves</th><th>Your power</th><th>Their power</th><th>Your playoff</th><th>Their playoff</th><th>Power evidence</th></tr></thead>
+          <thead><tr id="resultsHeaderRow"><th>Other team</th><th>You give</th><th>You receive</th><th>Automatic roster moves</th><th>Your power</th><th>Their power</th><th>Your playoff</th><th>Their playoff</th><th>Power evidence</th></tr></thead>
           <tbody id="resultsBody"></tbody>
         </table>
       </div>
@@ -201,6 +241,8 @@
   </main>
 
   <footer>All candidate scoring and season simulation run on this computer. Weekly source evidence stays in the selected bundle.</footer>
+  <script src="/three_way_ui.js" defer></script>
+  <script src="/trade_filter_ui.js" defer></script>
   <script src="/app.js" defer></script>
 </body>
 </html>

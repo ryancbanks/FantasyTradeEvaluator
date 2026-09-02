@@ -6,7 +6,7 @@ from threading import Thread
 import unittest
 from zipfile import ZipFile
 
-from tests.test_app_service import payload
+from tests.test_app_service import filter_expression, payload, player_filter
 from tests.test_engine_bundle import engine_bundle
 from tests.test_surrogate_disclosure import surrogate_bundle
 from trade_snapshot.extension_bridge import SESSION_TOKEN_HEADER, V1_CAPABILITIES
@@ -98,6 +98,21 @@ class LocalServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(raw)["candidate_count"], 1)
+
+        expression = payload(bundle.bundle_id)
+        expression["outgoing_filter_expression"] = filter_expression(
+            "and",
+            player_filter("p1"),
+            filter_expression("not", player_filter("p2")),
+        )
+        expression["incoming_filter_expression"] = filter_expression(
+            "xor", player_filter("q1"), player_filter("q2")
+        )
+        status, _, raw = self.request(
+            "POST", "/api/searches/estimate", value=expression
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["candidate_count"], 2)
         self.assertEqual(
             {
                 player["player_id"]
@@ -119,12 +134,27 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b'addEventListener("change", changeBundle)', body)
         self.assertIn(b'$("resultsPanel").classList.add("hidden")', body)
         self.assertIn(b'$("bundleSelect").disabled = true', body)
-        self.assertIn(b"packageFilterPayload", body)
-        self.assertIn(b"outgoing_filter", body)
-        self.assertIn(b"same other team", body)
+        self.assertIn(b"TradeFilterUi.requestFields", body)
+        self.assertIn(b'trade_format: format', body)
+        self.assertIn(b'format === "three_team"', body)
+        self.assertIn(b"candidate_count_text", body)
+        self.assertIn(b"threeTeamEstimateSignature", body)
+        self.assertIn(b"improve all three playoff chances", body)
+        self.assertIn(b"free_agent_allocation_policy", body)
+        self.assertIn(b"Count this specific three-team search", body)
+        self.assertNotIn(b"Count this exact three-team search", body)
         self.assertNotIn(b"expected_team_count", body)
         self.assertNotIn(b"exact combinations across", body)
         self.assertNotIn(self.directory.name.encode(), body)
+        status, headers, filter_body = self.request(
+            "GET", "/trade_filter_ui.js", token=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/javascript", headers["Content-Type"])
+        self.assertIn(b'`${side}_filter_expression`', filter_body)
+        self.assertIn(b'{operator: "not", operands: [leaf]}', filter_body)
+        self.assertIn(b"CONNECTORS", filter_body)
+        self.assertIn(b"same other team within one rule", filter_body)
         status, _, page = self.request("GET", "/", token=False)
         self.assertEqual(status, 200)
         self.assertIn(b"Power evidence", page)
@@ -140,13 +170,47 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b'<meta name="color-scheme" content="dark">', page)
         self.assertIn(b"Package contents", page)
         self.assertIn(b"Exactly the selected players", page)
+        self.assertIn(b"Multiple rules are evaluated from top to bottom", page)
+        self.assertIn(b"AND \xe2\x80\x94 both", page)
+        self.assertIn(b"OR \xe2\x80\x94 either or both", page)
+        self.assertIn(b"XOR \xe2\x80\x94 exactly one", page)
+        self.assertIn(b'data-filter-role="not"', page)
+        self.assertIn(b'src="/trade_filter_ui.js"', page)
+        self.assertIn(b'id="twoTeamFormat"', page)
+        self.assertIn(b'id="threeTeamFormat"', page)
+        self.assertIn(b'id="partnerTeamA"', page)
+        self.assertIn(b'id="partnerTeamB"', page)
+        self.assertIn(b"Search one selected three-team agreement", page)
+        self.assertNotIn(b"Search one exact three-team agreement", page)
+        self.assertIn(b'id="minOutgoingLabel"', page)
+        self.assertIn(b'id="noDropsLabel"', page)
+        self.assertIn(b'id="freeAgentAllocationPolicy"', page)
+        self.assertIn(b"always extrapolated", page)
+        self.assertIn(b"Every result requires all three teams", page)
+        self.assertIn(b'id="resultsHeaderRow"', page)
+        self.assertLess(page.index(b'/three_way_ui.js'), page.index(b'/app.js'))
         self.assertNotIn(b'id="expectedTeamCount"', page)
 
         status, _, stylesheet = self.request("GET", "/styles.css", token=False)
         self.assertEqual(status, 200)
         self.assertIn(b"color-scheme: dark", stylesheet)
         self.assertIn(b"--canvas: #071014", stylesheet)
+        self.assertIn(b".trade-format-options", stylesheet)
+        self.assertIn(b".team-impact-cell", stylesheet)
+        self.assertIn(b".roster-adjustment-warning", stylesheet)
         self.assertNotIn(b"color-scheme: light", stylesheet)
+
+        status, headers, three_way = self.request("GET", "/three_way_ui.js", token=False)
+        self.assertEqual(status, 200)
+        self.assertIn("text/javascript", headers["Content-Type"])
+        self.assertIn(b"window.ThreeWayUi", three_way)
+        self.assertIn(b"BigInt(raw)", three_way)
+        self.assertIn(b"row.transfers", three_way)
+        self.assertIn(b"row.team_impacts", three_way)
+        self.assertIn(b"row.all_teams_gain", three_way)
+        self.assertIn(b"Minimum each team sends", three_way)
+        self.assertIn(b"Do not force any team", three_way)
+        self.assertIn(b"three_team_free_agent_allocation_policy", three_way)
 
         status, headers, extension = self.request(
             "GET", "/browser-extension.zip", token=False
