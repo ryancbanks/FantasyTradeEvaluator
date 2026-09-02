@@ -1,12 +1,21 @@
 import inspect
 import math
+from itertools import combinations
 import unittest
+from unittest.mock import patch
 
 from trade_snapshot.trade_filters import (
+    MAX_TRADE_FILTER_EXPRESSION_DEPTH,
+    MAX_TRADE_FILTER_EXPRESSION_NODES,
+    TRADE_FILTER_EXPRESSION_SEMANTICS_VERSION,
     TRADE_FILTER_SEMANTICS_VERSION,
+    TradeFilterExpression,
     TradeFilterMode,
+    TradeFilterOperator,
     TradePackageFilter,
+    parse_trade_filter,
 )
+from trade_snapshot.trade_filter_compiler import CompiledTradeFilter
 from trade_snapshot.trade_space import (
     TradeCandidate,
     TeamRoster,
@@ -532,6 +541,236 @@ class TradeSpaceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "player_ids"):
             TradePackageFilter(player_ids={None}, player_mode="include")
 
+    def test_expression_records_are_recursive_canonical_and_strict(self):
+        include_a = TradePackageFilter(player_ids={"a"}, player_mode="include")
+        exclude_qb = TradePackageFilter(positions={"QB"}, position_mode="exclude")
+        expression = TradeFilterExpression(
+            "and",
+            (
+                TradeFilterExpression("not", (exclude_qb,)),
+                TradeFilterExpression("xor", (exclude_qb, include_a)),
+            ),
+        )
+
+        record = expression.to_record()
+
+        self.assertIs(expression.operator, TradeFilterOperator.AND)
+        self.assertEqual(parse_trade_filter("filter", record), expression)
+        self.assertEqual(
+            record,
+            TradeFilterExpression("and", tuple(reversed(expression.operands))).to_record(),
+        )
+        self.assertEqual(
+            TradeConstraints(outgoing_filter=expression).to_record()[
+                "package_filter_semantics_version"
+            ],
+            TRADE_FILTER_EXPRESSION_SEMANTICS_VERSION,
+        )
+        self.assertEqual(
+            TradeConstraints(outgoing_filter=include_a).to_record()[
+                "package_filter_semantics_version"
+            ],
+            TRADE_FILTER_SEMANTICS_VERSION,
+        )
+        with self.assertRaisesRegex(ValueError, "at least two"):
+            parse_trade_filter(
+                "filter",
+                {"operator": "xor", "operands": [include_a.to_record()]},
+            )
+        with self.assertRaisesRegex(ValueError, "active package rule"):
+            TradeFilterExpression("not", (TradePackageFilter(),))
+
+        too_deep = include_a.to_record()
+        for _ in range(MAX_TRADE_FILTER_EXPRESSION_DEPTH + 1):
+            too_deep = {"operator": "not", "operands": [too_deep]}
+        with self.assertRaisesRegex(ValueError, "maximum nesting depth"):
+            parse_trade_filter("filter", too_deep)
+
+        too_many = {
+            "operator": "or",
+            "operands": [
+                include_a.to_record()
+                for _ in range(MAX_TRADE_FILTER_EXPRESSION_NODES)
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "maximum node count"):
+            parse_trade_filter("filter", too_many)
+
+    def test_nested_boolean_filters_match_exhaustive_two_team_oracle(self):
+        primary = roster("primary", ("a", "b", "c", "d"))
+        counterparty = roster("counterparty", ("x", "y", "z"))
+        positions = {
+            "a": {"RB"},
+            "b": {"WR"},
+            "c": {"TE"},
+            "d": {"RB", "WR"},
+            "x": {"RB"},
+            "y": {"WR"},
+            "z": {"TE"},
+        }
+        include_a = TradePackageFilter(player_ids={"a"}, player_mode="include")
+        has_wr = TradePackageFilter(positions={"WR"}, position_mode="include")
+        excludes_c = TradePackageFilter(player_ids={"c"}, player_mode="exclude")
+        rb_only = TradePackageFilter(positions={"RB"}, position_mode="only")
+        outgoing_filter = TradeFilterExpression(
+            "and",
+            (
+                TradeFilterExpression("or", (include_a, has_wr)),
+                TradeFilterExpression(
+                    "not",
+                    (TradeFilterExpression("xor", (excludes_c, rb_only)),),
+                ),
+            ),
+        )
+        incoming_filter = TradeFilterExpression(
+            "xor",
+            (
+                TradePackageFilter(player_ids={"x"}, player_mode="include"),
+                TradePackageFilter(positions={"WR"}, position_mode="include"),
+                TradePackageFilter(player_ids={"z"}, player_mode="exclude"),
+            ),
+        )
+        constraints = TradeConstraints(
+            min_outgoing=1,
+            max_outgoing=3,
+            min_incoming=1,
+            max_incoming=3,
+            outgoing_filter=outgoing_filter,
+            incoming_filter=incoming_filter,
+        )
+        expected = tuple(
+            candidate(outgoing, incoming)
+            for outgoing_size in range(1, 4)
+            for incoming_size in range(1, 4)
+            for outgoing in combinations(primary.player_ids, outgoing_size)
+            if package_matches(outgoing, outgoing_filter, positions)
+            for incoming in combinations(counterparty.player_ids, incoming_size)
+            if package_matches(incoming, incoming_filter, positions)
+        )
+
+        space = TradeSpace(
+            primary,
+            counterparty,
+            constraints,
+            eligible_positions_by_player=positions,
+        )
+
+        self.assertTrue(expected)
+        self.assertEqual(space.candidate_count, len(expected))
+        self.assertEqual(tuple(space), expected)
+
+    def test_wrapping_a_legacy_filter_preserves_two_team_results(self):
+        positions = {"a": {"RB"}, "b": {"WR"}, "c": {"TE"}, "x": {"QB"}}
+        legacy_filter = TradePackageFilter(
+            player_ids={"a"},
+            player_mode="include",
+            positions={"TE"},
+            position_mode="exclude",
+        )
+        inputs = dict(
+            min_outgoing=1,
+            max_outgoing=3,
+            outgoing_filter=legacy_filter,
+        )
+        legacy = TradeSpace(
+            roster("primary", ("a", "b", "c")),
+            roster("counterparty", ("x",)),
+            TradeConstraints(**inputs),
+            eligible_positions_by_player=positions,
+        )
+        composed = TradeSpace(
+            roster("primary", ("a", "b", "c")),
+            roster("counterparty", ("x",)),
+            TradeConstraints(
+                **{
+                    **inputs,
+                    "outgoing_filter": TradeFilterExpression(
+                        "and", (legacy_filter, legacy_filter)
+                    ),
+                }
+            ),
+            eligible_positions_by_player=positions,
+        )
+
+        self.assertEqual(composed.candidate_count, legacy.candidate_count)
+        self.assertEqual(tuple(composed), tuple(legacy))
+
+    def test_legacy_only_iteration_prunes_before_combination_scanning(self):
+        selected = tuple(f"c{number}" for number in range(10))
+        primary = roster("primary", ("p0", "p1"))
+        counterparty = roster(
+            "counterparty", tuple(f"c{number}" for number in range(20))
+        )
+        real_combinations = combinations
+        examined = 0
+
+        def counted_combinations(*args):
+            nonlocal examined
+            for package in real_combinations(*args):
+                examined += 1
+                yield package
+
+        space = TradeSpace(
+            primary,
+            counterparty,
+            TradeConstraints(
+                min_incoming=10,
+                max_incoming=10,
+                incoming_filter=TradePackageFilter(
+                    player_ids=selected, player_mode="only"
+                ),
+            ),
+        )
+        with patch(
+            "trade_snapshot.trade_package_enumeration.combinations",
+            counted_combinations,
+        ):
+            rows = tuple(space)
+
+        self.assertEqual(len(rows), 2)
+        self.assertLess(examined, 10)
+        self.assertTrue(
+            all(row.incoming_player_ids == selected for row in rows)
+        )
+
+    def test_composed_incoming_packages_are_scanned_once_and_replayed(self):
+        selected = tuple(f"c{number}" for number in range(10))
+        only_selected = TradePackageFilter(
+            player_ids=selected, player_mode="only"
+        )
+        expression = TradeFilterExpression(
+            "and", (only_selected, only_selected)
+        )
+        original_matches = CompiledTradeFilter.matches
+        match_checks = 0
+
+        def counted_matches(compiled_filter, evidence):
+            nonlocal match_checks
+            match_checks += 1
+            return original_matches(compiled_filter, evidence)
+
+        with patch.object(CompiledTradeFilter, "matches", counted_matches):
+            space = TradeSpace(
+                roster("primary", ("p0", "p1")),
+                roster(
+                    "counterparty",
+                    tuple(f"c{number}" for number in range(20)),
+                ),
+                TradeConstraints(
+                    min_incoming=10,
+                    max_incoming=10,
+                    incoming_filter=expression,
+                ),
+            )
+            match_checks = 0
+            rows = tuple(space)
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(match_checks, math.comb(20, 10))
+        self.assertTrue(
+            all(row.incoming_player_ids == selected for row in rows)
+        )
+
     def test_no_drops_uses_each_teams_post_trade_roster_size(self):
         primary = TeamRoster("primary", ("a", "b"), current_size=14, roster_cap=14)
         counterparty = TeamRoster("counterparty", ("x", "y"), current_size=13, roster_cap=14)
@@ -712,6 +951,40 @@ def roster(team_id, player_ids):
 
 def candidate(outgoing, incoming):
     return TradeCandidate(outgoing, incoming)
+
+
+def package_matches(player_ids, rule, positions):
+    if isinstance(rule, TradeFilterExpression):
+        matches = tuple(
+            package_matches(player_ids, operand, positions)
+            for operand in rule.operands
+        )
+        if rule.operator is TradeFilterOperator.AND:
+            return all(matches)
+        if rule.operator is TradeFilterOperator.OR:
+            return any(matches)
+        if rule.operator is TradeFilterOperator.XOR:
+            return sum(matches) == 1
+        return not matches[0]
+    selected = set(player_ids)
+    if rule.player_mode is TradeFilterMode.INCLUDE and not rule.player_ids <= selected:
+        return False
+    if rule.player_mode is TradeFilterMode.ONLY and selected != rule.player_ids:
+        return False
+    if rule.player_mode is TradeFilterMode.EXCLUDE and selected & rule.player_ids:
+        return False
+    if rule.position_mode is None:
+        return True
+    eligible = {player_id: set(positions[player_id]) for player_id in player_ids}
+    if rule.position_mode is TradeFilterMode.INCLUDE:
+        covered = set().union(*eligible.values()) if eligible else set()
+        return rule.positions <= covered
+    matching = tuple(
+        bool(values & rule.positions) for values in eligible.values()
+    )
+    if rule.position_mode is TradeFilterMode.ONLY:
+        return all(matching)
+    return not any(matching)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,12 @@ from trade_snapshot.three_way_trade import (
     ThreeWayTradeSpace,
     TradeTransfer,
 )
-from trade_snapshot.trade_filters import TradeFilterMode, TradePackageFilter
+from trade_snapshot.trade_filters import (
+    TradeFilterExpression,
+    TradeFilterMode,
+    TradeFilterOperator,
+    TradePackageFilter,
+)
 from trade_snapshot.trade_space import TeamRoster, TradeConstraints
 
 
@@ -111,6 +116,18 @@ def brute_force(rosters, constraints, positions=None):
 def package_matches(player_ids, rule, positions):
     if rule is None:
         return True
+    if isinstance(rule, TradeFilterExpression):
+        matches = tuple(
+            package_matches(player_ids, operand, positions)
+            for operand in rule.operands
+        )
+        if rule.operator is TradeFilterOperator.AND:
+            return all(matches)
+        if rule.operator is TradeFilterOperator.OR:
+            return any(matches)
+        if rule.operator is TradeFilterOperator.XOR:
+            return sum(matches) == 1
+        return not matches[0]
     selected = set(player_ids)
     if rule.player_mode is TradeFilterMode.INCLUDE and not rule.player_ids <= selected:
         return False
@@ -270,6 +287,50 @@ class ThreeWayTradeSpaceTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 space.iter_from(invalid)
 
+    def test_legacy_enumeration_record_shape_is_unchanged(self):
+        space = ThreeWayTradeSpace(
+            (
+                roster("A", ("a",)),
+                roster("B", ("b",)),
+                roster("C", ("c",)),
+            ),
+            TradeConstraints(),
+        )
+
+        self.assertEqual(
+            space.enumeration_record(),
+            {
+                "incoming_target": 0,
+                "outgoing_target": 0,
+                "player_decisions": [
+                    {
+                        "active": 1,
+                        "destinations": [0, 1, 2],
+                        "incoming_coverage": 0,
+                        "origin": 0,
+                        "outgoing_coverage": 0,
+                        "player_id": "a",
+                    },
+                    {
+                        "active": 1,
+                        "destinations": [1, 0, 2],
+                        "incoming_coverage": 0,
+                        "origin": 1,
+                        "outgoing_coverage": 0,
+                        "player_id": "b",
+                    },
+                    {
+                        "active": 1,
+                        "destinations": [2, 0, 1],
+                        "incoming_coverage": 0,
+                        "origin": 2,
+                        "outgoing_coverage": 0,
+                        "player_id": "c",
+                    },
+                ],
+            },
+        )
+
     def test_primary_filters_apply_to_aggregate_packages_across_both_partners(self):
         rows = (
             roster("A", ("a-rb", "a-wr")),
@@ -322,6 +383,119 @@ class ThreeWayTradeSpaceTests(unittest.TestCase):
                 == {"B", "C"}
                 for row in candidates
             )
+        )
+
+    def test_nested_boolean_filters_match_all_route_brute_force(self):
+        rows = (
+            roster("A", ("a1", "a2")),
+            roster("B", ("b1", "b2")),
+            roster("C", ("c1", "c2")),
+        )
+        positions = {
+            "a1": {"RB"},
+            "a2": {"WR"},
+            "b1": {"RB"},
+            "b2": {"WR"},
+            "c1": {"TE"},
+            "c2": {"RB", "WR"},
+        }
+        includes_a1 = TradePackageFilter(
+            player_ids={"a1"}, player_mode="include"
+        )
+        outgoing_wr = TradePackageFilter(
+            positions={"WR"}, position_mode="include"
+        )
+        outgoing_filter = TradeFilterExpression(
+            "and",
+            (
+                TradeFilterExpression("or", (includes_a1, outgoing_wr)),
+                TradeFilterExpression(
+                    "not",
+                    (
+                        TradeFilterExpression(
+                            "xor", (includes_a1, outgoing_wr)
+                        ),
+                    ),
+                ),
+            ),
+        )
+        incoming_filter = TradeFilterExpression(
+            "xor",
+            (
+                TradePackageFilter(
+                    player_ids={"b1"}, player_mode="include"
+                ),
+                TradePackageFilter(
+                    positions={"WR"}, position_mode="include"
+                ),
+                TradePackageFilter(
+                    player_ids={"c1"}, player_mode="exclude"
+                ),
+            ),
+        )
+        constraints = TradeConstraints(
+            min_outgoing=1,
+            max_outgoing=2,
+            min_incoming=1,
+            max_incoming=2,
+            max_total_players=6,
+            outgoing_filter=outgoing_filter,
+            incoming_filter=incoming_filter,
+        )
+        expected = brute_force(rows, constraints, positions)
+
+        space = ThreeWayTradeSpace(
+            rows,
+            constraints,
+            eligible_positions_by_player=positions,
+        )
+        actual = tuple(space)
+
+        self.assertTrue(expected)
+        self.assertEqual(space.candidate_count, len(expected))
+        self.assertEqual(tuple(map(signature, actual)), expected)
+        enumeration_record = space.enumeration_record()
+        self.assertEqual(
+            enumeration_record["outgoing_filter_expression"],
+            outgoing_filter.to_record(),
+        )
+        self.assertEqual(
+            enumeration_record["incoming_filter_expression"],
+            incoming_filter.to_record(),
+        )
+
+    def test_wrapping_a_legacy_filter_preserves_three_way_results(self):
+        rows = (
+            roster("A", ("a1", "a2")),
+            roster("B", ("b1", "b2")),
+            roster("C", ("c1", "c2")),
+        )
+        legacy_filter = TradePackageFilter(
+            player_ids={"a1"}, player_mode="include"
+        )
+        base = dict(
+            min_outgoing=1,
+            max_outgoing=2,
+            min_incoming=1,
+            max_incoming=2,
+            outgoing_filter=legacy_filter,
+        )
+        legacy = ThreeWayTradeSpace(rows, TradeConstraints(**base))
+        composed = ThreeWayTradeSpace(
+            rows,
+            TradeConstraints(
+                **{
+                    **base,
+                    "outgoing_filter": TradeFilterExpression(
+                        "and", (legacy_filter, legacy_filter)
+                    ),
+                }
+            ),
+        )
+
+        self.assertEqual(composed.candidate_count, legacy.candidate_count)
+        self.assertEqual(
+            tuple(map(signature, composed)), tuple(map(signature, legacy))
         )
 
     def test_filter_ownership_and_position_evidence_are_validated(self):

@@ -1,17 +1,19 @@
 """Side-specific player and position rules for local trade packages."""
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from itertools import combinations
-from math import comb
-from typing import Iterator
+import json
+from typing import Iterator, TypeAlias
 
 from .positions import normalize_player_position
 
 
 PlayerId = str
 TRADE_FILTER_SEMANTICS_VERSION = 1
+TRADE_FILTER_EXPRESSION_SEMANTICS_VERSION = 2
+MAX_TRADE_FILTER_EXPRESSION_DEPTH = 16
+MAX_TRADE_FILTER_EXPRESSION_NODES = 128
 
 
 class TradeFilterMode(str, Enum):
@@ -20,6 +22,15 @@ class TradeFilterMode(str, Enum):
     INCLUDE = "include"
     ONLY = "only"
     EXCLUDE = "exclude"
+
+
+class TradeFilterOperator(str, Enum):
+    """Boolean operation joining package-filter operands."""
+
+    AND = "and"
+    OR = "or"
+    XOR = "xor"
+    NOT = "not"
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,254 +89,102 @@ class TradePackageFilter:
         }
 
 
-class TradePackagePool:
-    """Count and lazily iterate valid packages from one ordered roster side."""
+@dataclass(frozen=True, slots=True)
+class TradeFilterExpression:
+    """A recursive Boolean expression over active package-filter leaves.
 
-    def __init__(
-        self,
-        available_player_ids: tuple[PlayerId, ...],
-        package_filter: TradePackageFilter | None,
-        eligible_positions_by_player: Mapping[PlayerId, Iterable[str]] | None,
-        capacity_exempt_player_ids: frozenset[PlayerId],
-    ) -> None:
-        rule = package_filter or TradePackageFilter()
-        allowed, required, possible = _apply_player_rule(
-            available_player_ids, rule
-        )
-        allowed, positions_by_player, possible = _apply_position_rule(
-            allowed,
-            required,
-            possible,
-            rule,
-            eligible_positions_by_player,
-        )
+    ``xor`` means exactly one immediate operand matches.  ``and``, ``or``,
+    and ``xor`` are commutative, so their operands are stored in canonical
+    record order.  Duplicate operands and explicit nesting remain significant.
+    """
 
-        position_bits = {
-            position: 1 << index
-            for index, position in enumerate(sorted(rule.positions))
-        }
-        masks = {
-            player_id: sum(
-                bit
-                for position, bit in position_bits.items()
-                if position in positions_by_player.get(player_id, ())
-            )
-            for player_id in allowed
-        }
-        required_ids = tuple(
-            player_id for player_id in allowed if player_id in required
-        )
-        required_set = frozenset(required_ids)
-        self._allowed_ids = tuple(allowed)
-        self._required_ids = required_ids
-        self._required_set = required_set
-        self._optional_ids = tuple(
-            player_id for player_id in allowed if player_id not in required_set
-        )
-        self._capacity_exempt_ids = capacity_exempt_player_ids
-        self._position_masks = masks
-        self._target_position_mask = (
-            sum(position_bits.values())
-            if rule.position_mode is TradeFilterMode.INCLUDE
-            else 0
-        )
-        self._required_position_mask = _coverage(required_ids, masks)
-        self._possible = possible
+    operator: TradeFilterOperator | str
+    operands: tuple["TradePackageExpression", ...]
+    _depth: int = field(init=False, repr=False, compare=False)
+    _node_count: int = field(init=False, repr=False, compare=False)
 
-    def count(self, package_size: int, *, minimum_active: int = 0) -> int:
-        """Return an exact count without constructing package combinations."""
-
-        _nonnegative_int("package_size", package_size)
-        _nonnegative_int("minimum_active", minimum_active)
-        optional_count = package_size - len(self._required_ids)
-        if (
-            not self._possible
-            or optional_count < 0
-            or optional_count > len(self._optional_ids)
-            or minimum_active > package_size
-        ):
-            return 0
-        required_active = sum(
-            player_id not in self._capacity_exempt_ids
-            for player_id in self._required_ids
-        )
-        needed_active = max(0, minimum_active - required_active)
-        missing_positions = (
-            self._target_position_mask & ~self._required_position_mask
-        )
-        if not missing_positions:
-            return _count_by_active(
-                self._optional_ids,
-                self._capacity_exempt_ids,
-                optional_count,
-                needed_active,
-            )
-        return self._count_with_position_coverage(
-            optional_count, needed_active, missing_positions
-        )
-
-    def iter_packages(
-        self, package_size: int, *, minimum_active: int = 0
-    ) -> Iterator[tuple[PlayerId, ...]]:
-        """Yield matching packages in the roster's deterministic combination order."""
-
-        _nonnegative_int("package_size", package_size)
-        _nonnegative_int("minimum_active", minimum_active)
-        optional_count = package_size - len(self._required_ids)
-        if (
-            not self._possible
-            or optional_count < 0
-            or optional_count > len(self._optional_ids)
-            or minimum_active > package_size
-        ):
-            return
-        for optional in combinations(self._optional_ids, optional_count):
-            selected = self._required_set.union(optional)
-            package = tuple(
-                player_id for player_id in self._allowed_ids if player_id in selected
-            )
-            if sum(
-                player_id not in self._capacity_exempt_ids for player_id in package
-            ) < minimum_active:
-                continue
-            if (
-                _coverage(package, self._position_masks)
-                & self._target_position_mask
-                != self._target_position_mask
-            ):
-                continue
-            yield package
-
-    def _count_with_position_coverage(
-        self,
-        optional_count: int,
-        needed_active: int,
-        missing_positions: int,
-    ) -> int:
-        states = {(0, 0, 0): 1}
-        for player_id in self._optional_ids:
-            updated = dict(states)
-            active_increment = int(player_id not in self._capacity_exempt_ids)
-            coverage_increment = self._position_masks[player_id] & missing_positions
-            for (chosen, active, coverage), count in states.items():
-                if chosen >= optional_count:
-                    continue
-                key = (
-                    chosen + 1,
-                    min(needed_active, active + active_increment),
-                    coverage | coverage_increment,
-                )
-                updated[key] = updated.get(key, 0) + count
-            states = updated
-        return states.get((optional_count, needed_active, missing_positions), 0)
-
-
-def _positions_for(
-    player_ids: tuple[PlayerId, ...],
-    values: Mapping[PlayerId, Iterable[str]] | None,
-) -> dict[PlayerId, frozenset[str]]:
-    if not isinstance(values, Mapping):
-        raise ValueError(
-            "eligible_positions_by_player is required for an active position filter"
-        )
-    result = {}
-    for player_id in player_ids:
-        if player_id not in values:
-            raise ValueError(
-                f"eligible_positions_by_player is missing player {player_id!r}"
-            )
-        positions = values[player_id]
-        if isinstance(positions, (str, bytes)):
-            raise ValueError(
-                "eligible_positions_by_player values must be position iterables"
-            )
+    def __post_init__(self) -> None:
         try:
-            normalized = frozenset(
-                normalize_player_position(position) for position in positions
-            )
+            operator = TradeFilterOperator(self.operator)
+        except (TypeError, ValueError):
+            raise ValueError("operator must be and, or, xor, or not") from None
+        if isinstance(self.operands, (str, bytes)):
+            raise ValueError("operands must contain trade package filters")
+        try:
+            operands = tuple(self.operands)
         except TypeError:
+            raise ValueError("operands must contain trade package filters") from None
+        if any(
+            not isinstance(row, (TradePackageFilter, TradeFilterExpression))
+            for row in operands
+        ):
+            raise ValueError("operands must contain trade package filters")
+        if any(
+            isinstance(row, TradePackageFilter) and not row.active
+            for row in operands
+        ):
+            raise ValueError("expression leaves must contain an active package rule")
+        expected = 1 if operator is TradeFilterOperator.NOT else 2
+        if len(operands) < expected or (
+            operator is TradeFilterOperator.NOT and len(operands) != 1
+        ):
+            requirement = "exactly one" if expected == 1 else "at least two"
+            raise ValueError(f"{operator.value} requires {requirement} operand(s)")
+        if operator is not TradeFilterOperator.NOT:
+            operands = tuple(sorted(operands, key=_canonical_operand_key))
+        depth = 1 + max(
+            row._depth if isinstance(row, TradeFilterExpression) else 0
+            for row in operands
+        )
+        node_count = 1 + sum(
+            row._node_count if isinstance(row, TradeFilterExpression) else 1
+            for row in operands
+        )
+        if depth > MAX_TRADE_FILTER_EXPRESSION_DEPTH:
             raise ValueError(
-                "eligible_positions_by_player values must be position iterables"
-            ) from None
-        if not normalized:
-            raise ValueError(
-                "eligible_positions_by_player values cannot be empty"
+                "trade filter expression exceeds the maximum nesting depth of "
+                f"{MAX_TRADE_FILTER_EXPRESSION_DEPTH}"
             )
-        result[player_id] = normalized
-    return result
+        if node_count > MAX_TRADE_FILTER_EXPRESSION_NODES:
+            raise ValueError(
+                "trade filter expression exceeds the maximum node count of "
+                f"{MAX_TRADE_FILTER_EXPRESSION_NODES}"
+            )
+        object.__setattr__(self, "operator", operator)
+        object.__setattr__(self, "operands", operands)
+        object.__setattr__(self, "_depth", depth)
+        object.__setattr__(self, "_node_count", node_count)
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "operator": self.operator.value,
+            "operands": [row.to_record() for row in self.operands],
+        }
 
 
-def _apply_player_rule(
-    available_player_ids: tuple[PlayerId, ...], rule: TradePackageFilter
-) -> tuple[list[PlayerId], frozenset[PlayerId], bool]:
-    allowed = list(available_player_ids)
-    available = frozenset(allowed)
-    required: frozenset[PlayerId] = frozenset()
-    if rule.player_mode is TradeFilterMode.INCLUDE:
-        required = rule.player_ids
-        return allowed, required, required.issubset(available)
-    if rule.player_mode is TradeFilterMode.ONLY:
-        required = rule.player_ids
-        allowed = [player_id for player_id in allowed if player_id in required]
-        return allowed, required, required.issubset(available)
-    if rule.player_mode is TradeFilterMode.EXCLUDE:
-        allowed = [
-            player_id for player_id in allowed if player_id not in rule.player_ids
-        ]
-    return allowed, required, True
+TradePackageExpression: TypeAlias = TradePackageFilter | TradeFilterExpression
 
 
-def _apply_position_rule(
-    allowed: list[PlayerId],
-    required: frozenset[PlayerId],
-    possible: bool,
-    rule: TradePackageFilter,
-    eligible_positions_by_player: Mapping[PlayerId, Iterable[str]] | None,
-) -> tuple[list[PlayerId], dict[PlayerId, frozenset[str]], bool]:
-    if rule.position_mode is None or not possible:
-        return allowed, {}, possible
-    positions = _positions_for(tuple(allowed), eligible_positions_by_player)
-    if rule.position_mode is TradeFilterMode.ONLY:
-        allowed = [
-            player_id
-            for player_id in allowed
-            if positions[player_id].intersection(rule.positions)
-        ]
-    elif rule.position_mode is TradeFilterMode.EXCLUDE:
-        allowed = [
-            player_id
-            for player_id in allowed
-            if not positions[player_id].intersection(rule.positions)
-        ]
-    return allowed, positions, required.issubset(allowed)
+def iter_trade_filter_leaves(
+    value: TradePackageExpression,
+) -> Iterator[TradePackageFilter]:
+    """Yield atomic rules in canonical depth-first order."""
+
+    if isinstance(value, TradePackageFilter):
+        yield value
+        return
+    for operand in value.operands:
+        yield from iter_trade_filter_leaves(operand)
 
 
-def _count_by_active(
-    player_ids: tuple[PlayerId, ...],
-    capacity_exempt_player_ids: frozenset[PlayerId],
-    package_size: int,
-    minimum_active: int,
-) -> int:
-    exempt_count = sum(
-        player_id in capacity_exempt_player_ids for player_id in player_ids
+def parse_trade_filter(
+    name: str, value: object
+) -> TradePackageExpression | None:
+    """Parse one strict JSON filter record, including recursive expressions."""
+
+    return _parse_trade_filter(
+        name, value, nested=False, depth=0, node_count=[0]
     )
-    active_count = len(player_ids) - exempt_count
-    lower = max(0, package_size - exempt_count, minimum_active)
-    upper = min(package_size, active_count)
-    return sum(
-        comb(active_count, active)
-        * comb(exempt_count, package_size - active)
-        for active in range(lower, upper + 1)
-    )
-
-
-def _coverage(
-    player_ids: Iterable[PlayerId], position_masks: Mapping[PlayerId, int]
-) -> int:
-    result = 0
-    for player_id in player_ids:
-        result |= position_masks.get(player_id, 0)
-    return result
 
 
 def _string_set(name: str, values: object) -> frozenset[str]:
@@ -357,13 +216,93 @@ def _mode(name: str, value: object) -> TradeFilterMode | None:
         raise ValueError(f"{name} must be include, only, exclude, or null") from None
 
 
-def _nonnegative_int(name: str, value: object) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be a non-negative integer")
+def _parse_trade_filter(
+    name: str,
+    value: object,
+    *,
+    nested: bool,
+    depth: int,
+    node_count: list[int],
+) -> TradePackageExpression | None:
+    if value is None and not nested:
+        return None
+    if depth > MAX_TRADE_FILTER_EXPRESSION_DEPTH:
+        raise ValueError(
+            "trade filter expression exceeds the maximum nesting depth of "
+            f"{MAX_TRADE_FILTER_EXPRESSION_DEPTH}"
+        )
+    node_count[0] += 1
+    if node_count[0] > MAX_TRADE_FILTER_EXPRESSION_NODES:
+        raise ValueError(
+            "trade filter expression exceeds the maximum node count of "
+            f"{MAX_TRADE_FILTER_EXPRESSION_NODES}"
+        )
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a JSON object")
+    fields = set(value)
+    if fields == {"operator", "operands"}:
+        raw_operands = value["operands"]
+        if not isinstance(raw_operands, list):
+            raise ValueError(f"{name}.operands must be a JSON array")
+        operands = tuple(
+            _parse_trade_filter(
+                f"{name}.operands[{index}]",
+                row,
+                nested=True,
+                depth=depth + 1,
+                node_count=node_count,
+            )
+            for index, row in enumerate(raw_operands)
+        )
+        return TradeFilterExpression(value["operator"], operands)
+    if fields != {"player_ids", "player_mode", "positions", "position_mode"}:
+        raise ValueError(f"{name} fields are invalid")
+    player_ids = _json_string_array(f"{name}.player_ids", value["player_ids"])
+    positions = _json_string_array(f"{name}.positions", value["positions"])
+    if len(set(player_ids)) != len(player_ids):
+        raise ValueError(f"{name}.player_ids contains a duplicate")
+    if len(set(positions)) != len(positions):
+        raise ValueError(f"{name}.positions contains a duplicate")
+    for values_field, mode_field, selected, mode in (
+        ("player_ids", "player_mode", player_ids, value["player_mode"]),
+        ("positions", "position_mode", positions, value["position_mode"]),
+    ):
+        if bool(selected) != (mode is not None):
+            raise ValueError(
+                f"{name}.{mode_field} must be set exactly when "
+                f"{name}.{values_field} has selections"
+            )
+    package_filter = TradePackageFilter(
+        frozenset(player_ids),
+        value["player_mode"],
+        frozenset(positions),
+        value["position_mode"],
+    )
+    return package_filter if nested or package_filter.active else None
+
+
+def _json_string_array(name: str, value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(
+        not isinstance(row, str) or not row for row in value
+    ):
+        raise ValueError(f"{name} must be a JSON array of non-empty strings")
+    return tuple(value)
+
+
+def _canonical_operand_key(value: TradePackageExpression) -> str:
+    return json.dumps(value.to_record(), sort_keys=True, separators=(",", ":"))
 
 
 __all__ = (
+    "MAX_TRADE_FILTER_EXPRESSION_DEPTH",
+    "MAX_TRADE_FILTER_EXPRESSION_NODES",
+    "TRADE_FILTER_EXPRESSION_SEMANTICS_VERSION",
     "TRADE_FILTER_SEMANTICS_VERSION",
+    "TradeFilterExpression",
     "TradeFilterMode",
+    "TradeFilterOperator",
+    "TradePackageExpression",
     "TradePackageFilter",
+    "iter_trade_filter_leaves",
+    "parse_trade_filter",
 )

@@ -130,6 +130,17 @@ input[type="file"]:not(:disabled)::file-selector-button:hover { border-color: va
 .package-filter-card { min-width: 0; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 14px; }
 .filter-toggle { margin: 0; color: var(--accent); }
 .package-filter-controls { display: grid; gap: 12px; margin-top: 13px; }
+.filter-clauses { display: grid; gap: 12px; }
+.filter-clause { display: grid; gap: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-inset); padding: 12px; }
+.filter-connector { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 10px; border-bottom: 1px solid var(--border); padding-bottom: 12px; color: var(--accent); }
+.filter-connector > span { font-size: 12px; font-weight: 800; letter-spacing: .03em; text-transform: uppercase; }
+.filter-clause-heading { display: flex; align-items: center; gap: 10px; }
+.filter-clause-heading > strong { color: var(--text-primary); }
+.filter-not { margin: 0 0 0 auto; color: var(--accent); }
+.filter-not small { color: var(--text-secondary); font-weight: 600; }
+.filter-clause-heading .compact { padding: 6px 9px; font-size: 12px; }
+.add-filter-clause { justify-self: start; }
+.filter-evaluation-help { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.45; }
 .package-filter-controls.disabled label, .package-filter-controls.disabled .filter-team-label, .package-filter-controls.disabled .filter-choice, .package-filter-controls.disabled .filter-empty { color: var(--text-secondary); cursor: not-allowed; }
 .package-filter-controls.disabled .position-choices .filter-choice { border-color: var(--border); background: var(--surface); }
 .package-filter-controls.disabled .filter-choice:has(input:checked) { background: var(--surface-raised); color: var(--text-secondary); }

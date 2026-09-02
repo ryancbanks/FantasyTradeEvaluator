@@ -5,7 +5,14 @@ from dataclasses import dataclass
 from typing import Iterator
 
 from .positions import normalize_player_position
-from .trade_filters import TradeFilterMode, TradePackageFilter
+from .trade_filters import (
+    TradeFilterExpression,
+    TradeFilterMode,
+    TradePackageExpression,
+    TradePackageFilter,
+    iter_trade_filter_leaves,
+)
+from .trade_filter_compiler import CompiledTradeFilter, compile_trade_filter
 from .trade_space import TeamRoster, TradeConstraints
 
 
@@ -115,11 +122,17 @@ class _PackageRule:
     forbidden_player_ids: frozenset[PlayerId]
     coverage_by_player: Mapping[PlayerId, int]
     target_coverage: int
+    compiled_filter: CompiledTradeFilter | None = None
 
     def permits(self, player_id: PlayerId, selected: bool) -> bool:
         if selected:
             return player_id not in self.forbidden_player_ids
         return player_id not in self.required_player_ids
+
+    def matches(self, evidence: int) -> bool:
+        if self.compiled_filter is not None:
+            return self.compiled_filter.matches(evidence)
+        return evidence & self.target_coverage == self.target_coverage
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +184,8 @@ class ThreeWayTradeSpace:
             partner_players,
             eligible_positions_by_player,
         )
+        self._outgoing_rule = outgoing_rule
+        self._incoming_rule = incoming_rule
         self._players = _player_decisions(
             rows,
             constraints.locked_player_ids,
@@ -204,7 +219,7 @@ class ThreeWayTradeSpace:
     def enumeration_record(self) -> dict[str, object]:
         """Return the compiled, JSON-ready identity of index-to-candidate order."""
 
-        return {
+        record = {
             "incoming_target": self._incoming_target,
             "outgoing_target": self._outgoing_target,
             "player_decisions": [
@@ -219,6 +234,13 @@ class ThreeWayTradeSpace:
                 for row in self._players
             ],
         }
+        for name, value in (
+            ("outgoing_filter_expression", self.constraints.outgoing_filter),
+            ("incoming_filter_expression", self.constraints.incoming_filter),
+        ):
+            if isinstance(value, TradeFilterExpression):
+                record[name] = value.to_record()
+        return record
 
     def __iter__(self) -> Iterator[ThreeWayTradeCandidate]:
         return self.iter_from(0)
@@ -370,9 +392,8 @@ class ThreeWayTradeSpace:
             for team, row in enumerate(self.rosters)
         ):
             return False
-        return (
-            out_mask & self._outgoing_target == self._outgoing_target
-            and in_mask & self._incoming_target == self._incoming_target
+        return self._outgoing_rule.matches(out_mask) and self._incoming_rule.matches(
+            in_mask
         )
 
     def _candidate(self, destinations: list[int]) -> ThreeWayTradeCandidate:
@@ -418,14 +439,39 @@ def _rosters(values: Iterable[TeamRoster]) -> tuple[TeamRoster, TeamRoster, Team
 
 def _compile_rule(
     name: str,
-    rule: TradePackageFilter | None,
+    rule: TradePackageExpression | None,
     universe: tuple[PlayerId, ...],
     eligible_positions_by_player: Mapping[PlayerId, Iterable[str]] | None,
 ) -> _PackageRule:
     if rule is None:
         return _PackageRule(frozenset(), frozenset(), {}, 0)
+    if isinstance(rule, TradeFilterExpression):
+        available = frozenset(universe)
+        selected_ids = frozenset(
+            player_id
+            for leaf in iter_trade_filter_leaves(rule)
+            for player_id in leaf.player_ids
+        )
+        invalid = selected_ids.difference(available)
+        if invalid:
+            owner = "primary roster" if name == "outgoing_filter" else "partner rosters"
+            raise ValueError(f"{name} players must belong to the selected {owner}")
+        compiled = compile_trade_filter(
+            rule, universe, eligible_positions_by_player
+        )
+        if compiled is None:
+            raise AssertionError("an active expression did not compile")
+        return _PackageRule(
+            frozenset(),
+            frozenset(),
+            compiled.evidence_by_player,
+            0,
+            compiled,
+        )
     if not isinstance(rule, TradePackageFilter):
-        raise ValueError(f"{name} must be a TradePackageFilter or null")
+        raise ValueError(
+            f"{name} must be a TradePackageFilter, TradeFilterExpression, or null"
+        )
     available = frozenset(universe)
     invalid = rule.player_ids.difference(available)
     if invalid:

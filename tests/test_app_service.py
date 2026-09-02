@@ -34,6 +34,19 @@ def payload(bundle_id):
     }
 
 
+def player_filter(player_id, mode="include"):
+    return {
+        "player_ids": [player_id],
+        "player_mode": mode,
+        "positions": [],
+        "position_mode": None,
+    }
+
+
+def filter_expression(operator, *operands):
+    return {"operator": operator, "operands": list(operands)}
+
+
 def wait_for_job(service, job_id):
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -340,6 +353,167 @@ class LocalAppServiceTests(unittest.TestCase):
             service.import_bundle(bundle.to_record())
             with self.assertRaisesRegex(ValueError, "selected primary team"):
                 service.estimate_search(request)
+
+    def test_filter_expressions_are_canonical_and_legacy_fields_are_exclusive(self):
+        bundle = engine_bundle()
+        first_payload = payload(bundle.bundle_id)
+        first_payload["outgoing_filter_expression"] = filter_expression(
+            "and",
+            player_filter("p1"),
+            filter_expression("not", player_filter("p2", "exclude")),
+        )
+        second_payload = payload(bundle.bundle_id)
+        second_payload["outgoing_filter_expression"] = filter_expression(
+            "and",
+            filter_expression("not", player_filter("p2", "exclude")),
+            player_filter("p1"),
+        )
+
+        first = LocalSearchRequest.from_payload(first_payload)
+        second = LocalSearchRequest.from_payload(second_payload)
+        constraints = first.to_record()["trade_constraints"]
+
+        self.assertEqual(first.request_id, second.request_id)
+        self.assertEqual(first.to_record(), second.to_record())
+        self.assertEqual(constraints["package_filter_semantics_version"], 2)
+        self.assertEqual(constraints["outgoing_filter"]["operator"], "and")
+        self.assertNotIn("outgoing_filter_expression", first.to_record())
+
+        different_payload = dict(first_payload)
+        different_payload["outgoing_filter_expression"] = filter_expression(
+            "xor", *first_payload["outgoing_filter_expression"]["operands"]
+        )
+        different = LocalSearchRequest.from_payload(different_payload)
+        self.assertNotEqual(first.request_id, different.request_id)
+
+        ambiguous = dict(first_payload)
+        ambiguous["outgoing_filter"] = None
+        with self.assertRaisesRegex(ValueError, "cannot both be provided"):
+            LocalSearchRequest.from_payload(ambiguous)
+
+        leaf_as_expression = payload(bundle.bundle_id)
+        leaf_as_expression["incoming_filter_expression"] = player_filter("q1")
+        with self.assertRaisesRegex(ValueError, "must be an expression"):
+            LocalSearchRequest.from_payload(leaf_as_expression)
+
+        null_expression = payload(bundle.bundle_id)
+        null_expression["incoming_filter_expression"] = None
+        with self.assertRaisesRegex(ValueError, "must be an expression"):
+            LocalSearchRequest.from_payload(null_expression)
+
+        expression_in_legacy_field = payload(bundle.bundle_id)
+        expression_in_legacy_field["incoming_filter"] = filter_expression(
+            "not", player_filter("q1")
+        )
+        with self.assertRaisesRegex(ValueError, "legacy package filter"):
+            LocalSearchRequest.from_payload(expression_in_legacy_field)
+
+    def test_expression_player_ownership_supports_multiple_selected_partners(self):
+        _space, prepared, baseline, _ = three_way_components()
+        bundle = SimpleNamespace(
+            methodology_mode="exact",
+            state=baseline.state,
+            rosters=baseline.scenarios.rosters,
+            projections=baseline.scenarios.projections,
+            eligibilities=baseline.scenarios.eligibilities,
+            scenario_config=baseline.scenarios.config,
+            strength_model=prepared.model,
+            player_names={
+                player_id: player_id.upper() for player_id in prepared.model.players
+            },
+        )
+        two_team_payload = payload("engine_" + "1" * 64)
+        two_team_payload.update(
+            {
+                "primary_team_id": "a",
+                "counterparty_team_ids": ["b", "c"],
+                "incoming_filter_expression": filter_expression(
+                    "or", player_filter("b1"), player_filter("c1")
+                ),
+            }
+        )
+        two_team = LocalSearchRequest.from_payload(two_team_payload)
+
+        three_team_payload = dict(two_team_payload)
+        three_team_payload.update(
+            {
+                "trade_format": "three_team",
+                "max_outgoing": 2,
+                "max_incoming": 2,
+                "max_total_players": 4,
+                "max_imbalance": 1,
+                "balanced_only": False,
+                "incoming_filter_expression": filter_expression(
+                    "and", player_filter("b1"), player_filter("c1")
+                ),
+            }
+        )
+        three_team = LocalSearchRequest.from_payload(three_team_payload)
+
+        unselected_payload = dict(two_team_payload)
+        unselected_payload["incoming_filter_expression"] = filter_expression(
+            "not", player_filter("d1")
+        )
+        unselected = LocalSearchRequest.from_payload(unselected_payload)
+        wrong_side_payload = dict(three_team_payload)
+        wrong_side_payload["outgoing_filter_expression"] = filter_expression(
+            "not", player_filter("b1")
+        )
+        wrong_side = LocalSearchRequest.from_payload(wrong_side_payload)
+        legacy_cross_team_payload = payload("engine_" + "1" * 64)
+        legacy_cross_team_payload.update(
+            {
+                "primary_team_id": "a",
+                "counterparty_team_ids": ["b", "c"],
+                "incoming_filter": {
+                    "player_ids": ["b1", "c1"],
+                    "player_mode": "include",
+                    "positions": [],
+                    "position_mode": None,
+                },
+            }
+        )
+        legacy_cross_team = LocalSearchRequest.from_payload(
+            legacy_cross_team_payload
+        )
+        wrapped_cross_team_payload = payload("engine_" + "1" * 64)
+        wrapped_cross_team_payload.update(
+            {
+                "primary_team_id": "a",
+                "counterparty_team_ids": ["b", "c"],
+                "incoming_filter_expression": filter_expression(
+                    "not",
+                    {
+                        "player_ids": ["b1", "c1"],
+                        "player_mode": "include",
+                        "positions": [],
+                        "position_mode": None,
+                    },
+                ),
+            }
+        )
+        wrapped_cross_team = LocalSearchRequest.from_payload(
+            wrapped_cross_team_payload
+        )
+
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            with patch.object(
+                service, "_bundle_path", return_value=Path(directory) / "bundle.json"
+            ), patch("trade_snapshot.app_service.load_engine_bundle", return_value=bundle):
+                two_team_estimate = service.estimate_search(two_team)
+                three_team_estimate = service.estimate_search(three_team)
+                with self.assertRaisesRegex(ValueError, "selected other team"):
+                    service.estimate_search(unselected)
+                with self.assertRaisesRegex(ValueError, "selected primary team"):
+                    service.estimate_search(wrong_side)
+                with self.assertRaisesRegex(ValueError, "same other team"):
+                    service.estimate_search(legacy_cross_team)
+                with self.assertRaisesRegex(ValueError, "same other team"):
+                    service.estimate_search(wrapped_cross_team)
+
+        self.assertGreater(two_team_estimate["candidate_count"], 0)
+        self.assertGreater(int(three_team_estimate["candidate_count_text"]), 0)
 
     def test_surrogate_requires_consent_then_searches_entirely_offline(self):
         bundle = surrogate_bundle()

@@ -109,11 +109,6 @@ function selectedCounterpartyIds() {
   return ThreeWayUi.selectedCounterpartyIds(currentBundle());
 }
 
-function checkedValues(containerId) {
-  return [...$(containerId).querySelectorAll('input[type="checkbox"]:checked')]
-    .map(input => input.value);
-}
-
 function activeCounterpartyTeams(bundle) {
   const selected = new Set(selectedCounterpartyIds());
   return bundle.teams.filter(team =>
@@ -122,154 +117,13 @@ function activeCounterpartyTeams(bundle) {
   );
 }
 
-function renderPlayerChoices(side, teams) {
-  const container = $(`${side}PlayerChoices`);
-  const selected = new Set(checkedValues(`${side}PlayerChoices`));
-  container.replaceChildren();
-  for (const team of teams) {
-    if (teams.length > 1) {
-      const heading = document.createElement("div");
-      heading.className = "filter-team-label";
-      heading.textContent = team.name;
-      container.append(heading);
-    }
-    for (const player of team.players) {
-      const label = document.createElement("label");
-      label.className = "filter-choice";
-      label.dataset.search = `${player.name} ${team.name} ${player.positions.join(" ")}`.toLowerCase();
-      const checkbox = document.createElement("input");
-      checkbox.type = "checkbox";
-      checkbox.value = player.player_id;
-      checkbox.dataset.teamId = team.team_id;
-      checkbox.checked = selected.has(player.player_id);
-      checkbox.addEventListener("change", () => {
-        if (checkbox.checked && $(`${side}PlayerMode`).value === "any") {
-          $(`${side}PlayerMode`).value = "include";
-        }
-      });
-      const text = document.createElement("span");
-      text.textContent = player.positions.length
-        ? `${player.name} · ${player.positions.join("/")}`
-        : player.name;
-      label.append(checkbox, text);
-      container.append(label);
-    }
-  }
-  if (!container.children.length) {
-    const empty = document.createElement("p");
-    empty.className = "filter-empty";
-    empty.textContent = "No players are available for this side.";
-    container.append(empty);
-  }
-  filterPlayerChoices(side);
-}
-
-function renderPositionChoices(side, positions) {
-  const container = $(`${side}PositionChoices`);
-  const selected = new Set(checkedValues(`${side}PositionChoices`));
-  container.replaceChildren();
-  for (const position of positions) {
-    const label = document.createElement("label");
-    label.className = "filter-choice position-choice";
-    const checkbox = document.createElement("input");
-    checkbox.type = "checkbox";
-    checkbox.value = position;
-    checkbox.checked = selected.has(position);
-    checkbox.addEventListener("change", () => {
-      if (checkbox.checked && $(`${side}PositionMode`).value === "any") {
-        $(`${side}PositionMode`).value = "include";
-      }
-    });
-    const text = document.createElement("span");
-    text.textContent = position;
-    label.append(checkbox, text);
-    container.append(label);
-  }
-  if (!container.children.length) {
-    const empty = document.createElement("p");
-    empty.className = "filter-empty";
-    empty.textContent = "No roster positions are available for this side.";
-    container.append(empty);
-  }
-}
-
-function filterPlayerChoices(side) {
-  const query = $(`${side}PlayerSearch`).value.trim().toLowerCase();
-  const container = $(`${side}PlayerChoices`);
-  for (const choice of container.querySelectorAll(".filter-choice")) {
-    choice.hidden = Boolean(query) && !choice.dataset.search.includes(query);
-  }
-  for (const heading of container.querySelectorAll(".filter-team-label")) {
-    let row = heading.nextElementSibling;
-    let hasVisiblePlayer = false;
-    while (row && !row.classList.contains("filter-team-label")) {
-      if (row.classList.contains("filter-choice") && !row.hidden) hasVisiblePlayer = true;
-      row = row.nextElementSibling;
-    }
-    heading.hidden = !hasVisiblePlayer;
-  }
-}
-
-function setPackageFilterEnabled(side) {
-  const enabled = $(`${side}FilterEnabled`).checked;
-  const controls = $(`${side}FilterControls`);
-  controls.classList.toggle("disabled", !enabled);
-  for (const control of controls.querySelectorAll("input, select")) control.disabled = !enabled;
-}
-
 function populatePackageFilters() {
   const bundle = currentBundle();
-  if (!bundle) {
-    for (const side of ["outgoing", "incoming"]) {
-      renderPlayerChoices(side, []);
-      renderPositionChoices(side, []);
-      setPackageFilterEnabled(side);
-    }
-    return;
-  }
-  const primary = bundle.teams.find(team => team.team_id === $("primaryTeam").value);
-  const incomingTeams = activeCounterpartyTeams(bundle);
-  const outgoingTeams = primary ? [primary] : [];
-  renderPlayerChoices("outgoing", outgoingTeams);
-  renderPlayerChoices("incoming", incomingTeams);
-  for (const [side, teams] of [["outgoing", outgoingTeams], ["incoming", incomingTeams]]) {
-    const positions = [...new Set(
-      teams.flatMap(team => team.players.flatMap(player => player.positions))
-    )].sort();
-    renderPositionChoices(side, positions);
-    setPackageFilterEnabled(side);
-  }
-}
-
-function packageFilterPayload(side) {
-  if (!$(`${side}FilterEnabled`).checked) return null;
-  const sideLabel = side === "outgoing" ? "players you give" : "players you receive";
-  const playerMode = $(`${side}PlayerMode`).value;
-  const positionMode = $(`${side}PositionMode`).value;
-  const playerIds = playerMode === "any" ? [] : checkedValues(`${side}PlayerChoices`);
-  const positions = positionMode === "any" ? [] : checkedValues(`${side}PositionChoices`);
-  if (playerMode !== "any" && !playerIds.length) {
-    throw new Error(`Choose at least one player for the ${sideLabel} rule.`);
-  }
-  if (!isThreeTeam() && side === "incoming" && ["include", "only"].includes(playerMode)) {
-    const owners = new Set(
-      [...$(`${side}PlayerChoices`).querySelectorAll('input[type="checkbox"]:checked')]
-        .map(input => input.dataset.teamId)
-    );
-    if (owners.size > 1) {
-      throw new Error("Players that must appear together need to be on the same other team.");
-    }
-  }
-  if (positionMode !== "any" && !positions.length) {
-    throw new Error(`Choose at least one position for the ${sideLabel} rule.`);
-  }
-  if (!playerIds.length && !positions.length) return null;
-  return {
-    player_ids: playerIds,
-    player_mode: playerIds.length ? playerMode : null,
-    positions,
-    position_mode: positions.length ? positionMode : null
-  };
+  TradeFilterUi.populate({
+    bundle,
+    primaryTeamId: $("primaryTeam").value,
+    incomingTeams: bundle ? activeCounterpartyTeams(bundle) : []
+  });
 }
 
 function renderExtensionStatus(status) {
@@ -458,6 +312,7 @@ function requestPayload() {
   if (format === "three_team" && (partnerSlots.length !== 2 || new Set(partnerSlots).size !== 2)) {
     throw new Error("Choose two different partner teams for the three-team trade.");
   }
+  const packageFilters = TradeFilterUi.requestFields(format === "three_team");
   return {
     trade_format: format,
     bundle_id: $("bundleSelect").value,
@@ -473,8 +328,7 @@ function requestPayload() {
     skip_fantasypros_small_trades: format === "two_team" && $("skipSmall").checked,
     locked_player_ids: [],
     require_no_drops: $("noDrops").checked,
-    outgoing_filter: packageFilterPayload("outgoing"),
-    incoming_filter: packageFilterPayload("incoming"),
+    ...packageFilters,
     minimum_power_delta: numberValue("powerFloor"),
     checkpoint_interval: 1000,
     scenario_count: numberValue("scenarioCount"),
@@ -848,7 +702,7 @@ function changeThreeTeamPartner(side) {
 }
 
 function searchConfigurationChanged(event) {
-  if (["outgoingPlayerSearch", "incomingPlayerSearch"].includes(event.target.id)) return;
+  if (event.target.dataset.filterRole === "player-search") return;
   invalidateSearchEstimate();
 }
 
@@ -871,10 +725,7 @@ for (const option of document.querySelectorAll('input[name="tradeFormat"]')) {
 $("partnerTeamA").addEventListener("change", () => changeThreeTeamPartner("a"));
 $("partnerTeamB").addEventListener("change", () => changeThreeTeamPartner("b"));
 $("noDrops").addEventListener("change", () => ThreeWayUi.syncFormatControls(currentBundle()));
-for (const side of ["outgoing", "incoming"]) {
-  $(`${side}FilterEnabled`).addEventListener("change", () => setPackageFilterEnabled(side));
-  $(`${side}PlayerSearch`).addEventListener("input", () => filterPlayerChoices(side));
-}
+TradeFilterUi.bind(invalidateSearchEstimate);
 $("connectExtensionButton").addEventListener("click", connectExtension);
 $("collectionForm").addEventListener("submit", startCollection);
 $("cancelCollectionButton").addEventListener("click", cancelCollection);

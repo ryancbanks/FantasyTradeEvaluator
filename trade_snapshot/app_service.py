@@ -26,7 +26,13 @@ from .roster_adjustment import (
 from .scenario_config import CorrelatedScenarioConfig
 from .search_runner import TradeSearchSettings
 from .surrogate_disclosure import SURROGATE_QUALITY_GATE
-from .trade_filters import TradeFilterMode, TradePackageFilter
+from .trade_filters import (
+    TradeFilterExpression,
+    TradeFilterMode,
+    TradePackageFilter,
+    iter_trade_filter_leaves,
+    parse_trade_filter,
+)
 from .trade_impact import PreparedSeasonBaseline, prepare_season_baseline
 from .trade_space import TeamRoster, TradeConstraints, TradeSpace
 from .three_way_trade import ThreeWayTradeSpace
@@ -139,6 +145,8 @@ class LocalSearchRequest:
             "allow_surrogate_power",
             "outgoing_filter",
             "incoming_filter",
+            "outgoing_filter_expression",
+            "incoming_filter_expression",
             "trade_format",
         }
         if (
@@ -183,12 +191,8 @@ class LocalSearchRequest:
                 excluded_size_pairs=excluded,
                 locked_player_ids=frozenset(locked),
                 require_no_drops=boolean("require_no_drops", payload["require_no_drops"]),
-                outgoing_filter=_package_filter(
-                    "outgoing_filter", payload.get("outgoing_filter")
-                ),
-                incoming_filter=_package_filter(
-                    "incoming_filter", payload.get("incoming_filter")
-                ),
+                outgoing_filter=_payload_filter(payload, "outgoing"),
+                incoming_filter=_payload_filter(payload, "incoming"),
             ),
             settings=TradeSearchSettings(
                 payload["minimum_power_delta"], payload["checkpoint_interval"]
@@ -727,38 +731,36 @@ def _require_surrogate_consent(
         )
 
 
-def _package_filter(name: str, value: object) -> TradePackageFilter | None:
+def _payload_filter(
+    payload: Mapping[str, object], side: str
+) -> TradePackageFilter | TradeFilterExpression | None:
+    legacy_name = f"{side}_filter"
+    expression_name = f"{side}_filter_expression"
+    if legacy_name in payload and expression_name in payload:
+        raise ValueError(
+            f"{legacy_name} and {expression_name} cannot both be provided"
+        )
+    if expression_name in payload:
+        value = parse_trade_filter(expression_name, payload[expression_name])
+        if not isinstance(value, TradeFilterExpression):
+            raise ValueError(f"{expression_name} must be an expression")
+        return value
+    value = parse_trade_filter(legacy_name, payload.get(legacy_name))
+    if isinstance(value, TradeFilterExpression):
+        raise ValueError(f"{legacy_name} must be a legacy package filter")
+    return value
+
+
+def _filter_player_ids(
+    value: TradePackageFilter | TradeFilterExpression | None,
+) -> frozenset[str]:
     if value is None:
-        return None
-    if not isinstance(value, Mapping) or set(value) != {
-        "player_ids",
-        "player_mode",
-        "positions",
-        "position_mode",
-    }:
-        raise ValueError(f"{name} fields are invalid")
-    player_ids = string_array(f"{name}.player_ids", value["player_ids"])
-    positions = string_array(f"{name}.positions", value["positions"])
-    if len(set(player_ids)) != len(player_ids):
-        raise ValueError(f"{name}.player_ids contains a duplicate")
-    if len(set(positions)) != len(positions):
-        raise ValueError(f"{name}.positions contains a duplicate")
-    for values_field, mode_field, selected, mode in (
-        ("player_ids", "player_mode", player_ids, value["player_mode"]),
-        ("positions", "position_mode", positions, value["position_mode"]),
-    ):
-        if bool(selected) != (mode is not None):
-            raise ValueError(
-                f"{name}.{mode_field} must be set exactly when "
-                f"{name}.{values_field} has selections"
-            )
-    package_filter = TradePackageFilter(
-        frozenset(player_ids),
-        value["player_mode"],
-        frozenset(positions),
-        value["position_mode"],
+        return frozenset()
+    return frozenset(
+        player_id
+        for leaf in iter_trade_filter_leaves(value)
+        for player_id in leaf.player_ids
     )
-    return package_filter if package_filter.active else None
 
 
 def _search_scope(
@@ -786,31 +788,40 @@ def _search_scope(
 
     outgoing_filter = request.constraints.outgoing_filter
     if outgoing_filter is not None:
-        invalid = outgoing_filter.player_ids.difference(primary.player_ids)
+        invalid = _filter_player_ids(outgoing_filter).difference(primary.player_ids)
         if invalid:
             raise ValueError(
                 "players you give must belong to the selected primary team"
             )
 
     incoming_filter = request.constraints.incoming_filter
-    if incoming_filter is not None and incoming_filter.player_ids:
+    incoming_player_ids = _filter_player_ids(incoming_filter)
+    if incoming_player_ids:
         owner_by_player = {
             player_id: team_id
             for team_id in selected
             for player_id in by_team[team_id].player_ids
         }
-        invalid = incoming_filter.player_ids.difference(owner_by_player)
+        invalid = incoming_player_ids.difference(owner_by_player)
         if invalid:
             raise ValueError(
                 "players you receive must belong to a selected other team"
             )
-        if request.trade_format == "two_team" and incoming_filter.player_mode in {
-            TradeFilterMode.INCLUDE,
-            TradeFilterMode.ONLY,
-        } and len(
-            {owner_by_player[player_id] for player_id in incoming_filter.player_ids}
-        ) > 1:
-            raise ValueError(
-                "Players that must appear together need to be on the same other team."
-            )
+        if request.trade_format == "two_team" and incoming_filter is not None:
+            for leaf in iter_trade_filter_leaves(incoming_filter):
+                if (
+                    leaf.player_mode
+                    in {TradeFilterMode.INCLUDE, TradeFilterMode.ONLY}
+                    and len(
+                        {
+                            owner_by_player[player_id]
+                            for player_id in leaf.player_ids
+                        }
+                    )
+                    > 1
+                ):
+                    raise ValueError(
+                        "Players that must appear together need to be on the "
+                        "same other team."
+                    )
     return by_team, primary, selected

@@ -103,6 +103,14 @@ Before/after trade comparisons reuse the same simulated football outcomes, keyed
 
 Required outputs per team are current standing, expected final record, expected points, rank distribution, seed distribution, projected standing, and playoff qualification probability.
 
+## Composable package filters
+
+One atomic package rule can constrain players, positions, or both; when both dimensions are active they are combined with AND. Atomic rules may be nested under AND, OR, XOR, and NOT. XOR is true when exactly one of its immediate operands is true. The interface builds an explicit left-associated expression from top to bottom, so each connector combines the new rule with the complete result above it; NOT applies only to the rule beside it.
+
+The filter is part of exact candidate generation rather than a post-search screen. Two-team package counts and three-team decision-tree counts therefore include the full Boolean expression, and a resumed search seeks within the same filtered enumeration. In three-team mode, the outgoing expression evaluates the primary team's complete outgoing package and the incoming expression evaluates its complete incoming package across both partners.
+
+The original single-rule record remains package-filter semantics version 1 so existing request IDs and checkpoints do not change. A recursive expression uses semantics version 2 and its canonical tree is included in request and run identity. Commutative operands are canonically ordered without flattening nesting or removing duplicates; this preserves exact expression meaning while making equivalent operand orderings share an identity.
+
 ## Implemented calculation path
 
 1. Capture and validate one immutable weekly evidence set.
