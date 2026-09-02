@@ -16,6 +16,7 @@ from ._scenario_random import (
 from .ensemble import EnsembleProjection, ensemble_to_record
 from .league_state import LeagueState
 from .lineup import LineupPlayer, optimize_lineup
+from .positions import CANONICAL_PLAYER_POSITIONS
 from .projections import ProjectionStatus
 from .scenario_config import CorrelatedScenarioConfig, FactorLoadings, PlayerEligibility
 from .season import ScoreScenario, TeamWeekScore
@@ -232,7 +233,7 @@ class PreparedScoreScenarios:
         )
         return {
             "kind": "prepared_score_scenarios",
-            "schema_version": 3,
+            "schema_version": 4,
             **record,
             "run_id": self.run_id,
         }
@@ -312,8 +313,12 @@ def _validated_rosters(
     for roster in rosters:
         if roster.current_size != len(roster.player_ids):
             raise ValueError("scenario generation requires full rosters")
-        if roster.roster_cap != state.roster_rules.roster_cap:
-            raise ValueError("roster cap does not match league rules")
+        if (
+            roster.roster_cap != state.roster_rules.roster_cap
+            or roster.reserve_slot_counts
+            != state.roster_rules.reserve_slot_counts
+        ):
+            raise ValueError("roster capacities do not match league rules")
         if seen.intersection(roster.player_ids):
             raise ValueError("a player cannot be owned by multiple teams")
         seen.update(roster.player_ids)
@@ -323,7 +328,8 @@ def _validated_rosters(
                 tuple(sorted(roster.player_ids)),
                 roster.current_size,
                 roster.roster_cap,
-                roster.capacity_exempt_player_ids,
+                roster.reserve_slot_by_player,
+                roster.reserve_slot_counts,
             )
         )
     return tuple(sorted(normalized, key=lambda item: item.team_id))
@@ -346,7 +352,9 @@ def _validated_eligibilities(
     missing = set(player_ids).difference(by_player)
     if missing:
         raise ValueError("eligibilities must contain every rostered player")
-    allowed = set(state.roster_rules.starting_lineup_slots)
+    allowed = set(state.roster_rules.starting_lineup_slots) | set(
+        CANONICAL_PLAYER_POSITIONS
+    )
     for row in rows:
         unknown = set(row.eligible_slots).difference(allowed)
         if unknown:
@@ -481,10 +489,9 @@ def _run_record(state, rosters, eligibilities, config, projection_set_id, draw_s
         "roster_cap": state.roster_rules.roster_cap,
         "rosters": [
             {
-                "capacity_exempt_player_ids": sorted(
-                    row.capacity_exempt_player_ids
-                ),
                 "player_ids": list(row.player_ids),
+                "reserve_slot_by_player": dict(row.reserve_slot_by_player),
+                "reserve_slot_counts": dict(row.reserve_slot_counts),
                 "team_id": row.team_id,
             }
             for row in rosters

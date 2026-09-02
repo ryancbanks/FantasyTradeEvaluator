@@ -6,6 +6,13 @@ def validate_normalized_inputs(value) -> None:
     roster_ids = [row.team_id for row in value.rosters]
     if len(set(roster_ids)) != len(roster_ids) or set(roster_ids) != team_ids:
         raise ValueError("normalized rosters must exactly cover league teams")
+    if any(
+        row.roster_cap != value.league_state.roster_rules.roster_cap
+        or row.reserve_slot_counts
+        != value.league_state.roster_rules.reserve_slot_counts
+        for row in value.rosters
+    ):
+        raise ValueError("normalized roster capacities must match league rules")
     player_ids = {row.canonical_player_id for row in value.player_identities}
     owned_ids = [player_id for roster in value.rosters for player_id in roster.player_ids]
     if len(set(owned_ids)) != len(owned_ids) or set(owned_ids) != player_ids:

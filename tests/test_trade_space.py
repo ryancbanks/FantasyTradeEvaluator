@@ -353,7 +353,7 @@ class TradeSpaceTests(unittest.TestCase):
     def test_player_include_requires_every_selected_player(self):
         space = TradeSpace(
             roster("primary", ("a", "b", "c", "d")),
-            roster("counterparty", ("x",)),
+            TeamRoster("counterparty", ("x",), current_size=1, roster_cap=4),
             TradeConstraints(
                 min_outgoing=2,
                 max_outgoing=3,
@@ -422,7 +422,7 @@ class TradeSpaceTests(unittest.TestCase):
         }
         space = TradeSpace(
             roster("primary", ("a", "b", "c", "d")),
-            roster("counterparty", ("x",)),
+            TeamRoster("counterparty", ("x",), current_size=1, roster_cap=4),
             TradeConstraints(
                 min_outgoing=2,
                 max_outgoing=2,
@@ -451,7 +451,7 @@ class TradeSpaceTests(unittest.TestCase):
         }
         space = TradeSpace(
             roster("primary", ("a", "b", "c", "d")),
-            roster("counterparty", ("x",)),
+            TeamRoster("counterparty", ("x",), current_size=1, roster_cap=4),
             TradeConstraints(
                 min_outgoing=1,
                 max_outgoing=2,
@@ -502,7 +502,8 @@ class TradeSpaceTests(unittest.TestCase):
             ("p-rb", "p-wr", "p-ir"),
             current_size=3,
             roster_cap=2,
-            capacity_exempt_player_ids={"p-ir"},
+            reserve_slot_by_player={"p-ir": "IR"},
+            reserve_slot_counts={"IR": 1},
         )
         counterparty = roster("counterparty", ("c-rb", "c-wr"))
         space = TradeSpace(
@@ -533,7 +534,8 @@ class TradeSpaceTests(unittest.TestCase):
             ("p-rb", "p-wr", "p-dual-ir", "p-te"),
             current_size=4,
             roster_cap=3,
-            capacity_exempt_player_ids={"p-dual-ir"},
+            reserve_slot_by_player={"p-dual-ir": "IR"},
+            reserve_slot_counts={"IR": 1},
         )
         counterparty = roster("counterparty", ("c-qb", "c-te"))
         space = TradeSpace(
@@ -776,7 +778,7 @@ class TradeSpaceTests(unittest.TestCase):
 
     def test_legacy_only_iteration_prunes_before_combination_scanning(self):
         selected = tuple(f"c{number}" for number in range(10))
-        primary = roster("primary", ("p0", "p1"))
+        primary = TeamRoster("primary", ("p0", "p1"), 2, 20)
         counterparty = roster(
             "counterparty", tuple(f"c{number}" for number in range(20))
         )
@@ -830,7 +832,7 @@ class TradeSpaceTests(unittest.TestCase):
 
         with patch.object(CompiledTradeFilter, "matches", counted_matches):
             space = TradeSpace(
-                roster("primary", ("p0", "p1")),
+                TeamRoster("primary", ("p0", "p1"), 2, 20),
                 roster(
                     "counterparty",
                     tuple(f"c{number}" for number in range(20)),
@@ -883,7 +885,7 @@ class TradeSpaceTests(unittest.TestCase):
             )
         )
 
-    def test_capacity_exempt_player_is_owned_but_does_not_consume_active_cap(self):
+    def test_typed_reserve_player_is_owned_but_does_not_consume_active_cap(self):
         player_ids = (*tuple(f"p{number}" for number in range(14)), "p-ir")
 
         roster_with_ir = TeamRoster(
@@ -891,12 +893,15 @@ class TradeSpaceTests(unittest.TestCase):
             player_ids,
             current_size=15,
             roster_cap=14,
-            capacity_exempt_player_ids={"p-ir"},
+            reserve_slot_by_player={"p-ir": "IR"},
+            reserve_slot_counts={"IR": 1},
         )
 
         self.assertEqual(roster_with_ir.current_size, 15)
         self.assertEqual(roster_with_ir.active_size, 14)
-        self.assertEqual(roster_with_ir.capacity_exempt_player_ids, frozenset({"p-ir"}))
+        self.assertEqual(dict(roster_with_ir.reserve_slot_by_player), {"p-ir": "IR"})
+        self.assertEqual(dict(roster_with_ir.reserve_slot_counts), {"IR": 1})
+        self.assertIsInstance(hash(roster_with_ir), int)
         with self.assertRaisesRegex(ValueError, "roster_cap"):
             TeamRoster("primary", player_ids, current_size=15, roster_cap=14)
         with self.assertRaisesRegex(ValueError, "must be owned"):
@@ -905,7 +910,8 @@ class TradeSpaceTests(unittest.TestCase):
                 player_ids,
                 current_size=15,
                 roster_cap=14,
-                capacity_exempt_player_ids={"not-owned"},
+                reserve_slot_by_player={"not-owned": "IR"},
+                reserve_slot_counts={"IR": 1},
             )
 
     def test_no_drop_trade_sending_ir_does_not_free_an_active_slot(self):
@@ -913,15 +919,17 @@ class TradeSpaceTests(unittest.TestCase):
         primary = TeamRoster(
             "primary",
             primary_ids,
-            15,
-            14,
-            {"p-ir"},
+            current_size=15,
+            roster_cap=14,
+            reserve_slot_by_player={"p-ir": "IR"},
+            reserve_slot_counts={"IR": 1},
         )
         counterparty = TeamRoster(
             "counterparty",
             tuple(f"c{number}" for number in range(13)),
-            13,
-            14,
+            current_size=13,
+            roster_cap=14,
+            reserve_slot_counts={"IR": 1},
         )
 
         space = TradeSpace(
@@ -937,18 +945,67 @@ class TradeSpaceTests(unittest.TestCase):
             all("p-ir" not in row.outgoing_player_ids for row in candidates)
         )
 
-    def test_no_drop_trade_treats_an_incoming_ir_player_as_active(self):
+    def test_no_drop_trade_places_an_incoming_ir_player_in_an_open_ir_slot(self):
         primary_ids = tuple(f"p{number}" for number in range(14))
         counterparty_ids = (*tuple(f"c{number}" for number in range(14)), "c-ir")
         unlocked = {"p0", "p1", "c0", "c1", "c-ir"}
         space = TradeSpace(
-            TeamRoster("primary", primary_ids, 14, 14),
+            TeamRoster(
+                "primary",
+                primary_ids,
+                current_size=14,
+                roster_cap=14,
+                reserve_slot_counts={"IR": 1},
+            ),
             TeamRoster(
                 "counterparty",
                 counterparty_ids,
-                15,
-                14,
-                {"c-ir"},
+                current_size=15,
+                roster_cap=14,
+                reserve_slot_by_player={"c-ir": "IR"},
+                reserve_slot_counts={"IR": 1},
+            ),
+            TradeConstraints(
+                min_outgoing=2,
+                max_outgoing=2,
+                min_incoming=3,
+                max_incoming=3,
+                require_no_drops=True,
+                locked_player_ids=frozenset(
+                    set(primary_ids).union(counterparty_ids).difference(unlocked)
+                ),
+            ),
+        )
+
+        self.assertEqual(space.candidate_count, 1)
+        self.assertEqual(
+            tuple(space),
+            (candidate(("p0", "p1"), ("c0", "c1", "c-ir")),),
+        )
+
+    def test_no_drop_trade_keeps_an_active_ir_eligible_player_active(self):
+        primary_ids = tuple(f"p{number}" for number in range(14))
+        counterparty_ids = (
+            *tuple(f"c{number}" for number in range(13)),
+            "c-ir-eligible",
+            "c-resident-ir",
+        )
+        unlocked = {"p0", "p1", "c0", "c1", "c-ir-eligible"}
+        space = TradeSpace(
+            TeamRoster(
+                "primary",
+                primary_ids,
+                current_size=14,
+                roster_cap=14,
+                reserve_slot_counts={"IR": 1},
+            ),
+            TeamRoster(
+                "counterparty",
+                counterparty_ids,
+                current_size=15,
+                roster_cap=14,
+                reserve_slot_by_player={"c-resident-ir": "IR"},
+                reserve_slot_counts={"IR": 1},
             ),
             TradeConstraints(
                 min_outgoing=2,
@@ -965,13 +1022,109 @@ class TradeSpaceTests(unittest.TestCase):
         self.assertEqual(space.candidate_count, 0)
         self.assertEqual(tuple(space), ())
 
+    def test_ir_player_cannot_cross_fill_an_open_rookie_reserve_slot(self):
+        primary_ids = ("p1", "p2", "p-ir")
+        counterparty_ids = ("q1", "q-ir")
+        space = TradeSpace(
+            TeamRoster(
+                "primary",
+                primary_ids,
+                current_size=3,
+                roster_cap=2,
+                reserve_slot_by_player={"p-ir": "IR"},
+                reserve_slot_counts={"IR": 1, "ROOKIE_RESERVE": 1},
+            ),
+            TeamRoster(
+                "counterparty",
+                counterparty_ids,
+                current_size=2,
+                roster_cap=1,
+                reserve_slot_by_player={"q-ir": "IR"},
+                reserve_slot_counts={"IR": 1, "ROOKIE_RESERVE": 1},
+            ),
+            TradeConstraints(
+                min_outgoing=1,
+                max_outgoing=1,
+                min_incoming=2,
+                max_incoming=2,
+                require_no_drops=True,
+                locked_player_ids=frozenset({"p2", "p-ir"}),
+            ),
+        )
+
+        self.assertEqual(space.candidate_count, 0)
+        self.assertEqual(tuple(space), ())
+
+    def test_mixed_typed_reserve_count_matches_iteration_exactly(self):
+        primary = TeamRoster(
+            "primary",
+            ("p-a1", "p-a2", "p-ir", "p-rookie"),
+            current_size=4,
+            roster_cap=2,
+            reserve_slot_by_player={"p-ir": "IR", "p-rookie": "ROOKIE_RESERVE"},
+            reserve_slot_counts={"IR": 1, "ROOKIE_RESERVE": 1},
+        )
+        counterparty = TeamRoster(
+            "counterparty",
+            ("c-a1", "c-a2", "c-ir", "c-rookie"),
+            current_size=4,
+            roster_cap=2,
+            reserve_slot_by_player={"c-ir": "IR", "c-rookie": "ROOKIE_RESERVE"},
+            reserve_slot_counts={"IR": 1, "ROOKIE_RESERVE": 1},
+        )
+        space = TradeSpace(
+            primary,
+            counterparty,
+            TradeConstraints(
+                min_outgoing=1,
+                max_outgoing=2,
+                min_incoming=1,
+                max_incoming=2,
+                balanced_only=True,
+                require_no_drops=True,
+            ),
+        )
+
+        candidates = tuple(space)
+
+        self.assertEqual(space.candidate_count, 16)
+        self.assertEqual(len(candidates), space.candidate_count)
+
+    def test_drop_enabled_space_rejects_overflow_requiring_an_incoming_cut(self):
+        space = TradeSpace(
+            TeamRoster("primary", ("p1", "p2"), 2, 2),
+            TeamRoster("counterparty", ("c1",), 1, 1),
+            TradeConstraints(
+                min_outgoing=2,
+                max_outgoing=2,
+                min_incoming=1,
+                max_incoming=1,
+            ),
+        )
+
+        self.assertEqual(space.candidate_count, 0)
+        self.assertEqual(tuple(space), ())
+
     def test_thirteen_active_players_can_receive_one_net_active_player(self):
         primary_ids = (*tuple(f"p{number}" for number in range(13)), "p-ir")
         counterparty_ids = tuple(f"c{number}" for number in range(14))
         unlocked = {"p0", "c0", "c1"}
         space = TradeSpace(
-            TeamRoster("primary", primary_ids, 14, 14, {"p-ir"}),
-            TeamRoster("counterparty", counterparty_ids, 14, 14),
+            TeamRoster(
+                "primary",
+                primary_ids,
+                14,
+                14,
+                reserve_slot_by_player={"p-ir": "IR"},
+                reserve_slot_counts={"IR": 1},
+            ),
+            TeamRoster(
+                "counterparty",
+                counterparty_ids,
+                14,
+                14,
+                reserve_slot_counts={"IR": 1},
+            ),
             TradeConstraints(
                 min_outgoing=1,
                 max_outgoing=1,

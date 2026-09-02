@@ -47,6 +47,13 @@ async (options) => {
     return number !== null && number >= 0 && number <= 100 ? number : null;
   };
   const text = (value) => typeof value === 'string' && value.trim() ? value.trim() : null;
+  const reserveSlot = (value) => {
+    const normalized = text(value)?.toUpperCase().replace(/[^A-Z0-9]+/g, '');
+    return new Set([
+      'IR', 'INJUREDRESERVE', 'RES', 'RESERVE', 'ROOKIERESERVE',
+      'TAXI', 'TAXISQUAD', 'NFI', 'PUP', 'NA'
+    ]).has(normalized);
+  };
   const teamsRaw = Array.isArray(pageData.teams) ? pageData.teams.slice(0, 100) : [];
   const leagueRaw = record(pageData.league) ? pageData.league : null;
   const settingsRaw = record(leagueRaw?.settings) ? leagueRaw.settings : {};
@@ -56,10 +63,11 @@ async (options) => {
     if (!Array.isArray(slots) || !slots.length || slots.length > 100) return null;
     let total = 0;
     for (const slot of slots) {
+      const slotName = text(own(slot, ['type', 'position']));
       const rawCount = own(slot, ['count']);
       const count = Number.isInteger(rawCount) ? rawCount : null;
-      if (!text(own(slot, ['type', 'position'])) ||
-          count === null || count < 0 || count > 100) return null;
+      if (!slotName || count === null || count < 0 || count > 100) return null;
+      if (reserveSlot(slotName)) continue;
       total += count;
       if (total > 100) return null;
     }
@@ -70,10 +78,9 @@ async (options) => {
       ? team.players.length : null).filter(Number.isInteger);
     const explicitRosterSize = own(leagueRaw, ['rosterSize', 'roster_size']) ??
       own(settingsRaw, ['rosterSize', 'roster_size']);
-    const configuredSize = explicitRosterSize === undefined
-      ? configuredRosterSize() : undefined;
+    const configuredSize = configuredRosterSize();
     if (configuredSize === null) return null;
-    const rosterSize = integer(explicitRosterSize ?? configuredSize ??
+    const rosterSize = integer(configuredSize ?? explicitRosterSize ??
       own(settingsRaw, ['totalRounds']) ??
       (rosterSizes.length && new Set(rosterSizes).size === 1 ? rosterSizes[0] : null));
     const scoring = text(own(leagueRaw, ['scoring']) ??

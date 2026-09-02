@@ -15,6 +15,7 @@ from trade_snapshot.league_source import (
     SourceLeaguePlayer,
     SourceTeamRoster,
 )
+from trade_snapshot.league_state import RosterRules
 
 
 def identities_for(snapshot):
@@ -72,12 +73,14 @@ class LeagueIngestTests(unittest.TestCase):
         source_roster = SourceTeamRoster(
             "1",
             owned,
-            {extra_ids[-1]},
+            {extra_ids[-1]: "IR"},
         )
+        self.assertIsInstance(hash(source_roster), int)
         snapshot = replace(
             baseline,
             players=(*baseline.players, *extras),
             rosters=(source_roster, baseline.rosters[1]),
+            roster_rules=RosterRules(14, ("RB",), {"IR": 1}),
         )
 
         result = normalize_host_league_snapshot(snapshot, identities_for(snapshot))

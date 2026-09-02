@@ -24,7 +24,7 @@ from .trade_space import TeamRoster
 from .waiver_pool import WaiverPool
 
 
-_BUNDLE_SCHEMA_VERSION = 6
+_BUNDLE_SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,11 +125,10 @@ class EngineBundle:
             "projections": [ensemble_to_record(row) for row in self.projections],
             "rosters": [
                 {
-                    "capacity_exempt_player_ids": sorted(
-                        row.capacity_exempt_player_ids
-                    ),
                     "current_size": row.current_size,
                     "player_ids": list(row.player_ids),
+                    "reserve_slot_by_player": dict(row.reserve_slot_by_player),
+                    "reserve_slot_counts": dict(row.reserve_slot_counts),
                     "roster_cap": row.roster_cap,
                     "team_id": row.team_id,
                 }
@@ -310,9 +309,10 @@ def _validate_identity(bundle, rosters, projections, eligibilities, ecr, evidenc
     if any(
         row.current_size != len(row.player_ids)
         or row.roster_cap != state.roster_rules.roster_cap
+        or row.reserve_slot_counts != state.roster_rules.reserve_slot_counts
         for row in rosters
     ):
-        raise ValueError("rosters must be complete and use the league roster cap")
+        raise ValueError("rosters must be complete and use the league roster capacities")
     owned = [player_id for row in rosters for player_id in row.player_ids]
     if len(set(owned)) != len(owned):
         raise ValueError("a player cannot be owned by multiple teams")
@@ -412,9 +412,10 @@ def _names(value):
 def _roster_from_record(value):
     row = _mapping("roster", value)
     if set(row) != {
-        "capacity_exempt_player_ids",
         "current_size",
         "player_ids",
+        "reserve_slot_by_player",
+        "reserve_slot_counts",
         "roster_cap",
         "team_id",
     }:
@@ -424,10 +425,8 @@ def _roster_from_record(value):
         tuple(_json_array("player_ids", row["player_ids"])),
         row["current_size"],
         row["roster_cap"],
-        _json_array(
-            "capacity_exempt_player_ids",
-            row["capacity_exempt_player_ids"],
-        ),
+        _mapping("reserve_slot_by_player", row["reserve_slot_by_player"]),
+        _mapping("reserve_slot_counts", row["reserve_slot_counts"]),
     )
 
 

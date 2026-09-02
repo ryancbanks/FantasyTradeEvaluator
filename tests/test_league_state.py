@@ -109,7 +109,7 @@ class LeagueStateTests(unittest.TestCase):
         )
         record = league_state_to_record(state)
 
-        self.assertEqual(record["schema_version"], 2)
+        self.assertEqual(record["schema_version"], 3)
         self.assertEqual(
             record["remaining_matchups"][0]["team1_score_adjustment"],
             1.25,
@@ -129,6 +129,12 @@ class LeagueStateTests(unittest.TestCase):
             row.pop("team1_score_adjustment")
         with self.assertRaisesRegex(ValueError, "schema version"):
             league_state_from_record(legacy)
+
+        prior_roster_schema = copy.deepcopy(record)
+        prior_roster_schema["schema_version"] = 2
+        prior_roster_schema["roster_rules"].pop("reserve_slot_counts")
+        with self.assertRaisesRegex(ValueError, "schema version"):
+            league_state_from_record(prior_roster_schema)
 
         missing = copy.deepcopy(record)
         missing["remaining_matchups"][0].pop("team1_score_adjustment")
@@ -158,6 +164,9 @@ class LeagueStateTests(unittest.TestCase):
                 replace(state, teams=teams)
 
     def test_validates_roster_and_playoff_settings(self):
+        rules = RosterRules(2, ("QB",), {"IR": 1})
+        self.assertIsInstance(hash(rules), int)
+
         with self.subTest("lineup larger than roster"):
             with self.assertRaisesRegex(ValueError, "cannot exceed roster_cap"):
                 RosterRules(roster_cap=1, starting_lineup_slots=("QB", "RB"))

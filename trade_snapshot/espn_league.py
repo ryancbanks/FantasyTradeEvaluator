@@ -27,7 +27,7 @@ from .league_state import HeadToHeadPolicy, PlayoffRules, RosterRules, Tiebreake
 from .scoring import ScoringProfile
 
 
-ESPN_LEAGUE_ADAPTER_VERSION = "espn-ffl-v3-h2h-points-v2"
+ESPN_LEAGUE_ADAPTER_VERSION = "espn-ffl-v3-h2h-points-v3-typed-rosters"
 
 _DEFAULT_POSITION = {
     1: "QB",
@@ -44,9 +44,9 @@ _DEFAULT_POSITION = {
 _STARTING_SLOT = {
     0: "QB",
     2: "RB",
-    3: "FLEX",
+    3: "RB_WR",
     4: "WR",
-    5: "FLEX",
+    5: "WR_TE",
     6: "TE",
     7: "OP",
     8: "DL",
@@ -62,6 +62,7 @@ _STARTING_SLOT = {
     23: "FLEX",
 }
 _NONSTARTING_SLOT = {20: "BENCH", 21: "IR", 25: "ROOKIE_RESERVE"}
+_RESERVE_SLOT = {21: "IR", 25: "ROOKIE_RESERVE"}
 _SUPPORTED_SLOT_IDS = frozenset(_STARTING_SLOT) | frozenset(_NONSTARTING_SLOT)
 
 
@@ -125,18 +126,23 @@ def espn_host_league_snapshot(
     )
 
     lineup_counts = _slot_counts(roster_settings.get("lineupSlotCounts"))
-    capacity_exempt_slot_ids = frozenset({21, 25})
     roster_cap = sum(
         count
         for slot_id, count in lineup_counts.items()
-        if slot_id not in capacity_exempt_slot_ids
+        if slot_id not in _RESERVE_SLOT
     )
+    reserve_slot_counts = {
+        kind: lineup_counts.get(slot_id, 0)
+        for slot_id, kind in _RESERVE_SLOT.items()
+        if lineup_counts.get(slot_id, 0)
+    }
     starting_slots = tuple(
         slot
         for slot_id in sorted(_STARTING_SLOT)
         for slot in (_STARTING_SLOT[slot_id],) * lineup_counts.get(slot_id, 0)
     )
-    roster_rules = RosterRules(roster_cap, starting_slots)
+    configured_starting_slots = frozenset(starting_slots)
+    roster_rules = RosterRules(roster_cap, starting_slots, reserve_slot_counts)
 
     divisions = _divisions(schedule_settings.get("divisions"))
     team_rows = []
@@ -171,7 +177,7 @@ def espn_host_league_snapshot(
         )
         entries = _array("team.roster.entries", _object("team.roster", team.get("roster")).get("entries"))
         player_ids = []
-        capacity_exempt_player_ids = []
+        reserve_slot_by_player = {}
         slot_occupancy = {}
         active_count = 0
         for entry_raw in entries:
@@ -193,14 +199,18 @@ def espn_host_league_snapshot(
             )
             if _player_identifier("player.id", player.get("id")) != source_player_id:
                 raise ValueError("ESPN roster entry and player IDs disagree")
-            normalized = _source_player(player, pro_teams)
+            normalized = _source_player(
+                player, pro_teams, configured_starting_slots
+            )
             previous = player_rows.get(source_player_id)
             if previous is not None and previous != normalized:
                 raise ValueError("ESPN player metadata conflicts between rosters")
             player_rows[source_player_id] = normalized
             player_ids.append(source_player_id)
-            if lineup_slot_id in capacity_exempt_slot_ids:
-                capacity_exempt_player_ids.append(source_player_id)
+            if lineup_slot_id in _RESERVE_SLOT:
+                reserve_slot_by_player[source_player_id] = _RESERVE_SLOT[
+                    lineup_slot_id
+                ]
             else:
                 active_count += 1
         if any(
@@ -214,7 +224,7 @@ def espn_host_league_snapshot(
             SourceTeamRoster(
                 team_id,
                 tuple(player_ids),
-                frozenset(capacity_exempt_player_ids),
+                reserve_slot_by_player,
             )
         )
 
@@ -270,10 +280,15 @@ def espn_host_league_snapshot(
                 [
                     row.source_team_id,
                     list(row.source_player_ids),
-                    sorted(row.capacity_exempt_source_player_ids),
+                    dict(row.reserve_slot_by_player),
                 ]
                 for row in roster_rows
             ],
+            "roster_rules": {
+                "reserve_slot_counts": dict(roster_rules.reserve_slot_counts),
+                "roster_cap": roster_rules.roster_cap,
+                "starting_lineup_slots": list(roster_rules.starting_lineup_slots),
+            },
             "scoring_profile_id": scoring_profile.scoring_profile_id,
             "season": season,
             "standings": [
@@ -303,7 +318,7 @@ def espn_host_league_snapshot(
     )
 
 
-def _source_player(player, pro_teams):
+def _source_player(player, pro_teams, configured_starting_slots):
     player_id = _player_identifier("player.id", player.get("id"))
     position_id = _integer("defaultPositionId", player.get("defaultPositionId"), minimum=1)
     try:
@@ -317,8 +332,11 @@ def _source_player(player, pro_teams):
     for raw in _array("eligibleSlots", player.get("eligibleSlots")):
         slot_id = _integer("eligible slot", raw, minimum=0)
         if slot_id in _STARTING_SLOT:
-            eligible.append(_STARTING_SLOT[slot_id])
-        elif slot_id not in _NONSTARTING_SLOT:
+            slot = _STARTING_SLOT[slot_id]
+            if slot in configured_starting_slots:
+                eligible.append(slot)
+            continue
+        if slot_id not in _NONSTARTING_SLOT:
             raise ValueError(f"ESPN eligible slot {slot_id} is unsupported")
     eligible.append(position)
     return SourceLeaguePlayer(

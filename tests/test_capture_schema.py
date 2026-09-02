@@ -137,7 +137,7 @@ class CapturePlanTests(unittest.TestCase):
                 "analyzer": "capschema_bcf693343ec0769715115324a1c4e1bd210d418eb52abca72cca5d820f73092e",
                 "ecr_task": "capschema_75f616f4218befaa96bd8caaa5179825b5e22f4e088174d0e989f869602ef9a6",
                 "ecr": "capschema_7efe13de770357c2bc8031b32b1da11697c198e630c3664b6642b1a4dfb94faf",
-                "league": "capschema_b3643dca61d2ed438bd854a103593e9b14adfcd45ffcf564af293491ec0fc57d",
+                "league": "capschema_5de2665e9d4c2e5de7ffa7ff467e13cb8b2a0bea85e8a96be30f6dfcf585a202",
             },
         )
 

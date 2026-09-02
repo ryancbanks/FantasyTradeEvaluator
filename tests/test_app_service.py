@@ -926,6 +926,16 @@ class LocalAppServiceTests(unittest.TestCase):
 
         self.assertEqual(summary["status"], "ready")
         self.assertEqual(summary["positions"], ["RB"])
+        self.assertTrue(
+            all(team["active_count"] == team["active_capacity"] == 2 for team in summary["teams"])
+        )
+        self.assertTrue(
+            all(
+                player["roster_status"] == "ACTIVE"
+                for team in summary["teams"]
+                for player in team["players"]
+            )
+        )
         self.assertEqual(
             {
                 player["name"]

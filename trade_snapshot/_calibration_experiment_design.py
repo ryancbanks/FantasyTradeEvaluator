@@ -5,6 +5,7 @@ from itertools import combinations, product
 from math import comb, fsum
 
 from ._calibration_inputs import PlayerFeatureVector
+from .roster_capacity import reserve_counts_for, solve_post_trade_capacity
 from .strength import RoleDefinition
 from .trade_space import TeamRoster
 
@@ -35,20 +36,29 @@ def atomic_candidates(
     """Return every distinct one-player perturbation used for coefficient fitting."""
 
     mine = by_team[primary_team_id]
-    candidates = (
-        _candidate(
-            other_id,
-            (outgoing,),
-            (incoming,),
-            features,
-            roles,
-            residual_feature_names,
-            role_feature_names,
-        )
-        for other_id in sorted(set(by_team).difference({primary_team_id}))
-        for outgoing in sorted(mine.player_ids)
-        for incoming in sorted(by_team[other_id].player_ids)
-    )
+    candidates = []
+    for other_id in sorted(set(by_team).difference({primary_team_id})):
+        other = by_team[other_id]
+        for outgoing in sorted(mine.player_ids):
+            for incoming in sorted(other.player_ids):
+                if not _fits_without_roster_adjustment(
+                    mine,
+                    other,
+                    (outgoing,),
+                    (incoming,),
+                ):
+                    continue
+                candidates.append(
+                    _candidate(
+                        other_id,
+                        (outgoing,),
+                        (incoming,),
+                        features,
+                        roles,
+                        residual_feature_names,
+                        role_feature_names,
+                    )
+                )
     return _unique_nonzero_signatures(candidates)
 
 
@@ -77,6 +87,8 @@ def balanced_holdout_candidates(
             outgoing = _sample_packages(mine.player_ids, size, package_cache)
             incoming = _sample_packages(other.player_ids, size, package_cache)
             for left, right in product(outgoing, incoming):
+                if not _fits_without_roster_adjustment(mine, other, left, right):
+                    continue
                 candidate = _candidate(
                     other_id,
                     left,
@@ -103,6 +115,51 @@ def _candidate(team2_id, outgoing, incoming, features, roles, residual, role_fea
         _package_signature(
             outgoing, incoming, features, roles, residual, role_features
         ),
+    )
+
+
+def _fits_without_roster_adjustment(primary, counterparty, outgoing, incoming):
+    outgoing_reserve = reserve_counts_for(
+        outgoing, primary.reserve_slot_by_player
+    )
+    incoming_reserve = reserve_counts_for(
+        incoming, counterparty.reserve_slot_by_player
+    )
+    primary_plan = _capacity_plan(
+        primary,
+        outgoing,
+        outgoing_reserve,
+        incoming,
+        incoming_reserve,
+    )
+    counterparty_plan = _capacity_plan(
+        counterparty,
+        incoming,
+        incoming_reserve,
+        outgoing,
+        outgoing_reserve,
+    )
+    return (
+        primary_plan.required_cuts == 0
+        and primary_plan.active_before_cuts == primary.active_size
+        and counterparty_plan.required_cuts == 0
+        and counterparty_plan.active_before_cuts == counterparty.active_size
+    )
+
+
+def _capacity_plan(roster, outgoing, outgoing_reserve, incoming, incoming_reserve):
+    return solve_post_trade_capacity(
+        active_cap=roster.roster_cap,
+        current_size=roster.current_size,
+        known_player_count=len(roster.player_ids),
+        reserve_slot_counts=roster.reserve_slot_counts,
+        current_reserve_counts=reserve_counts_for(
+            roster.player_ids, roster.reserve_slot_by_player
+        ),
+        outgoing_size=len(outgoing),
+        outgoing_reserve_counts=outgoing_reserve,
+        incoming_size=len(incoming),
+        incoming_reserve_counts=incoming_reserve,
     )
 
 

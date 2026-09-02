@@ -67,7 +67,7 @@ LEAGUE_SOURCE_SCHEMA_FINGERPRINT = schema_fingerprint(
             "max_nodes": 250000,
             "max_string_length": 100000,
         },
-        "policy_version": "trade-analyzer-bootstrap-passive-init-v7-roster-slots-censored-odds",
+        "policy_version": "trade-analyzer-bootstrap-passive-init-v8-active-vs-reserve-slots",
     },
 )
 

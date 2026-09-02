@@ -5,11 +5,12 @@ from dataclasses import dataclass
 from itertools import combinations
 
 from ._scenario_random import content_id
+from .roster_capacity import assign_reserve_slots
 from .strength import StrengthModel
 from .trade_space import TeamRoster, TradeCandidate
 
 
-ROSTER_ADJUSTMENT_ALGORITHM = "post-trade-optimal-replacement-v3"
+ROSTER_ADJUSTMENT_ALGORITHM = "post-trade-optimal-replacement-v4"
 MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY = (
     "When automatic roster adjustments are allowed, each team's drops are "
     "optimized locally and scarce free-agent replacements are reserved in "
@@ -91,11 +92,12 @@ class PreparedRosterAdjuster:
                 "rosters": [
                     {
                         "active_size": row.active_size,
-                        "capacity_exempt_player_ids": sorted(
-                            row.capacity_exempt_player_ids
-                        ),
                         "current_size": row.current_size,
                         "player_ids": list(row.player_ids),
+                        "reserve_slot_by_player": dict(
+                            row.reserve_slot_by_player
+                        ),
+                        "reserve_slot_counts": dict(row.reserve_slot_counts),
                         "roster_cap": row.roster_cap,
                         "team_id": row.team_id,
                     }
@@ -129,16 +131,22 @@ class PreparedRosterAdjuster:
         primary_after = self._balance(
             primary,
             primary_raw,
-            capacity_exempt_player_ids=primary.capacity_exempt_player_ids.difference(
-                outgoing
+            reserve_candidates_by_player=_transferred_reserve_candidates(
+                primary,
+                outgoing,
+                counterparty,
+                candidate.incoming_player_ids,
             ),
             protected=set(candidate.incoming_player_ids),
         )
         counterparty_after = self._balance(
             counterparty,
             counterparty_raw,
-            capacity_exempt_player_ids=(
-                counterparty.capacity_exempt_player_ids.difference(incoming)
+            reserve_candidates_by_player=_transferred_reserve_candidates(
+                counterparty,
+                incoming,
+                primary,
+                candidate.outgoing_player_ids,
             ),
             protected=set(candidate.outgoing_player_ids),
         )
@@ -159,6 +167,11 @@ class PreparedRosterAdjuster:
         """
 
         normalized = _validated_team_changes(self, changes)
+        reserve_kind_by_player = {
+            player_id: kind
+            for roster, _, _ in normalized
+            for player_id, kind in roster.reserve_slot_by_player.items()
+        }
         available_free_agents = self.free_agent_ids
         by_team = {}
         for roster, outgoing, incoming in sorted(
@@ -171,9 +184,7 @@ class PreparedRosterAdjuster:
             adjusted = self._balance(
                 roster,
                 raw_players,
-                capacity_exempt_player_ids=(
-                    roster.capacity_exempt_player_ids.difference(outgoing_set)
-                ),
+                reserve_candidates_by_player=reserve_kind_by_player,
                 protected=set(incoming),
                 free_agent_ids=available_free_agents,
             )
@@ -199,21 +210,32 @@ class PreparedRosterAdjuster:
         before,
         raw_players,
         *,
-        capacity_exempt_player_ids,
+        reserve_candidates_by_player,
         protected,
         free_agent_ids=None,
     ) -> TeamRosterAdjustment:
         players = list(raw_players)
-        capacity_exempt = frozenset(capacity_exempt_player_ids)
-        active_count = len(players) - len(capacity_exempt)
+        assigned = assign_reserve_slots(
+            reserve_candidates_by_player,
+            before.reserve_slot_counts,
+            players,
+        )
+        active_count = len(players) - len(assigned)
         excess = max(0, active_count - before.roster_cap)
         dropped = self._optimal_drops(
             players,
-            protected.union(capacity_exempt),
+            protected,
             excess,
+            reserve_candidates_by_player,
+            before,
         )
         players = [player for player in players if player not in set(dropped)]
-        active_count = len(players) - len(capacity_exempt)
+        assigned = assign_reserve_slots(
+            reserve_candidates_by_player,
+            before.reserve_slot_counts,
+            players,
+        )
+        active_count = len(players) - len(assigned)
         needed = max(0, before.active_size - active_count)
         additions = self._optimal_additions(
             players,
@@ -221,28 +243,58 @@ class PreparedRosterAdjuster:
             free_agent_ids=free_agent_ids,
         )
         players.extend(additions)
-        if len(players) - len(capacity_exempt) > before.roster_cap:
+        assigned = assign_reserve_slots(
+            reserve_candidates_by_player,
+            before.reserve_slot_counts,
+            players,
+        )
+        if len(players) - len(assigned) > before.roster_cap:
             raise ValueError("adjusted roster exceeds its roster cap")
         roster = TeamRoster(
             before.team_id,
             tuple(players),
             len(players),
             before.roster_cap,
-            capacity_exempt,
+            assigned,
+            before.reserve_slot_counts,
         )
         return TeamRosterAdjustment(roster, tuple(additions), tuple(dropped))
 
-    def _optimal_drops(self, players, protected, count):
+    def _optimal_drops(
+        self,
+        players,
+        protected,
+        count,
+        reserve_candidates_by_player,
+        before,
+    ):
         if count == 0:
             return ()
         candidates = tuple(sorted(set(players).difference(protected)))
         if len(candidates) < count:
             raise ValueError("trade requires dropping a protected incoming player")
-        return _best_package(
-            combinations(candidates, count),
-            lambda package: tuple(player for player in players if player not in package),
-            self.model,
-        )
+        best_package = None
+        best_score = None
+        for package in combinations(candidates, count):
+            retained = tuple(player for player in players if player not in package)
+            assigned = assign_reserve_slots(
+                reserve_candidates_by_player,
+                before.reserve_slot_counts,
+                retained,
+            )
+            if len(retained) - len(assigned) > before.roster_cap:
+                continue
+            score = self.model.score_roster(retained).absolute_score
+            if (
+                best_score is None
+                or score > best_score
+                or (score == best_score and package < best_package)
+            ):
+                best_package = package
+                best_score = score
+        if best_package is None:
+            raise ValueError("trade requires dropping a protected incoming player")
+        return best_package
 
     def _optimal_additions(self, players, count, *, free_agent_ids=None):
         if count == 0:
@@ -266,8 +318,8 @@ class PreparedRosterAdjuster:
             frozenset(expected.player_ids) != frozenset(roster.player_ids)
             or expected.current_size != roster.current_size
             or expected.roster_cap != roster.roster_cap
-            or expected.capacity_exempt_player_ids
-            != roster.capacity_exempt_player_ids
+            or expected.reserve_slot_by_player != roster.reserve_slot_by_player
+            or expected.reserve_slot_counts != roster.reserve_slot_counts
         ):
             raise ValueError("trade roster does not match the prepared weekly league")
 
@@ -292,26 +344,59 @@ def unchanged_trade_adjustment(
         counterparty_players
     ).issubset(model.players):
         raise ValueError("trade contains a player absent from the strength model")
+    primary_reserve = _transferred_reserve_candidates(
+        primary, outgoing, counterparty, candidate.incoming_player_ids
+    )
+    counterparty_reserve = _transferred_reserve_candidates(
+        counterparty, incoming, primary, candidate.outgoing_player_ids
+    )
     return TradeRosterAdjustment(
         TeamRosterAdjustment(
-            TeamRoster(
-                primary.team_id,
-                primary_players,
-                len(primary_players),
-                primary.roster_cap,
-                primary.capacity_exempt_player_ids.difference(outgoing),
-            )
+            _pure_traded_roster(primary, primary_players, primary_reserve)
         ),
         TeamRosterAdjustment(
-            TeamRoster(
-                counterparty.team_id,
-                counterparty_players,
-                len(counterparty_players),
-                counterparty.roster_cap,
-                counterparty.capacity_exempt_player_ids.difference(incoming),
+            _pure_traded_roster(
+                counterparty, counterparty_players, counterparty_reserve
             )
         ),
     )
+
+
+def _pure_traded_roster(before, players, reserve_candidates_by_player):
+    assigned = assign_reserve_slots(
+        reserve_candidates_by_player,
+        before.reserve_slot_counts,
+        players,
+    )
+    return TeamRoster(
+        before.team_id,
+        players,
+        len(players),
+        before.roster_cap,
+        assigned,
+        before.reserve_slot_counts,
+    )
+
+
+def _transferred_reserve_candidates(
+    destination,
+    outgoing_player_ids,
+    source,
+    incoming_player_ids,
+):
+    result = {
+        player_id: kind
+        for player_id, kind in destination.reserve_slot_by_player.items()
+        if player_id not in outgoing_player_ids
+    }
+    result.update(
+        {
+            player_id: source.reserve_slot_by_player[player_id]
+            for player_id in incoming_player_ids
+            if player_id in source.reserve_slot_by_player
+        }
+    )
+    return result
 
 
 def _best_package(packages, roster_for_package, model):

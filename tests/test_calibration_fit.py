@@ -270,6 +270,119 @@ class CalibrationCorpusTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "numeric range"):
             feature("huge", 1e200)
 
+    def test_preserves_reserve_aware_baseline_capacity_and_identity(self):
+        role = RoleDefinition(
+            "RB_START_1", RoleKind.STARTER, "RB", frozenset({"RB"})
+        )
+        left = tuple(f"a{index:02d}" for index in range(15))
+        right = tuple(f"b{index:02d}" for index in range(14))
+        features = tuple(
+            feature(player_id, float(index + 1))
+            for index, player_id in enumerate((*left, *right))
+        )
+        samples = (
+            sample("base-a", "a", left, 100.0),
+            sample("base-b", "b", right, 90.0),
+        )
+
+        def value(reserve_player_id):
+            return CalibrationCorpus(
+                snapshot_id="reserve-snapshot",
+                season=2026,
+                scoring_profile_id="scoring-1",
+                role_definitions=(role,),
+                player_features=features,
+                baseline_rosters=(
+                    TeamRoster(
+                        "a",
+                        left,
+                        15,
+                        14,
+                        {reserve_player_id: "IR"},
+                        {"IR": 1},
+                    ),
+                    TeamRoster("b", right, 14, 14, {}, {"IR": 1}),
+                ),
+                samples=samples,
+            )
+
+        first = value("a14")
+        second = value("a13")
+
+        self.assertEqual(len(first.baseline_rosters["a"]), 15)
+        self.assertEqual(first.roster_cap, 14)
+        self.assertEqual(dict(first.reserve_slot_counts), {"IR": 1})
+        self.assertEqual(
+            dict(first.reserve_slot_by_player),
+            {"a14": "IR"},
+        )
+        self.assertNotEqual(first.corpus_id, second.corpus_id)
+        with self.assertRaises(TypeError):
+            first.reserve_slot_by_player["a13"] = "IR"
+
+    def test_requires_one_league_wide_reserve_capacity(self):
+        base = corpus(include_holdout=False)
+        with self.assertRaisesRegex(ValueError, "reserve-slot capacities"):
+            CalibrationCorpus(
+                snapshot_id=base.snapshot_id,
+                season=base.season,
+                scoring_profile_id=base.scoring_profile_id,
+                role_definitions=base.role_definitions,
+                player_features=base.player_features,
+                baseline_rosters=(
+                    TeamRoster(
+                        "a",
+                        ("p1", "p2", "p5"),
+                        3,
+                        3,
+                        {},
+                        {"IR": 1},
+                    ),
+                    TeamRoster(
+                        "b",
+                        ("p3", "p4", "p6"),
+                        3,
+                        3,
+                        {},
+                        {"IR": 2},
+                    ),
+                ),
+                samples=base.samples,
+            )
+
+    def test_rejects_sample_that_changes_baseline_active_occupancy(self):
+        role = RoleDefinition(
+            "RB_START_1", RoleKind.STARTER, "RB", frozenset({"RB"})
+        )
+        player_ids = ("a1", "a2", "b1", "b2", "b-ir")
+        with self.assertRaisesRegex(ValueError, "active roster occupancy"):
+            CalibrationCorpus(
+                snapshot_id="reserve-snapshot",
+                season=2026,
+                scoring_profile_id="scoring-1",
+                role_definitions=(role,),
+                player_features=tuple(
+                    feature(player_id, float(index + 1))
+                    for index, player_id in enumerate(player_ids)
+                ),
+                baseline_rosters=(
+                    TeamRoster("a", ("a1", "a2"), 2, 3, {}, {"IR": 1}),
+                    TeamRoster(
+                        "b",
+                        ("b1", "b2", "b-ir"),
+                        3,
+                        3,
+                        {"b-ir": "IR"},
+                        {"IR": 1},
+                    ),
+                ),
+                samples=(
+                    sample("base-a", "a", ("a1", "a2"), 100.0),
+                    sample("base-b", "b", ("b1", "b2", "b-ir"), 90.0),
+                    sample("invalid-a", "a", ("a2", "b-ir"), 95.0),
+                ),
+            )
+
 
 class FeatureCalibrationTests(unittest.TestCase):
     def test_fits_roles_and_validates_unseen_trade_deltas(self):

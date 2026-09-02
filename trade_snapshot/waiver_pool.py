@@ -446,8 +446,12 @@ def waiver_eligible_slots(
     primary = normalize_player_position(position, require_supported=True)
     starting = set(_slots(starting_lineup_slots))
     eligible = {primary}
-    if primary in {"RB", "WR", "TE"} and "FLEX" in starting:
-        eligible.add("FLEX")
+    composite_slots = {
+        "RB": {"RB_WR", "FLEX"},
+        "WR": {"RB_WR", "WR_TE", "FLEX"},
+        "TE": {"WR_TE", "FLEX"},
+    }
+    eligible.update(starting.intersection(composite_slots.get(primary, set())))
     if primary in {"QB", "RB", "WR", "TE"}:
         eligible.update(starting.intersection({"SFLX", "OP", "UTIL"}))
     if primary in {"DL", "LB", "DB"} and "IDP" in starting:

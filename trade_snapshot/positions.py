@@ -22,7 +22,20 @@ _ALIASES = {
 CANONICAL_PLAYER_POSITIONS = frozenset(
     {"QB", "RB", "WR", "TE", "K", "DST", "DL", "LB", "DB", "IDP"}
 )
-FLEX_SLOTS = frozenset({"FLEX", "FLX", "SUPERFLEX", "SFLX", "OP", "UTIL"})
+FLEX_SLOTS = frozenset(
+    {
+        "FLEX",
+        "FLX",
+        "RB_WR",
+        "RB/WR",
+        "WR_TE",
+        "WR/TE",
+        "SUPERFLEX",
+        "SFLX",
+        "OP",
+        "UTIL",
+    }
+)
 
 
 def normalize_player_position(value: object, *, require_supported: bool = False) -> str:
@@ -40,7 +53,12 @@ def normalize_lineup_slot(value: object) -> str:
         raise ValueError("lineup slot must be a non-empty string")
     raw = value.strip().upper().replace(" ", "")
     if raw in FLEX_SLOTS:
-        return {"FLX": "FLEX", "SUPERFLEX": "SFLX"}.get(raw, raw)
+        return {
+            "FLX": "FLEX",
+            "RB/WR": "RB_WR",
+            "WR/TE": "WR_TE",
+            "SUPERFLEX": "SFLX",
+        }.get(raw, raw)
     return normalize_player_position(raw)
 
 

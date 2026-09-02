@@ -278,13 +278,13 @@ class EngineBundleTests(unittest.TestCase):
     def test_strict_json_round_trip_and_atomic_file_persistence(self):
         bundle = engine_bundle()
         record = bundle.to_record()
-        self.assertEqual(record["schema_version"], 6)
+        self.assertEqual(record["schema_version"], 7)
         self.assertIsNone(record["surrogate_disclosure"])
         self.assertEqual(
             record["methodology_attestation"]["attestation_id"],
             bundle.methodology_attestation.attestation_id,
         )
-        self.assertEqual(record["league_state"]["schema_version"], 2)
+        self.assertEqual(record["league_state"]["schema_version"], 3)
         self.assertEqual(
             record["league_state"]["remaining_matchups"][0][
                 "team1_score_adjustment"
@@ -312,40 +312,75 @@ class EngineBundleTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "size limit"):
                     load_engine_bundle(path)
 
-    def test_round_trip_preserves_capacity_exempt_ownership_and_identity(self):
+    def test_round_trip_preserves_typed_reserve_capacity_and_placement(self):
         baseline = engine_bundle()
-        rosters = tuple(
+        reserve_counts = {"IR": 1, "ROOKIE_RESERVE": 1}
+        state = replace(
+            baseline.state,
+            roster_rules=RosterRules(
+                baseline.state.roster_rules.roster_cap,
+                baseline.state.roster_rules.starting_lineup_slots,
+                reserve_counts,
+            ),
+        )
+        capacity_only_rosters = tuple(
             TeamRoster(
-                row.team_id,
-                row.player_ids,
-                row.current_size,
-                row.roster_cap,
-                {"p2"} if row.team_id == "primary" else frozenset(),
+                team_id=row.team_id,
+                player_ids=row.player_ids,
+                current_size=row.current_size,
+                roster_cap=row.roster_cap,
+                reserve_slot_counts=reserve_counts,
             )
             for row in baseline.rosters
         )
-        with_ir = EngineBundle(
-            state=baseline.state,
-            scoring_profile=baseline.scoring_profile,
-            rosters=rosters,
-            projections=baseline.projections,
-            eligibilities=baseline.eligibilities,
-            scenario_config=baseline.scenario_config,
-            strength_model=baseline.strength_model,
-            ecr_snapshots=baseline.ecr_snapshots,
-            projection_evidence=baseline.projection_evidence,
-            player_names=baseline.player_names,
-            waiver_pool=baseline.waiver_pool,
-            methodology_attestation=baseline.methodology_attestation,
+        capacity_only = replace(
+            baseline,
+            state=state,
+            rosters=capacity_only_rosters,
+        )
+        placed_rosters = tuple(
+            TeamRoster(
+                team_id=row.team_id,
+                player_ids=row.player_ids,
+                current_size=row.current_size,
+                roster_cap=row.roster_cap,
+                reserve_slot_by_player=(
+                    {"p2": "IR"}
+                    if row.team_id == "primary"
+                    else {"q2": "ROOKIE_RESERVE"}
+                ),
+                reserve_slot_counts=reserve_counts,
+            )
+            for row in baseline.rosters
+        )
+        with_reserves = replace(
+            capacity_only,
+            rosters=placed_rosters,
         )
 
-        restored = EngineBundle.from_record(with_ir.to_record())
+        record = with_reserves.to_record()
+        restored = EngineBundle.from_record(record)
         primary = next(row for row in restored.rosters if row.team_id == "primary")
+        other = next(row for row in restored.rosters if row.team_id == "other")
 
-        self.assertEqual(primary.capacity_exempt_player_ids, frozenset({"p2"}))
+        self.assertEqual(
+            record["league_state"]["roster_rules"]["reserve_slot_counts"],
+            reserve_counts,
+        )
+        primary_record = next(
+            row for row in record["rosters"] if row["team_id"] == "primary"
+        )
+        self.assertEqual(primary_record["reserve_slot_by_player"], {"p2": "IR"})
+        self.assertEqual(primary_record["reserve_slot_counts"], reserve_counts)
+        self.assertEqual(dict(primary.reserve_slot_by_player), {"p2": "IR"})
+        self.assertEqual(
+            dict(other.reserve_slot_by_player), {"q2": "ROOKIE_RESERVE"}
+        )
+        self.assertEqual(dict(primary.reserve_slot_counts), reserve_counts)
         self.assertEqual(primary.current_size, 2)
         self.assertEqual(primary.active_size, 1)
-        self.assertNotEqual(with_ir.bundle_id, baseline.bundle_id)
+        self.assertNotEqual(capacity_only.bundle_id, baseline.bundle_id)
+        self.assertNotEqual(with_reserves.bundle_id, capacity_only.bundle_id)
 
     def test_input_order_is_canonical_but_tampering_changes_identity(self):
         bundle = engine_bundle()
@@ -376,6 +411,11 @@ class EngineBundleTests(unittest.TestCase):
 
     def test_old_or_tampered_scoring_profile_records_fail_closed(self):
         bundle = engine_bundle()
+        prior_bundle = copy.deepcopy(bundle.to_record())
+        prior_bundle["schema_version"] = 6
+        with self.assertRaisesRegex(ValueError, "schema version"):
+            EngineBundle.from_record(prior_bundle)
+
         legacy = copy.deepcopy(bundle.to_record())
         legacy.pop("scoring_profile")
         for old_schema in (1, 2, 3, 4):

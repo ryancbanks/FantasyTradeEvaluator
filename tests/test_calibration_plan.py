@@ -170,6 +170,74 @@ class CalibrationPlanTests(unittest.TestCase):
                 held_out_experiment_count=100,
             )
 
+    def test_excludes_balanced_swaps_that_require_an_active_roster_cut(self):
+        roles = (
+            RoleDefinition("RB", RoleKind.STARTER, "RB", frozenset({"RB"})),
+            RoleDefinition("WR", RoleKind.STARTER, "WR", frozenset({"WR"})),
+        )
+        rosters = (
+            TeamRoster(
+                "a",
+                ("a1", "a2", "a3"),
+                3,
+                2,
+                {"a3": "IR"},
+                {"IR": 1},
+            ),
+            TeamRoster("b", ("b1", "b2"), 2, 2, {}, {"IR": 1}),
+            TeamRoster("c", ("c1", "c2"), 2, 2, {}, {"IR": 1}),
+        )
+
+        plan = design_calibration_experiments(
+            features(),
+            roles,
+            rosters,
+            primary_team_id="a",
+            residual_feature_names=("ecr_ros_inverse_rank",),
+            role_feature_names=("projection_fantasypros_remaining_points",),
+            training_experiment_count=3,
+            held_out_experiment_count=2,
+        )
+
+        self.assertEqual(len(plan.experiments), 5)
+        self.assertTrue(
+            all("a3" not in row.team1_gives for row in plan.experiments)
+        )
+
+    def test_excludes_swaps_that_change_active_occupancy_without_a_cut(self):
+        roles = (
+            RoleDefinition("RB", RoleKind.STARTER, "RB", frozenset({"RB"})),
+            RoleDefinition("WR", RoleKind.STARTER, "WR", frozenset({"WR"})),
+        )
+        reserve_players = {"a3", "b3", "c3"}
+        rosters = tuple(
+            TeamRoster(
+                team_id,
+                tuple(f"{team_id}{index}" for index in range(1, 4)),
+                3,
+                3,
+                {f"{team_id}3": "IR"},
+                {"IR": 1},
+            )
+            for team_id in ("a", "b", "c")
+        )
+
+        plan = design_calibration_experiments(
+            features(),
+            roles,
+            rosters,
+            primary_team_id="a",
+            residual_feature_names=("ecr_ros_inverse_rank",),
+            role_feature_names=("projection_fantasypros_remaining_points",),
+            training_experiment_count=3,
+            held_out_experiment_count=2,
+        )
+
+        for row in plan.experiments:
+            outgoing_reserve = len(set(row.team1_gives).intersection(reserve_players))
+            incoming_reserve = len(set(row.team2_gives).intersection(reserve_players))
+            self.assertEqual(outgoing_reserve, incoming_reserve)
+
 
 if __name__ == "__main__":
     unittest.main()

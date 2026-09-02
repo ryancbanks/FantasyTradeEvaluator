@@ -1,8 +1,14 @@
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from itertools import islice
 from typing import Iterator
 
+from .roster_capacity import (
+    normalize_reserve_slot_by_player,
+    normalize_reserve_slot_counts,
+    reserve_counts_for,
+    signature_record,
+    solve_post_trade_capacity,
+)
 from .trade_filters import (
     TRADE_FILTER_EXPRESSION_SEMANTICS_VERSION,
     TRADE_FILTER_SEMANTICS_VERSION,
@@ -18,13 +24,14 @@ PlayerId = str
 
 @dataclass(frozen=True)
 class TeamRoster:
-    """All owned players, with explicit IDs that do not consume active capacity."""
+    """All owned players and their actual typed reserve placements."""
 
     team_id: str
     player_ids: tuple[PlayerId, ...]
     current_size: int
     roster_cap: int
-    capacity_exempt_player_ids: frozenset[PlayerId] = field(default_factory=frozenset)
+    reserve_slot_by_player: Mapping[PlayerId, str] = field(default_factory=dict)
+    reserve_slot_counts: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.team_id, str) or not self.team_id:
@@ -36,36 +43,58 @@ class TeamRoster:
         if len(unique_ids) != len(player_ids):
             raise ValueError("a team roster contains a duplicate player_id")
         _require_int("current_size", self.current_size, minimum=len(player_ids))
-        if isinstance(self.capacity_exempt_player_ids, (str, bytes)):
-            raise ValueError(
-                "capacity_exempt_player_ids must be non-empty strings"
-            )
-        try:
-            capacity_exempt = frozenset(self.capacity_exempt_player_ids)
-        except TypeError:
-            raise ValueError(
-                "capacity_exempt_player_ids must be non-empty strings"
-            ) from None
-        if any(
-            not isinstance(player_id, str) or not player_id
-            for player_id in capacity_exempt
-        ):
-            raise ValueError("capacity_exempt_player_ids must be non-empty strings")
-        if not capacity_exempt.issubset(unique_ids):
-            raise ValueError("capacity-exempt players must be owned by the team")
+        raw_reserve_slots = self.reserve_slot_by_player
+        raw_reserve_counts = self.reserve_slot_counts
+        if not isinstance(raw_reserve_slots, Mapping):
+            if isinstance(raw_reserve_slots, (str, bytes)):
+                raise ValueError("reserve_slot_by_player must be a mapping")
+            try:
+                legacy_exempt = frozenset(raw_reserve_slots)
+            except TypeError:
+                raise ValueError("reserve_slot_by_player must be a mapping") from None
+            raw_reserve_slots = {
+                player_id: "IR" for player_id in legacy_exempt
+            }
+            if legacy_exempt and not raw_reserve_counts:
+                raw_reserve_counts = {"IR": len(legacy_exempt)}
+        reserve_counts = normalize_reserve_slot_counts(raw_reserve_counts)
+        reserve_slots = normalize_reserve_slot_by_player(
+            raw_reserve_slots,
+            owned_player_ids=player_ids,
+            reserve_slot_counts=reserve_counts,
+        )
         _require_int(
             "roster_cap",
             self.roster_cap,
-            minimum=self.current_size - len(capacity_exempt),
+            minimum=self.current_size - len(reserve_slots),
         )
         object.__setattr__(self, "player_ids", player_ids)
-        object.__setattr__(self, "capacity_exempt_player_ids", capacity_exempt)
+        object.__setattr__(self, "reserve_slot_by_player", reserve_slots)
+        object.__setattr__(self, "reserve_slot_counts", reserve_counts)
+
+    @property
+    def capacity_exempt_player_ids(self) -> frozenset[PlayerId]:
+        """Legacy read view of players occupying any typed reserve slot."""
+
+        return frozenset(self.reserve_slot_by_player)
 
     @property
     def active_size(self) -> int:
         """Return the number of owned players consuming ordinary roster capacity."""
 
-        return self.current_size - len(self.capacity_exempt_player_ids)
+        return self.current_size - len(self.reserve_slot_by_player)
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.team_id,
+                self.player_ids,
+                self.current_size,
+                self.roster_cap,
+                tuple(self.reserve_slot_by_player.items()),
+                tuple(self.reserve_slot_counts.items()),
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -210,28 +239,33 @@ class TradeSpace:
             for player_id in counterparty.player_ids
             if player_id not in constraints.locked_player_ids
         )
+        self._reserve_kinds = tuple(
+            sorted(
+                set(primary.reserve_slot_counts)
+                | set(counterparty.reserve_slot_counts)
+                | set(primary.reserve_slot_by_player.values())
+                | set(counterparty.reserve_slot_by_player.values())
+            )
+        )
         self._outgoing_pool = _TradePackagePool(
             self._outgoing_ids,
             constraints.outgoing_filter,
             eligible_positions_by_player,
-            primary.capacity_exempt_player_ids,
+            primary.reserve_slot_by_player,
         )
         self._incoming_pool = _TradePackagePool(
             self._incoming_ids,
             constraints.incoming_filter,
             eligible_positions_by_player,
-            counterparty.capacity_exempt_player_ids,
+            counterparty.reserve_slot_by_player,
         )
+        self._simple_package_counts: dict[tuple[int, int], tuple[int, int]] = {}
         counted_pairs = tuple(
-            (*pair, *self._package_counts(*pair)) for pair in self._iter_size_pairs()
+            (*pair, self._count_candidates(*pair))
+            for pair in self._iter_size_pairs()
         )
-        self._size_pairs = tuple(
-            row for row in counted_pairs if row[2] and row[3]
-        )
-        self._candidate_count = sum(
-            outgoing_count * incoming_count
-            for _, _, outgoing_count, incoming_count in self._size_pairs
-        )
+        self._size_pairs = tuple(row for row in counted_pairs if row[2])
+        self._candidate_count = sum(count for _, _, count in self._size_pairs)
 
     @property
     def candidate_count(self) -> int:
@@ -257,38 +291,44 @@ class TradeSpace:
 
     def _iterate_from(self, start_candidate_index: int) -> Iterator[TradeCandidate]:
         remaining = start_candidate_index
-        for (
-            outgoing_size,
-            incoming_size,
-            outgoing_count,
-            incoming_count,
-        ) in self._size_pairs:
-            pair_count = outgoing_count * incoming_count
+        for outgoing_size, incoming_size, pair_count in self._size_pairs:
             if remaining >= pair_count:
                 remaining -= pair_count
                 continue
-            primary_minimum = self._minimum_active_outgoing(
-                self.primary, incoming_size
-            )
-            counterparty_minimum = self._minimum_active_outgoing(
-                self.counterparty, outgoing_size
-            )
-            outgoing_skip, incoming_skip = divmod(remaining, incoming_count)
-            remaining = 0
-            outgoing_packages = self._outgoing_pool.iter_packages(
-                outgoing_size, minimum_active=primary_minimum
-            )
-            for outgoing in islice(outgoing_packages, outgoing_skip, None):
-                incoming_packages = self._incoming_pool.iter_packages(
-                    incoming_size, minimum_active=counterparty_minimum
+            if not self._reserve_kinds:
+                incoming_count = self._simple_package_counts[
+                    (outgoing_size, incoming_size)
+                ][1]
+                outgoing_skip, incoming_skip = divmod(remaining, incoming_count)
+                outgoing_packages = self._outgoing_pool.iter_packages(outgoing_size)
+                for outgoing_index, outgoing in enumerate(outgoing_packages):
+                    if outgoing_index < outgoing_skip:
+                        continue
+                    incoming_packages = self._incoming_pool.iter_packages(incoming_size)
+                    for incoming_index, incoming in enumerate(incoming_packages):
+                        if outgoing_index == outgoing_skip and incoming_index < incoming_skip:
+                            continue
+                        yield TradeCandidate(outgoing, incoming)
+                remaining = 0
+                continue
+            for outgoing in self._outgoing_pool.iter_packages(outgoing_size):
+                outgoing_signature = self._package_signature(
+                    outgoing, self.primary
                 )
-                if incoming_skip:
-                    incoming_packages = islice(
-                        incoming_packages, incoming_skip, None
+                for incoming in self._incoming_pool.iter_packages(incoming_size):
+                    incoming_signature = self._package_signature(
+                        incoming, self.counterparty
                     )
-                    incoming_skip = 0
-                for incoming in incoming_packages:
-                    yield TradeCandidate(outgoing, incoming)
+                    if self._signature_pair_is_valid(
+                        outgoing_size,
+                        incoming_size,
+                        outgoing_signature,
+                        incoming_signature,
+                    ):
+                        if remaining:
+                            remaining -= 1
+                            continue
+                        yield TradeCandidate(outgoing, incoming)
 
     def _iter_size_pairs(self) -> Iterator[tuple[int, int]]:
         rules = self.constraints
@@ -313,31 +353,97 @@ class TradeSpace:
                     continue
                 yield pair
 
-    def _package_counts(
-        self, outgoing_size: int, incoming_size: int
-    ) -> tuple[int, int]:
-        outgoing_count = self._outgoing_pool.count(
-            outgoing_size,
-            minimum_active=self._minimum_active_outgoing(
-                self.primary, incoming_size
-            ),
+    def _count_candidates(self, outgoing_size: int, incoming_size: int) -> int:
+        if not self._reserve_kinds:
+            outgoing_count = self._outgoing_pool.count(outgoing_size)
+            incoming_count = self._incoming_pool.count(incoming_size)
+            self._simple_package_counts[(outgoing_size, incoming_size)] = (
+                outgoing_count,
+                incoming_count,
+            )
+            if not self._signature_pair_is_valid(
+                outgoing_size, incoming_size, (), ()
+            ):
+                return 0
+            return outgoing_count * incoming_count
+        outgoing = self._outgoing_pool.count_by_reserve_signature(
+            outgoing_size, self._reserve_kinds
         )
-        incoming_count = self._incoming_pool.count(
-            incoming_size,
-            minimum_active=self._minimum_active_outgoing(
-                self.counterparty, outgoing_size
-            ),
+        incoming = self._incoming_pool.count_by_reserve_signature(
+            incoming_size, self._reserve_kinds
         )
-        return outgoing_count, incoming_count
+        return sum(
+            outgoing_count * incoming_count
+            for outgoing_signature, outgoing_count in outgoing.items()
+            for incoming_signature, incoming_count in incoming.items()
+            if self._signature_pair_is_valid(
+                outgoing_size,
+                incoming_size,
+                outgoing_signature,
+                incoming_signature,
+            )
+        )
 
-    def _minimum_active_outgoing(
-        self, roster: TeamRoster, received_size: int
-    ) -> int:
-        if not self.constraints.require_no_drops:
-            return 0
-        return max(
-            0,
-            roster.active_size + received_size - roster.roster_cap,
+    def _package_signature(
+        self, player_ids: tuple[PlayerId, ...], roster: TeamRoster
+    ) -> tuple[int, ...]:
+        counts = reserve_counts_for(player_ids, roster.reserve_slot_by_player)
+        return tuple(counts.get(kind, 0) for kind in self._reserve_kinds)
+
+    def _signature_pair_is_valid(
+        self,
+        outgoing_size: int,
+        incoming_size: int,
+        outgoing_signature: tuple[int, ...],
+        incoming_signature: tuple[int, ...],
+    ) -> bool:
+        outgoing_reserve = signature_record(
+            self._reserve_kinds, outgoing_signature
+        )
+        incoming_reserve = signature_record(
+            self._reserve_kinds, incoming_signature
+        )
+        primary_plan = self._capacity_plan(
+            self.primary,
+            outgoing_size,
+            outgoing_reserve,
+            incoming_size,
+            incoming_reserve,
+        )
+        counterparty_plan = self._capacity_plan(
+            self.counterparty,
+            incoming_size,
+            incoming_reserve,
+            outgoing_size,
+            outgoing_reserve,
+        )
+        if self.constraints.require_no_drops:
+            return (
+                primary_plan.required_cuts == 0
+                and counterparty_plan.required_cuts == 0
+            )
+        return primary_plan.feasible and counterparty_plan.feasible
+
+    @staticmethod
+    def _capacity_plan(
+        roster: TeamRoster,
+        outgoing_size: int,
+        outgoing_reserve: Mapping[str, int],
+        incoming_size: int,
+        incoming_reserve: Mapping[str, int],
+    ):
+        return solve_post_trade_capacity(
+            active_cap=roster.roster_cap,
+            current_size=roster.current_size,
+            known_player_count=len(roster.player_ids),
+            reserve_slot_counts=roster.reserve_slot_counts,
+            current_reserve_counts=reserve_counts_for(
+                roster.player_ids, roster.reserve_slot_by_player
+            ),
+            outgoing_size=outgoing_size,
+            outgoing_reserve_counts=outgoing_reserve,
+            incoming_size=incoming_size,
+            incoming_reserve_counts=incoming_reserve,
         )
 
 

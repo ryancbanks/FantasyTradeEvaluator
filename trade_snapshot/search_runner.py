@@ -21,7 +21,7 @@ from .trade_impact import PreparedSeasonBaseline
 from .trade_space import TeamRoster, TradeSpace
 
 
-SEARCH_ALGORITHM = "local-power-paired-playoffs-v2"
+SEARCH_ALGORITHM = "local-power-paired-playoffs-v3"
 MAX_INLINE_OUTCOME_RESULTS = 1_000
 
 
@@ -343,14 +343,20 @@ class ResumableTradeSearch:
             trade_constraint_record={
                 "algorithm": SEARCH_ALGORITHM,
                 "candidate_order": {
-                    "counterparty_capacity_exempt_player_ids": sorted(
-                        trade_space.counterparty.capacity_exempt_player_ids
-                    ),
                     "counterparty_player_ids": list(trade_space.counterparty.player_ids),
-                    "primary_capacity_exempt_player_ids": sorted(
-                        trade_space.primary.capacity_exempt_player_ids
+                    "counterparty_reserve_slot_by_player": dict(
+                        trade_space.counterparty.reserve_slot_by_player
+                    ),
+                    "counterparty_reserve_slot_counts": dict(
+                        trade_space.counterparty.reserve_slot_counts
                     ),
                     "primary_player_ids": list(trade_space.primary.player_ids),
+                    "primary_reserve_slot_by_player": dict(
+                        trade_space.primary.reserve_slot_by_player
+                    ),
+                    "primary_reserve_slot_counts": dict(
+                        trade_space.primary.reserve_slot_counts
+                    ),
                 },
                 "scenario_run_id": season_baseline.scenarios.run_id,
                 "roster_adjustment_id": (
@@ -556,7 +562,8 @@ def _same_roster(left: TeamRoster, right: TeamRoster) -> bool:
         and frozenset(left.player_ids) == frozenset(right.player_ids)
         and left.current_size == right.current_size
         and left.roster_cap == right.roster_cap
-        and left.capacity_exempt_player_ids == right.capacity_exempt_player_ids
+        and left.reserve_slot_by_player == right.reserve_slot_by_player
+        and left.reserve_slot_counts == right.reserve_slot_counts
     )
 
 

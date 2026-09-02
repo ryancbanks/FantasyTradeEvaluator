@@ -112,6 +112,7 @@ class EspnLeagueAdapterTests(unittest.TestCase):
         self.assertEqual(snapshot.first_remaining_week, 2)
         self.assertEqual(snapshot.roster_rules.roster_cap, 1)
         self.assertEqual(snapshot.roster_rules.starting_lineup_slots, ("QB",))
+        self.assertEqual(dict(snapshot.roster_rules.reserve_slot_counts), {"IR": 1})
         self.assertEqual(len(snapshot.completed_matchups), 1)
         self.assertEqual(len(snapshot.remaining_matchups), 1)
         self.assertTrue(snapshot.playoff_rules.division_winner_qualifier_count, 2)
@@ -166,7 +167,91 @@ class EspnLeagueAdapterTests(unittest.TestCase):
             "espn:team:2",
         )
 
-    def test_ir_and_rookie_reserve_stay_owned_but_do_not_free_active_trade_slot(self):
+    def test_dynamic_lineup_and_reserve_rules_preserve_distinct_espn_slots(self):
+        payload = league_payload()
+        payload["settings"]["rosterSettings"]["lineupSlotCounts"] = {
+            "0": 1,
+            "2": 2,
+            "3": 1,
+            "4": 2,
+            "5": 1,
+            "6": 1,
+            "7": 1,
+            "20": 4,
+            "21": 2,
+            "23": 2,
+            "25": 1,
+        }
+        payload["teams"][0]["roster"]["entries"][0]["playerPoolEntry"]["player"][
+            "eligibleSlots"
+        ] = [3, 5, 7, 23, 20, 21]
+
+        snapshot = espn_host_league_snapshot(
+            payload,
+            pro_team_payload(),
+            captured_at=NOW,
+            expected_team_count=2,
+        )
+
+        self.assertEqual(snapshot.roster_rules.roster_cap, 15)
+        self.assertEqual(
+            snapshot.roster_rules.starting_lineup_slots,
+            (
+                "QB",
+                "RB",
+                "RB",
+                "RB_WR",
+                "WR",
+                "WR",
+                "WR_TE",
+                "TE",
+                "OP",
+                "FLEX",
+                "FLEX",
+            ),
+        )
+        self.assertEqual(
+            dict(snapshot.roster_rules.reserve_slot_counts),
+            {"IR": 2, "ROOKIE_RESERVE": 1},
+        )
+        first_player = next(
+            row for row in snapshot.players if row.source_player_id == "101"
+        )
+        self.assertIn("RB_WR", first_player.eligible_slots)
+        self.assertIn("WR_TE", first_player.eligible_slots)
+        self.assertIn("FLEX", first_player.eligible_slots)
+        self.assertIn("OP", first_player.eligible_slots)
+
+    def test_unconfigured_eligible_slots_are_ignored_without_losing_base_position(self):
+        payload = league_payload()
+        payload["teams"][0]["roster"]["entries"][0]["playerPoolEntry"]["player"][
+            "eligibleSlots"
+        ] = [0, 7, 20, 21]
+
+        snapshot = espn_host_league_snapshot(
+            payload,
+            pro_team_payload(),
+            captured_at=NOW,
+            expected_team_count=2,
+        )
+        first_player = next(
+            row for row in snapshot.players if row.source_player_id == "101"
+        )
+
+        self.assertEqual(first_player.eligible_slots, ("QB",))
+        identities = reconcile_player_identities(
+            host_player_records(snapshot),
+            anchor_provider="espn",
+        )
+        normalized = normalize_host_league_snapshot(snapshot, identities)
+        normalized_player = next(
+            row
+            for row in normalized.eligibilities
+            if row.canonical_player_id == "espn:101"
+        )
+        self.assertEqual(normalized_player.eligible_slots, ("QB",))
+
+    def test_ir_and_rookie_reserve_placements_remain_typed_through_ingest(self):
         payload = league_payload()
         payload["settings"]["rosterSettings"]["lineupSlotCounts"]["25"] = 1
         ir_player = player(103, "Injured Player", 1)
@@ -197,10 +282,14 @@ class EspnLeagueAdapterTests(unittest.TestCase):
         )
 
         self.assertEqual(snapshot.roster_rules.roster_cap, 1)
+        self.assertEqual(
+            dict(snapshot.roster_rules.reserve_slot_counts),
+            {"IR": 1, "ROOKIE_RESERVE": 1},
+        )
         self.assertEqual(len(source.source_player_ids), 3)
         self.assertEqual(
-            source.capacity_exempt_source_player_ids,
-            frozenset({"103", "104"}),
+            dict(source.reserve_slot_by_player),
+            {"103": "IR", "104": "ROOKIE_RESERVE"},
         )
 
         identities = reconcile_player_identities(
@@ -220,13 +309,64 @@ class EspnLeagueAdapterTests(unittest.TestCase):
 
         self.assertEqual(primary.current_size, 3)
         self.assertEqual(primary.active_size, 1)
+        self.assertEqual(
+            dict(primary.reserve_slot_by_player),
+            {
+                "espn:103": "IR",
+                "espn:104": "ROOKIE_RESERVE",
+            },
+        )
+        self.assertEqual(
+            dict(primary.reserve_slot_counts),
+            {"IR": 1, "ROOKIE_RESERVE": 1},
+        )
         self.assertEqual(space.candidate_count, 1)
         candidate = next(iter(space))
         self.assertTrue(
             set(candidate.outgoing_player_ids).isdisjoint(
-                primary.capacity_exempt_player_ids
+                primary.reserve_slot_by_player
             )
         )
+
+    def test_snapshot_identity_changes_with_reserve_capacity_or_current_placement(self):
+        payload = league_payload()
+        payload["settings"]["rosterSettings"]["lineupSlotCounts"]["20"] = 1
+        injured = player(103, "Injured Player", 1)
+        payload["teams"][0]["roster"]["entries"].append(
+            {
+                "playerId": 103,
+                "lineupSlotId": 21,
+                "playerPoolEntry": {"player": injured},
+            }
+        )
+        baseline = espn_host_league_snapshot(
+            payload,
+            pro_team_payload(),
+            captured_at=NOW,
+            expected_team_count=2,
+        )
+
+        changed_capacity = deepcopy(payload)
+        changed_capacity["settings"]["rosterSettings"]["lineupSlotCounts"]["21"] = 2
+        capacity_snapshot = espn_host_league_snapshot(
+            changed_capacity,
+            pro_team_payload(),
+            captured_at=NOW,
+            expected_team_count=2,
+        )
+        changed_placement = deepcopy(payload)
+        changed_placement["teams"][0]["roster"]["entries"][1][
+            "lineupSlotId"
+        ] = 20
+        placement_snapshot = espn_host_league_snapshot(
+            changed_placement,
+            pro_team_payload(),
+            captured_at=NOW,
+            expected_team_count=2,
+        )
+
+        self.assertNotEqual(capacity_snapshot.snapshot_id, baseline.snapshot_id)
+        self.assertNotEqual(placement_snapshot.snapshot_id, baseline.snapshot_id)
 
     def test_is_content_addressed_and_rejects_unsupported_rules_or_slots(self):
         left = espn_host_league_snapshot(

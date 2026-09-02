@@ -1,7 +1,10 @@
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 import math
 from numbers import Real
+
+from .roster_capacity import normalize_reserve_slot_counts
 
 
 TeamId = str
@@ -106,10 +109,11 @@ class CompletedFantasyMatchup:
 
 @dataclass(frozen=True)
 class RosterRules:
-    """League-wide roster cap and the ordered starting lineup slots."""
+    """League-wide active, reserve, and ordered starting-lineup slots."""
 
     roster_cap: int
     starting_lineup_slots: tuple[str, ...]
+    reserve_slot_counts: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _require_int("roster_cap", self.roster_cap, minimum=1)
@@ -119,6 +123,20 @@ class RosterRules:
         if len(slots) > self.roster_cap:
             raise ValueError("starting lineup size cannot exceed roster_cap")
         object.__setattr__(self, "starting_lineup_slots", slots)
+        object.__setattr__(
+            self,
+            "reserve_slot_counts",
+            normalize_reserve_slot_counts(self.reserve_slot_counts),
+        )
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.roster_cap,
+                self.starting_lineup_slots,
+                tuple(self.reserve_slot_counts.items()),
+            )
+        )
 
 
 @dataclass(frozen=True)

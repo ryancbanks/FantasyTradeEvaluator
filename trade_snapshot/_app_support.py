@@ -1,5 +1,6 @@
 """Small validation and presentation helpers for the localhost app service."""
 
+from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
 import os
@@ -44,16 +45,32 @@ def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
     }
     teams = []
     for team in bundle.state.teams:
+        roster = roster_by_team[team.team_id]
         players = [
             {
                 "player_id": player_id,
                 "name": bundle.player_names[player_id],
                 "positions": list(player_positions[player_id]),
+                "roster_status": roster.reserve_slot_by_player.get(
+                    player_id, "ACTIVE"
+                ),
             }
-            for player_id in roster_by_team[team.team_id].player_ids
+            for player_id in roster.player_ids
         ]
         players.sort(key=lambda row: (row["name"].casefold(), row["player_id"]))
-        teams.append({"team_id": team.team_id, "name": team.name, "players": players})
+        teams.append(
+            {
+                "active_count": roster.active_size,
+                "active_capacity": roster.roster_cap,
+                "name": team.name,
+                "players": players,
+                "reserve_capacity": dict(roster.reserve_slot_counts),
+                "reserve_occupancy": dict(
+                    sorted(Counter(roster.reserve_slot_by_player.values()).items())
+                ),
+                "team_id": team.team_id,
+            }
+        )
     return {
         "bundle_id": bundle.bundle_id,
         "status": "ready",

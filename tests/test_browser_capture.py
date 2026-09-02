@@ -724,11 +724,13 @@ class PlaywrightAdapterTests(unittest.TestCase):
             "season": 2026,
             "league": {
                 "key": "runtime-only-private-key", "season": 2026,
+                "rosterSize": 99,
                 "settings": {
                     "playoffsTeams": 1,
                     "roster_positions": [
                         {"type": "QB", "count": 1},
                         {"type": "BN", "count": 1},
+                        {"type": "IR", "count": 1},
                     ],
                     "basic_scoring": "PPR",
                 },
