@@ -9,15 +9,61 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  verify:
+    name: Verify source tree
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12.13"
+          architecture: x64
+          cache: pip
+      - name: Verify dependency lock and canonical build export
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check "uv==0.11.26"
+          uv lock --check
+          uv export --locked --extra build --no-dev --no-emit-project \
+            --no-header --no-annotate --format requirements.txt \
+            --output-file "$RUNNER_TEMP/build-requirements.txt"
+          diff -u packaging/build-requirements.txt \
+            "$RUNNER_TEMP/build-requirements.txt"
+      - name: Install source-test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary=:all: --requirement packaging/build-requirements.txt
+          python -m pip install --disable-pip-version-check ".[browser-test]"
+      - name: Install source-test Chromium and Linux libraries
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: "0"
+          PLAYWRIGHT_SKIP_BROWSER_GC: "1"
+        run: python -m playwright install --with-deps --no-shell chromium
+      - name: Run test suite
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: "0"
+        run: python -m unittest discover -s tests -v
+      - name: Smoke installed wheel outside the checkout
+        run: python packaging/smoke_wheel.py
+
   release:
     name: ${{ matrix.name }}
+    needs: verify
+    environment: ${{ github.event_name == 'push' && 'release' || 'build' }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: Windows x64
-            runner: windows-latest
+            runner: windows-2025
             python_arch: x64
             installer: windows
           - name: macOS Intel
@@ -37,33 +83,26 @@ jobs:
             python_arch: arm64
             installer: linux
     runs-on: ${{ matrix.runner }}
-    env:
-      PLAYWRIGHT_BROWSERS_PATH: "0"
-      PLAYWRIGHT_SKIP_BROWSER_GC: "1"
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12.13"
           architecture: ${{ matrix.python_arch }}
           cache: pip
       - name: Verify release tag matches project version
         if: github.ref_type == 'tag'
-        run: python release_build.py --check-tag "${{ github.ref_name }}"
-      - name: Install application and builder
+        shell: python
+        run: |
+          import os
+          import release_build
+          release_build.validate_release_tag(os.environ["GITHUB_REF_NAME"])
+      - name: Install hash-locked native build dependencies
         run: >-
-          python -m pip install --disable-pip-version-check
-          ".[build,browser-test]"
-      - name: Install source-test Chromium and Linux libraries
-        if: matrix.installer == 'linux'
-        run: python -m playwright install --with-deps --no-shell chromium
-      - name: Install source-test Chromium
-        if: matrix.installer != 'linux'
-        run: python -m playwright install --no-shell chromium
-      - name: Run test suite
-        run: python -m unittest discover -s tests -v
-      - name: Smoke installed wheel outside the checkout
-        run: python packaging/smoke_wheel.py
+          python -m pip install --disable-pip-version-check --require-hashes
+          --only-binary=:all: --requirement packaging/build-requirements.txt
       - name: Install Inno Setup
         if: matrix.installer == 'windows'
         shell: pwsh
@@ -71,16 +110,25 @@ jobs:
           $uri = 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe'
           $installer = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
           Invoke-WebRequest -Uri $uri -OutFile $installer
+          $expectedHash = '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732'
+          $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw 'Inno Setup SHA-256 verification failed'
+          }
           $signature = Get-AuthenticodeSignature -LiteralPath $installer
           if ($signature.Status -ne 'Valid' -or
-              $signature.SignerCertificate.Subject -notmatch 'Pyrsys B\.V\.') {
+              $signature.SignerCertificate.Subject -ne 'CN=Pyrsys B.V., O=Pyrsys B.V., S=Noord-Holland, C=NL' -or
+              $signature.SignerCertificate.Thumbprint -ne 'E0AB19C8D38CBF9C44709925122A7A02F8C70CB7') {
             throw 'Inno Setup Authenticode verification failed'
           }
           $process = Start-Process -FilePath $installer -WindowStyle Hidden -Wait -PassThru `
             -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER'
           if ($process.ExitCode -ne 0) { exit $process.ExitCode }
       - name: Configure macOS signing and notarization
-        if: matrix.installer == 'macos'
+        if: >-
+          matrix.installer == 'macos' &&
+          github.event_name == 'push' &&
+          github.ref_type == 'tag'
         shell: bash
         env:
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
@@ -142,7 +190,7 @@ jobs:
           rm -f "$RUNNER_TEMP/fte-signing.p12"
           if [ -f "$keychain" ]; then security delete-keychain "$keychain"; fi
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: fantasy-trade-evaluator-${{ matrix.installer }}-${{ matrix.python_arch }}
           path: |
@@ -153,3 +201,67 @@ jobs:
             release/SHA256SUMS
           if-no-files-found: error
           compression-level: 0
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: release
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Download verified platform artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          pattern: fantasy-trade-evaluator-*
+          path: downloaded
+      - name: Verify and assemble the exact release set
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          python release_assemble.py downloaded publish --version "$version"
+      - name: Create or resume the commit-matched draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          marker="Automated release draft for commit $GITHUB_SHA."
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            is_draft=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)
+            body=$(gh release view "$GITHUB_REF_NAME" --json body --jq .body)
+            if [ "$is_draft" != "true" ] || [ "$body" != "$marker" ]; then
+              echo "Refusing to replace an existing release or unrelated draft." >&2
+              exit 2
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --draft \
+              --notes "$marker" \
+              --title "Fantasy Trade Evaluator $GITHUB_REF_NAME"
+          fi
+      - name: Upload and verify the complete remote asset inventory
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" publish/* --clobber
+          gh release view "$GITHUB_REF_NAME" --json assets \
+            > "$RUNNER_TEMP/release-assets.json"
+          python release_inventory.py publish "$RUNNER_TEMP/release-assets.json"
+      - name: Publish completed GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

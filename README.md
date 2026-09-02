@@ -78,6 +78,30 @@ Lineups are solved as exact assignments, including duplicate slots, FLEX, and su
 
 See [weekly source collection](docs/source-collection.md), [methodology notes](docs/model-notes.md), and [desktop packaging](docs/packaging.md) for the validation contract and supported release targets.
 
+## Build installers from this repository
+
+The repository includes a one-command native builder. It creates a fresh,
+builder-owned `.installer-build-venv`, installs the hash-locked build dependency
+closure, freezes and self-checks the application, and writes the finished files
+plus `SHA256SUMS` to `release/`:
+
+```powershell
+py -3.12 build_installer.py
+```
+
+The build host must use 64-bit CPython 3.12.13. A Windows Setup and standalone
+uninstaller also require Inno Setup; install it once with
+`winget install --id JRSoftware.InnoSetup -e -s winget -i`. Use
+`--portable-only` when only the Windows portable ZIP is needed. macOS and Linux
+build their own native formats, because PyInstaller does not cross-compile.
+
+GitHub can build every supported platform without local packaging tools. Open
+**Actions → Build desktop releases → Run workflow** for temporary downloadable
+artifacts. Pushing a version tag that exactly matches `pyproject.toml` (for
+example, `v0.1.0`) additionally publishes the installers and a combined checksum
+file as durable GitHub Release assets. Generated binaries stay outside Git and
+the workflow retains its temporary build artifacts for 14 days.
+
 ## Verify the source tree
 
 ```powershell
