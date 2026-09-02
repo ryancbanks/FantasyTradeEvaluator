@@ -21,6 +21,9 @@ Chrome:
 5. Pin **Fantasy Trade Evaluator Browser Bridge** so its pairing status is easy to
    inspect.
 
+After installing or reloading the extension, refresh the already-open Fantasy
+Trade Evaluator app page once so Chrome injects the local page bridge.
+
 Edge uses the same steps at `edge://extensions`. Choose **Reload** on the extension
 card after changing its source files.
 

@@ -335,8 +335,11 @@ class PlaywrightAdapterTests(unittest.TestCase):
         invariants = (
             "url.hostname === 'api.fantasypros.com'",
             "url.pathname === '/v2/ajax/myplaybook.php'",
+            "url.hostname === 'mpbnfl.fantasypros.com'",
+            "url.pathname === '/api/tradeAnalyzer'",
             "action.includes('tradeanalyzer')",
-            "team1gets", "team2gets", "team2id", "queue.push",
+            "team1gets", "team2gets", "team2id", "team1drops", "team2drops",
+            "response.redirected", "queue.push",
         )
         for invariant in invariants:
             self.assertIn(invariant, ANALYZER_TAP_SCRIPT)
@@ -354,6 +357,136 @@ class PlaywrightAdapterTests(unittest.TestCase):
         self.assertEqual(session.finish_analyzer_response_capture(100, lambda: False), PLAYOFF_BODY)
         self.assertEqual(page.full_actions, 1)
         session.close()
+
+    def test_analyzer_tap_accepts_supported_endpoints_and_rejects_other_traffic(self):
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.skipTest("Playwright is optional for source-only test runs")
+
+        analyzer_url = (
+            "https://www.fantasypros.com/nfl/myplaybook/trade-analyzer.php"
+            "?team2Id=2&team1Gets=101&team2Gets=102"
+        )
+        current_init = (
+            "https://mpbnfl.fantasypros.com/api/tradeAnalyzer"
+            "?key=runtime-only&team1Id=1&period=ros&init=Y"
+        )
+        current_trade = (
+            "https://mpbnfl.fantasypros.com/api/tradeAnalyzer"
+            "?key=runtime-only&team1Id=1&period=ros&team2Id=2"
+            "&team1Gets=101&team2Gets=102"
+        )
+        current_full = f"{current_trade}&playoffs=Y"
+        pending = (
+            "https://mpbnfl.fantasypros.com/api/tradeAnalyzer"
+            "?key=runtime-only&pending="
+        )
+        mismatched = current_trade.replace("team2Gets=102", "team2Gets=999")
+        dropped = f"{current_trade}&team1Drops=103"
+        redirected = f"{current_trade}&redirect=1"
+        roundtrip = f"{current_trade}&roundtrip=1"
+        lookalike = current_trade.replace("mpbnfl.fantasypros.com", "evil.example")
+        legacy = "https://api.fantasypros.com/v2/ajax/myplaybook.php"
+        legacy_body = (
+            "action=tradeAnalyzer&team2Id=2&team1Gets=101&team2Gets=102"
+        )
+        body = """<!doctype html><script>
+        Promise.all([
+          fetch(%s),
+          fetch(%s),
+          fetch(%s),
+          fetch(%s),
+          fetch(%s),
+          fetch(%s),
+          fetch(%s),
+          fetch(%s),
+          fetch(%s, {method: 'POST'}),
+          fetch(%s),
+          fetch(%s, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: %s
+          })
+        ]);
+        </script>""" % tuple(map(json.dumps, (
+            current_init, current_trade, current_full, pending, mismatched,
+            dropped, redirected, roundtrip, current_trade, lookalike, legacy,
+            legacy_body,
+        )))
+
+        with sync_playwright() as playwright:
+            try:
+                browser = playwright.chromium.launch(channel="chromium", headless=True)
+            except Exception:
+                self.skipTest("Playwright Chromium is not installed")
+            try:
+                context = browser.new_context()
+                context.add_init_script(script=ANALYZER_TAP_SCRIPT)
+                page = context.new_page()
+                page.route(analyzer_url, lambda route: route.fulfill(
+                    status=200, content_type="text/html", body=body,
+                ))
+                roundtrip_started = False
+
+                def fulfill_current(route):
+                    nonlocal roundtrip_started
+                    if "redirect=1" in route.request.url:
+                        route.redirect(current_trade)
+                        return
+                    if "roundtrip-hop=1" in route.request.url:
+                        route.redirect(roundtrip)
+                        return
+                    if "roundtrip=1" in route.request.url and not roundtrip_started:
+                        roundtrip_started = True
+                        route.redirect(f"{current_trade}&roundtrip-hop=1")
+                        return
+                    marker = (
+                        "roundtrip" if "roundtrip=1" in route.request.url
+                        else "full" if "playoffs=Y" in route.request.url
+                        else "current"
+                    )
+                    route.fulfill(
+                        status=200,
+                        headers={
+                            "Access-Control-Allow-Origin": "https://www.fantasypros.com",
+                        },
+                        content_type="application/json",
+                        body=json.dumps({"marker": marker}),
+                    )
+
+                page.route("https://mpbnfl.fantasypros.com/**", fulfill_current)
+                page.route("https://api.fantasypros.com/**", lambda route: route.fulfill(
+                    status=200,
+                    headers={
+                        "Access-Control-Allow-Origin": "https://www.fantasypros.com",
+                    },
+                    content_type="application/json",
+                    body=json.dumps({"marker": "legacy"}),
+                ))
+                page.route("https://evil.example/**", lambda route: route.fulfill(
+                    status=200,
+                    headers={
+                        "Access-Control-Allow-Origin": "https://www.fantasypros.com",
+                    },
+                    content_type="application/json",
+                    body=json.dumps({"lookalike": True}),
+                ))
+                page.goto(analyzer_url, wait_until="networkidle")
+                captured = page.evaluate("""() => ({
+                  init: window.__tradeSnapshotAnalyzerV2.initQueue,
+                  trades: window.__tradeSnapshotAnalyzerV2.queue
+                })""")
+            finally:
+                browser.close()
+
+        self.assertEqual(len(captured["init"]), 1)
+        self.assertEqual(
+            sorted(row["marker"] for row in captured["trades"]),
+            ["current", "full", "legacy"],
+        )
+        self.assertNotIn("lookalike", json.dumps(captured))
+        self.assertNotIn("roundtrip", json.dumps(captured))
 
     def test_analyzer_bundle_is_discovered_on_page_and_hashed_without_session_data(self):
         page = FakePage()
@@ -591,8 +724,10 @@ class PlaywrightAdapterTests(unittest.TestCase):
             "season": 2026,
             "league": {
                 "key": "runtime-only-private-key", "season": 2026,
-                "playoffsTeams": 1, "rosterSize": 14, "scoring": "PPR",
-                "settings": {"scoring": "PPR"},
+                "settings": {
+                    "playoffsTeams": 1, "rosterSize": 14,
+                    "basic_scoring": "PPR",
+                },
             },
             "teams": [
                 {"teamId": 1, "teamName": "One", "players": [{"player_id": 101}]},

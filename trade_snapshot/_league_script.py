@@ -47,11 +47,12 @@ async (options) => {
       own(settingsRaw, ['rosterSize', 'roster_size', 'totalRounds']) ??
       (rosterSizes.length && new Set(rosterSizes).size === 1 ? rosterSizes[0] : null));
     const scoring = text(own(leagueRaw, ['scoring']) ??
-      own(settingsRaw, ['scoring', 'scoringType', 'scoring_type']));
+      own(settingsRaw, ['scoring', 'scoringType', 'scoring_type', 'basic_scoring']));
     const result = {
       season: integer(own(leagueRaw, ['season', 'year']) ?? own(pageData, ['season', 'year'])),
       team_count: teamsRaw.length,
       playoff_teams: integer(own(leagueRaw,
+        ['playoffsTeams', 'playoffTeams', 'playoff_teams']) ?? own(settingsRaw,
         ['playoffsTeams', 'playoffTeams', 'playoff_teams'])),
       roster_size: rosterSize,
       scoring

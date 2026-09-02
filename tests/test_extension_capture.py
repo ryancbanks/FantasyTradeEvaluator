@@ -151,6 +151,17 @@ class ExtensionCaptureTests(unittest.TestCase):
             session.read_yahoo_scoring(yahoo, settings, 5000, lambda: False), "PPR"
         )
 
+    def test_league_failure_code_becomes_actionable_without_private_data(self):
+        _, session = self.open({
+            "league.capture": {"error": "analyzer_init_incomplete"},
+        })
+        with self.assertRaisesRegex(
+            Exception, "Trade Analyzer initialization response was not captured"
+        ) as raised:
+            session.capture_league_sources(league_task(), 5000, lambda: False)
+        self.assertNotIn("key", str(raised.exception).casefold())
+        self.assertNotIn("url", str(raised.exception).casefold())
+
     def test_unpaired_bridge_fails_with_an_actionable_extension_message(self):
         class Unpaired:
             def execute(self, *_args):

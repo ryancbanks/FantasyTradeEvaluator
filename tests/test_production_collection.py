@@ -33,6 +33,7 @@ from trade_snapshot.espn_free_read import (
 from trade_snapshot._espn_browser_read import read_authenticated_espn_json
 from trade_snapshot.browser_capture import (
     BrowserCaptureCancelled,
+    BrowserCaptureError,
     BrowserCaptureOptions,
     BrowserExtensionUpgradeRequired,
     YahooScoringError,
@@ -252,6 +253,24 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
                 cancelled=lambda: False,
             )
         self.assertEqual(len(collector.calls), 1)
+
+    def test_sanitized_capture_failure_is_preserved_for_troubleshooting(self):
+        class FailingCollector(_Collector):
+            def collect(self, *_args, **_kwargs):
+                raise BrowserCaptureError(
+                    "FantasyPros loaded, but its analyzer initialization was not captured"
+                )
+
+        workflow = _workflow(collector=FailingCollector())
+        with TemporaryDirectory() as directory, self.assertRaisesRegex(
+            WeeklyCollectionError,
+            "FantasyPros loaded, but its analyzer initialization was not captured.*"
+            "No weekly bundle was published",
+        ):
+            workflow(
+                _request(), data_directory=Path(directory),
+                progress=lambda _: None, cancelled=lambda: False,
+            )
 
     def test_discovered_team_count_must_match_espn(self):
         collector = _Collector()

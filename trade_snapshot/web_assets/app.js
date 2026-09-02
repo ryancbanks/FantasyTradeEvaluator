@@ -165,7 +165,7 @@ function renderExtensionStatus(status) {
   extensionConnected = paired && !updateRequired;
   const pairing = extensionPairing;
   let statusText = "Browser extension not connected";
-  let helpText = "Install the downloaded extension once, then click Connect extension before collecting weekly data.";
+  let helpText = "Install or reload the downloaded extension, refresh this page once, then click Connect extension before collecting weekly data.";
   let buttonText = "Connect extension";
   if (updateRequired) {
     statusText = `Browser extension update required${status.extension_version ? ` · ${status.extension_version}` : ""}`;
@@ -238,7 +238,7 @@ async function connectExtension() {
       }
       if (!extensionPairAcknowledged && Date.now() >= detectionDeadline) {
         throw new Error(
-          "The browser extension was not detected. Install or reload it, refresh this page, and try Connect extension again."
+          "The extension is not active on this page yet. If you just installed or reloaded it, refresh this Trade Evaluator page (Ctrl+R on Windows/Linux or Cmd+R on Mac), then click Connect extension again."
         );
       }
     }
