@@ -159,6 +159,7 @@ class ExtensionStaticContractTests(unittest.TestCase):
         self.assertIn("privateColumn", projection)
         self.assertIn("Yahoo All Players", projection)
         self.assertIn("projected_standings", league)
+        self.assertIn("roster_positions", league)
         self.assertIn("proTeamSchedules_wl", espn)
         self.assertIn('credentials: "include"', espn)
 

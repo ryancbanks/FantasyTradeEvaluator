@@ -725,19 +725,27 @@ class PlaywrightAdapterTests(unittest.TestCase):
             "league": {
                 "key": "runtime-only-private-key", "season": 2026,
                 "settings": {
-                    "playoffsTeams": 1, "rosterSize": 14,
+                    "playoffsTeams": 1,
+                    "roster_positions": [
+                        {"type": "QB", "count": 1},
+                        {"type": "BN", "count": 1},
+                    ],
                     "basic_scoring": "PPR",
                 },
             },
             "teams": [
                 {"teamId": 1, "teamName": "One", "players": [{"player_id": 101}]},
-                {"teamId": 2, "teamName": "Two", "players": [{"player_id": 102}]},
+                {"teamId": 2, "teamName": "Two", "players": [
+                    {"player_id": 102}, {"player_id": 103},
+                ]},
             ],
             "playerInfo": {
                 "101": {"player_id": 101, "player_name": "A", "position_id": 2,
                         "eligibility": ["RB"]},
                 "102": {"player_id": 102, "player_name": "B", "position_id": 3,
                         "eligibility": ["WR"]},
+                "103": {"player_id": 103, "player_name": "C", "position_id": 1,
+                        "eligibility": ["QB"]},
             },
         }
         current = [
@@ -747,24 +755,28 @@ class PlaywrightAdapterTests(unittest.TestCase):
         projected = {"playoffsTeam": 1, "standings": [
             {"teamId": 1, "teamName": "One", "rank_proj": 1, "rank_current": 1,
              "wins_current": 1, "losses_current": 0, "wins_proj": 8,
-             "losses_proj": 6, "playoffs_odds": 60, "championship_odds": 20},
+             "losses_proj": 6, "playoffs_odds": "60%", "championship_odds": "20%"},
             {"teamId": 2, "teamName": "Two", "rank_proj": 2, "rank_current": 2,
              "wins_current": 0, "losses_current": 1, "wins_proj": 6,
-             "losses_proj": 8, "playoffs_odds": 40, "championship_odds": 10},
+             "losses_proj": 8, "playoffs_odds": "40%", "championship_odds": "<1%"},
         ]}
+        initial = {"standings": current, "best_free_agents": [{"id": 104}]}
         body = """<!doctype html><script>
         const data=Object.freeze(%s);
         window.__tradeSnapshotAnalyzerV2={initQueue:[%s],error:null};
         window.MPB={getProjectedStandings:(_args,ok)=>ok(%s)};
         </script>""" % tuple(map(json.dumps, (
-            page_data,
-            {"standings": current, "best_free_agents": [{"id": 103}]},
-            projected,
+            page_data, initial, projected,
         )))
         with sync_playwright() as playwright:
-            try:
-                browser = playwright.chromium.launch(channel="chromium", headless=True)
-            except Exception:
+            browser = None
+            for channel in ("chromium", "msedge", "chrome"):
+                try:
+                    browser = playwright.chromium.launch(channel=channel, headless=True)
+                    break
+                except Exception:
+                    continue
+            if browser is None:
                 self.skipTest("Playwright Chromium is not installed")
             try:
                 page = browser.new_page()
@@ -778,12 +790,76 @@ class PlaywrightAdapterTests(unittest.TestCase):
                 wrong = page.evaluate(LEAGUE_SOURCE_SCRIPT, {
                     "timeout_ms": 5000, "expected_season": 2025, "expected_week": 7,
                 })
+                invalid_projected = json.loads(json.dumps(projected))
+                invalid_projected["standings"][0]["playoffs_odds"] = "101%"
+                page.evaluate(
+                    """value => {
+                      window.__tradeSnapshotAnalyzerV2.initQueue.push(value.initial);
+                      window.MPB.getProjectedStandings = (_args, ok) => ok(value.projected);
+                    }""",
+                    {
+                        "initial": {"standings": current,
+                                    "best_free_agents": [{"id": 104}]},
+                        "projected": invalid_projected,
+                    },
+                )
+                invalid = page.evaluate(LEAGUE_SOURCE_SCRIPT, {
+                    "timeout_ms": 5000, "expected_season": 2026, "expected_week": 7,
+                })
+                malformed_slots = []
+                for invalid_count in (None, False, "", "1"):
+                    invalid_page_data = json.loads(json.dumps(page_data))
+                    invalid_page_data["league"]["settings"]["roster_positions"][0][
+                        "count"
+                    ] = invalid_count
+                    invalid_body = """<!doctype html><script>
+                    const data=Object.freeze(%s);
+                    window.__tradeSnapshotAnalyzerV2={initQueue:[%s],error:null};
+                    window.MPB={getProjectedStandings:(_args,ok)=>ok(%s)};
+                    </script>""" % tuple(map(json.dumps, (
+                        invalid_page_data, initial, projected,
+                    )))
+                    invalid_page = browser.new_page()
+                    try:
+                        invalid_page.route(
+                            analyzer_task().url,
+                            lambda route: route.fulfill(
+                                content_type="text/html", body=invalid_body
+                            ),
+                        )
+                        invalid_page.goto(analyzer_task().url)
+                        malformed_slots.append(
+                            invalid_page.evaluate(LEAGUE_SOURCE_SCRIPT, {
+                                "timeout_ms": 5000,
+                                "expected_season": 2026,
+                                "expected_week": 7,
+                            })
+                        )
+                    finally:
+                        invalid_page.close()
             finally:
                 browser.close()
         bootstrap = next(row for row in captured["sources"] if row["source"] == "bootstrap")
         self.assertEqual(bootstrap["body"]["payload"]["current_week"], 7)
+        self.assertEqual(bootstrap["body"]["payload"]["league"]["roster_size"], 2)
+        projected_capture = next(
+            row for row in captured["sources"] if row["source"] == "projected_standings"
+        )
+        self.assertEqual(
+            projected_capture["body"]["payload"]["standings"][0]["playoffs_odds"],
+            60,
+        )
+        self.assertEqual(
+            projected_capture["body"]["payload"]["standings"][1]["championship_odds"],
+            "<1%",
+        )
         self.assertNotIn("runtime-only-private-key", json.dumps(captured))
         self.assertEqual(wrong, {"error": "bootstrap_incomplete"})
+        self.assertEqual(invalid, {"error": "projected_standings_incomplete"})
+        self.assertEqual(
+            malformed_slots,
+            [{"error": "bootstrap_incomplete"}] * 4,
+        )
 
     def test_league_bootstrap_keeps_position_and_playoff_model_fields(self):
         player_fields = ("position_id", "eligibility", "eligibility_espn", "eligibility_yahoo")

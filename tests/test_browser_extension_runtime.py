@@ -17,6 +17,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXTENSION_ROOT = PROJECT_ROOT / "trade_snapshot" / "browser_extension"
 
 
+def _launch_persistent_chromium(playwright, profile, *, args=()):
+    error = None
+    for channel in ("chromium", "msedge", "chrome"):
+        try:
+            return playwright.chromium.launch_persistent_context(
+                profile, channel=channel, headless=True, args=list(args)
+            )
+        except Exception as caught:
+            error = caught
+    raise error
+
+
 class BrowserExtensionRuntimeTests(unittest.TestCase):
     def test_missing_extension_fails_promptly_and_allows_retry(self):
         try:
@@ -37,9 +49,7 @@ class BrowserExtensionRuntimeTests(unittest.TestCase):
             try:
                 with sync_playwright() as playwright:
                     try:
-                        context = playwright.chromium.launch_persistent_context(
-                            profile, channel="chromium", headless=True
-                        )
+                        context = _launch_persistent_chromium(playwright, profile)
                     except Exception:
                         self.skipTest("the local Chromium runtime is unavailable")
                     try:
@@ -85,14 +95,13 @@ class BrowserExtensionRuntimeTests(unittest.TestCase):
             try:
                 with sync_playwright() as playwright:
                     try:
-                        context = playwright.chromium.launch_persistent_context(
+                        context = _launch_persistent_chromium(
+                            playwright,
                             profile,
-                            channel="chromium",
-                            headless=True,
-                            args=[
+                            args=(
                                 f"--disable-extensions-except={EXTENSION_ROOT}",
                                 f"--load-extension={EXTENSION_ROOT}",
-                            ],
+                            ),
                         )
                     except Exception:
                         self.skipTest("the local Chromium runtime cannot load extensions")
@@ -104,17 +113,21 @@ class BrowserExtensionRuntimeTests(unittest.TestCase):
                                 "season": 2026,
                                 "settings": {
                                     "playoffsTeams": 1,
-                                    "rosterSize": 1,
+                                    "roster_positions": [
+                                        {"type": "QB", "count": 1},
+                                        {"type": "BN", "count": 1},
+                                    ],
                                     "basic_scoring": "PPR",
                                 },
                             },
                             "teams": [
                                 {"id": 1, "teamName": "One", "players": [101]},
-                                {"id": 2, "teamName": "Two", "players": [102]},
+                                {"id": 2, "teamName": "Two", "players": [102, 103]},
                             ],
                             "playerInfo": {
                                 "101": {"player_id": 101, "player_name": "A"},
                                 "102": {"player_id": 102, "player_name": "B"},
+                                "103": {"player_id": 103, "player_name": "C"},
                             },
                         }
                         initial = {
@@ -122,7 +135,7 @@ class BrowserExtensionRuntimeTests(unittest.TestCase):
                                 {"teamId": 1, "wins": 1, "losses": 0, "ties": 0},
                                 {"teamId": 2, "wins": 0, "losses": 1, "ties": 0},
                             ],
-                            "best_free_agents": [{"id": 103}],
+                            "best_free_agents": [{"id": 104}],
                         }
                         projected = {
                             "playoffsTeam": 1,
@@ -131,15 +144,15 @@ class BrowserExtensionRuntimeTests(unittest.TestCase):
                                     "teamId": 1, "teamName": "One", "rank_proj": 1,
                                     "rank_current": 1, "wins_current": 1,
                                     "losses_current": 0, "wins_proj": 8,
-                                    "losses_proj": 6, "playoffs_odds": 60,
-                                    "championship_odds": 20,
+                                    "losses_proj": 6, "playoffs_odds": "60%",
+                                    "championship_odds": "20%",
                                 },
                                 {
                                     "teamId": 2, "teamName": "Two", "rank_proj": 2,
                                     "rank_current": 2, "wins_current": 0,
                                     "losses_current": 1, "wins_proj": 6,
-                                    "losses_proj": 8, "playoffs_odds": 40,
-                                    "championship_odds": 10,
+                                    "losses_proj": 8, "playoffs_odds": "40%",
+                                    "championship_odds": "<1%",
                                 },
                             ],
                         }
@@ -276,6 +289,23 @@ class BrowserExtensionRuntimeTests(unittest.TestCase):
                             ),
                         )
                         self.assertEqual(captured[0].team_count, 2)
+                        bootstrap = next(
+                            source for source in captured[0].sources
+                            if source.source.value == "bootstrap"
+                        )
+                        self.assertEqual(bootstrap.body["payload"]["league"]["roster_size"], 2)
+                        projected_capture = next(
+                            source for source in captured[0].sources
+                            if source.source.value == "projected_standings"
+                        )
+                        self.assertEqual(
+                            projected_capture.body["payload"]["standings"][0]["playoffs_odds"],
+                            60,
+                        )
+                        self.assertEqual(
+                            projected_capture.body["payload"]["standings"][1]["championship_odds"],
+                            "<1%",
+                        )
                         session.close(5000)
                         self._wait_for(
                             lambda: worker.evaluate("chrome.tabs.query({}).then(tabs => tabs.length)")
