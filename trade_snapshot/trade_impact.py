@@ -7,6 +7,7 @@ from ._scenario_random import content_id
 from .ensemble import EnsembleProjection
 from .league_state import LeagueState
 from .scenario_config import CorrelatedScenarioConfig, PlayerEligibility
+from .scenario_score_cache import ScenarioScoreCache, ScenarioScoreCacheBuilder
 from .score_scenarios import PreparedScoreScenarios, prepare_score_scenarios
 from .season import SeasonProjection, TeamSeasonProjection, project_remaining_season
 from .trade_space import TeamRoster
@@ -124,6 +125,9 @@ class PreparedSeasonBaseline:
     season_projection: SeasonProjection
     score_decimal_places: int
     tiebreak_random_seed: int
+    _score_cache: ScenarioScoreCache | None = field(
+        default=None, compare=False, repr=False
+    )
 
     def __init__(
         self,
@@ -132,6 +136,7 @@ class PreparedSeasonBaseline:
         season_projection: SeasonProjection,
         score_decimal_places: int,
         tiebreak_random_seed: int,
+        score_cache: ScenarioScoreCache | None = None,
     ) -> None:
         if not isinstance(state, LeagueState):
             raise ValueError("state must be a LeagueState")
@@ -153,28 +158,46 @@ class PreparedSeasonBaseline:
             or season_projection.random_seed != tiebreak_random_seed
         ):
             raise ValueError("season projection options do not match the baseline")
+        if score_cache is not None:
+            if not isinstance(score_cache, ScenarioScoreCache):
+                raise ValueError("score_cache must be a ScenarioScoreCache")
+            score_cache.recomputed_cell_count(scenarios)
         object.__setattr__(self, "state", state)
         object.__setattr__(self, "scenarios", scenarios)
         object.__setattr__(self, "season_projection", season_projection)
         object.__setattr__(self, "score_decimal_places", score_decimal_places)
         object.__setattr__(self, "tiebreak_random_seed", tiebreak_random_seed)
+        object.__setattr__(self, "_score_cache", score_cache)
 
     def project(self, after_rosters: Iterable[TeamRoster]) -> PairedSeasonProjection:
         after_roster_rows = tuple(after_rosters)
-        after = prepare_score_scenarios(
-            self.state,
-            after_roster_rows,
-            self.scenarios.projections,
-            self.scenarios.eligibilities,
-            self.scenarios.config,
-        )
-        _validate_common_draw_space(self.scenarios, after)
-        after_projection = project_remaining_season(
-            self.state,
-            after,
-            score_decimal_places=self.score_decimal_places,
-            random_seed=self.tiebreak_random_seed,
-        )
+        if self._score_cache is None:
+            after = prepare_score_scenarios(
+                self.state,
+                after_roster_rows,
+                self.scenarios.projections,
+                self.scenarios.eligibilities,
+                self.scenarios.config,
+            )
+            _validate_common_draw_space(self.scenarios, after)
+            after_projection = project_remaining_season(
+                self.state,
+                after,
+                score_decimal_places=self.score_decimal_places,
+                random_seed=self.tiebreak_random_seed,
+            )
+        else:
+            after = self.scenarios.with_rosters(after_roster_rows)
+            _validate_common_draw_space(self.scenarios, after)
+            if self._score_cache.recomputed_cell_count(after) == 0:
+                after_projection = self.season_projection
+            else:
+                after_projection = project_remaining_season(
+                    self.state,
+                    self._score_cache.iter_scenarios(after),
+                    score_decimal_places=self.score_decimal_places,
+                    random_seed=self.tiebreak_random_seed,
+                )
         return _paired_projection(
             self.state,
             self.scenarios,
@@ -201,18 +224,21 @@ def prepare_season_baseline(
         tuple(eligibilities),
         scenario_config,
     )
+    cache_builder = ScenarioScoreCacheBuilder.for_prepared(scenarios)
     projection = project_remaining_season(
         state,
-        scenarios,
+        scenarios if cache_builder is None else cache_builder,
         score_decimal_places=score_decimal_places,
         random_seed=tiebreak_random_seed,
     )
+    score_cache = None if cache_builder is None else cache_builder.finish()
     return PreparedSeasonBaseline(
         state,
         scenarios,
         projection,
         score_decimal_places,
         tiebreak_random_seed,
+        score_cache,
     )
 
 

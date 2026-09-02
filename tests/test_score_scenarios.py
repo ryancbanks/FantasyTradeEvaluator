@@ -3,6 +3,7 @@ import inspect
 import json
 import math
 import unittest
+from unittest.mock import patch
 
 from trade_snapshot.ensemble import EnsembleProjection, ProviderObservation
 from trade_snapshot.league_state import (
@@ -14,6 +15,7 @@ from trade_snapshot.league_state import (
     TeamStanding,
     Tiebreaker,
 )
+from trade_snapshot.lineup import optimize_lineup
 from trade_snapshot.projections import ProjectionStatus
 from trade_snapshot.score_scenarios import (
     CorrelatedScenarioConfig,
@@ -100,12 +102,17 @@ class PreparedScoreScenarioTests(unittest.TestCase):
 
     def test_capacity_exempt_membership_is_preserved_in_scenario_identity(self):
         ordinary = basic_prepared(scenario_count=2)
-        with_ir = prepare_score_scenarios(
+        with patch("trade_snapshot.score_scenarios.optimize_lineup") as optimizer:
+            with_ir = ordinary.with_rosters(
+                (
+                    TeamRoster("a", ("p1",), 1, 1, {"p1"}),
+                    ordinary.rosters[1],
+                )
+            )
+        optimizer.assert_not_called()
+        fresh = prepare_score_scenarios(
             ordinary.state,
-            (
-                TeamRoster("a", ("p1",), 1, 1, {"p1"}),
-                ordinary.rosters[1],
-            ),
+            with_ir.rosters,
             ordinary.projections,
             ordinary.eligibilities,
             ordinary.config,
@@ -113,6 +120,9 @@ class PreparedScoreScenarioTests(unittest.TestCase):
 
         self.assertEqual(with_ir.draw_space_id, ordinary.draw_space_id)
         self.assertNotEqual(with_ir.run_id, ordinary.run_id)
+        self.assertIs(with_ir._lineups, ordinary._lineups)
+        self.assertEqual(with_ir.run_id, fresh.run_id)
+        self.assertEqual(tuple(with_ir), tuple(fresh))
         self.assertEqual(
             with_ir.rosters[0].capacity_exempt_player_ids,
             frozenset({"p1"}),
@@ -123,6 +133,126 @@ class PreparedScoreScenarioTests(unittest.TestCase):
             ],
             ["p1"],
         )
+
+    def test_roster_rebind_has_exact_fresh_preparation_parity(self):
+        state = make_state(("FLEX",), roster_cap=2)
+        before = (
+            TeamRoster("a", ("p1", "p2"), 2, 2),
+            TeamRoster("b", ("p3", "p4"), 2, 2),
+        )
+        after = (
+            TeamRoster("b", ("p4", "p1"), 2, 2),
+            TeamRoster("a", ("p3", "p2"), 2, 2),
+        )
+        projections = tuple(
+            projection(player, mean, nfl_team=f"NFL-{player}", game=f"G-{player}")
+            for player, mean in zip(("p1", "p2", "p3", "p4"), (15, 10, 14, 9))
+        )
+        eligibility = tuple(
+            PlayerEligibility(player, ("FLEX",))
+            for player in ("p1", "p2", "p3", "p4")
+        )
+        prepared = prepare_score_scenarios(
+            state, before, projections, eligibility, config_for(5, seed=17)
+        )
+
+        rebound = prepared.with_rosters(after)
+        fresh = prepare_score_scenarios(
+            state,
+            after,
+            prepared.projections,
+            prepared.eligibilities,
+            prepared.config,
+        )
+
+        self.assertEqual(rebound.rosters, fresh.rosters)
+        self.assertEqual(rebound.run_id, fresh.run_id)
+        self.assertEqual(rebound.identity_record(), fresh.identity_record())
+        self.assertEqual(rebound._lineups, fresh._lineups)
+        self.assertEqual(tuple(rebound), tuple(fresh))
+        self.assertEqual(rebound.draw_space_id, prepared.draw_space_id)
+        self.assertIs(rebound.projections, prepared.projections)
+        self.assertIs(rebound.eligibilities, prepared.eligibilities)
+        self.assertIs(rebound.config, prepared.config)
+
+    def test_roster_rebind_rejects_the_same_unknown_player_as_fresh_preparation(self):
+        prepared = basic_prepared(scenario_count=1)
+        rosters = (
+            TeamRoster("a", ("unknown",), 1, 1),
+            prepared.rosters[1],
+        )
+
+        with self.assertRaises(ValueError) as rebound_error:
+            prepared.with_rosters(rosters)
+        with self.assertRaises(ValueError) as fresh_error:
+            prepare_score_scenarios(
+                prepared.state,
+                rosters,
+                prepared.projections,
+                prepared.eligibilities,
+                prepared.config,
+            )
+
+        self.assertEqual(str(rebound_error.exception), str(fresh_error.exception))
+
+    def test_roster_rebind_matches_fresh_noniterable_validation(self):
+        prepared = basic_prepared(scenario_count=1)
+
+        with self.assertRaises(TypeError) as rebound_error:
+            prepared.with_rosters(None)
+        with self.assertRaises(TypeError) as fresh_error:
+            prepare_score_scenarios(
+                prepared.state,
+                None,
+                prepared.projections,
+                prepared.eligibilities,
+                prepared.config,
+            )
+
+        self.assertEqual(str(rebound_error.exception), str(fresh_error.exception))
+
+    def test_roster_rebind_recalculates_lineups_only_for_changed_teams(self):
+        state = make_state(("FLEX",), roster_cap=1)
+        rosters = (
+            TeamRoster("a", ("p1",), 1, 1),
+            TeamRoster("b", ("p2",), 1, 1),
+        )
+        projections = (
+            projection("p1", 10),
+            projection("p2", 11, nfl_team="NFL-B"),
+            projection("p3", 12, nfl_team="NFL-C"),
+        )
+        eligibilities = tuple(
+            PlayerEligibility(player, ("FLEX",)) for player in ("p1", "p2", "p3")
+        )
+        prepared = prepare_score_scenarios(
+            state, rosters, projections, eligibilities, config_for(2)
+        )
+        after = (
+            TeamRoster("a", ("p3",), 1, 1),
+            TeamRoster("b", ("p2",), 1, 1),
+        )
+
+        with patch(
+            "trade_snapshot.score_scenarios.optimize_lineup",
+            wraps=optimize_lineup,
+        ) as optimizer:
+            rebound = prepared.with_rosters(after)
+
+        self.assertEqual(optimizer.call_count, 1)
+        selected_players = optimizer.call_args.args[1]
+        self.assertEqual(
+            tuple(player.player_id for player in selected_players),
+            ("p3",),
+        )
+        self.assertIs(
+            rebound._lineups[("b", 1)],
+            prepared._lineups[("b", 1)],
+        )
+        fresh = prepare_score_scenarios(
+            state, after, projections, eligibilities, prepared.config
+        )
+        self.assertEqual(tuple(rebound), tuple(fresh))
 
     def test_matchup_score_adjustment_changes_content_identity_not_player_draws(self):
         ordinary = basic_prepared(scenario_count=2)

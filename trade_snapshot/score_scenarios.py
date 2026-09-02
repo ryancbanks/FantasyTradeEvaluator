@@ -1,6 +1,7 @@
 """Streaming, correlated team-score scenarios from weekly ensembles."""
 
 from collections.abc import Iterable, Iterator, Mapping
+from copy import copy
 from dataclasses import dataclass, field
 from math import fsum, isfinite
 from types import MappingProxyType
@@ -103,6 +104,60 @@ class PreparedScoreScenarios:
     def __iter__(self) -> Iterator[ScoreScenario]:
         return self.iter_scenarios()
 
+    def with_rosters(
+        self, rosters: Iterable[TeamRoster]
+    ) -> "PreparedScoreScenarios":
+        """Rebind validated scenario inputs to rosters after a local trade."""
+
+        normalized_rosters = _validated_rosters(self.state, tuple(rosters))
+        rostered_player_ids = frozenset(
+            player
+            for roster in normalized_rosters
+            for player in roster.player_ids
+        )
+        eligible_player_ids = frozenset(
+            row.canonical_player_id for row in self.eligibilities
+        )
+        if rostered_player_ids.difference(eligible_player_ids):
+            raise ValueError("eligibilities must contain every rostered player")
+
+        previous_rosters = {roster.team_id: roster for roster in self.rosters}
+        changed_rosters = tuple(
+            roster
+            for roster in normalized_rosters
+            if roster.player_ids != previous_rosters[roster.team_id].player_ids
+        )
+        if changed_rosters:
+            lineups = dict(self._lineups)
+            lineups.update(
+                _select_lineups(
+                    self.state,
+                    changed_rosters,
+                    self.eligibilities,
+                    self._projection_by_key,
+                )
+            )
+            prepared_lineups = MappingProxyType(lineups)
+        else:
+            prepared_lineups = self._lineups
+
+        run_id = content_id(
+            "srun",
+            _run_record(
+                self.state,
+                normalized_rosters,
+                self.eligibilities,
+                self.config,
+                self.projection_set_id,
+                self.draw_space_id,
+            ),
+        )
+        rebound = copy(self)
+        object.__setattr__(rebound, "rosters", normalized_rosters)
+        object.__setattr__(rebound, "run_id", run_id)
+        object.__setattr__(rebound, "_lineups", prepared_lineups)
+        return rebound
+
     def iter_scenarios(
         self, start: int = 0, stop: int | None = None
     ) -> Iterator[ScoreScenario]:
@@ -156,21 +211,34 @@ class PreparedScoreScenarios:
             "run_id": self.run_id,
         }
 
+    def _lineup_player_ids(self, team_id: str, week: int) -> tuple[str, ...]:
+        return self._lineups[(team_id, week)]
+
+    def _team_week_score(
+        self,
+        team_id: str,
+        week: int,
+        scenario_index: int,
+        draw_cache: dict[tuple[str, tuple[object, ...]], float],
+    ) -> float:
+        return fsum(
+            _realize(
+                self._projection_by_key[(player_id, week)],
+                self.config.loadings,
+                self.draw_space_id,
+                scenario_index,
+                draw_cache,
+            )
+            for player_id in self._lineup_player_ids(team_id, week)
+        )
+
     def _scenario(self, index: int) -> ScoreScenario:
         scores = []
         draw_cache: dict[tuple[str, tuple[object, ...]], float] = {}
         for week in self.state.remaining_regular_season_weeks:
             for team_id in sorted(team.team_id for team in self.state.teams):
-                player_ids = self._lineups[(team_id, week)]
-                total = fsum(
-                    _realize(
-                        self._projection_by_key[(player_id, week)],
-                        self.config.loadings,
-                        self.draw_space_id,
-                        index,
-                        draw_cache,
-                    )
-                    for player_id in player_ids
+                total = self._team_week_score(
+                    team_id, week, index, draw_cache
                 )
                 scores.append(TeamWeekScore(team_id, week, total))
         return ScoreScenario(

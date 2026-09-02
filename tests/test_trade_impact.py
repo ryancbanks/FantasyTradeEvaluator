@@ -1,5 +1,6 @@
 from dataclasses import replace
 import unittest
+from unittest.mock import patch
 
 from trade_snapshot.ensemble import EnsembleProjection, ProviderObservation
 from trade_snapshot.league_state import (
@@ -137,6 +138,19 @@ class PairedSeasonProjectionTests(unittest.TestCase):
         self.assertIs(trade.before, baseline.season_projection)
         self.assertEqual(no_op.for_team("a").playoff_probability_delta, 0)
         self.assertEqual(trade.for_team("a").playoff_probability_delta, -1)
+
+    def test_oversized_score_cache_uses_the_existing_streaming_projection(self):
+        before, projections, eligibility, config = inputs()
+        with patch(
+            "trade_snapshot.trade_impact.ScenarioScoreCacheBuilder.for_prepared",
+            return_value=None,
+        ):
+            baseline = prepare_season_baseline(
+                state(), before, projections, eligibility, config
+            )
+
+        self.assertIsNone(baseline._score_cache)
+        self.assertEqual(baseline.project(before).before, baseline.season_projection)
 
     def test_add_drop_uses_the_same_full_projection_draw_space(self):
         before, projections, eligibility, config = inputs()
