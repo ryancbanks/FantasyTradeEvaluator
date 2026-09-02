@@ -674,11 +674,17 @@ class LocalAppService:
             and row.get("power_engine_mode") == "surrogate"
             for row in bundles
         )
+        independent_count = sum(
+            row.get("status") == "ready"
+            and row.get("power_engine_mode") == "independent"
+            for row in bundles
+        )
         invalid_count = len(bundles) - ready_count
         if ready_count:
             message = (
-                f"{exact_count} exact-method and {surrogate_count} SURROGATE weekly "
-                "engine(s) are ready. Surrogate use requires explicit acceptance."
+                f"{exact_count} exact-method, {surrogate_count} SURROGATE, and "
+                f"{independent_count} independent weekly engine(s) are ready. "
+                "Surrogate use requires explicit acceptance."
             )
         elif invalid_count:
             message = (
@@ -697,6 +703,7 @@ class LocalAppService:
             "ready_bundle_count": ready_count,
             "exact_bundle_count": exact_count,
             "surrogate_bundle_count": surrogate_count,
+            "independent_bundle_count": independent_count,
             "invalid_bundle_count": invalid_count,
             "collection_available": self._collections.available,
             "message": message,
@@ -1236,6 +1243,7 @@ def _workbook_context(
     request: LocalSearchRequest,
 ) -> TradeWorkbookContext:
     methodology = bundle.methodology_evidence
+    independent = bundle.methodology_mode == "independent"
     team_names = {row.team_id: row.name for row in bundle.state.teams}
     return TradeWorkbookContext(
         snapshot_id=bundle.state.snapshot_id,
@@ -1247,35 +1255,59 @@ def _workbook_context(
         minimum_power_delta=request.settings.minimum_displayed_power_delta,
         scenario_count=request.scenario_count,
         power_engine_mode=bundle.methodology_mode,
-        calibration_status=bundle.strength_model.calibration.status.value,
+        calibration_status=(
+            "independent"
+            if independent
+            else bundle.strength_model.calibration.status.value
+        ),
         methodology_evidence_kind=(
             "exact_attestation"
             if bundle.methodology_mode == "exact"
+            else "independent_disclosure"
+            if independent
             else "surrogate_disclosure"
         ),
         methodology_record_id=(
             bundle.methodology_attestation.attestation_id
             if bundle.methodology_mode == "exact"
+            else bundle.independent_power_disclosure.disclosure_id
+            if independent
             else bundle.surrogate_disclosure.disclosure_id
         ),
-        formula_id=methodology.formula_id,
-        formula_source_fit_id=methodology.formula_source_fit_id,
-        methodology_fingerprint_id=(
-            methodology.methodology_fingerprint.fingerprint_id
+        formula_id=(methodology.policy_id if independent else methodology.formula_id),
+        formula_source_fit_id=(
+            methodology.disclosure_id
+            if independent
+            else methodology.formula_source_fit_id
         ),
-        formula_action=methodology.formula_decision.action.value,
+        methodology_fingerprint_id=(
+            methodology.policy_id
+            if independent
+            else methodology.methodology_fingerprint.fingerprint_id
+        ),
+        formula_action=(
+            "independent_policy"
+            if independent
+            else methodology.formula_decision.action.value
+        ),
         methodology_current_evidence_id=methodology.current_evidence_id,
         methodology_quality_gate=(
             "exact_attestation_v1"
             if bundle.methodology_mode == "exact"
+            else "transparent_independent_v1"
+            if independent
             else SURROGATE_QUALITY_GATE
         ),
         methodology_holdout_count=methodology.current_holdout_count,
         holdout_max_absolute_score_error=(
-            methodology.calibration_diagnostics.max_absolute_score_error
+            None
+            if independent
+            else methodology.calibration_diagnostics.max_absolute_score_error
         ),
         holdout_display_match_rate=(
-            methodology.calibration_diagnostics.display_match_rate
+            None
+            if independent
+            else methodology.calibration_diagnostics.display_match_rate
         ),
         exact_balanced_package_sizes=methodology.validated_balanced_package_sizes,
         sources=workbook_sources(bundle),

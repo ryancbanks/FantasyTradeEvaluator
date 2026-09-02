@@ -9,6 +9,13 @@ from numbers import Real
 from .three_way_search_records import ThreeWayQualifiedResult
 
 
+_POWER_STATUS_BY_ENGINE_MODE = {
+    "exact": "extrapolated",
+    "surrogate": "surrogate_extrapolated",
+    "independent": "independent",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class ThreeWayExportProvenance:
     """Canonical request and run evidence carried into a three-way workbook."""
@@ -199,11 +206,10 @@ class ThreeWayWorkbookRow:
             raise ValueError("team_impacts must contain exactly three team impacts")
         if len({row.team_id for row in impacts}) != 3:
             raise ValueError("team_impacts contains a duplicate team")
-        if self.power_methodology_status not in {
-            "extrapolated",
-            "surrogate_extrapolated",
-        }:
-            raise ValueError("three-team power must be labeled as extrapolated")
+        if self.power_methodology_status not in set(
+            _POWER_STATUS_BY_ENGINE_MODE.values()
+        ):
+            raise ValueError("three-team power methodology status is invalid")
         object.__setattr__(self, "transfers", transfers)
         object.__setattr__(self, "team_impacts", impacts)
 
@@ -226,13 +232,12 @@ def three_way_workbook_rows(
 
     if not isinstance(team_names, Mapping) or not isinstance(player_names, Mapping):
         raise ValueError("team_names and player_names must be mappings")
-    if power_engine_mode not in {"exact", "surrogate"}:
-        raise ValueError("power_engine_mode must be exact or surrogate")
-    status = (
-        "extrapolated"
-        if power_engine_mode == "exact"
-        else "surrogate_extrapolated"
-    )
+    try:
+        status = _POWER_STATUS_BY_ENGINE_MODE[power_engine_mode]
+    except KeyError:
+        raise ValueError(
+            "power_engine_mode must be exact, surrogate, or independent"
+        ) from None
     try:
         rows = tuple(
             ThreeWayWorkbookRow(

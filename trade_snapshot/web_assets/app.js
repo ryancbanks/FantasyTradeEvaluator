@@ -26,6 +26,7 @@ let exportBusy = false;
 let draftWorkBusy = false;
 let publishedTradeBusy = null;
 let recoveredSearchScopeOnly = false;
+let sourceDebugTimer = null;
 const heartbeatInterval = 20000;
 const extensionProtocolVersion = 1;
 const minimumHistoryExtensionVersion = [0, 2, 0, 0];
@@ -105,6 +106,102 @@ function percent(value) { return new Intl.NumberFormat(undefined, {style: "perce
 function signed(value, asPercent = false) {
   const text = asPercent ? percent(Math.abs(value)) : Math.abs(value).toFixed(1);
   return `${value >= 0 ? "+" : "−"}${text}`;
+}
+
+function sourceStatusLabel(status) {
+  return {
+    required: "REQUIRED FOR THIS MODE",
+    best_effort: "AUTO · USED IF VALID",
+    reference: "REFERENCE ONLY",
+    off: "OFF"
+  }[status] || status;
+}
+
+function renderSourceCatalog(catalog) {
+  const container = $("sourceDebugList");
+  container.replaceChildren();
+  $("sourceDebugMode").textContent = `${catalog.mode === "independent"
+    ? "Independent power mode: FantasyPros is neither opened nor required."
+    : "FantasyPros power mode: exact or explicitly accepted surrogate replication is attempted."} ${
+      catalog.projection_mode === "broad_consensus"
+        ? "Forecasts equal-average independent publishers; composite products are excluded from that arithmetic."
+        : "Broad consensus is off; the core FantasyPros, ESPN, and Yahoo ensemble is used."
+    }`;
+  for (const group of [catalog.calculation_sources, catalog.reference_sources]) {
+    for (const source of group) {
+      const card = document.createElement("section");
+      card.className = `source-debug-card source-${source.status}`;
+      const heading = document.createElement("div");
+      heading.className = "source-debug-heading";
+      const name = document.createElement("strong");
+      name.textContent = source.provider;
+      const badge = document.createElement("span");
+      badge.className = "source-debug-badge";
+      badge.textContent = sourceStatusLabel(source.status);
+      heading.append(name, badge);
+      const note = document.createElement("p");
+      note.textContent = source.note;
+      card.append(heading, note);
+      const links = document.createElement("div");
+      links.className = "source-debug-links";
+      source.urls.forEach((url, index) => {
+        const link = document.createElement("a");
+        link.href = url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = source.urls.length === 1
+          ? url
+          : `${index + 1}. ${url}`;
+        links.append(link);
+      });
+      if (source.urls.length > 4) {
+        const details = document.createElement("details");
+        const summary = document.createElement("summary");
+        summary.textContent = `Show ${source.urls.length} selected URLs`;
+        details.append(summary, links);
+        card.append(details);
+      } else {
+        card.append(links);
+      }
+      container.append(card);
+    }
+  }
+}
+
+async function refreshSourceDebug() {
+  try {
+    const catalog = await api("/api/weekly-sources", {
+      method: "POST",
+      body: JSON.stringify(collectionPayload())
+    });
+    renderSourceCatalog(catalog);
+  } catch (error) {
+    $("sourceDebugMode").textContent = error.message;
+    $("sourceDebugList").replaceChildren();
+  }
+}
+
+function scheduleSourceDebugRefresh() {
+  clearTimeout(sourceDebugTimer);
+  sourceDebugTimer = setTimeout(refreshSourceDebug, 250);
+}
+
+function syncCollectionMode() {
+  const useFantasyPros = $("useFantasyPros").checked;
+  $("hostLeagueUrl").required = !useFantasyPros;
+  $("espnLinkRequirement").textContent = useFantasyPros ? "(recommended)" : "(required)";
+  $("allowSurrogatePower").disabled = !useFantasyPros;
+  if (!useFantasyPros) $("allowSurrogatePower").checked = false;
+  const broad = $("useBroadConsensus").checked;
+  const projectionText = broad
+    ? "Forecasts equal-average ESPN, Yahoo, and every accepted public publisher once. CBS, FFToday, and FantasySharks are attempted automatically from the built-in source catalog."
+    : useFantasyPros
+      ? "Forecasts use the established FantasyPros, ESPN, and Yahoo core ensemble."
+      : "Forecasts use the independent ESPN and Yahoo core ensemble.";
+  $("collectionModeHelp").textContent = useFantasyPros
+    ? `FantasyPros supplies ECR and calibration evidence; ESPN supplies league rules, rosters, standings, and schedules; Yahoo supplies league-scored projections. ${projectionText} Only numeric league identifiers are retained.`
+    : `FantasyPros will not be opened or required. ESPN supplies the league, custom lineup/IR rules, standings, and schedules; Yahoo supplies league-scored projections. ${projectionText} Power is produced by the transparent independent model.`;
+  scheduleSourceDebugRefresh();
 }
 
 function currentBundle() {
@@ -263,7 +360,11 @@ async function refreshBundles(selectId = null) {
   const select = $("bundleSelect");
   select.replaceChildren(new Option(bundles.length ? "Choose a ready week" : "No weekly bundle yet", ""));
   for (const bundle of bundles) {
-    const mode = bundle.power_engine_mode === "surrogate" ? " · SURROGATE" : " · exact method";
+    const mode = bundle.power_engine_mode === "surrogate"
+      ? " · SURROGATE"
+      : bundle.power_engine_mode === "independent"
+        ? " · independent"
+        : " · exact method";
     const option = new Option(`${bundle.season} · Week ${bundle.week} · ${bundle.team_count} teams${mode}`, bundle.bundle_id);
     select.add(option);
   }
@@ -292,12 +393,15 @@ function renderBundle() {
   if (!bundle) {
     $("bundleSummary").textContent = "Import or collect a weekly bundle to begin.";
     $("bundleSummary").classList.remove("surrogate-warning");
+    $("bundleSummary").classList.remove("independent-notice");
     $("estimateButton").disabled = true;
     $("surrogateSearchConsentRow").classList.add("hidden");
     $("acceptSurrogateSearch").checked = false;
     threeTeamEstimateSignature = null;
     ThreeWayUi.syncPartnerOptions(null, "");
     ThreeWayUi.syncFormatControls(null);
+    $("skipSmall").disabled = false;
+    $("skipSmall").title = "";
     populatePackageFilters();
     updateSearchStartButton();
     return;
@@ -307,19 +411,37 @@ function renderBundle() {
     others.add(new Option(team.name, team.team_id));
   }
   const surrogate = bundle.power_engine_mode === "surrogate";
+  const independent = bundle.power_engine_mode === "independent";
+  const forecast = bundle.forecast_provider_names.join(" + ").toUpperCase();
+  const forecastLabel = bundle.forecast_mode === "broad_consensus"
+    ? `forecast consensus: ${forecast}`
+    : bundle.forecast_mode === "core_ensemble"
+      ? `core forecast ensemble: ${forecast}`
+      : `single-source forecast: ${forecast}`;
   const summary = $("bundleSummary");
   if (surrogate) {
     const error = bundle.methodology.holdout_max_absolute_score_error;
     const match = percent(bundle.methodology.holdout_display_match_rate);
-    summary.textContent = `${bundle.season} week ${bundle.week} · ${bundle.team_count} teams · SURROGATE / APPROXIMATE POWER · Blind max score error ${error}; display match ${match}. ${bundle.power_engine_notice}`;
+    summary.textContent = `${bundle.season} week ${bundle.week} · ${bundle.team_count} teams · SURROGATE / APPROXIMATE POWER · ${forecastLabel} · Blind max score error ${error}; display match ${match}. ${bundle.power_engine_notice}`;
     summary.classList.add("surrogate-warning");
+    summary.classList.remove("independent-notice");
+  } else if (independent) {
+    summary.textContent = `${bundle.season} week ${bundle.week} · ${bundle.team_count} teams · INDEPENDENT LOCAL POWER · ${forecastLabel}. ${bundle.power_engine_notice}`;
+    summary.classList.remove("surrogate-warning");
+    summary.classList.add("independent-notice");
   } else {
     const sizes = bundle.methodology.validated_balanced_package_sizes.join(", ");
-    summary.textContent = `${bundle.season} week ${bundle.week} · ${bundle.team_count} teams · exact FantasyPros-power evidence: balanced ${sizes}-player packages without adds/drops; other shapes are labeled extrapolated`;
+    summary.textContent = `${bundle.season} week ${bundle.week} · ${bundle.team_count} teams · ${forecastLabel} · exact FantasyPros-power evidence: balanced ${sizes}-player packages without adds/drops; other shapes are labeled extrapolated`;
     summary.classList.remove("surrogate-warning");
+    summary.classList.remove("independent-notice");
   }
   $("surrogateSearchConsentRow").classList.toggle("hidden", !surrogate);
   $("acceptSurrogateSearch").checked = false;
+  $("skipSmall").disabled = independent;
+  if (independent) $("skipSmall").checked = false;
+  $("skipSmall").title = independent
+    ? "The independent engine has no FantasyPros small-trade exclusion."
+    : "";
   $("estimateButton").disabled = Boolean(activeCollection);
   syncCounterparties();
   ThreeWayUi.syncFormatControls(bundle);
@@ -608,7 +730,9 @@ function collectionPayload() {
     host_league_url: hostLeagueUrl || null,
     yahoo_projection_league_url: yahooProjectionUrl || null,
     include_future_weekly: $("includeFutureWeekly").checked,
-    allow_surrogate_power: $("allowSurrogatePower").checked
+    allow_surrogate_power: $("allowSurrogatePower").checked,
+    use_fantasypros: $("useFantasyPros").checked,
+    use_broad_consensus: $("useBroadConsensus").checked
   };
 }
 
@@ -684,7 +808,14 @@ function renderCollectionProgress(job) {
     ? `${progress.message} · ${pct.toFixed(0)}%`
     : "Weekly collection is waiting to start…";
   const pending = job.sign_in && job.sign_in.pending_provider;
-  const labels = {fantasypros: "FantasyPros", espn: "ESPN", yahoo: "Yahoo"};
+  const labels = {
+    fantasypros: "FantasyPros",
+    espn: "ESPN",
+    yahoo: "Yahoo",
+    cbs: "CBS",
+    fftoday: "FFToday",
+    fantasysharks: "FantasySharks"
+  };
   $("signInPrompt").classList.toggle("hidden", !pending);
   if (pending) {
     $("signInPromptText").textContent = `If needed, finish signing in to ${labels[pending] || pending} on the extension’s scan tab, then continue.`;
@@ -700,7 +831,10 @@ function setCollectionRunning(running) {
   $("collectButton").disabled = running || !collectionAvailable || !extensionConnected;
   $("estimateButton").disabled = running || !$("bundleSelect").value;
   updateSearchStartButton();
-  if (!running) $("signInPrompt").classList.add("hidden");
+  if (!running) {
+    $("signInPrompt").classList.add("hidden");
+    syncCollectionMode();
+  }
 }
 
 async function confirmCollectionSignIn() {
@@ -930,11 +1064,9 @@ async function loadResults() {
     );
   }
   else renderTwoTeamTradeRows(value.rows);
-  const powerNotice = value.power_engine_mode === "surrogate"
-    ? ` SURROGATE POWER: ${value.power_engine_notice}`
-    : threeTeam
-      ? ` POWER NOTICE: ${value.power_engine_notice}`
-      : "";
+  const powerNotice = value.power_engine_mode === "exact"
+    ? (threeTeam ? ` POWER NOTICE: ${value.power_engine_notice}` : "")
+    : ` ${value.power_engine_mode.toUpperCase()} POWER: ${value.power_engine_notice}`;
   const gainLabel = threeTeam ? "trades improving all three teams first" : "mutual gains first";
   const adjustmentPolicy = value.free_agent_allocation_policy
     ? ` Automatic roster adjustment policy: ${value.free_agent_allocation_policy}`
@@ -1029,6 +1161,11 @@ $("partnerTeamB").addEventListener("change", () => changeThreeTeamPartner("b"));
 $("noDrops").addEventListener("change", () => ThreeWayUi.syncFormatControls(currentBundle()));
 TradeFilterUi.bind(invalidateSearchEstimate);
 $("connectExtensionButton").addEventListener("click", connectExtension);
+$("useFantasyPros").addEventListener("change", syncCollectionMode);
+$("useBroadConsensus").addEventListener("change", syncCollectionMode);
+for (const id of ["collectionSeason", "collectionWeek", "collectionScoring", "hostLeagueUrl", "yahooProjectionUrl"]) {
+  $(id).addEventListener(["hostLeagueUrl", "yahooProjectionUrl"].includes(id) ? "input" : "change", scheduleSourceDebugRefresh);
+}
 $("collectionForm").addEventListener("submit", startCollection);
 $("cancelCollectionButton").addEventListener("click", cancelCollection);
 $("confirmSignInButton").addEventListener("click", confirmCollectionSignIn);
@@ -1046,6 +1183,7 @@ $("exportButton").addEventListener("click", exportWorkbook);
 (async () => {
   try {
     $("collectionSeason").value = String(new Date().getFullYear());
+    syncCollectionMode();
     await pingLifecycle();
     await api("/api/health");
     $("health").textContent = "App running locally";

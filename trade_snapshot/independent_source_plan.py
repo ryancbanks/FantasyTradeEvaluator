@@ -1,15 +1,14 @@
-"""Deterministic ESPN/Yahoo projection capture plans for independent refreshes."""
+"""Deterministic public projection capture plans for independent refreshes."""
 
 from collections.abc import Iterable
 
 from .capture_schema import CapturePlan, PageCaptureTask, ProjectionTableSpec
-from .positions import normalize_player_position
+from .positions import CANONICAL_PLAYER_POSITIONS, normalize_player_position
+from .public_projection_plan import public_projection_tasks
 
 
-_PROVIDER_PAGES = (
-    ("espn", "https://fantasy.espn.com/football/players/projections"),
-    ("yahoo", "https://football.fantasysports.yahoo.com/f1/players"),
-)
+_ESPN_PAGE = "https://fantasy.espn.com/football/players/projections"
+_YAHOO_PAGE = "https://football.fantasysports.yahoo.com/f1/players"
 
 
 def build_independent_weekly_source_plan(
@@ -20,35 +19,69 @@ def build_independent_weekly_source_plan(
     scoring: str,
     player_positions: Iterable[str],
     include_future_weekly: bool = True,
+    broad_consensus: bool = True,
 ) -> CapturePlan:
-    """Capture ESPN/Yahoo weekly and ROS tables without an analyzer source."""
+    """Capture ESPN plus public CBS ROS tables without an analyzer source."""
 
     weeks = _weeks(remaining_weeks, as_of_week, include_future_weekly)
-    _validate_positions(player_positions)
-    tasks = [
-        _projection_task(provider, url, season, week, "weekly", scoring)
-        for week in weeks
-        for provider, url in _PROVIDER_PAGES
-    ]
-    tasks.extend(
-        _projection_task(provider, url, season, as_of_week, "ros", scoring)
-        for provider, url in _PROVIDER_PAGES
+    positions = _validate_positions(player_positions)
+    tasks = []
+    for week in weeks:
+        tasks.append(
+            _projection_task("espn", _ESPN_PAGE, season, week, "weekly", scoring)
+        )
+        tasks.extend(
+            _projection_task(
+                "yahoo", _YAHOO_PAGE, season, week, "weekly", scoring, (position,)
+            )
+            for position in positions
+        )
+    tasks.append(
+        _projection_task("espn", _ESPN_PAGE, season, as_of_week, "ros", scoring)
     )
+    tasks.extend(
+        _projection_task(
+            "yahoo", _YAHOO_PAGE, season, as_of_week, "ros", scoring, (position,)
+        )
+        for position in positions
+    )
+    if broad_consensus:
+        for week in weeks:
+            tasks.extend(
+                public_projection_tasks(
+                    season=season,
+                    week=week,
+                    horizon="weekly",
+                    scoring=scoring,
+                    positions=positions,
+                )
+            )
+        tasks.extend(
+            public_projection_tasks(
+                season=season,
+                week=as_of_week,
+                horizon="ros",
+                scoring=scoring,
+                positions=positions,
+            )
+        )
     return CapturePlan(tasks)
 
 
-def _projection_task(provider, url, season, week, horizon, scoring):
+def _projection_task(
+    provider, url, season, week, horizon, scoring, positions=("ALL",)
+):
     return PageCaptureTask(
         provider,
         season,
         week,
         "visible_table",
         url,
-        projection=ProjectionTableSpec(horizon, scoring, ("ALL",)),
+        projection=ProjectionTableSpec(horizon, scoring, positions),
     )
 
 
-def _validate_positions(values: Iterable[str]) -> None:
+def _validate_positions(values: Iterable[str]) -> tuple[str, ...]:
     if isinstance(values, (str, bytes)):
         raise ValueError("player_positions must be an iterable")
     try:
@@ -58,8 +91,12 @@ def _validate_positions(values: Iterable[str]) -> None:
         }
     except TypeError:
         raise ValueError("player_positions must be an iterable") from None
-    if not positions:
+    if "IDP" in positions:
+        positions.remove("IDP")
+        positions.update(("DL", "LB", "DB"))
+    if not positions or not positions <= CANONICAL_PLAYER_POSITIONS:
         raise ValueError("player_positions must contain supported positions")
+    return tuple(sorted(positions))
 
 
 def _weeks(values, as_of_week, include_future):

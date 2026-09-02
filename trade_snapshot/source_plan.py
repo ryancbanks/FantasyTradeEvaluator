@@ -9,12 +9,11 @@ from .capture_schema import (
     ProjectionTableSpec,
 )
 from .positions import CANONICAL_PLAYER_POSITIONS, normalize_player_position
+from .public_projection_plan import public_projection_tasks
 
 
-_PROVIDER_PAGES = {
-    "espn": "https://fantasy.espn.com/football/players/projections",
-    "yahoo": "https://football.fantasysports.yahoo.com/f1/players",
-}
+_ESPN_PROJECTION_PAGE = "https://fantasy.espn.com/football/players/projections"
+_YAHOO_PROJECTION_PAGE = "https://football.fantasysports.yahoo.com/f1/players"
 _FP_PROJECTION_ROOT = "https://www.fantasypros.com/nfl/projections"
 _FP_RANKING_ROOT = "https://www.fantasypros.com/nfl/rankings"
 _LEAGUE_PAGE = "https://www.fantasypros.com/nfl/myplaybook/trade-analyzer.php"
@@ -28,6 +27,7 @@ def build_weekly_source_plan(
     scoring: str,
     player_positions: Iterable[str],
     include_future_weekly: bool = True,
+    broad_consensus: bool = True,
 ) -> CapturePlan:
     """Capture tables once; every trade calculation after this is local."""
 
@@ -51,14 +51,20 @@ def build_weekly_source_plan(
             for horizon in ("weekly", "ros")
         )
     for week in weeks:
-        tasks.extend(_projection_tasks(season, week, "weekly", scoring, positions))
+        tasks.extend(
+            _projection_tasks(
+                season, week, "weekly", scoring, positions, broad_consensus
+            )
+        )
     tasks.extend(
-        _projection_tasks(season, as_of_week, "ros", scoring, positions)
+        _projection_tasks(
+            season, as_of_week, "ros", scoring, positions, broad_consensus
+        )
     )
     return CapturePlan(tasks)
 
 
-def _projection_tasks(season, week, horizon, scoring, positions):
+def _projection_tasks(season, week, horizon, scoring, positions, broad_consensus):
     tasks = [
         PageCaptureTask(
             "fantasypros",
@@ -76,7 +82,7 @@ def _projection_tasks(season, week, horizon, scoring, positions):
             season,
             week,
             "visible_table",
-            _PROVIDER_PAGES["espn"],
+            _ESPN_PROJECTION_PAGE,
             projection=ProjectionTableSpec(horizon, scoring, ("ALL",)),
         )
     )
@@ -86,10 +92,21 @@ def _projection_tasks(season, week, horizon, scoring, positions):
             season,
             week,
             "visible_table",
-            _PROVIDER_PAGES["yahoo"],
+            _YAHOO_PROJECTION_PAGE,
             projection=ProjectionTableSpec(horizon, scoring, (position,)),
         )
         for position in positions
+    )
+    if not broad_consensus:
+        return tasks
+    tasks.extend(
+        public_projection_tasks(
+            season=season,
+            week=week,
+            horizon=horizon,
+            scoring=scoring,
+            positions=positions,
+        )
     )
     return tasks
 

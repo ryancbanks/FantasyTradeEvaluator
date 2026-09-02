@@ -194,15 +194,36 @@ def projection_artifact(provider, horizon, week):
             "https://sports.yahoo.com/nfl/players/302/",
             "https://sports.yahoo.com/nfl/players/303/",
         ),
+        CaptureProvider.CBS: (
+            "https://www.cbssports.com/nfl/players/401/player-one/fantasy/",
+            "https://www.cbssports.com/nfl/players/402/player-two/fantasy/",
+            "https://www.cbssports.com/nfl/players/403/player-three/fantasy/",
+        ),
+        CaptureProvider.FFTODAY: (
+            "https://www.fftoday.com/stats/players/501/Player_One",
+            "https://www.fftoday.com/stats/players/502/Player_Two",
+            "https://www.fftoday.com/stats/players/503/Player_Three",
+        ),
+        CaptureProvider.FANTASYSHARKS: (
+            "https://www.fantasysharks.com/apps/bert/players/playerpage.php?id=601",
+            "https://www.fantasysharks.com/apps/bert/players/playerpage.php?id=602",
+            "https://www.fantasysharks.com/apps/bert/players/playerpage.php?id=603",
+        ),
     }[provider]
     table = VisibleTable((
-        tuple(VisibleTableCell(value) for value in ("PLAYER", "TEAM", "POS", "FPTS")),
+        tuple(
+            VisibleTableCell(value)
+            for value in ("PLAYER", "TEAM", "POS", "FPTS", "FPPG", "GP")
+        ),
         (VisibleTableCell("Player One", (links[0],)), VisibleTableCell("ARI"),
-         VisibleTableCell("RB"), VisibleTableCell("10")),
+         VisibleTableCell("RB"), VisibleTableCell("10"), VisibleTableCell("10"),
+         VisibleTableCell("17")),
         (VisibleTableCell("Player Two", (links[1],)), VisibleTableCell("ATL"),
-         VisibleTableCell("RB"), VisibleTableCell("9")),
+         VisibleTableCell("RB"), VisibleTableCell("9"), VisibleTableCell("9"),
+         VisibleTableCell("17")),
         (VisibleTableCell("Player Three", (links[2],)), VisibleTableCell("CAR"),
-         VisibleTableCell("RB"), VisibleTableCell("8")),
+         VisibleTableCell("RB"), VisibleTableCell("8"), VisibleTableCell("8"),
+         VisibleTableCell("17")),
     ))
     return GenericTableArtifact(
         "captask_" + str(4 + week) * 64,
@@ -213,9 +234,14 @@ def projection_artifact(provider, horizon, week):
 
 
 def all_projection_artifacts():
+    providers = (
+        CaptureProvider.FANTASYPROS,
+        CaptureProvider.ESPN,
+        CaptureProvider.YAHOO,
+    )
     return tuple(
         projection_artifact(provider, horizon, week)
-        for provider in CaptureProvider
+        for provider in providers
         for horizon, weeks in (
             (RankingHorizon.WEEKLY, (1, 2)),
             (RankingHorizon.ROS, (1,)),
@@ -224,7 +250,95 @@ def all_projection_artifacts():
     )
 
 
+def broad_projection_artifacts():
+    provider_periods = (
+        (CaptureProvider.FANTASYPROS, (RankingHorizon.WEEKLY, RankingHorizon.ROS)),
+        (CaptureProvider.ESPN, (RankingHorizon.WEEKLY, RankingHorizon.ROS)),
+        (CaptureProvider.YAHOO, (RankingHorizon.WEEKLY, RankingHorizon.ROS)),
+        (CaptureProvider.CBS, (RankingHorizon.ROS,)),
+        (CaptureProvider.FFTODAY, (RankingHorizon.WEEKLY, RankingHorizon.ROS)),
+        (CaptureProvider.FANTASYSHARKS, (RankingHorizon.WEEKLY, RankingHorizon.ROS)),
+    )
+    return tuple(
+        projection_artifact(provider, horizon, week)
+        for provider, horizons in provider_periods
+        for horizon in horizons
+        for week in ((1, 2) if horizon is RankingHorizon.WEEKLY else (1,))
+    )
+
+
 class WeeklyAssemblyTests(unittest.TestCase):
+    def test_broad_consensus_excludes_fantasypros_composite_from_forecast_votes(self):
+        result = assemble_weekly_refresh_evidence(
+            host_snapshot=host_snapshot(),
+            fantasypros_league=league_artifact(),
+            projection_artifacts=broad_projection_artifacts(),
+            ecr_artifacts=(
+                ecr_artifact(RankingHorizon.WEEKLY),
+                ecr_artifact(RankingHorizon.ROS),
+            ),
+            nfl_schedule=nfl_schedule(),
+            analyzer_bundle=BundleFingerprint(
+                "https://cdn.fantasypros.com/assets/js/min/pages/myplaybook/"
+                "trade-analyzer/bundle-1234567890abcdef.js",
+                "a" * 64,
+            ),
+            response_schema_sha256="b" * 64,
+            scoring="PPR",
+            expected_team_count=2,
+            broad_consensus=True,
+        )
+
+        forecast = tuple(
+            row.provider for row in result.evidence.ensemble_config.provider_weights
+        )
+        self.assertEqual(
+            forecast, ("espn", "yahoo", "cbs", "fftoday", "fantasysharks")
+        )
+        self.assertNotIn("fantasypros", forecast)
+        self.assertIn(
+            "fantasypros",
+            {row.provider for row in result.evidence.projection_evidence},
+        )
+
+    def test_broad_consensus_accepts_ros_only_fftoday_evidence(self):
+        projections = tuple(
+            row
+            for row in broad_projection_artifacts()
+            if not (
+                row.provider is CaptureProvider.FFTODAY
+                and row.horizon is RankingHorizon.WEEKLY
+            )
+        )
+
+        result = assemble_weekly_refresh_evidence(
+            host_snapshot=host_snapshot(),
+            fantasypros_league=league_artifact(),
+            projection_artifacts=projections,
+            ecr_artifacts=(
+                ecr_artifact(RankingHorizon.WEEKLY),
+                ecr_artifact(RankingHorizon.ROS),
+            ),
+            nfl_schedule=nfl_schedule(),
+            analyzer_bundle=BundleFingerprint(
+                "https://cdn.fantasypros.com/assets/js/min/pages/myplaybook/"
+                "trade-analyzer/bundle-1234567890abcdef.js",
+                "a" * 64,
+            ),
+            response_schema_sha256="b" * 64,
+            scoring="PPR",
+            expected_team_count=2,
+            broad_consensus=True,
+        )
+
+        self.assertIn(
+            "fftoday",
+            tuple(
+                row.provider
+                for row in result.evidence.ensemble_config.provider_weights
+            ),
+        )
+
     def test_assembles_complete_exact_provider_mappings_and_refresh_evidence(self):
         host = host_snapshot()
         projections = all_projection_artifacts()
@@ -263,6 +377,17 @@ class WeeklyAssemblyTests(unittest.TestCase):
             },
         )
         self.assertEqual(result.evidence.waiver_pool.player_ids, ("fantasypros:103",))
+        prepared = prepare_weekly_model_inputs(
+            state=result.evidence.state,
+            projection_evidence=result.evidence.projection_evidence,
+            ecr_snapshots=result.evidence.ecr_snapshots,
+            eligibilities=result.evidence.eligibilities,
+            player_positions=result.evidence.player_positions,
+            player_nfl_team_ids=result.evidence.player_nfl_team_ids,
+            nfl_schedule=result.evidence.nfl_schedule,
+            ensemble_config=result.evidence.ensemble_config,
+        )
+        self.assertEqual(len(prepared.projections), 6)
         self.assertNotIn(
             "fantasypros:103",
             {
@@ -280,7 +405,11 @@ class WeeklyAssemblyTests(unittest.TestCase):
     def test_current_week_plus_ros_materializes_future_projection_grid(self):
         projections = tuple(
             projection_artifact(provider, horizon, 1)
-            for provider in CaptureProvider
+            for provider in (
+                CaptureProvider.FANTASYPROS,
+                CaptureProvider.ESPN,
+                CaptureProvider.YAHOO,
+            )
             for horizon in (RankingHorizon.WEEKLY, RankingHorizon.ROS)
         )
         result = assemble_weekly_refresh_evidence(
@@ -320,6 +449,32 @@ class WeeklyAssemblyTests(unittest.TestCase):
             {row.week for row in prepared.projections},
             {1, 2},
         )
+
+    def test_core_ensemble_requires_yahoo_projection_evidence(self):
+        projections = tuple(
+            row
+            for row in all_projection_artifacts()
+            if row.provider is not CaptureProvider.YAHOO
+        )
+        with self.assertRaisesRegex(ValueError, "ESPN and Yahoo"):
+            assemble_weekly_refresh_evidence(
+                host_snapshot=host_snapshot(),
+                fantasypros_league=league_artifact(),
+                projection_artifacts=projections,
+                ecr_artifacts=(
+                    ecr_artifact(RankingHorizon.WEEKLY),
+                    ecr_artifact(RankingHorizon.ROS),
+                ),
+                nfl_schedule=nfl_schedule(),
+                analyzer_bundle=BundleFingerprint(
+                    "https://cdn.fantasypros.com/assets/js/min/pages/myplaybook/"
+                    "trade-analyzer/bundle-1234567890abcdef.js",
+                    "a" * 64,
+                ),
+                response_schema_sha256="b" * 64,
+                scoring="PPR",
+                expected_team_count=2,
+            )
 
     def test_rejects_a_fantasypros_roster_player_without_exact_identity(self):
         broken = league_artifact()

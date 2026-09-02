@@ -11,10 +11,16 @@ from uuid import uuid4
 from ._scenario_random import content_id
 from .ecr import EcrPeriod, EcrSnapshot
 from .ensemble import EnsembleProjection, ensemble_from_record, ensemble_to_record
+from .independent_power_disclosure import IndependentPowerDisclosure
+from .independent_waiver_pool import IndependentWaiverPool
 from .league_io import league_state_from_record, league_state_to_record
 from .league_state import LeagueState
 from .methodology_attestation import MethodologyAttestation
 from .projection_io import projection_from_record, projection_to_record
+from .projection_source_policy import (
+    validate_no_composite_double_count,
+    validate_selectable_projection_providers,
+)
 from .projections import RemainingSeasonProjection, WeeklyProjection
 from .scenario_config import CorrelatedScenarioConfig, PlayerEligibility
 from .scoring import ScoringProfile
@@ -24,7 +30,7 @@ from .trade_space import TeamRoster
 from .waiver_pool import WaiverPool
 
 
-_BUNDLE_SCHEMA_VERSION = 7
+_BUNDLE_SCHEMA_VERSION = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,9 +45,10 @@ class EngineBundle:
     ecr_snapshots: tuple[EcrSnapshot, ...]
     projection_evidence: tuple[WeeklyProjection | RemainingSeasonProjection, ...]
     player_names: Mapping[str, str]
-    waiver_pool: WaiverPool
+    waiver_pool: WaiverPool | IndependentWaiverPool
     methodology_attestation: MethodologyAttestation | None
     surrogate_disclosure: SurrogateDisclosure | None = None
+    independent_power_disclosure: IndependentPowerDisclosure | None = None
     bundle_id: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -52,7 +59,12 @@ class EngineBundle:
         rosters = _typed("rosters", self.rosters, TeamRoster)
         projections = _typed("projections", self.projections, EnsembleProjection)
         eligibilities = _typed("eligibilities", self.eligibilities, PlayerEligibility)
-        ecr = _typed("ecr_snapshots", self.ecr_snapshots, EcrSnapshot)
+        try:
+            ecr = tuple(self.ecr_snapshots)
+        except TypeError:
+            raise ValueError("ecr_snapshots must be an iterable") from None
+        if any(not isinstance(row, EcrSnapshot) for row in ecr):
+            raise ValueError("ecr_snapshots must contain EcrSnapshot values")
         evidence = tuple(self.projection_evidence)
         if not evidence or any(
             not isinstance(row, (WeeklyProjection, RemainingSeasonProjection))
@@ -63,17 +75,26 @@ class EngineBundle:
             raise ValueError("scenario_config must be a CorrelatedScenarioConfig")
         if not isinstance(self.strength_model, StrengthModel):
             raise ValueError("strength_model must be a StrengthModel")
-        if not isinstance(self.waiver_pool, WaiverPool):
-            raise ValueError("waiver_pool must be a WaiverPool")
+        if not isinstance(self.waiver_pool, (WaiverPool, IndependentWaiverPool)):
+            raise ValueError("waiver_pool has an invalid type")
         exact = isinstance(self.methodology_attestation, MethodologyAttestation)
         surrogate = isinstance(self.surrogate_disclosure, SurrogateDisclosure)
+        independent = isinstance(
+            self.independent_power_disclosure, IndependentPowerDisclosure
+        )
         if (self.methodology_attestation is not None and not exact) or (
             self.surrogate_disclosure is not None and not surrogate
+        ) or (
+            self.independent_power_disclosure is not None and not independent
         ):
             raise ValueError("methodology evidence has an invalid type")
-        if exact == surrogate:
+        if sum((exact, surrogate, independent)) != 1:
             raise ValueError(
-                "bundle requires exactly one exact attestation or surrogate disclosure"
+                "bundle requires exactly one exact, surrogate, or independent disclosure"
+            )
+        if independent != isinstance(self.waiver_pool, IndependentWaiverPool):
+            raise ValueError(
+                "independent methodology and waiver-pool provenance must be paired"
             )
         names = _names(self.player_names)
         _validate_identity(self, rosters, projections, eligibilities, ecr, evidence, names)
@@ -93,14 +114,24 @@ class EngineBundle:
         object.__setattr__(self, "bundle_id", content_id("engine", self._content_record()))
 
     @property
-    def methodology_evidence(self) -> MethodologyAttestation | SurrogateDisclosure:
-        evidence = self.methodology_attestation or self.surrogate_disclosure
+    def methodology_evidence(
+        self,
+    ) -> MethodologyAttestation | SurrogateDisclosure | IndependentPowerDisclosure:
+        evidence = (
+            self.methodology_attestation
+            or self.surrogate_disclosure
+            or self.independent_power_disclosure
+        )
         assert evidence is not None
         return evidence
 
     @property
     def methodology_mode(self) -> str:
-        return "exact" if self.methodology_attestation is not None else "surrogate"
+        if self.methodology_attestation is not None:
+            return "exact"
+        if self.surrogate_disclosure is not None:
+            return "surrogate"
+        return "independent"
 
     def _content_record(self) -> dict[str, object]:
         return {
@@ -117,6 +148,11 @@ class EngineBundle:
                 None
                 if self.methodology_attestation is None
                 else self.methodology_attestation.to_record()
+            ),
+            "independent_power_disclosure": (
+                None
+                if self.independent_power_disclosure is None
+                else self.independent_power_disclosure.to_record()
             ),
             "player_names": dict(self.player_names),
             "projection_evidence": [
@@ -155,7 +191,7 @@ class EngineBundle:
 
     @classmethod
     def from_record(cls, record: Mapping[str, object]) -> "EngineBundle":
-        content_keys = {
+        legacy_content_keys = {
             "ecr_snapshots",
             "eligibilities",
             "league_state",
@@ -170,7 +206,17 @@ class EngineBundle:
             "surrogate_disclosure",
             "waiver_pool",
         }
-        if not isinstance(record, Mapping) or set(record) != content_keys | {
+        if not isinstance(record, Mapping):
+            raise ValueError("engine bundle record fields are invalid")
+        version = record.get("schema_version")
+        if type(version) is not int or version not in {7, _BUNDLE_SCHEMA_VERSION}:
+            raise ValueError("engine bundle kind or schema version is invalid")
+        content_keys = legacy_content_keys | (
+            {"independent_power_disclosure"}
+            if version == _BUNDLE_SCHEMA_VERSION
+            else set()
+        )
+        if set(record) != content_keys | {
             "kind",
             "schema_version",
             "bundle_id",
@@ -178,10 +224,12 @@ class EngineBundle:
             raise ValueError("engine bundle record fields are invalid")
         if (
             record["kind"] != "fantasy_trade_engine_bundle"
-            or type(record["schema_version"]) is not int
-            or record["schema_version"] != _BUNDLE_SCHEMA_VERSION
         ):
             raise ValueError("engine bundle kind or schema version is invalid")
+        if version == 7:
+            legacy_content = {key: record[key] for key in legacy_content_keys}
+            if record["bundle_id"] != content_id("engine", legacy_content):
+                raise ValueError("engine bundle content does not match bundle_id")
         arrays = {
             name: _json_array(name, record[name])
             for name in (
@@ -220,7 +268,7 @@ class EngineBundle:
                 for row in arrays["projection_evidence"]
             ),
             player_names=_mapping("player_names", record["player_names"]),
-            waiver_pool=WaiverPool.from_record(
+            waiver_pool=_waiver_pool_from_record(
                 _mapping("waiver_pool", record["waiver_pool"])
             ),
             methodology_attestation=(
@@ -241,8 +289,18 @@ class EngineBundle:
                     )
                 )
             ),
+            independent_power_disclosure=(
+                None
+                if version == 7 or record["independent_power_disclosure"] is None
+                else IndependentPowerDisclosure.from_record(
+                    _mapping(
+                        "independent_power_disclosure",
+                        record["independent_power_disclosure"],
+                    )
+                )
+            ),
         )
-        if record["bundle_id"] != bundle.bundle_id:
+        if version == _BUNDLE_SCHEMA_VERSION and record["bundle_id"] != bundle.bundle_id:
             raise ValueError("engine bundle content does not match bundle_id")
         return bundle
 
@@ -344,13 +402,39 @@ def _validate_identity(bundle, rosters, projections, eligibilities, ecr, evidenc
     for row in projections:
         if (row.snapshot_id, row.scoring_profile_id, row.season) != identity:
             raise ValueError("projection identity does not match league state")
+    observation_providers = {
+        observation.provider
+        for row in projections
+        for observation in row.provider_observations
+    }
+    validate_selectable_projection_providers(observation_providers)
+    validate_no_composite_double_count(observation_providers)
+    independent = bundle.methodology_mode == "independent"
     periods = {row.period for row in ecr}
-    if len(ecr) != 2 or periods != {EcrPeriod.WEEKLY, EcrPeriod.REST_OF_SEASON}:
-        raise ValueError("engine bundle requires weekly and ROS ECR snapshots")
-    if any((row.snapshot_id, row.scoring_profile_id, row.season) != identity for row in ecr):
-        raise ValueError("ECR identity does not match league state")
-    if any(row.as_of_week != state.first_remaining_week for row in ecr):
-        raise ValueError("ECR as_of_week does not match the league state")
+    if independent:
+        if ecr:
+            raise ValueError("independent engine bundles cannot claim FantasyPros ECR")
+        declared = set(bundle.independent_power_disclosure.provider_names)
+        validate_selectable_projection_providers(declared)
+        evidence_providers = {row.provider for row in evidence}
+        if (
+            declared != evidence_providers
+            or not observation_providers <= declared
+            or any(provider.startswith("fantasypros") for provider in declared)
+        ):
+            raise ValueError(
+                "independent provider disclosure does not match projection evidence"
+            )
+    else:
+        if len(ecr) != 2 or periods != {EcrPeriod.WEEKLY, EcrPeriod.REST_OF_SEASON}:
+            raise ValueError("engine bundle requires weekly and ROS ECR snapshots")
+        if any(
+            (row.snapshot_id, row.scoring_profile_id, row.season) != identity
+            for row in ecr
+        ):
+            raise ValueError("ECR identity does not match league state")
+        if any(row.as_of_week != state.first_remaining_week for row in ecr):
+            raise ValueError("ECR as_of_week does not match the league state")
     eligibility_by_player = {
         row.canonical_player_id: row.eligible_slots for row in eligibilities
     }
@@ -372,20 +456,21 @@ def _validate_identity(bundle, rosters, projections, eligibilities, ecr, evidenc
             raise ValueError("waiver pool eligibility does not match calculation metadata")
         if nfl_teams_by_player.get(waiver.canonical_player_id) != {waiver.nfl_team_id}:
             raise ValueError("waiver pool NFL team does not match the projection grid")
-        for period in (EcrPeriod.WEEKLY, EcrPeriod.REST_OF_SEASON):
-            ranking = ecr_by_period[period].get(waiver.canonical_player_id)
+        if isinstance(bundle.waiver_pool, WaiverPool):
+            for period in (EcrPeriod.WEEKLY, EcrPeriod.REST_OF_SEASON):
+                ranking = ecr_by_period[period].get(waiver.canonical_player_id)
+                if (
+                    ranking is None
+                    or ranking.fantasypros_player_id != waiver.fantasypros_player_id
+                ):
+                    raise ValueError("waiver pool player lacks exact FantasyPros ECR evidence")
             if (
-                ranking is None
-                or ranking.fantasypros_player_id != waiver.fantasypros_player_id
+                ecr_by_period[EcrPeriod.REST_OF_SEASON][
+                    waiver.canonical_player_id
+                ].rank_ecr
+                != waiver.rest_of_season_ecr_rank
             ):
-                raise ValueError("waiver pool player lacks exact FantasyPros ECR evidence")
-        if (
-            ecr_by_period[EcrPeriod.REST_OF_SEASON][
-                waiver.canonical_player_id
-            ].rank_ecr
-            != waiver.rest_of_season_ecr_rank
-        ):
-            raise ValueError("waiver pool ROS ECR rank does not match its provenance")
+                raise ValueError("waiver pool ROS ECR rank does not match its provenance")
     for row in evidence:
         if (row.snapshot_id, row.scoring_profile_id, row.season) != identity:
             raise ValueError("projection evidence identity does not match league state")
@@ -399,6 +484,15 @@ def _typed(name, values, expected_type):
     if not rows or any(not isinstance(row, expected_type) for row in rows):
         raise ValueError(f"{name} must contain {expected_type.__name__} values")
     return rows
+
+
+def _waiver_pool_from_record(record):
+    kind = record.get("kind")
+    if kind == "weekly_waiver_pool":
+        return WaiverPool.from_record(record)
+    if kind == "independent_weekly_waiver_pool":
+        return IndependentWaiverPool.from_record(record)
+    raise ValueError("waiver_pool kind is invalid")
 
 
 def _names(value):

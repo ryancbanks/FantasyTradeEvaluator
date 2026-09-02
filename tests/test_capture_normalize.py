@@ -20,7 +20,19 @@ from trade_snapshot.capture_schema import (
 )
 from trade_snapshot.ecr import EcrPeriod
 from trade_snapshot.identity_match import ProviderPlayerRecord, reconcile_player_identities
-from trade_snapshot.projections import ProjectionStatus, RemainingSeasonProjection, WeeklyProjection
+from trade_snapshot.nfl_schedule import (
+    NflSchedule,
+    NflTeamWeek,
+    NflTeamWeekStatus,
+    canonical_nfl_game_id,
+)
+from trade_snapshot.projections import (
+    ProjectionStatus,
+    RemainingSeasonOrigin,
+    RemainingSeasonProjection,
+    WeeklyProjection,
+)
+from datetime import datetime, timezone
 
 
 def artifact(*, horizon=RankingHorizon.WEEKLY):
@@ -151,6 +163,84 @@ class CaptureNormalizeTests(unittest.TestCase):
         self.assertIsNone(evidence[0].canonical_player_id)
         self.assertEqual(evidence[0].applicable_weeks, (8, 9, 10))
 
+    def test_fftoday_full_season_total_is_scaled_to_remaining_schedule(self):
+        source = public_projection_artifact(
+            CaptureProvider.FFTODAY,
+            "https://www.fftoday.com/stats/players/501/AJ_Brown",
+            points="30",
+            extra_headers=("YDS", "GP", "AVG"),
+            extra_values=("300", "3", "10"),
+            scoring="PPR",
+        )
+        registry = reconcile_player_identities(
+            projection_provider_records(source), anchor_provider="fftoday"
+        )
+
+        evidence = projection_evidence_from_artifact(
+            source,
+            registry,
+            snapshot_id="week-8",
+            scoring_profile_id="ppr",
+            applicable_weeks=(8, 9),
+            nfl_schedule=three_week_schedule(),
+        )
+
+        row = evidence[0]
+        self.assertEqual(row.origin, RemainingSeasonOrigin.DERIVED_FULL_SEASON)
+        self.assertAlmostEqual(row.projected_fantasy_points, 20.0)
+        self.assertEqual(
+            dict(row.raw_projected_stats),
+            {"yds": 200.0, "gp": 2.0, "avg": 10.0},
+        )
+
+    def test_cbs_ppr_season_rate_becomes_remaining_points_and_half_ppr_adjusts(self):
+        source = public_projection_artifact(
+            CaptureProvider.CBS,
+            "https://www.cbssports.com/nfl/players/401/aj-brown/fantasy/",
+            points="170",
+            extra_headers=("FPPG", "GP", "REC"),
+            extra_values=("10", "3", "6"),
+            scoring="HALF",
+        )
+        registry = reconcile_player_identities(
+            projection_provider_records(source), anchor_provider="cbs"
+        )
+
+        evidence = projection_evidence_from_artifact(
+            source,
+            registry,
+            snapshot_id="week-8",
+            scoring_profile_id="half",
+            applicable_weeks=(8, 9),
+            nfl_schedule=three_week_schedule(),
+        )
+
+        row = evidence[0]
+        self.assertEqual(row.origin, RemainingSeasonOrigin.DERIVED_FULL_SEASON)
+        self.assertAlmostEqual(row.projected_fantasy_points, 18.0)
+        self.assertEqual(dict(row.raw_projected_stats)["gp"], 2.0)
+        self.assertEqual(dict(row.raw_projected_stats)["rec"], 4.0)
+
+    def test_full_season_publishers_require_verified_schedule_context(self):
+        source = public_projection_artifact(
+            CaptureProvider.FFTODAY,
+            "https://www.fftoday.com/stats/players/501/AJ_Brown",
+            points="30",
+            scoring="PPR",
+        )
+        registry = reconcile_player_identities(
+            projection_provider_records(source), anchor_provider="fftoday"
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires the NFL schedule"):
+            projection_evidence_from_artifact(
+                source,
+                registry,
+                snapshot_id="week-8",
+                scoring_profile_id="ppr",
+                applicable_weeks=(8, 9),
+            )
+
 
 def projection_artifact(provider, horizon, link):
     return GenericTableArtifact(
@@ -181,6 +271,78 @@ def projection_artifact(provider, horizon, link):
                 )
             ),
         ),
+    )
+
+
+def public_projection_artifact(
+    provider,
+    link,
+    *,
+    points,
+    extra_headers=(),
+    extra_values=(),
+    scoring,
+):
+    return GenericTableArtifact(
+        task_id="captask_" + "3" * 64,
+        provider=provider,
+        season=2026,
+        week=8,
+        kind=CaptureKind.VISIBLE_TABLE,
+        captured_at="2026-10-27T16:00:00Z",
+        horizon=RankingHorizon.ROS,
+        scoring=scoring,
+        position_scope=("WR",),
+        source_period_text="2026 | season projections | WR",
+        segments_captured=1,
+        complete=True,
+        tables=(
+            VisibleTable(
+                (
+                    tuple(
+                        VisibleTableCell(value)
+                        for value in (
+                            "PLAYER",
+                            "TEAM",
+                            "POS",
+                            "FPTS",
+                            *extra_headers,
+                        )
+                    ),
+                    (
+                        VisibleTableCell("A.J. Brown", (link,)),
+                        VisibleTableCell("PHI"),
+                        VisibleTableCell("WR"),
+                        VisibleTableCell(points),
+                        *(VisibleTableCell(value) for value in extra_values),
+                    ),
+                )
+            ),
+        ),
+    )
+
+
+def three_week_schedule():
+    rows = []
+    for week in (8, 9, 10):
+        game_id = canonical_nfl_game_id(2026, week, "PHI", "DAL")
+        rows.extend(
+            (
+                NflTeamWeek(
+                    "PHI", week, NflTeamWeekStatus.SCHEDULED,
+                    game_id, "DAL", True,
+                ),
+                NflTeamWeek(
+                    "DAL", week, NflTeamWeekStatus.SCHEDULED,
+                    game_id, "PHI", False,
+                ),
+            )
+        )
+    return NflSchedule(
+        2026,
+        datetime(2026, 10, 27, tzinfo=timezone.utc),
+        "espn",
+        tuple(rows),
     )
 
 

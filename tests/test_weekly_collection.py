@@ -171,12 +171,10 @@ class WeeklyCollectionRequestTests(unittest.TestCase):
     def test_direct_request_defaults_to_current_week_plus_ros(self):
         request = WeeklyCollectionRequest(2026, 1, "PPR")
         self.assertFalse(request.include_future_weekly)
+        self.assertIsNone(request.yahoo_projection_league_url)
 
     def test_accepts_purpose_specific_urls_and_auto_discovers_team_count(self):
         record = request_payload()
-        record["yahoo_projection_league_url"] = (
-            "https://football.fantasysports.yahoo.com/f1/456/players"
-        )
         request = WeeklyCollectionRequest.from_payload(record)
         self.assertIsNone(request.expected_team_count)
         self.assertEqual(request.scoring, "PPR")
@@ -196,17 +194,10 @@ class WeeklyCollectionRequestTests(unittest.TestCase):
                 "https://fantasy.espn.com/football/league/standings"
                 "?leagueId=123&view=standings"
             ),
-            yahoo_projection_league_url=(
-                "https://football.fantasysports.yahoo.com/f1/456/players/"
-            ),
         )
         self.assertEqual(
             request.host_league_url,
             "https://fantasy.espn.com/football/league?leagueId=123",
-        )
-        self.assertEqual(
-            request.yahoo_projection_league_url,
-            "https://football.fantasysports.yahoo.com/f1/456/players?status=ALL",
         )
 
     def test_accepts_current_espn_pages_and_discards_unneeded_query_state(self):
@@ -239,47 +230,35 @@ class WeeklyCollectionRequestTests(unittest.TestCase):
                     )
                 )
 
-    def test_accepts_yahoo_home_team_filtered_and_season_prefixed_pages(self):
-        pages = {
-            "https://football.fantasysports.yahoo.com/f1/456":
-                "https://football.fantasysports.yahoo.com/f1/456/players?status=ALL",
-            "https://football.fantasysports.yahoo.com/f1/456/7?module=team":
-                "https://football.fantasysports.yahoo.com/f1/456/players?status=ALL",
-            "https://football.fantasysports.yahoo.com/f1/456/players?"
-            "status=ALL&pos=O&stat1=S_PW#players":
-                "https://football.fantasysports.yahoo.com/f1/456/players?status=ALL",
-            "https://football.fantasysports.yahoo.com/f1/456/playersearch":
-                "https://football.fantasysports.yahoo.com/f1/456/players?status=ALL",
-            "https://football.fantasysports.yahoo.com/2026/f1/456/players?"
-            "status=A&pos=P":
-                "https://football.fantasysports.yahoo.com/2026/f1/456/players?status=ALL",
-        }
-        for page, expected in pages.items():
-            with self.subTest(page=page):
+    def test_yahoo_league_pages_are_normalized_to_the_complete_player_list(self):
+        expected = (
+            "https://football.fantasysports.yahoo.com/"
+            "f1/456/players?status=ALL"
+        )
+        self.assertEqual(valid_request().yahoo_projection_league_url, expected)
+        self.assertIsNone(
+            valid_request(yahoo_projection_league_url=None).yahoo_projection_league_url
+        )
+        for value in (
+            "https://football.fantasysports.yahoo.com/f1/456",
+            "https://football.fantasysports.yahoo.com/f1/456/9",
+            "https://football.fantasysports.yahoo.com/f1/456/playersearch",
+        ):
+            with self.subTest(value=value):
                 self.assertEqual(
                     valid_request(
-                        yahoo_projection_league_url=page
+                        yahoo_projection_league_url=value
                     ).yahoo_projection_league_url,
                     expected,
                 )
+        with self.assertRaisesRegex(ValueError, "web address"):
+            valid_request(yahoo_projection_league_url=False)
 
     def test_rejects_unknown_fields_and_unsafe_or_wrong_purpose_urls(self):
         with self.assertRaisesRegex(ValueError, "fields are invalid"):
             WeeklyCollectionRequest.from_payload(request_payload(cookie="secret"))
         with self.assertRaisesRegex(ValueError, "ESPN Fantasy Football"):
             valid_request(host_league_url="https://example.com/league/123")
-        with self.assertRaisesRegex(ValueError, "numeric Yahoo"):
-            valid_request(
-                yahoo_projection_league_url=(
-                    "https://football.fantasys.yahoo.com/f1/456/players"
-                )
-            )
-        with self.assertRaisesRegex(ValueError, "numeric Yahoo"):
-            valid_request(
-                yahoo_projection_league_url=(
-                    "https://football.fantasysports.yahoo.com/league/custom-name"
-                )
-            )
         with self.assertRaisesRegex(ValueError, "safe HTTPS"):
             valid_request(host_league_url="https://user:password@fantasy.espn.com/football/league")
 
@@ -287,9 +266,6 @@ class WeeklyCollectionRequestTests(unittest.TestCase):
         invalid = (
             {"host_league_url": (
                 "https://fantasy.espn.com/football/league?leagueId=123&seasonId=2025"
-            )},
-            {"yahoo_projection_league_url": (
-                "https://football.fantasysports.yahoo.com/2025/f1/456/players"
             )},
             {"host_league_url": (
                 "https://fantasy.espn.com/football/league?leagueId=123&LeagueID=123"
@@ -300,12 +276,6 @@ class WeeklyCollectionRequestTests(unittest.TestCase):
             )},
             {"host_league_url": (
                 "https://fantasy.espn.com/baseball/league?leagueId=123"
-            )},
-            {"yahoo_projection_league_url": (
-                "https://football.fantasysports.yahoo.com/f1/456/settings"
-            )},
-            {"yahoo_projection_league_url": (
-                "https://football.fantasysports.yahoo.com/f1/456/players/extra"
             )},
         )
         for changes in invalid:
@@ -421,6 +391,9 @@ class WeeklyCollectionJobTests(unittest.TestCase):
         self.assertTrue(bundle_exists)
         self.assertNotIn("host_league_url", finished["request"])
         self.assertNotIn("yahoo_projection_league_url", finished["request"])
+        self.assertTrue(
+            finished["request"]["yahoo_projection_league_configured"]
+        )
         self.assertIsNone(finished["request"]["expected_team_count"])
         self.assertFalse(finished["request"]["allow_surrogate_power"])
         self.assertEqual(len(workflow.calls), 1)
@@ -644,11 +617,7 @@ class WeeklyCollectionHTTPTests(unittest.TestCase):
 
     def test_background_start_status_and_readiness_routes(self):
         status, started = self.request(
-            "POST", "/api/weekly-collections", request_payload(
-                yahoo_projection_league_url=(
-                    "https://football.fantasysports.yahoo.com/f1/456/players"
-                )
-            )
+            "POST", "/api/weekly-collections", request_payload()
         )
         self.assertEqual(status, 202)
         finished = wait_for_collection(
@@ -661,6 +630,31 @@ class WeeklyCollectionHTTPTests(unittest.TestCase):
         self.assertEqual(finished["status"], "complete")
         self.assertEqual(status, 200)
         self.assertTrue(catalog["readiness"]["ready"])
+
+    def test_yahoo_league_link_is_accepted_at_the_api_boundary(self):
+        status, started = self.request(
+            "POST",
+            "/api/weekly-collections",
+            request_payload(
+                yahoo_projection_league_url=(
+                    "https://football.fantasysports.yahoo.com/f1/456/players"
+                )
+            ),
+        )
+
+        self.assertEqual(status, 202)
+        finished = wait_for_collection(
+            lambda job_id: self.request(
+                "GET", f"/api/weekly-collections/{job_id}"
+            )[1],
+            started["job_id"],
+        )
+        self.assertEqual(finished["status"], "complete")
+        self.assertEqual(
+            self.workflow.calls[-1][0].yahoo_projection_league_url,
+            "https://football.fantasysports.yahoo.com/"
+            "f1/456/players?status=ALL",
+        )
 
     def test_interface_exposes_collection_and_fail_closed_readiness_controls(self):
         connection = http.client.HTTPConnection(
@@ -679,6 +673,11 @@ class WeeklyCollectionHTTPTests(unittest.TestCase):
             'id="includeFutureWeekly" type="checkbox" checked', page
         )
         self.assertIn('id="yahooProjectionUrl"', page)
+        self.assertIn("Yahoo league or player-list link", page)
+        self.assertIn('id="useFantasyPros" type="checkbox" checked', page)
+        self.assertIn('id="useBroadConsensus" type="checkbox" checked', page)
+        self.assertIn("sign in to ESPN and Yahoo normally", page)
+        self.assertIn('id="sourceDebug"', page)
         self.assertIn('id="readiness"', page)
 
 

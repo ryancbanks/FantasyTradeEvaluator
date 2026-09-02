@@ -7,6 +7,11 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from .espn_payload_projection import (
+    project_espn_league_payload,
+    project_espn_pro_team_payload,
+)
+
 
 _READ_ROOT = "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl"
 _TRANSACTION_FILTER = json.dumps(
@@ -52,13 +57,17 @@ class EspnFreeReadClient:
     ) -> tuple[Mapping[str, object], Mapping[str, object]]:
         league_url, pro_team_url = self.urls(season, league_id)
         _check_cancelled(cancelled)
-        league = self._read(
-            league_url,
-            cancelled,
-            extra_headers={"X-Fantasy-Filter": _TRANSACTION_FILTER},
+        league = project_espn_league_payload(
+            self._read(
+                league_url,
+                cancelled,
+                extra_headers={"X-Fantasy-Filter": _TRANSACTION_FILTER},
+            )
         )
         _check_cancelled(cancelled)
-        pro_teams = self._read(pro_team_url, cancelled)
+        pro_teams = project_espn_pro_team_payload(
+            self._read(pro_team_url, cancelled)
+        )
         _check_cancelled(cancelled)
         return league, pro_teams
 

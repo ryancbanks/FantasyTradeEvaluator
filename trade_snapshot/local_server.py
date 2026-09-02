@@ -30,6 +30,7 @@ from .extension_bridge import (
     BridgeStateError,
     ExtensionCommandBridge,
 )
+from .source_catalog import weekly_source_catalog
 from .weekly_collection import WeeklyCollectionRequest, WeeklyCollectionWorkflow
 
 
@@ -462,6 +463,12 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
                     self._read_json(max_bytes=64 * 1024)
                 ),
             )
+            return
+        if path == "/api/weekly-sources":
+            request = WeeklyCollectionRequest.from_payload(
+                self._read_json(max_bytes=32 * 1024)
+            )
+            self._json(HTTPStatus.OK, weekly_source_catalog(request))
             return
         if path == "/api/weekly-collections":
             request = WeeklyCollectionRequest.from_payload(

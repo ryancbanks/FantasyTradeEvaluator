@@ -63,6 +63,8 @@ def runtime_bindings(plan, host_id, yahoo_url):
         if task.provider is CaptureProvider.ESPN:
             result[task.task_id] = espn_url
         elif task.provider is CaptureProvider.YAHOO:
+            if yahoo_url is None:
+                raise ValueError("Yahoo projection task requires a Yahoo league URL")
             result[task.task_id] = yahoo_url
     return result
 

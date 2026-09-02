@@ -12,6 +12,90 @@ CONFIGURE_PROJECTION_SCRIPT = r"""
       Number(style.opacity) !== 0 && box.width > 0 && box.height > 0;
   };
   const controls = Array.from(document.querySelectorAll('select')).filter(visible);
+  if (request.provider === 'cbs') {
+    return {action: 'ready'};
+  }
+  if (request.provider === 'fftoday') {
+    const positionIds = {QB: '10', RB: '20', WR: '30', TE: '40', DL: '50',
+      LB: '60', DB: '70', K: '80'};
+    const scoringIds = {STD: '1', HALF: '193033', PPR: '107644'};
+    const weekly = request.horizon === 'weekly';
+    const supportedPositions = weekly
+      ? ['QB', 'RB', 'WR', 'TE', 'K']
+      : ['QB', 'RB', 'WR', 'TE', 'K', 'DL', 'LB', 'DB'];
+    if (request.positions.length !== 1 ||
+        !supportedPositions.includes(request.positions[0]) ||
+        !positionIds[request.positions[0]] ||
+        !scoringIds[request.scoring]) {
+      return {action: 'error', dimension: 'fftoday request'};
+    }
+    const expectedPath = weekly ? '/rankings/playerwkproj.php' : '/rankings/playerproj.php';
+    if (location.pathname !== expectedPath) {
+      return {action: 'error', dimension: 'fftoday path'};
+    }
+    const target = new URL(expectedPath, location.origin);
+    target.searchParams.set('LeagueID', scoringIds[request.scoring]);
+    target.searchParams.set('PosID', positionIds[request.positions[0]]);
+    target.searchParams.set('Season', String(request.season));
+    if (weekly) target.searchParams.set('GameWeek', String(request.week));
+    const current = new URL(location.href);
+    const keys = weekly
+      ? ['LeagueID', 'PosID', 'Season', 'GameWeek']
+      : ['LeagueID', 'PosID', 'Season'];
+    if (keys.some((key) => current.searchParams.get(key) !== target.searchParams.get(key))) {
+      location.replace(target.href);
+      return {action: 'changed', dimension: 'fftoday dimensions'};
+    }
+    const unavailable = Array.from(document.querySelectorAll('p'))
+      .filter(visible).map((node) => upper(node.innerText))
+      .some((text) => text === 'NO PLAYER FOUND!');
+    if (unavailable) {
+      return {action: 'error', dimension: 'fftoday availability'};
+    }
+    return {action: 'ready'};
+  }
+  if (request.provider === 'fantasysharks') {
+    const one = (name) => {
+      const matches = controls.filter((control) => control.name === name);
+      return matches.length === 1 ? matches[0] : null;
+    };
+    const segment = one('Segment'), position = one('Position'), scoring = one('scoring');
+    const positionIds = {QB: '1', RB: '2', WR: '4', TE: '5', DST: '6', K: '7',
+      DL: '8', LB: '9', DB: '10'};
+    const scoringIds = {STD: '1', HALF: '18', PPR: '2'};
+    if (!segment || !position || !scoring || request.positions.length !== 1 ||
+        !positionIds[request.positions[0]] || !scoringIds[request.scoring]) {
+      return {action: 'error', dimension: 'fantasysharks controls'};
+    }
+    let optionYear = null, desiredSegment = null;
+    for (const option of Array.from(segment.options)) {
+      const label = upper(option.textContent);
+      const season = label.match(/^(20\d{2}) NFL SEASON$/);
+      if (season) optionYear = Number(season[1]);
+      const desired = request.horizon === 'ros'
+        ? label === `${request.season} REST OF YEAR`
+        : optionYear === request.season && label === `WEEK ${request.week}`;
+      if (desired) desiredSegment = option.value;
+    }
+    if (!desiredSegment) {
+      return {action: 'error', dimension: 'fantasysharks period'};
+    }
+    for (const [control, value, dimension] of [
+      [segment, desiredSegment, 'period'],
+      [position, positionIds[request.positions[0]], 'position'],
+      [scoring, scoringIds[request.scoring], 'scoring']
+    ]) {
+      if (control.value === value) continue;
+      control.value = value;
+      const selected = Array.from(control.options).find((option) => option.value === value);
+      if (!selected) return {action: 'error', dimension};
+      selected.selected = true;
+      control.dispatchEvent(new Event('input', {bubbles: true}));
+      control.dispatchEvent(new Event('change', {bubbles: true}));
+      return {action: 'changed', dimension};
+    }
+    return {action: 'ready'};
+  }
   if (request.provider === 'yahoo') {
     const exactControl = (selector) => {
       const matches = Array.from(document.querySelectorAll(selector));
@@ -22,9 +106,19 @@ CONFIGURE_PROJECTION_SCRIPT = r"""
     if (!status || !stats || request.positions.length !== 1) {
       return {action: 'error', dimension: 'yahoo controls'};
     }
+    const weeklyPeriod = `S_PW_${Number(request.week)}`;
+    const remainingPeriod = `S_PSR_${Number(request.season)}`;
+    const fullSeasonPeriod = `S_PS_${Number(request.season)}`;
+    const availablePeriods = new Set(
+      Array.from(stats.options).map((option) => option.value)
+    );
     const periodValue = request.horizon === 'weekly'
-      ? `S_PW_${Number(request.week)}`
-      : `S_PSR_${Number(request.season)}`;
+      ? weeklyPeriod
+      : availablePeriods.has(remainingPeriod)
+        ? remainingPeriod
+        : Number(request.week) === 1 && availablePeriods.has(fullSeasonPeriod)
+          ? fullSeasonPeriod
+          : remainingPeriod;
     const periodOptions = Array.from(stats.options).filter(
       (option) => option.value === periodValue
     );

@@ -816,6 +816,9 @@ class LocalAppServiceTests(unittest.TestCase):
                 finished = wait_for_job(service, started["job_id"])
                 self.assertEqual(finished["status"], "complete", finished)
                 preview = service.job_results(started["job_id"])
+                bundle.methodology_mode = "independent"
+                independent_preview = service.job_results(started["job_id"])
+                bundle.methodology_mode = "exact"
                 with patch(
                     "trade_snapshot.three_way_xlsx.MAX_THREE_WAY_EXPORT_ROWS", 0
                 ), patch.object(
@@ -851,6 +854,17 @@ class LocalAppServiceTests(unittest.TestCase):
         self.assertEqual(
             {row["power_methodology_status"] for row in preview["rows"]},
             {"extrapolated"},
+        )
+        self.assertEqual(
+            {
+                row["power_methodology_status"]
+                for row in independent_preview["rows"]
+            },
+            {"independent"},
+        )
+        self.assertIn(
+            "Independent power model",
+            independent_preview["power_engine_notice"],
         )
 
     def test_three_team_request_is_explicit_canonical_and_does_not_change_legacy_identity(self):

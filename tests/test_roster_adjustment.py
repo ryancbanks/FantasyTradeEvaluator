@@ -94,7 +94,7 @@ class RosterAdjustmentTests(unittest.TestCase):
                 status=projections[0].status,
                 provider_observations=(
                     type(projections[0].provider_observations[0])(
-                        "source", f"source-{player}", projections[0].status, POINTS[player], 1
+                        "espn", f"espn-{player}", projections[0].status, POINTS[player], 1
                     ),
                 ),
                 minimum_observed_sources=1,

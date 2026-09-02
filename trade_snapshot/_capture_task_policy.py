@@ -10,11 +10,26 @@ VISIBLE_PAGE_PATHS = {
     "fantasypros": r"/nfl/projections/[a-z0-9-]+\.php",
     "espn": r"/football/players/projections/?",
     "yahoo": r"/f1/players/?",
+    "cbs": (
+        r"/fantasy/football/stats/(?:QB|RB|WR|TE|K|DST)/20[0-9]{2}/"
+        r"season/projections/(?:ppr|nonppr)/?"
+    ),
+    "fftoday": r"/rankings/player(?:wk)?proj\.php",
+    "fantasysharks": r"/apps/bert/forecasts/projections\.php",
 }
 VISIBLE_PAGE_HOSTS = {
     "fantasypros": frozenset({"fantasypros.com", "www.fantasypros.com"}),
     "espn": frozenset({"fantasy.espn.com"}),
     "yahoo": frozenset({"football.fantasysports.yahoo.com"}),
+    "cbs": frozenset({"cbssports.com", "www.cbssports.com"}),
+    "fftoday": frozenset({"fftoday.com", "www.fftoday.com"}),
+    "fantasysharks": frozenset(
+        {"fantasysharks.com", "www.fantasysharks.com"}
+    ),
+}
+FFTODAY_POSITION_SCOPES = {
+    "weekly": frozenset({"QB", "RB", "WR", "TE", "K"}),
+    "ros": frozenset({"QB", "RB", "WR", "TE", "K", "DL", "LB", "DB"}),
 }
 YAHOO_BOUND_PROJECTION_PATH = (
     r"/(?:20[0-9]{2}/)?f1/(?P<league>[1-9][0-9]{0,19})/"
@@ -25,7 +40,7 @@ YAHOO_BOUND_SETTINGS_PATH = (
 )
 
 
-def validate_visible_table_task(provider, url: str) -> None:
+def validate_visible_table_task(provider, url: str, projection=None) -> None:
     name = getattr(provider, "value", provider)
     parsed = urlsplit(url)
     if (
@@ -33,6 +48,21 @@ def validate_visible_table_task(provider, url: str) -> None:
         or not re.fullmatch(VISIBLE_PAGE_PATHS.get(name, r"(?!)"), parsed.path)
     ):
         raise ValueError("visible_table task URL does not match the provider projection page")
+    if name == "fftoday" and projection is not None:
+        horizon = getattr(getattr(projection, "horizon", None), "value", None)
+        positions = getattr(projection, "position_scope", ())
+        expected_path = {
+            "weekly": "/rankings/playerwkproj.php",
+            "ros": "/rankings/playerproj.php",
+        }.get(horizon)
+        if (
+            expected_path != parsed.path
+            or len(positions) != 1
+            or positions[0] not in FFTODAY_POSITION_SCOPES.get(horizon, frozenset())
+        ):
+            raise ValueError(
+                "FFToday projection task requests an unsupported period or position"
+            )
 
 
 def runtime_path_matches_task(task, runtime_path: str) -> bool:
@@ -158,8 +188,12 @@ def page_task_fingerprint(kinds, analyzer_phases, provider_hosts) -> str:
                 name: sorted(hosts) for name, hosts in VISIBLE_PAGE_HOSTS.items()
             },
             "yahoo_bound_projection_path": YAHOO_BOUND_PROJECTION_PATH,
+            "fftoday_position_scopes": {
+                horizon: sorted(positions)
+                for horizon, positions in FFTODAY_POSITION_SCOPES.items()
+            },
             "league_source_path": "/nfl/myplaybook/trade-analyzer.php",
-            "policy_version": "bound-yahoo-aliases-v6",
+            "policy_version": "bound-public-projection-surfaces-v7",
         },
     )
 
@@ -179,7 +213,8 @@ def validate_league_source_task(provider, url: str, attached: tuple[object, ...]
 
 
 __all__ = (
-    "VISIBLE_PAGE_HOSTS", "VISIBLE_PAGE_PATHS", "capture_plan_fingerprint",
+    "FFTODAY_POSITION_SCOPES", "VISIBLE_PAGE_HOSTS", "VISIBLE_PAGE_PATHS",
+    "capture_plan_fingerprint",
     "page_path_matches_task", "page_task_fingerprint",
     "runtime_path_matches_task",
     "validate_league_source_task",

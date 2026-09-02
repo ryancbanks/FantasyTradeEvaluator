@@ -109,6 +109,16 @@ class ThreeWayWorkbookTests(unittest.TestCase):
                 "exact",
             )
 
+    def test_independent_power_keeps_its_truthful_methodology_status(self):
+        row = three_way_workbook_rows(
+            (result(),),
+            {"A": "Alpha", "B": "Beta", "C": "Gamma"},
+            {"a": "A Player", "b": "B Player", "c": "C Player"},
+            "independent",
+        )[0]
+
+        self.assertEqual(row.power_methodology_status, "independent")
+
 
 if __name__ == "__main__":
     unittest.main()

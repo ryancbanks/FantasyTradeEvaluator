@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
+from .independent_power_disclosure import INDEPENDENT_POWER_NOTICE
 from .surrogate_disclosure import SURROGATE_NOTICE
 from .three_way_workbook import ThreeWayExportProvenance, ThreeWayWorkbookRow
 from .workbook_model import TradeWorkbookContext, WorkbookTeamOutlook
@@ -380,13 +381,28 @@ def _details_sheet(
     sheet.set_row(0, 30)
     sheet.merge_range("A1:C1", "Calculation Provenance", formats["title"])
     exact = context.power_engine_mode == "exact"
-    three_way_notice = (
-        "EXTRAPOLATED — three-way trades are outside the attested two-team "
-        "trade-shape scope; playoff projections remain local."
-        if exact
-        else "SURROGATE_EXTRAPOLATED — three-way trades are outside the "
-        "observed two-team surrogate shapes."
-    )
+    independent = context.power_engine_mode == "independent"
+    if exact:
+        three_way_notice = (
+            "EXTRAPOLATED — three-way trades are outside the attested two-team "
+            "trade-shape scope; playoff projections remain local."
+        )
+        power_mode_label = "EXACT / ATTESTED"
+        accuracy_notice = three_way_notice
+    elif independent:
+        three_way_notice = (
+            "INDEPENDENT — three-way trades use the disclosed local power policy; "
+            "playoff projections remain local."
+        )
+        power_mode_label = "INDEPENDENT / LOCAL"
+        accuracy_notice = f"{three_way_notice} {INDEPENDENT_POWER_NOTICE}"
+    else:
+        three_way_notice = (
+            "SURROGATE_EXTRAPOLATED — three-way trades are outside the "
+            "observed two-team surrogate shapes."
+        )
+        power_mode_label = "SURROGATE / APPROXIMATE"
+        accuracy_notice = f"{three_way_notice} {SURROGATE_NOTICE}"
     details = (
         ("Trade Format", "three_team"),
         ("Request ID", provenance.request_id),
@@ -422,7 +438,7 @@ def _details_sheet(
         ("Simulation Scenarios", context.scenario_count),
         (
             "Power Engine Mode",
-            "EXACT / ATTESTED" if exact else "SURROGATE / APPROXIMATE",
+            power_mode_label,
         ),
         ("Three-Way Power Method", three_way_notice),
         ("Calibration Status", context.calibration_status),
@@ -439,11 +455,15 @@ def _details_sheet(
         ("Current Methodology Evidence ID", context.methodology_current_evidence_id),
         (
             "Exact FantasyPros-Power Scope",
-            "NONE for three-way trades — every three-team result is extrapolated.",
+            (
+                "NONE — independent local power does not claim FantasyPros exactness."
+                if independent
+                else "NONE for three-way trades — every three-team result is extrapolated."
+            ),
         ),
         (
             "Power Accuracy Notice",
-            three_way_notice if exact else f"{three_way_notice} {SURROGATE_NOTICE}",
+            accuracy_notice,
         ),
         ("Qualified Three-Way Trades", trade_count),
         ("All-Three Playoff Gains", all_gain_count),

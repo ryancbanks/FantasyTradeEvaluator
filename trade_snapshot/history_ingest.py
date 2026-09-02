@@ -24,7 +24,8 @@ from .league_history import (
     LeagueHistoryCapture,
     make_league_key,
 )
-from .weekly_assembly import AssembledWeeklyEvidence
+from .identity import IdentityRegistry
+from .league_ingest import NormalizedLeagueInputs
 
 
 _KINDS = {
@@ -41,7 +42,7 @@ _ASSET_KINDS = {
 
 def canonicalize_espn_history(
     source: EspnActivityCapture,
-    assembled: AssembledWeeklyEvidence,
+    assembled: object,
     bundle: EngineBundle,
     *,
     bundle_captured_at: datetime,
@@ -50,12 +51,17 @@ def canonicalize_espn_history(
 
     if not isinstance(source, EspnActivityCapture):
         raise ValueError("source must be an EspnActivityCapture")
-    if not isinstance(assembled, AssembledWeeklyEvidence):
-        raise ValueError("assembled must be AssembledWeeklyEvidence")
+    identities = getattr(assembled, "identities", None)
+    league = getattr(assembled, "league_inputs", None)
+    if not isinstance(identities, IdentityRegistry) or not isinstance(
+        league, NormalizedLeagueInputs
+    ):
+        raise ValueError(
+            "assembled must provide validated identities and normalized league inputs"
+        )
     if not isinstance(bundle, EngineBundle):
         raise ValueError("bundle must be an EngineBundle")
     bound_at = _aware(bundle_captured_at)
-    league = assembled.league_inputs
     if (
         league.source_provider != "espn"
         or league.source_league_id != source.source_league_id
@@ -83,7 +89,7 @@ def canonicalize_espn_history(
             raise ValueError("ESPN activity references an unknown team") from None
 
     def player_id(source_id):
-        identity = assembled.identities.lookup("espn", source_id)
+        identity = identities.lookup("espn", source_id)
         return None if identity is None else identity.canonical_player_id
 
     teams = tuple(

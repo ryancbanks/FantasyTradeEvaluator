@@ -38,6 +38,9 @@ from .trade_space import TeamRoster
 _MAX_VALUATION_LAG = timedelta(days=8)
 _MAX_PLAYOFF_SCENARIOS = 2_000
 _MAX_HEALTH_COVERAGE_GAP = timedelta(days=8)
+_METHODOLOGY_STATUSES = frozenset(
+    {"exact", "extrapolated", "surrogate", "surrogate_extrapolated", "independent"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,12 +208,7 @@ class CurrentTradeRevaluation:
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f"{name} must be a non-empty string")
         captured_at = _aware("bundle_captured_at", self.bundle_captured_at)
-        if self.methodology_status not in {
-            "exact",
-            "extrapolated",
-            "surrogate",
-            "surrogate_extrapolated",
-        }:
+        if self.methodology_status not in _METHODOLOGY_STATUSES:
             raise ValueError("methodology_status is invalid")
         if not isinstance(self.foresight_eligible, bool):
             raise ValueError("foresight_eligible must be a boolean")
@@ -264,9 +262,7 @@ class HistoricalTradeValuation:
         expected_lag = (proposal_at - source_at).total_seconds() / 3600
         if abs(expected_lag - self.valuation_lag_hours) > 1e-9:
             raise ValueError("valuation_lag_hours does not match its evidence timestamps")
-        if self.methodology_status not in {
-            "exact", "extrapolated", "surrogate", "surrogate_extrapolated"
-        }:
+        if self.methodology_status not in _METHODOLOGY_STATUSES:
             raise ValueError("methodology_status is invalid")
         if self.playoff_scenario_count is not None and (
             type(self.playoff_scenario_count) is not int

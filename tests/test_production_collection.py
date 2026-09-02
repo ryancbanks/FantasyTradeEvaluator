@@ -306,6 +306,8 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
             )
         self.assertEqual(collector.calls, [])
 
+        collector = _Collector()
+        workflow = _workflow(collector=collector)
         with TemporaryDirectory() as directory, self.assertRaisesRegex(
             WeeklyCollectionError, "does not match"
         ):
@@ -345,6 +347,40 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
             self.assertFalse((Path(directory) / "identity-registry.json").exists())
         self.assertNotIn("private player", str(raised.exception))
         self.assertEqual(len(collector.calls), 2)
+
+    def test_validation_failure_retains_safe_stage_and_league_diagnostics(self):
+        def invalid_identity(**_kwargs):
+            raise ValueError("private player mismatch detail")
+
+        workflow = _workflow(collector=_Collector(), assembler=invalid_identity)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(
+                WeeklyCollectionError,
+                "cross-source identity and weekly evidence assembly.*Local diagnostic",
+            ) as raised:
+                workflow(
+                    _request(), data_directory=root,
+                    progress=lambda _: None, cancelled=lambda: False,
+                )
+            failure = json.loads(
+                (root / "diagnostics" / "latest-weekly-validation-error.json")
+                .read_text(encoding="utf-8")
+            )
+            league = json.loads(
+                (root / "diagnostics" / "latest-fantasypros-league.json")
+                .read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(
+            failure["stage"], "cross-source identity and weekly evidence assembly"
+        )
+        self.assertEqual(failure["exception_type"], "ValueError")
+        self.assertTrue(failure["league_capture_available"])
+        self.assertTrue(failure["frames"])
+        self.assertNotIn("private player mismatch detail", json.dumps(failure))
+        self.assertNotIn("private player mismatch detail", str(raised.exception))
+        self.assertEqual(league["kind"], "fantasypros_league_capture_diagnostic")
 
     def test_refresh_failure_does_not_persist_identity_registry(self):
         def failed_refresh(*_args, **_kwargs):
@@ -598,15 +634,71 @@ class EspnFreeReadClientTests(unittest.TestCase):
     def test_uses_two_exact_cookie_free_bounded_reads(self):
         calls = []
 
+        league_payload = {
+            "id": 123,
+            "seasonId": 2026,
+            "members": [{"displayName": "PRIVATE OWNER"}],
+            "teams": [{"id": 1, "owners": ["PRIVATE MEMBER"]}],
+        }
+        pro_team_payload = {
+            "display": True,
+            "settings": {
+                "proTeams": [
+                    {
+                        "id": 1,
+                        "abbrev": "ATL",
+                        "byeWeek": 6,
+                        "location": "Atlanta",
+                        "name": "Falcons",
+                        "universeId": 1,
+                        "proGamesByScoringPeriod": {
+                            "1": [
+                                {
+                                    "id": 1001,
+                                    "scoringPeriodId": 1,
+                                    "awayProTeamId": 1,
+                                    "homeProTeamId": 2,
+                                    "date": 1788000000000,
+                                    "startTimeTBD": False,
+                                    "statsOfficial": False,
+                                    "validForLocking": True,
+                                    "private": "SECRET",
+                                }
+                            ]
+                        },
+                        "teamPlayersByPosition": {"1": ["PRIVATE PLAYER"]},
+                        "private": "SECRET",
+                    }
+                ]
+            },
+            "private": "SECRET",
+        }
+
         def opener(request, *, timeout):
             calls.append((request, timeout))
-            return _Response(request.full_url, b'{"ok":true}')
+            payload = (
+                pro_team_payload
+                if "proTeamSchedules_wl" in request.full_url
+                else league_payload
+            )
+            return _Response(request.full_url, json.dumps(payload).encode("utf-8"))
 
         client = EspnFreeReadClient(timeout_seconds=7, maximum_bytes=2048, opener=opener)
         league, pro_teams = client(2026, "123", lambda: False)
 
-        self.assertEqual(league, {"ok": True})
-        self.assertEqual(pro_teams, {"ok": True})
+        self.assertEqual(league["id"], 123)
+        self.assertEqual(league["seasonId"], 2026)
+        self.assertEqual(league["teams"][0]["id"], 1)
+        self.assertTrue(pro_teams["display"])
+        projected_team = pro_teams["settings"]["proTeams"][0]
+        self.assertEqual(projected_team["id"], 1)
+        self.assertEqual(projected_team["abbrev"], "ATL")
+        self.assertEqual(projected_team["teamPlayersByPosition"], {})
+        self.assertEqual(
+            projected_team["proGamesByScoringPeriod"]["1"][0]["id"], 1001
+        )
+        self.assertNotIn("PRIVATE", repr((league, pro_teams)))
+        self.assertNotIn("SECRET", repr((league, pro_teams)))
         self.assertEqual(len(calls), 2)
         first = calls[0][0]
         self.assertEqual(first.get_method(), "GET")
@@ -708,9 +800,22 @@ class EspnFreeReadClientTests(unittest.TestCase):
         context = _CookieContext()
         calls = []
 
+        league_payload = {
+            "id": 123,
+            "members": [{"displayName": "PRIVATE OWNER"}],
+        }
+        pro_team_payload = {
+            "settings": {"proTeams": [{"id": 1, "abbrev": "ATL"}]}
+        }
+
         def transport(request, *, timeout):
             calls.append(request)
-            return _Response(request.full_url, b'{"ok":true}')
+            payload = (
+                pro_team_payload
+                if "proTeamSchedules_wl" in request.full_url
+                else league_payload
+            )
+            return _Response(request.full_url, json.dumps(payload).encode("utf-8"))
 
         result = read_authenticated_espn_json(
             context,
@@ -722,7 +827,21 @@ class EspnFreeReadClientTests(unittest.TestCase):
             transport=transport,
         )
 
-        self.assertEqual(result, ({"ok": True}, {"ok": True}))
+        self.assertEqual(result[0]["id"], 123)
+        self.assertEqual(
+            result[1],
+            {
+                "settings": {
+                    "proTeams": [
+                        {
+                            "id": 1,
+                            "abbrev": "ATL",
+                            "proGamesByScoringPeriod": {},
+                        }
+                    ]
+                }
+            },
+        )
         self.assertEqual(tuple(context.urls), EspnFreeReadClient.urls(2026, "123"))
         self.assertEqual(len(calls), 2)
         for request in calls:
@@ -730,6 +849,7 @@ class EspnFreeReadClientTests(unittest.TestCase):
             self.assertEqual(headers["Cookie"], "espn_s2=worker-only-secret")
         self.assertNotIn("worker-only-secret", repr(result))
         self.assertNotIn("Cookie", repr(result))
+        self.assertNotIn("PRIVATE OWNER", repr(result))
 
         with self.assertRaisesRegex(EspnFreeReadError, "cancelled"):
             read_authenticated_espn_json(
@@ -826,6 +946,11 @@ def _small_plan(**dimensions):
             projection=projection,
         ),
         PageCaptureTask(
+            "fantasypros", season, week, "visible_table",
+            "https://www.fantasypros.com/nfl/projections/rb.php",
+            projection=projection,
+        ),
+        PageCaptureTask(
             "yahoo", season, week, "visible_table",
             "https://football.fantasysports.yahoo.com/f1/players",
             projection=projection,
@@ -851,6 +976,7 @@ def _artifact(task):
             ),),
         )
     links = {
+        "fantasypros": "https://www.fantasypros.com/nfl/players/player-one.php",
         "espn": "https://www.espn.com/nfl/player/_/id/201/player-one",
         "yahoo": "https://sports.yahoo.com/nfl/players/301/",
     }

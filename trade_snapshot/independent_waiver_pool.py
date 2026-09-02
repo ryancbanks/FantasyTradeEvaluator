@@ -7,9 +7,10 @@ from types import MappingProxyType
 
 from ._scenario_random import content_id
 from .positions import normalize_lineup_slot, normalize_player_position
+from .projection_source_policy import INDEPENDENT_PROJECTION_PROVIDERS
 
 
-INDEPENDENT_WAIVER_ALGORITHM = "independent-two-source-ros-value-v1"
+INDEPENDENT_WAIVER_ALGORITHM = "independent-ensemble-ros-value-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,9 +250,18 @@ def select_independent_waiver_pool(
 
 
 def _provider_ids(value: object) -> Mapping[str, str]:
-    if not isinstance(value, Mapping) or set(value) != {"espn", "yahoo"}:
-        raise ValueError("provider_player_ids must exactly cover ESPN and Yahoo")
-    result = {provider: _text(f"{provider} player ID", player_id) for provider, player_id in value.items()}
+    if (
+        not isinstance(value, Mapping)
+        or "espn" not in value
+        or not set(value) <= set(INDEPENDENT_PROJECTION_PROVIDERS)
+    ):
+        raise ValueError(
+            "provider_player_ids must contain ESPN and only independent sources"
+        )
+    result = {
+        provider: _text(f"{provider} player ID", player_id)
+        for provider, player_id in value.items()
+    }
     return MappingProxyType(dict(sorted(result.items())))
 
 

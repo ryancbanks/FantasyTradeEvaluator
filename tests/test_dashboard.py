@@ -6,8 +6,10 @@ import unittest
 from tests.test_engine_bundle import engine_bundle
 from trade_snapshot.dashboard import (
     _field_conditioned_title_shares,
+    _power_notice,
     build_league_dashboard,
 )
+from trade_snapshot.independent_power_disclosure import INDEPENDENT_POWER_NOTICE
 from trade_snapshot.trade_impact import prepare_season_baseline
 
 
@@ -33,6 +35,9 @@ def build_dashboard(bundle, baseline):
 
 
 class LeagueDashboardTests(unittest.TestCase):
+    def test_independent_power_notice_is_not_described_as_surrogate(self):
+        self.assertEqual(_power_notice("independent"), INDEPENDENT_POWER_NOTICE)
+
     def test_builds_deterministic_strict_json_contract(self):
         bundle, baseline = dashboard_inputs()
 

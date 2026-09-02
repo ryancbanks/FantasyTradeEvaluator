@@ -285,6 +285,9 @@ def _league(value: object) -> None:
     _positive_int(value["roster_size"], "roster_size", maximum=100)
     if not isinstance(value["scoring"], str) or not value["scoring"].strip():
         raise ValueError("league scoring must be non-empty text")
+    for name in ("id", "team_id"):
+        if name in value:
+            _id(value[name], f"league {name}")
     if str(value.get("host", "")).upper() == "ESPN" and value.get(
         "host_league_id"
     ) is not None:

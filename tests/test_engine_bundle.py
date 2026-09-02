@@ -11,7 +11,10 @@ from tests.test_search_runner import PLAYER_POINTS, components
 from trade_snapshot.analyzer_contract import BundleFingerprint
 from trade_snapshot.ecr import EcrPeriod, EcrPlayerRanking, EcrSnapshot
 from trade_snapshot.engine_bundle import EngineBundle, load_engine_bundle, save_engine_bundle
-from trade_snapshot.ensemble import EnsembleProjection, ProviderObservation
+from trade_snapshot.ensemble import (
+    EnsembleProjection,
+    ProviderObservation,
+)
 from trade_snapshot.methodology import PowerMethodology
 from trade_snapshot.methodology_attestation import MethodologyAttestation
 from trade_snapshot.methodology_reuse import (
@@ -143,8 +146,8 @@ def waiver_projection(template, player_id):
         ProjectionStatus.OBSERVED,
         (
             ProviderObservation(
-                "source",
-                f"source-{player_id}",
+                "espn",
+                f"espn-{player_id}",
                 ProjectionStatus.OBSERVED,
                 ALL_POINTS[player_id],
                 1,
@@ -198,7 +201,20 @@ def engine_bundle():
         runner.prepared_strength.model
     )
     projections = (
-        *baseline.scenarios.projections,
+        *(
+            replace(
+                row,
+                provider_observations=tuple(
+                    replace(
+                        observation,
+                        provider="espn",
+                        provider_player_id=f"espn-{row.canonical_player_id}",
+                    )
+                    for observation in row.provider_observations
+                ),
+            )
+            for row in baseline.scenarios.projections
+        ),
         *(waiver_projection(baseline.scenarios.projections[0], player_id)
           for player_id in WAIVER_PLAYER_IDS),
     )
@@ -278,7 +294,7 @@ class EngineBundleTests(unittest.TestCase):
     def test_strict_json_round_trip_and_atomic_file_persistence(self):
         bundle = engine_bundle()
         record = bundle.to_record()
-        self.assertEqual(record["schema_version"], 7)
+        self.assertEqual(record["schema_version"], 8)
         self.assertIsNone(record["surrogate_disclosure"])
         self.assertEqual(
             record["methodology_attestation"]["attestation_id"],
@@ -311,6 +327,14 @@ class EngineBundleTests(unittest.TestCase):
             with patch("trade_snapshot.engine_bundle._MAX_ENGINE_BUNDLE_BYTES", 1):
                 with self.assertRaisesRegex(ValueError, "size limit"):
                     load_engine_bundle(path)
+
+    def test_loaded_bundle_rejects_reference_only_calculation_provider(self):
+        bundle = engine_bundle()
+        record = bundle.to_record()
+        record["projections"][0]["provider_observations"][0]["provider"] = "ffa"
+
+        with self.assertRaisesRegex(ValueError, "reference-only"):
+            EngineBundle.from_record(record)
 
     def test_round_trip_preserves_typed_reserve_capacity_and_placement(self):
         baseline = engine_bundle()
@@ -421,7 +445,7 @@ class EngineBundleTests(unittest.TestCase):
         for old_schema in (1, 2, 3, 4):
             with self.subTest(old_schema=old_schema):
                 legacy["schema_version"] = old_schema
-                with self.assertRaisesRegex(ValueError, "fields are invalid"):
+                with self.assertRaisesRegex(ValueError, "schema version"):
                     EngineBundle.from_record(legacy)
 
         tampered = copy.deepcopy(bundle.to_record())

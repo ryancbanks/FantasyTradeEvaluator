@@ -73,8 +73,13 @@ window.ThreeWayUi = (() => {
     $("noDropsLabel").textContent = threeTeam
       ? "Do not force any team to drop a player"
       : "Do not force either team to drop a player";
+    const threeTeamPower = bundle?.power_engine_mode === "independent"
+      ? "power uses the disclosed independent local model"
+      : bundle?.power_engine_mode === "surrogate"
+        ? "power is labeled surrogate_extrapolated"
+        : "power is extrapolated beyond the attested two-team scope";
     $("tradeFormatHelp").textContent = threeTeam
-      ? "Choose exactly two partner teams. Every valid player route is considered; three-team power is always extrapolated."
+      ? `Choose exactly two partner teams. Every valid player route is considered; ${threeTeamPower}.`
       : "Two-team mode searches each selected opponent independently.";
     const adjustmentNotice = $("freeAgentAllocationHelp");
     const showAdjustmentPolicy = threeTeam && !$("noDrops").checked;

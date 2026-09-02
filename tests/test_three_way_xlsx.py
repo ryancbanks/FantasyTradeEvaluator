@@ -269,6 +269,45 @@ class ThreeWayExcelExportTests(unittest.TestCase):
         self.assertIn("three-way", shared.casefold())
         self.assertIn("outside", shared.casefold())
 
+    def test_independent_provenance_is_never_labeled_surrogate(self):
+        independent = replace(
+            context(),
+            power_engine_mode="independent",
+            calibration_status="independent",
+            methodology_evidence_kind="independent_disclosure",
+            methodology_record_id="independent-disclosure-3way",
+            formula_id="independent-policy-3way",
+            formula_source_fit_id="not-applicable",
+            methodology_fingerprint_id="independent-fingerprint-3way",
+            formula_action="independent_policy",
+            methodology_current_evidence_id="independent-evidence-3way",
+            methodology_quality_gate="transparent_independent_v1",
+            methodology_holdout_count=0,
+            holdout_max_absolute_score_error=None,
+            holdout_display_match_rate=None,
+            exact_balanced_package_sizes=(),
+        )
+        with TemporaryDirectory() as directory:
+            target = Path(directory) / "independent-three-way.xlsx"
+            export_three_way_trade_workbook(
+                target,
+                independent,
+                provenance(),
+                (replace(trade(), power_methodology_status="independent"),),
+                outlook(),
+            )
+            with ZipFile(target) as archive:
+                shared = archive.read("xl/sharedStrings.xml").decode()
+
+        self.assertIn("INDEPENDENT / LOCAL", shared)
+        self.assertIn("independent", shared.casefold())
+        self.assertIn("not a FantasyPros score", shared)
+        self.assertIn(
+            "independent local power does not claim FantasyPros exactness",
+            shared,
+        )
+        self.assertNotIn("SURROGATE / APPROXIMATE", shared)
+
     def test_validates_suffix_row_types_and_excel_limit(self):
         with TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "end in .xlsx"):

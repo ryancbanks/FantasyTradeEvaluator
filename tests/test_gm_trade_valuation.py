@@ -707,6 +707,24 @@ class HistoricalTradeValuationTests(unittest.TestCase):
             current["primary"].relative_power_edge_drift,
             -current["other"].relative_power_edge_drift,
         )
+        independent_current = replace(
+            valuation.current_revaluation,
+            methodology_status="independent",
+            foresight_eligible=False,
+            foresight_ineligibility_reasons=(
+                "methodology_not_exact_at_both_times",
+            ),
+        )
+        independent = replace(
+            valuation,
+            methodology_status="independent",
+            current_revaluation=independent_current,
+        )
+        self.assertEqual(independent.methodology_status, "independent")
+        self.assertEqual(
+            independent.current_revaluation.methodology_status, "independent"
+        )
+        self.assertFalse(independent.current_revaluation.foresight_eligible)
 
     def test_complete_active_health_captures_make_comparison_foresight_eligible(self):
         source = engine_bundle()

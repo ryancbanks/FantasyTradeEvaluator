@@ -13,6 +13,7 @@ from .workbook_model import (
     WorkbookTradeRows,
 )
 from .surrogate_disclosure import SURROGATE_NOTICE
+from .independent_power_disclosure import INDEPENDENT_POWER_NOTICE
 
 
 MAX_EXCEL_DATA_ROWS = 1_000_000
@@ -342,6 +343,27 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
     sheet.set_row(0, 30)
     sheet.merge_range("A1:C1", "Calculation Provenance", formats["title"])
     exact = context.power_engine_mode == "exact"
+    independent = context.power_engine_mode == "independent"
+    if exact:
+        mode_label = "EXACT / ATTESTED"
+        scope = (
+            "balanced, no adds/drops, package sizes "
+            + ", ".join(
+                str(value) for value in context.exact_balanced_package_sizes
+            )
+        )
+        notice = (
+            "Outside the attested scope, FantasyPros-style power is labeled "
+            "extrapolated; playoff projections remain local."
+        )
+    elif independent:
+        mode_label = "INDEPENDENT / LOCAL"
+        scope = "NONE — this is not a FantasyPros-derived power engine"
+        notice = INDEPENDENT_POWER_NOTICE
+    else:
+        mode_label = "SURROGATE / APPROXIMATE"
+        scope = "NONE — this engine is a SURROGATE approximation"
+        notice = SURROGATE_NOTICE
     details = (
         ("Snapshot ID", context.snapshot_id),
         ("Strength Model ID", context.strength_model_id),
@@ -352,20 +374,27 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
         ("Simulation Scenarios", context.scenario_count),
         (
             "Power Engine Mode",
-            "EXACT / ATTESTED" if exact else "SURROGATE / APPROXIMATE",
+            mode_label,
         ),
         ("Calibration Status", context.calibration_status),
         ("Methodology Evidence Type", context.methodology_evidence_kind),
         ("Methodology Evidence Record ID", context.methodology_record_id),
-        ("Strength Formula ID", context.formula_id),
-        ("Source Fit ID", context.formula_source_fit_id),
+        ("Strength Formula / Policy ID", context.formula_id),
+        ("Source Fit / Disclosure ID", context.formula_source_fit_id),
         ("Publication Quality Gate", context.methodology_quality_gate),
         ("Blind Holdout Trades", context.methodology_holdout_count),
         (
             "Maximum Blind Score Error",
-            context.holdout_max_absolute_score_error,
+            (
+                "Not applicable"
+                if independent
+                else context.holdout_max_absolute_score_error
+            ),
         ),
-        ("Blind Display Match Rate", context.holdout_display_match_rate),
+        (
+            "Blind Display Match Rate",
+            "Not applicable" if independent else context.holdout_display_match_rate,
+        ),
         ("Methodology Fingerprint ID", context.methodology_fingerprint_id),
         ("Formula Action", context.formula_action),
         (
@@ -374,23 +403,11 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
         ),
         (
             "Exact FantasyPros-Power Scope",
-            (
-                "balanced, no adds/drops, package sizes "
-                + ", ".join(
-                    str(value) for value in context.exact_balanced_package_sizes
-                )
-                if exact
-                else "NONE — this engine is a SURROGATE approximation"
-            ),
+            scope,
         ),
         (
             "Power Accuracy Notice",
-            (
-                "Outside the attested scope, FantasyPros-style power is labeled "
-                "extrapolated; playoff projections remain local."
-                if exact
-                else SURROGATE_NOTICE
-            ),
+            notice,
         ),
         ("Qualified Trades", trade_count),
         ("Mutual Playoff Gains", mutual_count),
@@ -400,7 +417,7 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
         label, value = values
         sheet.write(row, 0, label, formats["section"])
         value_format = None
-        if label == "Blind Display Match Rate":
+        if label == "Blind Display Match Rate" and not independent:
             value_format = formats["percent"]
         elif label == "Power Accuracy Notice":
             value_format = formats["wrapped_text"] if exact else formats["warning"]

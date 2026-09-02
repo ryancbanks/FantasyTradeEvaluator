@@ -213,7 +213,12 @@ class _PlaywrightSession:
 
     def capture_visible_tables(self, task, timeout_ms, action_delay_ms, cancelled):
         if task.provider not in (
-            CaptureProvider.FANTASYPROS, CaptureProvider.ESPN, CaptureProvider.YAHOO
+            CaptureProvider.FANTASYPROS,
+            CaptureProvider.ESPN,
+            CaptureProvider.YAHOO,
+            CaptureProvider.CBS,
+            CaptureProvider.FFTODAY,
+            CaptureProvider.FANTASYSHARKS,
         ) or task.projection is None:
             raise BrowserCaptureError("projection table task is invalid")
         deadline = time.monotonic() + timeout_ms / 1000

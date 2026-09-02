@@ -11,10 +11,15 @@ from .feature_engineering import StrengthFeatureSet, build_strength_features
 from .league_state import LeagueState
 from .formula_verification import FormulaVerificationReport
 from .methodology_attestation import MethodologyAttestation
+from .methodology import default_projection_ensemble
 from .methodology_reuse import FormulaReuseDecision, MethodologyFingerprint
 from .nfl_schedule import NflSchedule
 from .projections import RemainingSeasonProjection, WeeklyProjection
 from .projection_schedule import materialize_weekly_grid
+from .projection_source_policy import (
+    validate_no_composite_double_count,
+    validate_selectable_projection_providers,
+)
 from .positions import normalize_player_position
 from .scenario_config import CorrelatedScenarioConfig, PlayerEligibility
 from .scoring import ScoringProfile
@@ -155,32 +160,80 @@ def prepare_weekly_model_inputs(
         raise ValueError("ensemble_config must be an EnsembleConfig")
     if not isinstance(nfl_schedule, NflSchedule):
         raise ValueError("nfl_schedule must be an NflSchedule")
-    evidence = tuple(projection_evidence)
     ecr = tuple(ecr_snapshots)
     eligibility = tuple(eligibilities)
     positions = _positions(player_positions)
-    providers = tuple(row.provider for row in ensemble_config.provider_weights)
-    weekly = materialize_weekly_grid(
+    evidence = tuple(projection_evidence)
+    ensembles = prepare_projection_ensemble(
         state,
         evidence,
+        player_positions=positions,
+        player_nfl_team_ids=player_nfl_team_ids,
+        nfl_schedule=nfl_schedule,
+        ensemble_config=ensemble_config,
+    )
+    forecast_providers = tuple(
+        row.provider for row in ensemble_config.provider_weights
+    )
+    power_ensembles = (
+        ensembles
+        if forecast_providers == ("fantasypros",)
+        else prepare_projection_ensemble(
+            state,
+            evidence,
+            player_positions=positions,
+            player_nfl_team_ids=player_nfl_team_ids,
+            nfl_schedule=nfl_schedule,
+            ensemble_config=default_projection_ensemble(
+                ("fantasypros",), minimum_observed_sources=1
+            ),
+        )
+    )
+    features = build_strength_features(
+        ecr,
+        power_ensembles,
+        eligibility,
+        provider_names=("fantasypros",),
+    )
+    return WeeklyModelInputs(ensembles, features)
+
+
+def prepare_projection_ensemble(
+    state: LeagueState,
+    projection_evidence: Iterable[WeeklyProjection | RemainingSeasonProjection],
+    *,
+    player_positions: Mapping[str, str],
+    player_nfl_team_ids: Mapping[str, str],
+    nfl_schedule: NflSchedule,
+    ensemble_config: EnsembleConfig,
+) -> tuple[EnsembleProjection, ...]:
+    """Materialize and fuse provider evidence without requiring ECR features."""
+
+    if not isinstance(state, LeagueState):
+        raise ValueError("state must be a LeagueState")
+    if not isinstance(ensemble_config, EnsembleConfig):
+        raise ValueError("ensemble_config must be an EnsembleConfig")
+    if not isinstance(nfl_schedule, NflSchedule):
+        raise ValueError("nfl_schedule must be an NflSchedule")
+    positions = _positions(player_positions)
+    providers = tuple(row.provider for row in ensemble_config.provider_weights)
+    validate_selectable_projection_providers(providers)
+    validate_no_composite_double_count(providers)
+    weekly = materialize_weekly_grid(
+        state,
+        tuple(projection_evidence),
         player_ids=positions,
         provider_names=providers,
         nfl_schedule=nfl_schedule,
         player_nfl_team_ids=player_nfl_team_ids,
     )
-    ensembles = _fuse_grid(state, weekly, positions, ensemble_config)
-    features = build_strength_features(
-        ecr,
-        ensembles,
-        eligibility,
-        provider_names=providers,
-    )
-    return WeeklyModelInputs(ensembles, features)
+    return _fuse_grid(state, weekly, positions, ensemble_config)
 
 
 __all__ = (
     "WeeklyModelInputs",
     "build_weekly_engine",
+    "prepare_projection_ensemble",
     "prepare_weekly_model_inputs",
 )
 

@@ -48,6 +48,9 @@ from .extension_bridge import (
 )
 
 
+_NAVIGATION_RESULT_DELIVERY_GRACE_MS = 5_000
+
+
 class ExtensionCaptureBackend:
     """Open one capture session in the explicitly paired ordinary browser."""
 
@@ -121,7 +124,7 @@ class _ExtensionSession:
             self._bridge,
             "session.navigate",
             {"url": url, "timeout_ms": timeout_ms},
-            timeout_ms,
+            timeout_ms + _NAVIGATION_RESULT_DELIVERY_GRACE_MS,
             cancelled,
             "browser extension navigation failed",
         )
@@ -231,6 +234,9 @@ class _ExtensionSession:
                 CaptureProvider.FANTASYPROS,
                 CaptureProvider.ESPN,
                 CaptureProvider.YAHOO,
+                CaptureProvider.CBS,
+                CaptureProvider.FFTODAY,
+                CaptureProvider.FANTASYSHARKS,
             )
             or task.projection is None
         ):
@@ -313,7 +319,15 @@ class _ExtensionSession:
             result["pro_teams"], Mapping
         ):
             raise BrowserCaptureError("ESPN browser data returned an invalid result")
-        return result["league"], result["pro_teams"]
+        from .espn_payload_projection import (
+            project_espn_league_payload,
+            project_espn_pro_team_payload,
+        )
+
+        return (
+            project_espn_league_payload(result["league"]),
+            project_espn_pro_team_payload(result["pro_teams"]),
+        )
 
     def read_yahoo_scoring(self, task, settings_url, timeout_ms, cancelled):
         if (
@@ -322,7 +336,9 @@ class _ExtensionSession:
             or task.projection is None
             or task.projection.scoring not in {"STD", "HALF", "PPR"}
         ):
-            raise YahooScoringError("Yahoo league scoring verification was not configured safely.")
+            raise YahooScoringError(
+                "Yahoo league scoring verification was not configured safely."
+            )
         try:
             validate_yahoo_settings_url(task, settings_url)
             self.navigate(settings_url, timeout_ms, cancelled)
@@ -341,7 +357,9 @@ class _ExtensionSession:
                 or value["protocol"] != "https:"
                 or value["port"] not in ("", "443")
                 or value["hostname"] != (expected.hostname or "").casefold().rstrip(".")
-                or not yahoo_settings_path_matches(task, value["pathname"], expected.path)
+                or not yahoo_settings_path_matches(
+                    task, value["pathname"], expected.path
+                )
             ):
                 raise YahooScoringError(
                     "Yahoo redirected away from the selected league's Settings page."
@@ -365,7 +383,11 @@ class _ExtensionSession:
             ) from None
         if not isinstance(result, Mapping):
             raise YahooScoringError("Yahoo's Settings layout could not be verified.")
-        if set(result) == {"scoring"} and result["scoring"] in {"STD", "HALF", "PPR"}:
+        if set(result) == {"scoring"} and result["scoring"] in {
+            "STD",
+            "HALF",
+            "PPR",
+        }:
             return result["scoring"]
         if result == {"error": "unsupported_receptions"}:
             raise YahooScoringError(

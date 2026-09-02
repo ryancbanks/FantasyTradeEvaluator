@@ -7,7 +7,7 @@ from trade_snapshot.independent_source_plan import (
 
 
 class IndependentSourcePlanTests(unittest.TestCase):
-    def test_plan_contains_only_deterministic_espn_yahoo_projection_tasks(self):
+    def test_plan_contains_deterministic_espn_yahoo_and_public_projection_tasks(self):
         first = build_independent_weekly_source_plan(
             season=2026,
             as_of_week=4,
@@ -25,37 +25,30 @@ class IndependentSourcePlanTests(unittest.TestCase):
 
         self.assertEqual(first, reordered)
         self.assertEqual(first.plan_id, reordered.plan_id)
-        self.assertEqual(
-            [
-                (task.provider, task.week, task.projection.horizon)
-                for task in first.tasks
-            ],
-            [
-                (provider, week, RankingHorizon.WEEKLY)
-                for week in (4, 5, 6)
-                for provider in (CaptureProvider.ESPN, CaptureProvider.YAHOO)
-            ]
-            + [
-                (CaptureProvider.ESPN, 4, RankingHorizon.ROS),
-                (CaptureProvider.YAHOO, 4, RankingHorizon.ROS),
-            ],
-        )
+        self.assertEqual(len(first.tasks), 57)
         self.assertTrue(
             all(task.kind is CaptureKind.VISIBLE_TABLE for task in first.tasks)
         )
         self.assertTrue(
-            all(task.projection.position_scope == ("ALL",) for task in first.tasks)
+            all(
+                task.projection.position_scope == ("ALL",)
+                for task in first.tasks
+                if task.provider is CaptureProvider.ESPN
+            )
         )
         self.assertEqual(
-            {task.url for task in first.tasks},
+            {task.provider for task in first.tasks},
             {
-                "https://fantasy.espn.com/football/players/projections",
-                "https://football.fantasysports.yahoo.com/f1/players",
+                CaptureProvider.ESPN,
+                CaptureProvider.YAHOO,
+                CaptureProvider.CBS,
+                CaptureProvider.FFTODAY,
+                CaptureProvider.FANTASYSHARKS,
             },
         )
         self.assertNotIn("fantasypros", str(first.to_record()).casefold())
 
-    def test_current_week_only_still_captures_weekly_and_ros_from_both_sources(self):
+    def test_current_week_only_keeps_weekly_and_ros_public_coverage(self):
         plan = build_independent_weekly_source_plan(
             season=2026,
             as_of_week=8,
@@ -65,7 +58,7 @@ class IndependentSourcePlanTests(unittest.TestCase):
             include_future_weekly=False,
         )
 
-        self.assertEqual(len(plan.tasks), 4)
+        self.assertEqual(len(plan.tasks), 9)
         self.assertEqual({task.week for task in plan.tasks}, {8})
         self.assertEqual(
             {task.projection.horizon for task in plan.tasks},
@@ -73,7 +66,34 @@ class IndependentSourcePlanTests(unittest.TestCase):
         )
         self.assertEqual(
             {task.provider for task in plan.tasks},
+            {
+                CaptureProvider.ESPN,
+                CaptureProvider.YAHOO,
+                CaptureProvider.CBS,
+                CaptureProvider.FFTODAY,
+                CaptureProvider.FANTASYSHARKS,
+            },
+        )
+
+    def test_core_fallback_visits_espn_and_yahoo(self):
+        plan = build_independent_weekly_source_plan(
+            season=2026,
+            as_of_week=8,
+            remaining_weeks=(8, 9),
+            scoring="PPR",
+            player_positions=("RB",),
+            include_future_weekly=False,
+            broad_consensus=False,
+        )
+
+        self.assertEqual(len(plan.tasks), 4)
+        self.assertEqual(
+            {task.provider for task in plan.tasks},
             {CaptureProvider.ESPN, CaptureProvider.YAHOO},
+        )
+        self.assertEqual(
+            {task.projection.horizon for task in plan.tasks},
+            {RankingHorizon.WEEKLY, RankingHorizon.ROS},
         )
 
     def test_rejects_invalid_dimensions_before_publishing_a_plan(self):

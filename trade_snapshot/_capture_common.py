@@ -292,5 +292,16 @@ def sanitized_visible_link(value: object) -> str:
         parsed = urlsplit(text)
     except ValueError:
         raise ValueError("url is invalid") from None
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if (
+        host in {"fantasysharks.com", "www.fantasysharks.com"}
+        and parsed.path == "/apps/bert/players/playerpage.php"
+        and re.fullmatch(r"id=[1-9][0-9]{0,9}", parsed.query or "")
+        and not parsed.fragment
+    ):
+        base = require_safe_https_url(
+            urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+        )
+        return f"{base}?{parsed.query}"
     stripped = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
     return require_safe_https_url(stripped)

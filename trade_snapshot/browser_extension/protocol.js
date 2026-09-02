@@ -51,6 +51,24 @@
     "football.fantasysports.yahoo.com": [
       /^\/f1\/players\/?$/,
       /^\/(?:20\d{2}\/)?f1\/[1-9]\d{0,19}\/(?:players|playersearch|settings)\/?$/
+    ],
+    "cbssports.com": [
+      /^\/fantasy\/football\/stats\/(?:QB|RB|WR|TE|K|DST)\/20\d{2}\/season\/projections\/(?:ppr|nonppr)\/?$/i
+    ],
+    "www.cbssports.com": [
+      /^\/fantasy\/football\/stats\/(?:QB|RB|WR|TE|K|DST)\/20\d{2}\/season\/projections\/(?:ppr|nonppr)\/?$/i
+    ],
+    "fftoday.com": [
+      /^\/rankings\/player(?:wk)?proj\.php$/i
+    ],
+    "www.fftoday.com": [
+      /^\/rankings\/player(?:wk)?proj\.php$/i
+    ],
+    "fantasysharks.com": [
+      /^\/apps\/bert\/forecasts\/projections\.php$/i
+    ],
+    "www.fantasysharks.com": [
+      /^\/apps\/bert\/forecasts\/projections\.php$/i
     ]
   });
   const ENDPOINTS = Object.freeze({
@@ -62,7 +80,9 @@
   const CAPABILITIES = Object.freeze({
     protocol_version: VERSION,
     operations: OPERATIONS,
-    providers: Object.freeze(["fantasypros", "espn", "yahoo"]),
+    providers: Object.freeze([
+      "fantasypros", "espn", "yahoo", "cbs", "fftoday", "fantasysharks"
+    ]),
     dedicated_scan_tab: true,
     persistent_pairing: false,
     arbitrary_code: false,
@@ -144,7 +164,7 @@
   function projectionRequest(value) {
     const allowed = ["provider", "season", "week", "horizon", "scoring", "positions"];
     if (!hasOnlyKeys(value, allowed) ||
-        !["fantasypros", "espn", "yahoo"].includes(value.provider) ||
+        !["fantasypros", "espn", "yahoo", "cbs", "fftoday", "fantasysharks"].includes(value.provider) ||
         !isInteger(value.season, 2000, 2200) ||
         !["weekly", "ros"].includes(value.horizon) ||
         !["STD", "HALF", "PPR"].includes(value.scoring) ||

@@ -25,6 +25,7 @@ from ._season_ranking import (
     validate_tiebreaker_inputs,
 )
 from .engine_bundle import EngineBundle
+from .independent_power_disclosure import INDEPENDENT_POWER_NOTICE
 from .score_scenarios import PreparedScoreScenarios
 from .season import ScoreScenario, SeasonProjection
 
@@ -435,6 +436,8 @@ def _power_notice(mode):
             "Power scores use this bundle's calibrated FantasyPros-method model; "
             "exact-method claims remain limited to its attested trade scope."
         )
+    if mode == "independent":
+        return INDEPENDENT_POWER_NOTICE
     return (
         "Power scores use this bundle's disclosed surrogate model and are "
         "approximations, not exact FantasyPros values."

@@ -81,6 +81,7 @@ class ExtensionCaptureTests(unittest.TestCase):
         self.assertEqual(bridge.calls[3][1]["request"]["provider"], "espn")
         self.assertEqual(bridge.calls[0][1], {"action_delay_ms": 200})
         self.assertEqual(bridge.calls[1][1]["timeout_ms"], 5000)
+        self.assertEqual(bridge.calls[1][2], 10.0)
         self.assertEqual(bridge.calls[3][1]["timeout_ms"], 5000)
 
     def test_analyzer_phase_bundle_and_raw_body_are_revalidated_in_python(self):
@@ -115,24 +116,21 @@ class ExtensionCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "invalid"):
             wrong.finish_analyzer_response_capture(5000, lambda: False)
 
-    def test_league_ecr_espn_and_yahoo_results_keep_existing_strict_parsers(self):
-        yahoo = projection_task("yahoo")
-        settings = "https://football.fantasysports.yahoo.com/2026/f1/12345/settings"
+    def test_league_ecr_and_espn_results_keep_existing_strict_parsers(self):
         bridge, session = self.open({
             "league.capture": league_capture_value(),
             "ecr.capture": ecr_raw(expert_count=19),
             "espn.authenticated_json": {
-                "league": {"league": True},
-                "pro_teams": {"schedule": True},
+                "league": {
+                    "id": 123,
+                    "members": [{"displayName": "PRIVATE OWNER"}],
+                },
+                "pro_teams": {
+                    "settings": {
+                        "proTeams": [{"id": 1, "abbrev": "ATL", "secret": True}]
+                    }
+                },
             },
-            "session.navigate": {"loaded": True},
-            "page.provenance": {
-                "protocol": "https:",
-                "hostname": "football.fantasysports.yahoo.com",
-                "port": "",
-                "pathname": "/2026/f1/12345/settings",
-            },
-            "yahoo.scoring": {"scoring": "PPR"},
         })
 
         self.assertEqual(
@@ -143,12 +141,62 @@ class ExtensionCaptureTests(unittest.TestCase):
             session.capture_ecr_rankings(ecr_task(expected=False), 5000, lambda: False).expert_count,
             19,
         )
+        espn = session.read_authenticated_espn_json(
+            2026, "123", 5000, 1024, lambda: False
+        )
+        self.assertEqual(espn[0]["id"], 123)
         self.assertEqual(
-            session.read_authenticated_espn_json(2026, "123", 5000, 1024, lambda: False),
-            ({"league": True}, {"schedule": True}),
+            espn[1],
+            {
+                "settings": {
+                    "proTeams": [
+                        {
+                            "id": 1,
+                            "abbrev": "ATL",
+                            "proGamesByScoringPeriod": {},
+                        }
+                    ]
+                }
+            },
+        )
+        self.assertNotIn("PRIVATE OWNER", repr(espn))
+        self.assertNotIn("secret", repr(espn))
+
+    def test_yahoo_projection_and_league_scoring_use_strict_extension_operations(self):
+        task = projection_task("yahoo")
+        raw = projection_raw("yahoo", "Player A", "123", "12.4")
+        settings_url = (
+            "https://football.fantasysports.yahoo.com/2026/f1/12345/settings"
+        )
+        bridge, session = self.open({
+            "projection.capture": {"segments": [raw]},
+            "session.navigate": {"loaded": True},
+            "page.provenance": {
+                "protocol": "https:",
+                "hostname": "football.fantasysports.yahoo.com",
+                "port": "",
+                "pathname": "/2026/f1/12345/settings",
+            },
+            "yahoo.scoring": {"scoring": "PPR"},
+        })
+
+        captured = session.capture_visible_tables(task, 5000, 200, lambda: False)
+        self.assertEqual(captured.tables[0].rows[1][0].text, "Player A")
+        self.assertEqual(
+            session.read_yahoo_scoring(
+                task, settings_url, 5000, lambda: False
+            ),
+            "PPR",
         )
         self.assertEqual(
-            session.read_yahoo_scoring(yahoo, settings, 5000, lambda: False), "PPR"
+            [call[0] for call in bridge.calls],
+            [
+                "session.open",
+                "projection.capture",
+                "session.navigate",
+                "page.provenance",
+                "yahoo.scoring",
+            ],
         )
 
     def test_league_failure_code_becomes_actionable_without_private_data(self):

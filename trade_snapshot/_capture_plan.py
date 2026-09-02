@@ -20,6 +20,9 @@ class CaptureProvider(str, Enum):
     FANTASYPROS = "fantasypros"
     ESPN = "espn"
     YAHOO = "yahoo"
+    CBS = "cbs"
+    FFTODAY = "fftoday"
+    FANTASYSHARKS = "fantasysharks"
 
 
 class CaptureKind(str, Enum):
@@ -58,6 +61,18 @@ PROVIDER_HOST_ALLOWLISTS: Mapping[CaptureProvider, frozenset[str]] = MappingProx
             "football.fantasysports.yahoo.com",
             "sports.yahoo.com",
         }
+    ),
+    CaptureProvider.CBS: frozenset(
+        {
+            "cbssports.com",
+            "www.cbssports.com",
+        }
+    ),
+    CaptureProvider.FFTODAY: frozenset(
+        {"fftoday.com", "www.fftoday.com"}
+    ),
+    CaptureProvider.FANTASYSHARKS: frozenset(
+        {"fantasysharks.com", "www.fantasysharks.com"}
     ),
 })
 
@@ -129,7 +144,7 @@ class PageCaptureTask:
                 raise ValueError("analyzer_trade is only valid for analyzer_response tasks")
             if not isinstance(self.projection, ProjectionTableSpec):
                 raise ValueError("visible_table tasks require ProjectionTableSpec")
-            validate_visible_table_task(provider, url)
+            validate_visible_table_task(provider, url, self.projection)
             analyzer_phase = None
             trade = None
             projection = self.projection

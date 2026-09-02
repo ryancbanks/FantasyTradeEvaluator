@@ -87,6 +87,14 @@ class InteractiveSignInGate:
         provider = getattr(task, "provider", None)
         if not isinstance(provider, CaptureProvider):
             raise ValueError("sign-in task provider is invalid")
+        # These projection tables are public. Do not stop a collection to ask
+        # the user to confirm a sign-in that the source does not need.
+        if provider in {
+            CaptureProvider.CBS,
+            CaptureProvider.FFTODAY,
+            CaptureProvider.FANTASYSHARKS,
+        }:
+            return True
         with self._lock:
             if provider in self._confirmed:
                 return True

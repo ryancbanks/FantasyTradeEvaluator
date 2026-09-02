@@ -9,6 +9,7 @@ import sys
 
 from ._scenario_random import content_id
 from .engine_bundle import EngineBundle
+from .independent_power_disclosure import INDEPENDENT_POWER_NOTICE
 from .league_search import LeagueSearchOutcome
 from .positions import CANONICAL_PLAYER_POSITIONS
 from .projection_io import projection_to_record
@@ -36,6 +37,12 @@ def default_data_directory() -> Path:
 def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
     evidence = bundle.methodology_evidence
     exact = bundle.methodology_attestation is not None
+    independent = bundle.independent_power_disclosure is not None
+    forecast_providers = tuple(sorted({
+        observation.provider
+        for projection in bundle.projections
+        for observation in projection.provider_observations
+    }))
     roster_by_team = {row.team_id: row for row in bundle.rosters}
     player_positions = {
         player_id: tuple(sorted(
@@ -71,27 +78,30 @@ def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
                 "team_id": team.team_id,
             }
         )
-    return {
-        "bundle_id": bundle.bundle_id,
-        "status": "ready",
-        "season": bundle.state.season,
-        "week": bundle.state.first_remaining_week,
-        "team_count": len(bundle.state.teams),
-        "teams": teams,
-        "positions": sorted({
-            position for positions in player_positions.values() for position in positions
-        }),
-        "calibration_status": bundle.strength_model.calibration.status.value,
-        "power_engine_mode": bundle.methodology_mode,
-        "power_engine_notice": (
-            "Exact within the attested balanced-package scope; other shapes are extrapolated."
-            if exact
-            else SURROGATE_NOTICE
-        ),
-        "three_team_free_agent_allocation_policy": (
-            MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
-        ),
-        "methodology": {
+    if independent:
+        methodology = {
+            "mode": "independent",
+            "attestation_id": None,
+            "surrogate_disclosure_id": None,
+            "independent_disclosure_id": evidence.disclosure_id,
+            "policy_id": evidence.policy_id,
+            "provider_names": list(evidence.provider_names),
+            "formula_id": None,
+            "fingerprint_id": None,
+            "formula_action": "independent_policy",
+            "current_evidence_id": evidence.current_evidence_id,
+            "source_fit_id": None,
+            "quality_gate": "transparent_independent_v1",
+            "source_fit_id_binds_full_solver_diagnostics": False,
+            "current_holdout_count": 0,
+            "exact_trade_scope": None,
+            "validated_balanced_package_sizes": [],
+            "observed_balanced_package_sizes": [],
+            "holdout_max_absolute_score_error": None,
+            "holdout_display_match_rate": None,
+        }
+    else:
+        methodology = {
             "mode": bundle.methodology_mode,
             "attestation_id": (
                 None if not exact else bundle.methodology_attestation.attestation_id
@@ -99,6 +109,9 @@ def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
             "surrogate_disclosure_id": (
                 None if exact else bundle.surrogate_disclosure.disclosure_id
             ),
+            "independent_disclosure_id": None,
+            "policy_id": None,
+            "provider_names": [],
             "formula_id": evidence.formula_id,
             "fingerprint_id": evidence.methodology_fingerprint.fingerprint_id,
             "formula_action": evidence.formula_decision.action.value,
@@ -126,7 +139,44 @@ def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
             "holdout_display_match_rate": (
                 evidence.calibration_diagnostics.display_match_rate
             ),
-        },
+        }
+    return {
+        "bundle_id": bundle.bundle_id,
+        "status": "ready",
+        "season": bundle.state.season,
+        "week": bundle.state.first_remaining_week,
+        "team_count": len(bundle.state.teams),
+        "teams": teams,
+        "positions": sorted({
+            position for positions in player_positions.values() for position in positions
+        }),
+        "calibration_status": (
+            "independent"
+            if independent
+            else bundle.strength_model.calibration.status.value
+        ),
+        "power_engine_mode": bundle.methodology_mode,
+        "forecast_provider_names": list(forecast_providers),
+        "forecast_mode": (
+            "core_ensemble"
+            if set(forecast_providers)
+            in (
+                {"fantasypros", "espn", "yahoo"},
+                {"espn", "yahoo"},
+            )
+            else "broad_consensus"
+            if len(forecast_providers) > 1
+            else "single_source"
+        ),
+        "power_engine_notice": (
+            "Exact within the attested balanced-package scope; other shapes are extrapolated."
+            if exact
+            else INDEPENDENT_POWER_NOTICE if independent else SURROGATE_NOTICE
+        ),
+        "three_team_free_agent_allocation_policy": (
+            MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
+        ),
+        "methodology": methodology,
     }
 
 
@@ -139,6 +189,11 @@ def workbook_sources(bundle: EngineBundle) -> tuple[WorkbookSource, ...]:
         for row in bundle.ecr_snapshots
     ]
     by_provider = {}
+    forecast_providers = {
+        observation.provider
+        for projection in bundle.projections
+        for observation in projection.provider_observations
+    }
     for row in bundle.projection_evidence:
         by_provider.setdefault(row.provider, []).append(row)
     for provider, rows in sorted(by_provider.items()):
@@ -146,8 +201,25 @@ def workbook_sources(bundle: EngineBundle) -> tuple[WorkbookSource, ...]:
             "projection-source", {"rows": [projection_to_record(row) for row in rows]}
         )
         sources.append(
-            WorkbookSource(provider, evidence_id, max(row.captured_at for row in rows))
+            WorkbookSource(
+                (
+                    f"{provider} projections (forecast vote)"
+                    if provider in forecast_providers
+                    else f"{provider} projections (power evidence only; not a forecast vote)"
+                ),
+                evidence_id,
+                max(row.captured_at for row in rows),
+            )
         )
+    if bundle.methodology_mode == "independent":
+        sources.append(
+            WorkbookSource(
+                "Independent power policy disclosure",
+                bundle.independent_power_disclosure.disclosure_id,
+                bundle.independent_power_disclosure.captured_at,
+            )
+        )
+        return tuple(sources)
     sources.extend(
         (
             WorkbookSource(
@@ -195,6 +267,8 @@ def search_result_record(
         "power_engine_notice": (
             SURROGATE_NOTICE
             if bundle.methodology_mode == "surrogate"
+            else INDEPENDENT_POWER_NOTICE
+            if bundle.methodology_mode == "independent"
             else "Exact only inside the attested trade scope."
         ),
         "team_outlook": _team_outlook_records(outlook),
@@ -287,6 +361,8 @@ def three_way_search_result_record(
                     "extrapolated"
                     if bundle.methodology_mode == "exact"
                     else "surrogate_extrapolated"
+                    if bundle.methodology_mode == "surrogate"
+                    else "independent"
                 ),
             }
             for result in results
@@ -306,6 +382,8 @@ def three_way_search_result_record(
         "power_engine_notice": (
             SURROGATE_NOTICE
             if bundle.methodology_mode == "surrogate"
+            else INDEPENDENT_POWER_NOTICE
+            if bundle.methodology_mode == "independent"
             else "Three-team power is extrapolated beyond the attested two-team scope."
         ),
         "free_agent_allocation_policy": free_agent_allocation_policy,

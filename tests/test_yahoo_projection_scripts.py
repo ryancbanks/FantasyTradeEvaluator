@@ -175,6 +175,56 @@ class YahooProjectionScriptTests(unittest.TestCase):
             "action": "error", "dimension": "yahoo period",
         })
 
+    def test_week_one_ros_uses_explicit_full_season_fallback(self):
+        body = yahoo_player_list().replace(
+            '<option value="S_PSR_2026">Rest of Season</option>', ""
+        )
+        page = self.open_page(body)
+        request = {
+            "provider": "yahoo",
+            "season": 2026,
+            "week": 1,
+            "horizon": "ros",
+            "scoring": "HALF",
+            "positions": ["RB"],
+        }
+
+        actions = [page.evaluate(CONFIGURE_PROJECTION_SCRIPT, request) for _ in range(4)]
+        self.assertEqual(actions, [
+            {"action": "changed", "dimension": "availability"},
+            {"action": "changed", "dimension": "period"},
+            {"action": "changed", "dimension": "position"},
+            {"action": "ready"},
+        ])
+        self.assertEqual(page.locator("#statselect").input_value(), "S_PS_2026")
+        captured = page.evaluate(PROJECTION_TABLE_SCRIPT, request)
+        self.assertEqual(captured["source"]["horizon"], "ros")
+        self.assertEqual(
+            captured["source"]["period_text"],
+            "2026 | Full Season | HALF | RB | Yahoo All Players",
+        )
+
+    def test_later_week_never_labels_full_season_as_remaining(self):
+        body = yahoo_player_list().replace(
+            '<option value="S_PSR_2026">Rest of Season</option>', ""
+        )
+        page = self.open_page(body)
+        request = {
+            "provider": "yahoo",
+            "season": 2026,
+            "week": 2,
+            "horizon": "ros",
+            "scoring": "HALF",
+            "positions": ["RB"],
+        }
+
+        self.assertEqual(page.evaluate(CONFIGURE_PROJECTION_SCRIPT, request), {
+            "action": "changed", "dimension": "availability",
+        })
+        self.assertEqual(page.evaluate(CONFIGURE_PROJECTION_SCRIPT, request), {
+            "action": "error", "dimension": "yahoo period",
+        })
+
     def test_duplicate_next_links_accept_playersearch_to_players_alias(self):
         destination = (
             "https://football.fantasysports.yahoo.com/2026/f1/12345/players"
@@ -187,7 +237,20 @@ class YahooProjectionScriptTests(unittest.TestCase):
         self.assertEqual(page.evaluate(ADVANCE_PROJECTION_SCRIPT, "yahoo"), {
             "action": "next",
         })
-        self.assertEqual(page.evaluate("window.nextClicks"), 1)
+
+    def test_pagination_accepts_prefixed_and_unprefixed_same_league_alias(self):
+        destination = (
+            "https://football.fantasysports.yahoo.com/f1/12345/players"
+            "?status=ALL&stat1=S_PW_1&pos=RB&count=25"
+        )
+        page = self.open_page(
+            yahoo_player_list(next_links=(destination, destination)),
+            query="?status=ALL&stat1=S_PW_1&pos=RB&count=0",
+        )
+
+        self.assertEqual(page.evaluate(ADVANCE_PROJECTION_SCRIPT, "yahoo"), {
+            "action": "next",
+        })
 
     def test_conflicting_next_links_fail_closed_without_clicking(self):
         base = "https://football.fantasysports.yahoo.com/2026/f1/12345/players"

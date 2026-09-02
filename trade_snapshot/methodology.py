@@ -5,6 +5,10 @@ from dataclasses import dataclass, field
 from ._scenario_random import content_id
 from .calibration_fit import CalibrationFitConfig
 from .ensemble import EnsembleConfig, ProviderWeight
+from .projection_provider_rules import (
+    validate_no_composite_double_count,
+    validate_selectable_projection_providers,
+)
 
 
 __all__ = (
@@ -49,15 +53,29 @@ class PowerMethodology:
         )
 
 
-def default_projection_ensemble() -> EnsembleConfig:
-    """Equal-source baseline; disagreement becomes predictive uncertainty."""
+def default_projection_ensemble(
+    providers: tuple[str, ...] = ("fantasypros", "espn", "yahoo"),
+    *,
+    minimum_observed_sources: int | None = None,
+) -> EnsembleConfig:
+    """Equal-source baseline for the explicitly captured projection providers."""
+
+    if not isinstance(providers, tuple):
+        raise ValueError("projection providers must be a tuple")
+    ordered = validate_selectable_projection_providers(providers)
+    validate_no_composite_double_count(ordered)
+    minimum = (
+        min(2, len(ordered))
+        if minimum_observed_sources is None
+        else minimum_observed_sources
+    )
 
     return EnsembleConfig(
         provider_weights=tuple(
             ProviderWeight(provider, 1.0)
-            for provider in ("fantasypros", "espn", "yahoo")
+            for provider in ordered
         ),
-        minimum_observed_sources=2,
+        minimum_observed_sources=minimum,
         position_stddev_floors={
             "QB": 3.0,
             "RB": 4.0,

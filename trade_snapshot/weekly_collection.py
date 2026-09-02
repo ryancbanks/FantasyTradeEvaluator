@@ -36,6 +36,7 @@ class WeeklyCollectionStage(str, Enum):
     COLLECTING_FANTASYPROS = "collecting_fantasypros"
     COLLECTING_ESPN = "collecting_espn"
     COLLECTING_YAHOO = "collecting_yahoo"
+    COLLECTING_PUBLIC = "collecting_public"
     NORMALIZING = "normalizing"
     CALIBRATING = "calibrating"
     BUILDING = "building"
@@ -56,6 +57,10 @@ class WeeklyCollectionRequest:
     yahoo_projection_league_url: str | None = None
     include_future_weekly: bool = False
     allow_surrogate_power: bool = False
+    use_fantasypros: bool = True
+    # Kept false for programmatic backward compatibility. The localhost UI
+    # sends its checked, recommended consensus choice explicitly.
+    use_broad_consensus: bool = False
 
     def __post_init__(self) -> None:
         if type(self.season) is not int or not 2012 <= self.season <= 9999:
@@ -85,6 +90,18 @@ class WeeklyCollectionRequest:
             raise ValueError("include_future_weekly must be a boolean")
         if not isinstance(self.allow_surrogate_power, bool):
             raise ValueError("allow_surrogate_power must be a boolean")
+        if not isinstance(self.use_fantasypros, bool):
+            raise ValueError("use_fantasypros must be a boolean")
+        if not isinstance(self.use_broad_consensus, bool):
+            raise ValueError("use_broad_consensus must be a boolean")
+        if not self.use_fantasypros and self.host_league_url is None:
+            raise ValueError(
+                "An ESPN league link is required when FantasyPros is turned off."
+            )
+        if not self.use_fantasypros and self.allow_surrogate_power:
+            raise ValueError(
+                "SURROGATE FantasyPros power cannot be enabled when FantasyPros is off."
+            )
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "WeeklyCollectionRequest":
@@ -99,6 +116,8 @@ class WeeklyCollectionRequest:
             "host_league_url",
             "yahoo_projection_league_url",
             "allow_surrogate_power",
+            "use_fantasypros",
+            "use_broad_consensus",
         }
         if (
             not isinstance(payload, Mapping)
@@ -115,6 +134,8 @@ class WeeklyCollectionRequest:
             yahoo_projection_league_url=payload.get("yahoo_projection_league_url"),
             include_future_weekly=payload["include_future_weekly"],
             allow_surrogate_power=payload.get("allow_surrogate_power", False),
+            use_fantasypros=payload.get("use_fantasypros", True),
+            use_broad_consensus=payload.get("use_broad_consensus", False),
         )
 
 
@@ -535,6 +556,8 @@ class WeeklyCollectionJobs:
                 ),
                 "include_future_weekly": job.request.include_future_weekly,
                 "allow_surrogate_power": job.request.allow_surrogate_power,
+                "use_fantasypros": job.request.use_fantasypros,
+                "use_broad_consensus": job.request.use_broad_consensus,
             },
             "progress": None
             if progress is None
@@ -552,11 +575,14 @@ def _sign_in_record(value: object) -> dict[str, object]:
     }:
         raise ValueError("interactive sign-in status is invalid")
     pending = value["pending_provider"]
-    if pending is not None and pending not in {"fantasypros", "espn", "yahoo"}:
+    if pending is not None and pending not in {
+        "fantasypros", "espn", "yahoo", "cbs"
+    }:
         raise ValueError("interactive sign-in provider is invalid")
     confirmed = value["confirmed_providers"]
     if not isinstance(confirmed, list) or any(
-        provider not in {"fantasypros", "espn", "yahoo"} for provider in confirmed
+        provider not in {"fantasypros", "espn", "yahoo", "cbs"}
+        for provider in confirmed
     ) or len(set(confirmed)) != len(confirmed):
         raise ValueError("confirmed sign-in providers are invalid")
     return {

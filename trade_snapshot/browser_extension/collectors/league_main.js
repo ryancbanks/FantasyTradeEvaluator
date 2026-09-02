@@ -35,7 +35,11 @@
     return Number.isInteger(number) ? number : null;
   };
   const finite = (value) => {
-    const number = Number(value);
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+    if (typeof value !== 'string') return null;
+    const display = value.trim();
+    if (!/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(display)) return null;
+    const number = Number(display);
     return Number.isFinite(number) ? number : null;
   };
   const percentage = (value) => {
@@ -53,7 +57,7 @@
     const normalized = text(value)?.toUpperCase().replace(/[^A-Z0-9]+/g, '');
     return new Set([
       'IR', 'INJUREDRESERVE', 'RES', 'RESERVE', 'ROOKIERESERVE',
-      'TAXI', 'TAXISQUAD', 'NFI', 'PUP', 'NA'
+      'RESERVEIR', 'INJUREDLIST', 'IL', 'TAXI', 'TAXISQUAD', 'NFI', 'PUP', 'NA'
     ]).has(normalized);
   };
   const teamsRaw = Array.isArray(pageData.teams) ? pageData.teams.slice(0, 100) : [];
@@ -76,8 +80,10 @@
     return total || null;
   };
   const projectLeague = () => {
-    const rosterSizes = teamsRaw.map((team) => Array.isArray(team?.players)
-      ? team.players.length : null).filter(Number.isInteger);
+    const rosterSizes = teamsRaw.map((team) => {
+      const size = playerIds(team).length;
+      return size > 0 ? size : null;
+    }).filter(Number.isInteger);
     const explicitRosterSize = own(leagueRaw, ['rosterSize', 'roster_size']) ??
       own(settingsRaw, ['rosterSize', 'roster_size']);
     const configuredSize = configuredRosterSize();
@@ -106,7 +112,14 @@
     };
     for (const [name, names] of Object.entries(aliases)) {
       const raw = own(leagueRaw, names) ?? own(settingsRaw, names);
-      if (raw !== undefined && raw !== null && raw !== '') result[name] = raw;
+      if (raw === undefined || raw === null || raw === '') continue;
+      if (['id', 'team_id'].includes(name)) {
+        const normalizedId = identifier(raw);
+        if (!normalizedId) return null;
+        result[name] = normalizedId;
+      } else {
+        result[name] = raw;
+      }
     }
     for (const name of ['playoffs_start_week', 'playoffs_end_week', 'total_rounds']) {
       if (result[name] !== undefined) result[name] = integer(result[name]);
@@ -148,9 +161,30 @@
     if (Array.isArray(row.needs)) team.needs = row.needs;
     return team.team_id && team.team_name ? team : null;
   }).filter(Boolean);
-  const playerIds = (team) => !Array.isArray(team?.players) ? [] : team.players
-    .map((item) => identifier(record(item)
-      ? own(item, ['playerId', 'player_id', 'fpId', 'id']) : item)).filter(Boolean);
+  const playerIds = (team) => {
+    if (!record(team)) return [];
+    const buckets = ['players', 'roster', 'rosterPlayers', 'reservePlayers', 'irPlayers']
+      .filter((name) => Object.hasOwn(team, name))
+      .map((name) => team[name]);
+    const ids = [];
+    for (const bucket of buckets) {
+      const entries = Array.isArray(bucket)
+        ? bucket.slice(0, 200).map((item) => [null, item])
+        : record(bucket) ? Object.entries(bucket).slice(0, 200) : [];
+      for (const [mapId, item] of entries) {
+        const nested = record(item) ? own(item, ['player']) : null;
+        const raw = record(item)
+          ? own(item, ['playerId', 'player_id', 'fpId', 'id']) ??
+            (record(nested)
+              ? own(nested, ['playerId', 'player_id', 'fpId', 'id'])
+              : nested)
+          : item;
+        const playerId = identifier(raw ?? mapId);
+        if (playerId) ids.push(playerId);
+      }
+    }
+    return [...new Set(ids)];
+  };
   const projectRosters = () => teamsRaw.map((team) => {
     const team_id = identifier(own(team, ['teamId', 'team_id', 'id']));
     const player_ids = playerIds(team);
@@ -220,7 +254,7 @@
     return standings.length === value.standings.length && playoffsTeam
       ? {playoffsTeam, standings} : null;
   };
-  const boundedMs = Math.max(1000, Math.min(timeoutMs || 10000, 60000));
+  const boundedMs = Math.max(1000, Math.min(timeoutMs || 10000, 30000));
   const deadline = Date.now() + boundedMs;
   const takeInit = async () => {
     while (Date.now() < deadline) {

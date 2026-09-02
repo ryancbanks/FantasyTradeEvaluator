@@ -71,6 +71,36 @@ def public_player_link(
             host in {"fantasypros.com", "www.fantasypros.com"}
             and re.fullmatch(r"/nfl/players/[a-z0-9-]+\.php", path, re.IGNORECASE)
         )
+    elif provider is CaptureProvider.CBS:
+        allowed = (
+            host in {"cbssports.com", "www.cbssports.com"}
+            and (
+                re.fullmatch(
+                    r"/nfl/players/[0-9]+/[a-z0-9-]+/fantasy/?",
+                    path,
+                    re.IGNORECASE,
+                )
+                or re.fullmatch(
+                    r"/nfl/teams/[a-z]{2,3}/[a-z0-9]+(?:-[a-z0-9]+)*/?",
+                    path,
+                    re.IGNORECASE,
+                )
+            )
+        )
+    elif provider is CaptureProvider.FFTODAY:
+        allowed = (
+            host in {"fftoday.com", "www.fftoday.com"}
+            and re.fullmatch(
+                r"/stats/players/[0-9]+/[A-Za-z0-9_.'-]+/?",
+                path,
+            )
+        )
+    elif provider is CaptureProvider.FANTASYSHARKS:
+        allowed = (
+            host in {"fantasysharks.com", "www.fantasysharks.com"}
+            and path == "/apps/bert/players/playerpage.php"
+            and re.fullmatch(r"id=[1-9][0-9]{0,9}", parsed.query or "")
+        )
     else:
         allowed = False
     return link if allowed else None

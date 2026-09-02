@@ -12,6 +12,11 @@ from ._ensemble_validation import (
     require_nonempty_string,
     validate_game_context,
 )
+from .projection_provider_rules import (
+    validate_no_composite_double_count,
+    validate_selectable_projection_provider,
+    validate_selectable_projection_providers,
+)
 from .projections import ProjectionStatus, WeeklyProjection
 
 
@@ -34,10 +39,11 @@ class ProviderWeight:
     weight: float
 
     def __post_init__(self) -> None:
-        require_nonempty_string("provider", self.provider)
+        provider = validate_selectable_projection_provider(self.provider)
         weight = finite_float("provider weight", self.weight)
         if weight <= 0:
             raise ValueError("provider weight must be a positive finite number")
+        object.__setattr__(self, "provider", provider)
         object.__setattr__(self, "weight", weight)
 
 
@@ -57,8 +63,8 @@ class EnsembleConfig:
         if not weights or any(not isinstance(item, ProviderWeight) for item in weights):
             raise ValueError("provider_weights must contain ProviderWeight values")
         providers = tuple(item.provider for item in weights)
-        if len(set(providers)) != len(providers):
-            raise ValueError("duplicate provider in provider_weights")
+        validate_selectable_projection_providers(providers)
+        validate_no_composite_double_count(providers)
         if (
             isinstance(self.minimum_observed_sources, bool)
             or not isinstance(self.minimum_observed_sources, int)
@@ -92,13 +98,14 @@ class ProviderObservation:
     weight: float
 
     def __post_init__(self) -> None:
-        require_nonempty_string("provider", self.provider)
+        provider = validate_selectable_projection_provider(self.provider)
         require_nonempty_string("provider_player_id", self.provider_player_id)
         if not isinstance(self.status, ProjectionStatus):
             raise ValueError("provider observation status must be a ProjectionStatus")
         weight = finite_float("provider observation weight", self.weight)
         if weight <= 0:
             raise ValueError("provider observation weight must be positive and finite")
+        object.__setattr__(self, "provider", provider)
         object.__setattr__(self, "weight", weight)
         if self.status is ProjectionStatus.OBSERVED:
             object.__setattr__(
@@ -163,8 +170,8 @@ class EnsembleProjection:
                 "provider_observations must contain ProviderObservation values"
             )
         providers = tuple(item.provider for item in observations)
-        if len(set(providers)) != len(providers):
-            raise ValueError("duplicate provider observation")
+        validate_selectable_projection_providers(providers)
+        validate_no_composite_double_count(providers)
         object.__setattr__(self, "provider_observations", observations)
         if (
             isinstance(self.minimum_observed_sources, bool)
@@ -251,6 +258,8 @@ def fuse_weekly_projections(
             raise ValueError(f"duplicate provider row: {row.provider}")
         rows_by_provider[row.provider] = row
     configured = tuple(item.provider for item in config.provider_weights)
+    validate_selectable_projection_providers(configured)
+    validate_no_composite_double_count(configured)
     missing = [provider for provider in configured if provider not in rows_by_provider]
     if missing:
         raise ValueError(f"missing required provider: {missing[0]}")

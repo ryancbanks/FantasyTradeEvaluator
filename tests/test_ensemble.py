@@ -8,6 +8,7 @@ import unittest
 
 from trade_snapshot.ensemble import (
     EnsembleConfig,
+    ProviderObservation,
     ProviderWeight,
     ensemble_from_record,
     ensemble_to_record,
@@ -17,6 +18,7 @@ from trade_snapshot.projections import ProjectionStatus, WeeklyProjection
 
 
 CAPTURED_AT = datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc)
+ENSEMBLE_PROVIDERS = ("espn", "cbs", "fftoday")
 
 
 class EnsembleConfigTests(unittest.TestCase):
@@ -45,9 +47,32 @@ class EnsembleConfigTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     make_config(position_stddev_floors={"RB": floor})
 
-        with self.assertRaisesRegex(ValueError, "duplicate provider"):
+        with self.assertRaisesRegex(ValueError, "duplicate"):
             EnsembleConfig(
                 provider_weights=(ProviderWeight("espn", 1), ProviderWeight("espn", 2)),
+                minimum_observed_sources=1,
+                position_stddev_floors={"RB": 1},
+            )
+        self.assertEqual(ProviderWeight("yahoo", 1).provider, "yahoo")
+        for provider in ("ffa", "unknown"):
+            with self.subTest(provider=provider), self.assertRaises(ValueError):
+                ProviderWeight(provider, 1)
+        self.assertEqual(
+            ProviderObservation(
+                "yahoo", "yahoo-p1", ProjectionStatus.OBSERVED, 1, 1
+            ).provider,
+            "yahoo",
+        )
+        with self.assertRaisesRegex(ValueError, "reference-only"):
+            ProviderObservation(
+                "ffa", "ffa-p1", ProjectionStatus.OBSERVED, 1, 1
+            )
+        with self.assertRaisesRegex(ValueError, "composite projections"):
+            EnsembleConfig(
+                provider_weights=(
+                    ProviderWeight("fantasypros", 1),
+                    ProviderWeight("espn", 1),
+                ),
                 minimum_observed_sources=1,
                 position_stddev_floors={"RB": 1},
             )
@@ -60,11 +85,34 @@ class EnsembleConfigTests(unittest.TestCase):
 
 
 class WeeklyEnsembleTests(unittest.TestCase):
+    def test_established_fantasypros_espn_yahoo_core_round_trips(self):
+        providers = ("fantasypros", "espn", "yahoo")
+        config = EnsembleConfig(
+            tuple(ProviderWeight(provider, 1) for provider in providers),
+            2,
+            {"RB": 0},
+        )
+        result = fuse_weekly_projections(
+            tuple(
+                make_projection(provider, points)
+                for provider, points in zip(providers, (9, 12, 15))
+            ),
+            "RB",
+            config,
+        )
+
+        self.assertEqual(
+            tuple(row.provider for row in result.provider_observations),
+            providers,
+        )
+        self.assertAlmostEqual(result.projected_fantasy_points, 12)
+        self.assertEqual(ensemble_from_record(ensemble_to_record(result)), result)
+
     def test_weighted_mean_renormalizes_and_preserves_zero_and_unavailable(self):
         rows = (
-            make_projection("fantasypros", 0),
-            make_projection("espn", None, ProjectionStatus.NOT_PUBLISHED),
-            make_projection("yahoo", 12),
+            make_projection("espn", 0),
+            make_projection("cbs", None, ProjectionStatus.NOT_PUBLISHED),
+            make_projection("fftoday", 12),
         )
 
         result = fuse_weekly_projections(rows, position="rb", config=make_config())
@@ -77,9 +125,9 @@ class WeeklyEnsembleTests(unittest.TestCase):
         self.assertEqual(
             tuple((item.provider, item.status, item.projected_fantasy_points) for item in result.provider_observations),
             (
-                ("fantasypros", ProjectionStatus.OBSERVED, 0.0),
-                ("espn", ProjectionStatus.NOT_PUBLISHED, None),
-                ("yahoo", ProjectionStatus.OBSERVED, 12.0),
+                ("espn", ProjectionStatus.OBSERVED, 0.0),
+                ("cbs", ProjectionStatus.NOT_PUBLISHED, None),
+                ("fftoday", ProjectionStatus.OBSERVED, 12.0),
             ),
         )
         with self.assertRaises(FrozenInstanceError):
@@ -90,9 +138,9 @@ class WeeklyEnsembleTests(unittest.TestCase):
     def test_predictive_uncertainty_formula_uses_position_floor(self):
         result = fuse_weekly_projections(
             (
-                make_projection("fantasypros", 10),
-                make_projection("espn", 14),
-                make_projection("yahoo", 12),
+                make_projection("espn", 10),
+                make_projection("cbs", 14),
+                make_projection("fftoday", 12),
             ),
             position="WR",
             config=make_config(position_stddev_floors={"RB": 3, "WR": 4}),
@@ -107,18 +155,18 @@ class WeeklyEnsembleTests(unittest.TestCase):
     def test_extreme_finite_values_and_weights_do_not_overflow(self):
         config = EnsembleConfig(
             provider_weights=(
-                ProviderWeight("fantasypros", 1e308),
                 ProviderWeight("espn", 1e308),
-                ProviderWeight("yahoo", 1e308),
+                ProviderWeight("cbs", 1e308),
+                ProviderWeight("fftoday", 1e308),
             ),
             minimum_observed_sources=2,
             position_stddev_floors={"RB": 3},
         )
         result = fuse_weekly_projections(
             (
-                make_projection("fantasypros", 1e200),
-                make_projection("espn", -1e200),
-                make_projection("yahoo", None, ProjectionStatus.NOT_PUBLISHED),
+                make_projection("espn", 1e200),
+                make_projection("cbs", -1e200),
+                make_projection("fftoday", None, ProjectionStatus.NOT_PUBLISHED),
             ),
             "RB",
             config,
@@ -128,7 +176,7 @@ class WeeklyEnsembleTests(unittest.TestCase):
         self.assertEqual(result.between_provider_stddev, 1e200)
         self.assertEqual(result.predictive_stddev, 1e200)
 
-        providers = ("a", "b", "c", "d")
+        providers = ("espn", "cbs", "fftoday", "fantasysharks")
         weights = (12406484271974.576, 1.3083879156488584e89, 1.0697798020554897e83, 2.4065675944243345e-83)
         max_config = EnsembleConfig(
             provider_weights=tuple(
@@ -155,7 +203,7 @@ class WeeklyEnsembleTests(unittest.TestCase):
                 opponent_team_id=None,
                 is_home=None,
             )
-            for provider in ("fantasypros", "espn", "yahoo")
+            for provider in ENSEMBLE_PROVIDERS
         )
 
         result = fuse_weekly_projections(rows, "RB", make_config())
@@ -164,7 +212,7 @@ class WeeklyEnsembleTests(unittest.TestCase):
         self.assertIsNone(result.nfl_game_id)
 
     def test_bye_requires_every_configured_provider_to_report_bye(self):
-        bye_rows = tuple(make_bye(provider) for provider in ("fantasypros", "espn", "yahoo"))
+        bye_rows = tuple(make_bye(provider) for provider in ENSEMBLE_PROVIDERS)
         result = fuse_weekly_projections(bye_rows, position="RB", config=make_config())
 
         self.assertIs(result.status, ProjectionStatus.BYE)
@@ -179,9 +227,9 @@ class WeeklyEnsembleTests(unittest.TestCase):
 
     def test_rejects_duplicate_missing_and_unconfigured_providers(self):
         complete = (
-            make_projection("fantasypros", 10),
-            make_projection("espn", 11),
-            make_projection("yahoo", 12),
+            make_projection("espn", 10),
+            make_projection("cbs", 11),
+            make_projection("fftoday", 12),
         )
         with self.assertRaisesRegex(ValueError, "duplicate provider"):
             fuse_weekly_projections((complete[0], complete[0], complete[2]), "RB", make_config())
@@ -191,7 +239,7 @@ class WeeklyEnsembleTests(unittest.TestCase):
             fuse_weekly_projections((*complete, make_projection("other", 9)), "RB", make_config())
 
     def test_rejects_mixed_identity_or_game_context(self):
-        baseline = make_projection("fantasypros", 10)
+        baseline = make_projection("espn", 10)
         variants = {
             "canonical_player_id": "p2",
             "snapshot_id": "snapshot-2",
@@ -207,23 +255,23 @@ class WeeklyEnsembleTests(unittest.TestCase):
             with self.subTest(field=field):
                 rows = (
                     baseline,
-                    replace(make_projection("espn", 11), **{field: value}),
-                    make_projection("yahoo", 12),
+                    replace(make_projection("cbs", 11), **{field: value}),
+                    make_projection("fftoday", 12),
                 )
                 with self.assertRaisesRegex(ValueError, "identity and game context"):
                     fuse_weekly_projections(rows, "RB", make_config())
 
     def test_rejects_insufficient_observed_sources_and_unknown_position(self):
         rows = (
-            make_projection("fantasypros", 0),
-            make_projection("espn", None, ProjectionStatus.PARSE_ERROR),
-            make_projection("yahoo", None, ProjectionStatus.NOT_PUBLISHED),
+            make_projection("espn", 0),
+            make_projection("cbs", None, ProjectionStatus.PARSE_ERROR),
+            make_projection("fftoday", None, ProjectionStatus.NOT_PUBLISHED),
         )
         with self.assertRaisesRegex(ValueError, "insufficient observed"):
             fuse_weekly_projections(rows, "RB", make_config())
         with self.assertRaisesRegex(ValueError, "uncertainty floor"):
             fuse_weekly_projections(
-                tuple(make_projection(provider, 10) for provider in ("fantasypros", "espn", "yahoo")),
+                tuple(make_projection(provider, 10) for provider in ENSEMBLE_PROVIDERS),
                 "TE",
                 make_config(),
             )
@@ -231,9 +279,9 @@ class WeeklyEnsembleTests(unittest.TestCase):
     def test_strict_json_record_round_trip_is_lossless(self):
         result = fuse_weekly_projections(
             (
-                make_projection("fantasypros", 0),
-                make_projection("espn", None, ProjectionStatus.NOT_PUBLISHED),
-                make_projection("yahoo", 12),
+                make_projection("espn", 0),
+                make_projection("cbs", None, ProjectionStatus.NOT_PUBLISHED),
+                make_projection("fftoday", 12),
             ),
             "RB",
             make_config(),
@@ -242,6 +290,50 @@ class WeeklyEnsembleTests(unittest.TestCase):
         record = ensemble_to_record(result)
         json.dumps(record, allow_nan=False)
         self.assertEqual(ensemble_from_record(record), result)
+
+        yahoo_record = {
+            **record,
+            "provider_observations": [
+                {
+                    **record["provider_observations"][0],
+                    "provider": "yahoo",
+                },
+                *record["provider_observations"][1:],
+            ],
+        }
+        self.assertEqual(
+            ensemble_from_record(yahoo_record).provider_observations[0].provider,
+            "yahoo",
+        )
+
+        for provider in ("ffa",):
+            reference_only = {
+                **record,
+                "provider_observations": [
+                    {
+                        **record["provider_observations"][0],
+                        "provider": provider,
+                    },
+                    *record["provider_observations"][1:],
+                ],
+            }
+            with self.subTest(provider=provider), self.assertRaisesRegex(
+                ValueError, "reference-only"
+            ):
+                ensemble_from_record(reference_only)
+
+        mixed = {
+            **record,
+            "provider_observations": [
+                {
+                    **record["provider_observations"][0],
+                    "provider": "fantasypros",
+                },
+                *record["provider_observations"][1:],
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "composite projections"):
+            ensemble_from_record(mixed)
 
         invalid_records = (
             {**record, "extra": True},
@@ -260,7 +352,7 @@ class WeeklyEnsembleTests(unittest.TestCase):
             ensemble_from_record(same_team_opponent)
 
         bye = fuse_weekly_projections(
-            tuple(make_bye(provider) for provider in ("fantasypros", "espn", "yahoo")),
+            tuple(make_bye(provider) for provider in ENSEMBLE_PROVIDERS),
             "RB",
             make_config(),
         )
@@ -270,9 +362,9 @@ class WeeklyEnsembleTests(unittest.TestCase):
 def make_config(**changes) -> EnsembleConfig:
     values = {
         "provider_weights": (
-            ProviderWeight("fantasypros", 2),
-            ProviderWeight("espn", 1),
-            ProviderWeight("yahoo", 1),
+            ProviderWeight("espn", 2),
+            ProviderWeight("cbs", 1),
+            ProviderWeight("fftoday", 1),
         ),
         "minimum_observed_sources": 2,
         "position_stddev_floors": {"RB": 3.0},

@@ -42,6 +42,7 @@ from trade_snapshot.weekly_engine import build_weekly_engine
 
 NOW = datetime(2026, 9, 1, tzinfo=timezone.utc)
 SCORING_PROFILE = ScoringProfile("espn", {"reception": 1, "passing_td": 4})
+FORECAST_PROVIDERS = ("espn", "cbs")
 
 
 def state(scoring_profile_id="profile-1"):
@@ -74,20 +75,30 @@ def state(scoring_profile_id="profile-1"):
 def raw_rows(ensembles):
     rows = []
     for ensemble in ensembles:
-        for observed in ensemble.provider_observations:
+        fantasypros = ensemble.provider_observations[0]
+        for provider, offset in (
+            ("fantasypros", 0),
+            ("espn", 2),
+            ("cbs", 4),
+        ):
+            points = (
+                fantasypros.projected_fantasy_points + offset
+                if fantasypros.status is ProjectionStatus.OBSERVED
+                else None
+            )
             rows.append(
                 WeeklyProjection(
                     ensemble.canonical_player_id,
                     ensemble.snapshot_id,
                     ensemble.scoring_profile_id,
-                    observed.provider,
-                    observed.provider_player_id,
+                    provider,
+                    f"{provider}-{ensemble.canonical_player_id}",
                     ensemble.season,
                     ensemble.week,
-                    observed.status,
+                    fantasypros.status,
                     NOW,
-                    observed.projected_fantasy_points,
-                    {"fantasy_points": observed.projected_fantasy_points},
+                    points,
+                    {"fantasy_points": points},
                     ensemble.nfl_team_id,
                     ensemble.nfl_game_id,
                     ensemble.opponent_team_id,
@@ -197,7 +208,7 @@ def waiver_pool(profile_id):
     )
 
 
-def build(rows=None):
+def build(rows=None, *, ensemble_config=None):
     profile_id = SCORING_PROFILE.scoring_profile_id
     ecr, ensembles, eligibility = inputs(profile_id)
     ecr = tuple(
@@ -251,8 +262,8 @@ def build(rows=None):
             "p4": "Player Four",
         },
         nfl_schedule=nfl_schedule(),
-        ensemble_config=EnsembleConfig(
-            tuple(ProviderWeight(provider, 1) for provider in ("fantasypros", "espn", "yahoo")),
+        ensemble_config=ensemble_config or EnsembleConfig(
+            tuple(ProviderWeight(provider, 1) for provider in FORECAST_PROVIDERS),
             2,
             {"RB": 0},
         ),
@@ -285,22 +296,21 @@ class WeeklyEngineTests(unittest.TestCase):
     def test_fails_closed_when_a_provider_row_is_missing_or_identity_drifts(self):
         ecr, ensembles, _ = inputs(SCORING_PROFILE.scoring_profile_id)
         rows = raw_rows(ensembles)
-        degraded = build(rows[:-1])
-        p2_week2 = next(
+        missing_observation = tuple(
             row
-            for row in degraded.projections
-            if row.canonical_player_id == "p2" and row.week == 2
-        )
-        self.assertTrue(
-            any(
-                item.provider == "yahoo" and item.status is ProjectionStatus.NOT_PUBLISHED
-                for item in p2_week2.provider_observations
+            for row in rows
+            if not (
+                row.canonical_player_id == "p2"
+                and row.week == 2
+                and row.provider == "cbs"
             )
         )
+        with self.assertRaisesRegex(ValueError, "insufficient observed provider sources"):
+            build(missing_observation)
         missing_identity = tuple(
             row
             for row in rows
-            if not (row.canonical_player_id == "p2" and row.provider == "yahoo")
+            if not (row.canonical_player_id == "p2" and row.provider == "cbs")
         )
         with self.assertRaisesRegex(ValueError, "lacks provider identity"):
             build(missing_identity)
@@ -326,7 +336,7 @@ class WeeklyEngineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "identity"):
             build(tuple(changed))
 
-    def test_espn_and_yahoo_change_playoff_inputs_but_not_power(self):
+    def test_forecast_sources_change_playoff_inputs_but_not_power(self):
         ecr, ensembles, _ = inputs(SCORING_PROFILE.scoring_profile_id)
         rows = raw_rows(ensembles)
         changed = tuple(
@@ -337,7 +347,7 @@ class WeeklyEngineTests(unittest.TestCase):
                     "fantasy_points": row.projected_fantasy_points + 100
                 },
             )
-            if row.provider in {"espn", "yahoo"}
+            if row.provider in {"espn", "cbs"}
             and row.status is ProjectionStatus.OBSERVED
             else row
             for row in rows
@@ -348,6 +358,16 @@ class WeeklyEngineTests(unittest.TestCase):
 
         self.assertEqual(baseline.strength_model, updated.strength_model)
         self.assertNotEqual(baseline.projections, updated.projections)
+
+    def test_rejects_reference_only_provider_before_ensemble_calculation(self):
+        with self.assertRaisesRegex(ValueError, "reference-only"):
+            build(
+                ensemble_config=EnsembleConfig(
+                    (ProviderWeight("ffa", 1),),
+                    1,
+                    {"RB": 0},
+                )
+            )
 
 
 if __name__ == "__main__":

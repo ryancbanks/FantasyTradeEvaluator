@@ -110,6 +110,8 @@ class BrowserExtensionRuntimeTests(unittest.TestCase):
                             "season": 2026,
                             "league": {
                                 "key": "runtime-only-private-key",
+                                "id": 77,
+                                "teamId": 1,
                                 "season": 2026,
                                 "rosterSize": 99,
                                 "settings": {
@@ -117,7 +119,7 @@ class BrowserExtensionRuntimeTests(unittest.TestCase):
                                     "roster_positions": [
                                         {"type": "QB", "count": 1},
                                         {"type": "BN", "count": 1},
-                                        {"type": "IR", "count": 1},
+                                        {"type": "RESERVE_IR", "count": 1},
                                     ],
                                     "basic_scoring": "PPR",
                                 },
@@ -296,6 +298,8 @@ class BrowserExtensionRuntimeTests(unittest.TestCase):
                             if source.source.value == "bootstrap"
                         )
                         self.assertEqual(bootstrap.body["payload"]["league"]["roster_size"], 2)
+                        self.assertEqual(bootstrap.body["payload"]["league"]["id"], "77")
+                        self.assertEqual(bootstrap.body["payload"]["league"]["team_id"], "1")
                         projected_capture = next(
                             source for source in captured[0].sources
                             if source.source.value == "projected_standings"
@@ -315,6 +319,9 @@ class BrowserExtensionRuntimeTests(unittest.TestCase):
                         )
                         self._wait_for(
                             lambda: server.extension_bridge.state == "unpaired"
+                        )
+                        self._wait_for(
+                            lambda: worker.evaluate("statusSnapshot().phase") == "idle"
                         )
                         status = worker.evaluate("statusSnapshot()")
                         self.assertEqual(status["phase"], "idle")

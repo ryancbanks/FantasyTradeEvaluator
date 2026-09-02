@@ -11,6 +11,7 @@ from tests.test_feature_engineering import (
 )
 from tests.test_methodology_reuse import SCHEMA, formula, fingerprint
 from tests.test_weekly_engine import (
+    FORECAST_PROVIDERS,
     SCORING_PROFILE,
     nfl_schedule,
     raw_rows,
@@ -93,7 +94,7 @@ def evidence():
         ensemble_config=EnsembleConfig(
             tuple(
                 ProviderWeight(provider, 1)
-                for provider in ("fantasypros", "espn", "yahoo")
+                for provider in FORECAST_PROVIDERS
             ),
             2,
             {"RB": 0},

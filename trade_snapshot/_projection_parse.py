@@ -80,7 +80,11 @@ def projection_artifact_rows(
             name, position, team = _player_metadata(
                 cells[player_index].text,
                 None if position_index is None else cells[position_index].text,
-                None if team_index is None else cells[team_index].text,
+                (
+                    link_id
+                    if is_team_link and artifact.provider is CaptureProvider.CBS
+                    else None if team_index is None else cells[team_index].text
+                ),
                 artifact,
                 known,
             )
@@ -150,14 +154,22 @@ def _player_metadata(player_text, position_text, team_text, artifact, known):
         raise ValueError("projection player row lacks exact name/position/team metadata")
     if position is None or team is None:
         raise ValueError("projection player row lacks exact position or NFL team")
-    return name, position, team
+    return _display_name(name, artifact.provider), position, team
 
 
 def _parse_player_cell(value, expected_position, expected_team):
     text = re.sub(r"\s+", " ", value).strip()
     if not text:
         return None
-    positions = [re.escape(expected_position)] if expected_position else [
+    expected_aliases = {
+        "RB": ("RB", "FB"),
+        "K": ("K", "PK"),
+        "DST": (r"D\s*/\s*ST", "DST", "DEF"),
+    }
+    positions = [
+        re.escape(value) if "\\" not in value else value
+        for value in expected_aliases.get(expected_position, (expected_position,))
+    ] if expected_position else [
         r"D\s*/\s*ST", "DST", "DEF", "QB", "RB", "FB", "WR", "TE", "K", "PK",
         "DL", "DE", "DT", "NT", "EDGE", "LB", "ILB", "OLB", "MLB", "DB", "CB",
         "S", "FS", "SS", "IDP"
@@ -195,11 +207,23 @@ def _provider_link(provider, link):
         CaptureProvider.FANTASYPROS: (
             "fantasypros_projection", r"^/nfl/players/([a-z0-9-]+)\.php$"
         ),
+        CaptureProvider.CBS: (
+            "cbs", r"^/nfl/players/([0-9]+)/[a-z0-9-]+/fantasy/?$"
+        ),
+        CaptureProvider.FFTODAY: (
+            "fftoday", r"^/stats/players/([0-9]+)/[A-Za-z0-9_.'-]+/?$"
+        ),
     }
-    identity_provider, pattern = patterns[provider]
-    match = re.fullmatch(pattern, path, flags=re.IGNORECASE)
-    if match is not None:
-        return identity_provider, match.group(1), False
+    if provider is CaptureProvider.FANTASYSHARKS:
+        query = urlsplit(link).query
+        match = re.fullmatch(r"id=([1-9][0-9]{0,9})", query)
+        if path == "/apps/bert/players/playerpage.php" and match is not None:
+            return "fantasysharks", match.group(1), False
+    else:
+        identity_provider, pattern = patterns[provider]
+        match = re.fullmatch(pattern, path, flags=re.IGNORECASE)
+        if match is not None:
+            return identity_provider, match.group(1), False
     if provider is CaptureProvider.YAHOO:
         team = re.fullmatch(
             r"^/nfl/teams/([a-z0-9]+(?:-[a-z0-9]+)*)/?$",
@@ -208,6 +232,14 @@ def _provider_link(provider, link):
         )
         if team is not None:
             return "yahoo", team.group(1).casefold(), True
+    if provider is CaptureProvider.CBS:
+        team = re.fullmatch(
+            r"^/nfl/teams/([a-z]{2,3})/[a-z0-9]+(?:-[a-z0-9]+)*/?$",
+            path,
+            flags=re.IGNORECASE,
+        )
+        if team is not None:
+            return "cbs", _team(team.group(1)), True
     raise ValueError("projection link does not contain a supported public identity")
 
 
@@ -275,10 +307,23 @@ def normalize_position(value):
 
 def _team(value):
     normalized = value.strip().upper()
-    normalized = {"JAC": "JAX", "WAS": "WSH", "LA": "LAR"}.get(normalized, normalized)
+    normalized = {
+        "GBP": "GB", "JAC": "JAX", "KCC": "KC", "LA": "LAR",
+        "LVR": "LV", "NEP": "NE", "NOS": "NO", "SFO": "SF",
+        "TBB": "TB", "WAS": "WSH",
+    }.get(normalized, normalized)
     if not re.fullmatch(r"[A-Z]{2,3}|FA", normalized):
         raise ValueError(f"invalid NFL team abbreviation {value!r}")
     return normalized
+
+
+def _display_name(value: str, provider: CaptureProvider) -> str:
+    name = re.sub(r"\s+", " ", value).strip()
+    if provider is CaptureProvider.FANTASYSHARKS:
+        match = re.fullmatch(r"([^,]+),\s*(.+)", name)
+        if match:
+            name = f"{match.group(2)} {match.group(1)}"
+    return name
 
 
 def _header(value):

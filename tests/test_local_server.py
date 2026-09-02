@@ -376,7 +376,8 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b'id="minOutgoingLabel"', page)
         self.assertIn(b'id="noDropsLabel"', page)
         self.assertIn(b'id="freeAgentAllocationPolicy"', page)
-        self.assertIn(b"always extrapolated", page)
+        self.assertIn(b"Independent weeks use the disclosed local power model", page)
+        self.assertIn(b"extrapolated beyond their attested two-team", page)
         self.assertIn(b"Every result requires all three teams", page)
         self.assertIn(b'id="resultsHeaderRow"', page)
         self.assertIn(b'id="dashboardPanel"', page)
@@ -429,6 +430,15 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b".roster-adjustment-warning", stylesheet)
         self.assertNotIn(b"color-scheme: light", stylesheet)
 
+        status, headers, three_way_ui = self.request(
+            "GET", "/three_way_ui.js", token=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/javascript", headers["Content-Type"])
+        self.assertIn(b"disclosed independent local model", three_way_ui)
+        self.assertIn(b"surrogate_extrapolated", three_way_ui)
+        self.assertIn(b"attested two-team scope", three_way_ui)
+
         status, headers, dashboard_styles = self.request(
             "GET", "/dashboard.css", token=False
         )
@@ -459,6 +469,7 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b'rowHeader.scope = "row"', dashboard_ui)
         self.assertIn(b"replacement?.focus()", dashboard_ui)
         self.assertIn(b"bindHorizontalScroll(container)", dashboard_ui)
+        self.assertIn(b"independent local power", dashboard_ui)
         self.assertNotIn(b"innerHTML", dashboard_ui)
 
         status, headers, gm_insights_format = self.request(

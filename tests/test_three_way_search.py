@@ -143,7 +143,7 @@ def projection(player_id, value):
         status=ProjectionStatus.OBSERVED,
         provider_observations=(
             ProviderObservation(
-                "source", f"source-{player_id}", ProjectionStatus.OBSERVED, value, 1
+                "espn", f"espn-{player_id}", ProjectionStatus.OBSERVED, value, 1
             ),
         ),
         minimum_observed_sources=1,

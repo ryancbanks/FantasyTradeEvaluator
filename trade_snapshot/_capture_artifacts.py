@@ -40,8 +40,8 @@ GENERIC_TABLE_SCHEMA_FINGERPRINT = schema_fingerprint(
             "horizon", "scoring", "position_scope", "source_period_text",
             "segments_captured", "complete",
         ],
-        "policy_version": "projection-stats-allowlist-complete-traversal-v4",
-        "link_policy": "provider-player-or-yahoo-dst-team-path-only-v4",
+        "policy_version": "projection-stats-allowlist-complete-traversal-v5",
+        "link_policy": "provider-player-or-provider-dst-team-path-only-v5",
     },
 )
 ANALYZER_RESPONSE_SCHEMA_FINGERPRINT = schema_fingerprint(

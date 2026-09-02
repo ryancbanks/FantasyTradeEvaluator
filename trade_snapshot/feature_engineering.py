@@ -3,17 +3,18 @@
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from math import log, sqrt
-import re
 
 from ._calibration_inputs import PlayerFeatureVector
 from ._scenario_random import content_id
 from .ecr import EcrPeriod, EcrPlayerRanking, EcrSnapshot
 from .ensemble import EnsembleProjection
+from .projection_provider_rules import (
+    validate_selectable_projection_providers,
+)
 from .projections import ProjectionStatus
 from .scenario_config import PlayerEligibility
 
 
-_PROVIDER_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 DEFAULT_PROVIDERS = ("fantasypros", "espn", "yahoo")
 ECR_METRICS = (
     "available",
@@ -199,20 +200,7 @@ def _ecr_pair(values) -> tuple[EcrSnapshot, EcrSnapshot]:
 
 
 def _providers(values) -> tuple[str, ...]:
-    if isinstance(values, (str, bytes)):
-        raise ValueError("provider_names must be an iterable")
-    try:
-        providers = tuple(values)
-    except TypeError:
-        raise ValueError("provider_names must be an iterable") from None
-    if not providers or any(
-        not isinstance(value, str) or not _PROVIDER_NAME.fullmatch(value)
-        for value in providers
-    ):
-        raise ValueError("provider_names must be lowercase identifier strings")
-    if len(set(providers)) != len(providers):
-        raise ValueError("provider_names contains a duplicate")
-    return tuple(sorted(providers))
+    return validate_selectable_projection_providers(values)
 
 
 def _eligibility(values) -> dict[str, PlayerEligibility]:

@@ -432,14 +432,17 @@ class PlaywrightAdapterTests(unittest.TestCase):
                 def fulfill_current(route):
                     nonlocal roundtrip_started
                     if "redirect=1" in route.request.url:
-                        route.redirect(current_trade)
+                        route.fulfill(status=302, headers={"Location": current_trade})
                         return
                     if "roundtrip-hop=1" in route.request.url:
-                        route.redirect(roundtrip)
+                        route.fulfill(status=302, headers={"Location": roundtrip})
                         return
                     if "roundtrip=1" in route.request.url and not roundtrip_started:
                         roundtrip_started = True
-                        route.redirect(f"{current_trade}&roundtrip-hop=1")
+                        route.fulfill(
+                            status=302,
+                            headers={"Location": f"{current_trade}&roundtrip-hop=1"},
+                        )
                         return
                     marker = (
                         "roundtrip" if "roundtrip=1" in route.request.url
@@ -723,14 +726,15 @@ class PlaywrightAdapterTests(unittest.TestCase):
         page_data = {
             "season": 2026,
             "league": {
-                "key": "runtime-only-private-key", "season": 2026,
+                "key": "runtime-only-private-key", "id": 77, "teamId": 1,
+                "season": 2026,
                 "rosterSize": 99,
                 "settings": {
                     "playoffsTeams": 1,
                     "roster_positions": [
                         {"type": "QB", "count": 1},
                         {"type": "BN", "count": 1},
-                        {"type": "IR", "count": 1},
+                        {"type": "RESERVE_IR", "count": 1},
                     ],
                     "basic_scoring": "PPR",
                 },
@@ -844,6 +848,8 @@ class PlaywrightAdapterTests(unittest.TestCase):
         bootstrap = next(row for row in captured["sources"] if row["source"] == "bootstrap")
         self.assertEqual(bootstrap["body"]["payload"]["current_week"], 7)
         self.assertEqual(bootstrap["body"]["payload"]["league"]["roster_size"], 2)
+        self.assertEqual(bootstrap["body"]["payload"]["league"]["id"], "77")
+        self.assertEqual(bootstrap["body"]["payload"]["league"]["team_id"], "1")
         projected_capture = next(
             row for row in captured["sources"] if row["source"] == "projected_standings"
         )

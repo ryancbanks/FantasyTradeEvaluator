@@ -131,9 +131,9 @@ class CapturePlanTests(unittest.TestCase):
                 "league": LEAGUE_SOURCE_SCHEMA_FINGERPRINT,
             },
             {
-                "task": "capschema_14dd3e69ae0237cd2f3a451ed1a412e4cc0c34415499a3dbfe224a4608ce5841",
-                "plan": "capschema_7637127ff6ae3e425ae723916a45daa62d579d58ded2ab687ea3d1bc702e6704",
-                "table": "capschema_abde1ebf0213e2cde16382bd6448a1a254e4efa9745745334c7977a6e90e068b",
+                "task": "capschema_a1f994964ac17c6d4e00c5630a5178b31df2a97345a8115798b5551be537e72b",
+                "plan": "capschema_8090b2c67c77b1e4d1d45a9826735f314395376b2596939f8368fcf06a59004d",
+                "table": "capschema_b188bdea5c549ed3992750e5663d2b4c32a956b760174df2b5f3d1fbf5b83265",
                 "analyzer": "capschema_bcf693343ec0769715115324a1c4e1bd210d418eb52abca72cca5d820f73092e",
                 "ecr_task": "capschema_75f616f4218befaa96bd8caaa5179825b5e22f4e088174d0e989f869602ef9a6",
                 "ecr": "capschema_7efe13de770357c2bc8031b32b1da11697c198e630c3664b6642b1a4dfb94faf",
@@ -195,6 +195,38 @@ class ProjectionArtifactTests(unittest.TestCase):
                 "weekly", "PPR", ("RB",), "Week 1", 1, False, (valid,),
             )
 
+    def test_public_source_identity_links_are_minimized_without_losing_identity(self):
+        self.assertEqual(
+            public_player_link(
+                "fftoday",
+                "https://www.fftoday.com/stats/players/501/A.J._Brown"
+                "?LeagueID=107644#top",
+            ),
+            "https://www.fftoday.com/stats/players/501/A.J._Brown",
+        )
+        self.assertEqual(
+            public_player_link(
+                "fantasysharks",
+                "https://www.fantasysharks.com/apps/bert/players/"
+                "playerpage.php?id=13589",
+            ),
+            "https://www.fantasysharks.com/apps/bert/players/"
+            "playerpage.php?id=13589",
+        )
+        for invalid in (
+            "https://www.fantasysharks.com/apps/bert/players/"
+            "playerpage.php?id=13589&league=private",
+            "https://www.fftoday.com/stats/players/not-an-id/Josh_Allen",
+            "https://evil.example/stats/players/501/Josh_Allen",
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(
+                    public_player_link(
+                        "fantasysharks" if "fantasysharks" in invalid else "fftoday",
+                        invalid,
+                    )
+                )
+
 
 class AnalyzerArtifactTests(unittest.TestCase):
     def test_phase_allowlist_discards_every_non_result_field(self):
@@ -250,6 +282,19 @@ class AnalyzerArtifactTests(unittest.TestCase):
 
 
 class LeagueArtifactTests(unittest.TestCase):
+    def test_optional_league_identifiers_are_normalized_decimal_text(self):
+        bootstrap = next(
+            source for source in league_sources()
+            if source.source is LeagueSourceKind.BOOTSTRAP
+        ).to_record()["body"]["payload"]
+        for field, invalid in (("id", 77), ("team_id", 1), ("id", "0")):
+            changed = copy.deepcopy(bootstrap)
+            changed["league"][field] = invalid
+            with self.subTest(field=field, invalid=invalid), self.assertRaisesRegex(
+                ValueError, "positive decimal"
+            ):
+                LeagueSource("bootstrap", {"payload": changed})
+
     def test_complete_sources_round_trip_and_remove_secrets_urls(self):
         task = league_task()
         records = [source.to_record() for source in league_sources()]

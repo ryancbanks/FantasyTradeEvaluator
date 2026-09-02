@@ -14,7 +14,13 @@
     "https://www.fantasypros.com/*",
     "https://fantasy.espn.com/*",
     "https://lm-api-reads.fantasy.espn.com/*",
-    "https://football.fantasysports.yahoo.com/*"
+    "https://football.fantasysports.yahoo.com/*",
+    "https://cbssports.com/*",
+    "https://www.cbssports.com/*",
+    "https://fftoday.com/*",
+    "https://www.fftoday.com/*",
+    "https://fantasysharks.com/*",
+    "https://www.fantasysharks.com/*"
   ],
   "background": {
     "service_worker": "service_worker.js"
@@ -40,7 +46,13 @@
         "https://fantasypros.com/*",
         "https://www.fantasypros.com/*",
         "https://fantasy.espn.com/*",
-        "https://football.fantasysports.yahoo.com/*"
+        "https://football.fantasysports.yahoo.com/*",
+        "https://cbssports.com/*",
+        "https://www.cbssports.com/*",
+        "https://fftoday.com/*",
+        "https://www.fftoday.com/*",
+        "https://fantasysharks.com/*",
+        "https://www.fantasysharks.com/*"
       ],
       "js": [
         "single_page_main.js",
@@ -58,12 +70,20 @@
         "https://fantasypros.com/*",
         "https://www.fantasypros.com/*",
         "https://fantasy.espn.com/*",
-        "https://football.fantasysports.yahoo.com/*"
+        "https://football.fantasysports.yahoo.com/*",
+        "https://cbssports.com/*",
+        "https://www.cbssports.com/*",
+        "https://fftoday.com/*",
+        "https://www.fftoday.com/*",
+        "https://fantasysharks.com/*",
+        "https://www.fantasysharks.com/*"
       ],
       "js": [
         "protocol.js",
         "collectors/page.js",
-        "collectors/projection.js",
+        "collectors/projection_configure.js",
+        "collectors/projection_read.js",
+        "collectors/projection_advance.js",
         "collectors/yahoo.js",
         "scan_agent.js"
       ],

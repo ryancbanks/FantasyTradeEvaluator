@@ -9,6 +9,7 @@ offline engine.
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from types import MappingProxyType
 
 from ._analyzer_types import BundleFingerprint
@@ -31,9 +32,20 @@ from .identity import IdentityRegistry
 from .identity_match import ProviderPlayerRecord, reconcile_player_identities
 from .league_ingest import NormalizedLeagueInputs, host_player_records, normalize_host_league_snapshot
 from .league_source import VerifiedHostLeagueSnapshot
-from .methodology import DEFAULT_POWER_METHODOLOGY, PowerMethodology, default_projection_ensemble
+from .methodology import DEFAULT_POWER_METHODOLOGY, PowerMethodology
 from .nfl_schedule import NflSchedule
 from .positions import normalize_player_position
+from .projections import (
+    ProjectionStatus,
+    RemainingSeasonOrigin,
+    RemainingSeasonProjection,
+)
+from .projection_source_policy import (
+    INDEPENDENT_PROJECTION_PROVIDERS,
+    select_projection_sources,
+    validate_no_composite_double_count,
+    validate_selectable_projection_providers,
+)
 from .role_design import build_calibration_roles
 from .scenario_config import CorrelatedScenarioConfig, FactorLoadings
 from .scenario_config import PlayerEligibility
@@ -90,6 +102,7 @@ def assemble_weekly_refresh_evidence(
     ensemble_config: EnsembleConfig | None = None,
     scenario_config: CorrelatedScenarioConfig | None = None,
     power_methodology: PowerMethodology = DEFAULT_POWER_METHODOLOGY,
+    broad_consensus: bool = False,
 ) -> AssembledWeeklyEvidence:
     """Build one complete local-engine input or fail before publishing anything."""
 
@@ -133,13 +146,28 @@ def assemble_weekly_refresh_evidence(
         "projection_artifacts", projection_artifacts, GenericTableArtifact
     )
     ecr = _typed_tuple("ecr_artifacts", ecr_artifacts, FantasyProsECRArtifact)
-    _validate_artifact_dimensions(
+    projection_providers = _validate_artifact_dimensions(
         host_snapshot.season,
         host_snapshot.first_remaining_week,
         scoring,
         projections,
         ecr,
     )
+    selection = select_projection_sources(
+        projection_providers,
+        broad_consensus=broad_consensus,
+        fantasypros_available=True,
+    )
+    ensemble = ensemble_config or selection.ensemble_config()
+    configured_providers = {
+        row.provider for row in ensemble.provider_weights
+    }
+    validate_selectable_projection_providers(configured_providers)
+    validate_no_composite_double_count(configured_providers)
+    if configured_providers != set(selection.providers):
+        raise ValueError(
+            "projection ensemble providers must exactly match the selected forecast sources"
+        )
 
     identity_records = _dedupe_player_records(
         (
@@ -181,6 +209,7 @@ def assemble_weekly_refresh_evidence(
         snapshot_id=host_snapshot.snapshot_id,
         scoring_profile_id=host_snapshot.scoring_profile.scoring_profile_id,
         applicable_weeks=league_inputs.league_state.remaining_regular_season_weeks,
+        nfl_schedule=nfl_schedule,
     )
     players = {row.canonical_player_id: row for row in identities.players}
     waiver_pool = _waiver_pool(
@@ -190,6 +219,8 @@ def assemble_weekly_refresh_evidence(
         ecr_snapshots,
         all_projection_evidence,
         nfl_schedule,
+        selection.providers,
+        selection.minimum_observed_sources,
     )
     computation_players = rostered | frozenset(waiver_pool.player_ids)
     player_ids = _fantasypros_player_ids(computation_players, identities)
@@ -197,6 +228,19 @@ def assemble_weekly_refresh_evidence(
         row
         for row in all_projection_evidence
         if row.canonical_player_id in computation_players
+    )
+    required_evidence_providers = tuple(dict.fromkeys(
+        (*selection.providers, "fantasypros")
+    ))
+    projection_evidence = _complete_projection_evidence(
+        projection_evidence,
+        computation_players,
+        required_evidence_providers,
+        projections,
+        snapshot_id=host_snapshot.snapshot_id,
+        scoring_profile_id=host_snapshot.scoring_profile.scoring_profile_id,
+        season=host_snapshot.season,
+        applicable_weeks=league_inputs.league_state.remaining_regular_season_weeks,
     )
     positions = {
         player_id: normalize_player_position(players[player_id].position)
@@ -230,7 +274,6 @@ def assemble_weekly_refresh_evidence(
         positions,
         eligibilities,
     )
-    ensemble = ensemble_config or default_projection_ensemble()
     scenarios = scenario_config or CorrelatedScenarioConfig(
         10_000,
         20_260_901,
@@ -264,7 +307,9 @@ def assemble_weekly_refresh_evidence(
     )
 
 
-def _validate_artifact_dimensions(season, week, scoring, projections, ecr) -> None:
+def _validate_artifact_dimensions(
+    season, week, scoring, projections, ecr
+) -> tuple[str, ...]:
     for row in (*projections, *ecr):
         if row.season != season or row.scoring != scoring:
             raise ValueError("weekly artifacts do not share season and scoring")
@@ -275,12 +320,36 @@ def _validate_artifact_dimensions(season, week, scoring, projections, ecr) -> No
         raise ValueError("ECR artifacts must include weekly and rest-of-season rankings")
     if any(row.week != week for row in ecr):
         raise ValueError("ECR artifacts must use the first remaining week")
-    projection_horizons = {row.horizon for row in projections}
-    if projection_horizons != {RankingHorizon.WEEKLY, RankingHorizon.ROS}:
-        raise ValueError("projection artifacts must include weekly and rest-of-season rows")
-    providers = {row.provider.value for row in projections}
-    if providers != {"fantasypros", "espn", "yahoo"}:
-        raise ValueError("projection artifacts must include FantasyPros, ESPN, and Yahoo")
+    providers = validate_selectable_projection_providers(
+        {row.provider.value for row in projections}
+    )
+    allowed = {"fantasypros", *INDEPENDENT_PROJECTION_PROVIDERS}
+    if "fantasypros" not in providers or not set(providers) <= allowed:
+        raise ValueError(
+            "projection artifacts must include FantasyPros and only supported sources"
+        )
+    required_horizons = {RankingHorizon.WEEKLY, RankingHorizon.ROS}
+    for provider in providers:
+        horizons = {
+            row.horizon for row in projections if row.provider.value == provider
+        }
+        if provider == "cbs":
+            complete = horizons == {RankingHorizon.ROS}
+        elif provider == "fftoday":
+            # Weekly IDP pages cannot be joined safely because they omit
+            # stable player identities.  ROS-only is complete when those are
+            # the only FFToday positions requested.
+            complete = (
+                RankingHorizon.ROS in horizons
+                and horizons <= required_horizons
+            )
+        else:
+            complete = horizons == required_horizons
+        if not complete:
+            raise ValueError(
+                f"{provider} projection artifacts have incomplete period coverage"
+            )
+    return providers
 
 
 def _dedupe_player_records(values) -> tuple[ProviderPlayerRecord, ...]:
@@ -413,6 +482,7 @@ def _projection_evidence(
     snapshot_id,
     scoring_profile_id,
     applicable_weeks,
+    nfl_schedule,
 ):
     result = []
     for artifact in artifacts:
@@ -422,6 +492,7 @@ def _projection_evidence(
             snapshot_id=snapshot_id,
             scoring_profile_id=scoring_profile_id,
             applicable_weeks=applicable_weeks,
+            nfl_schedule=nfl_schedule,
         )
         result.extend(row for row in rows if row.canonical_player_id is not None)
     if not result:
@@ -435,6 +506,51 @@ def _projection_evidence(
     return tuple(result)
 
 
+def _complete_projection_evidence(
+    evidence,
+    player_ids,
+    providers,
+    artifacts,
+    *,
+    snapshot_id,
+    scoring_profile_id,
+    season,
+    applicable_weeks,
+):
+    """Represent selected-source noncoverage explicitly instead of imputing it."""
+
+    rows = list(evidence)
+    required = set(providers)
+    covered = {(row.provider, row.canonical_player_id) for row in rows}
+    captured_by_provider = {
+        provider: max(
+            _capture_time(row.captured_at)
+            for row in artifacts
+            if row.provider.value == provider
+        )
+        for provider in required
+    }
+    for provider in sorted(required):
+        for player_id in sorted(player_ids):
+            if (provider, player_id) in covered:
+                continue
+            rows.append(
+                RemainingSeasonProjection(
+                    canonical_player_id=player_id,
+                    snapshot_id=snapshot_id,
+                    scoring_profile_id=scoring_profile_id,
+                    provider=provider,
+                    provider_player_id=f"not-published:{player_id}",
+                    season=season,
+                    applicable_weeks=applicable_weeks,
+                    status=ProjectionStatus.NOT_PUBLISHED,
+                    origin=RemainingSeasonOrigin.PROVIDER_PUBLISHED,
+                    captured_at=captured_by_provider[provider],
+                )
+            )
+    return tuple(rows)
+
+
 def _waiver_pool(
     artifact,
     league_inputs,
@@ -442,6 +558,8 @@ def _waiver_pool(
     ecr_snapshots,
     projection_evidence,
     nfl_schedule,
+    forecast_providers,
+    minimum_forecast_sources,
 ):
     state = league_inputs.league_state
     rostered = frozenset(
@@ -454,6 +572,9 @@ def _waiver_pool(
     materializable = _materializable_projection_player_ids(
         projection_evidence,
         state.remaining_regular_season_weeks,
+        forecast_providers,
+        minimum_forecast_sources,
+        required_provider="fantasypros",
     )
     by_period = {row.period: row for row in ecr_snapshots}
     weekly = {
@@ -504,21 +625,24 @@ def _waiver_pool(
     )
 
 
-def _materializable_projection_player_ids(rows, weeks) -> set[str]:
-    providers = ("fantasypros", "espn", "yahoo")
+def _materializable_projection_player_ids(
+    rows, weeks, providers, minimum_sources, *, required_provider
+) -> set[str]:
     required_weeks = frozenset(weeks)
     coverage = defaultdict(lambda: defaultdict(set))
     for row in rows:
         period = row.week if hasattr(row, "week") else "ros"
         coverage[row.canonical_player_id][row.provider].add(period)
+    def complete(periods, provider):
+        available = periods.get(provider, ())
+        return "ros" in available or required_weeks.issubset(available)
+
     return {
         player_id
         for player_id, provider_periods in coverage.items()
-        if all(
-            "ros" in provider_periods.get(provider, ())
-            or required_weeks.issubset(provider_periods.get(provider, ()))
-            for provider in providers
-        )
+        if complete(provider_periods, required_provider)
+        and sum(complete(provider_periods, provider) for provider in providers)
+        >= minimum_sources
     }
 
 
@@ -529,6 +653,16 @@ def _has_complete_schedule(schedule, nfl_team_id, weeks) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _capture_time(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        raise ValueError("artifact captured_at must be an ISO-8601 timestamp") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("artifact captured_at must include a timezone")
+    return parsed.astimezone(timezone.utc)
 
 
 def _validate_fantasypros_league_scoring(artifact, scoring) -> None:

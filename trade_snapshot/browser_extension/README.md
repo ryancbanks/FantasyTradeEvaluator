@@ -166,23 +166,25 @@ operation list is:
 12. `espn.authenticated_json` — bounded `season`, numeric `league_id`, `timeout_ms`,
     and `maximum_bytes`; constructs exactly the two existing ESPN URLs and returns
     `{league,pro_teams}`.
-13. `yahoo.scoring` — payload `{}`; returns `{scoring:"STD"|"HALF"|"PPR"}` or a
-    fixed `{error}` from the visible Settings table.
-14. `session.wait` — bounded `timeout_ms`; returns `{"ok":true}`.
-15. `session.close` — payload `{}` or a fixed reason; acknowledges, closes the scan
+13. `session.wait` — bounded `timeout_ms`; returns `{"ok":true}`.
+14. `session.close` — payload `{}` or a fixed reason; acknowledges, closes the scan
     tab, clears the token, and disconnects.
 
 The projection request is exactly `{provider,season,week,horizon,scoring,positions}`.
-Providers are `fantasypros`, `espn`, or `yahoo`; weeks are 1–25; horizons are
-`weekly` or `ros`; scoring is `STD`, `HALF`, or `PPR`; and positions use the
-application's fixed canonical enum.
+Providers are `fantasypros`, `espn`, `cbs`, `fftoday`, or
+`fantasysharks`; weeks are 1–25; horizons are `weekly` or `ros`; scoring is
+`STD`, `HALF`, or `PPR`; and positions use the application's fixed canonical
+enum. ESPN is always used for league data. FantasyPros is visited only when its
+power mode is enabled. Supported public projection publishers are attempted
+automatically. The standard workflow does not require a Yahoo league.
 
 ## Navigation and privacy boundary
 
 Managed navigation is limited to the existing FantasyPros analyzer, ranking, and
-projection paths; ESPN's projections path; and Yahoo's generic or numeric-league
-Players, Player Search, and Settings paths. Manifest access is limited to those
-three providers, the exact ESPN JSON host, and loopback HTTP. There is no
+projection paths; ESPN's projections path; CBS's public fantasy projection paths;
+FFToday's public projection paths; and FantasySharks' public forecast path.
+Manifest access is limited to those providers, the exact ESPN JSON host, and
+loopback HTTP. There is no
 `<all_urls>`, cookie, web-request, debugger, or arbitrary scripting permission.
 
 The fixed scan marker activates the MAIN-world analyzer tap at `document_start`.

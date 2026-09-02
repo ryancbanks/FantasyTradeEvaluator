@@ -11,6 +11,7 @@ from types import MappingProxyType
 
 from .league_search import LeagueQualifiedTrade, LeagueSearchOutcome
 from .league_state import LeagueState
+from .independent_power_disclosure import IndependentPowerDisclosure
 from .methodology_attestation import MethodologyAttestation
 from .season import SeasonProjection
 from .surrogate_disclosure import SurrogateDisclosure
@@ -49,8 +50,8 @@ class TradeWorkbookContext:
     methodology_current_evidence_id: str
     methodology_quality_gate: str
     methodology_holdout_count: int
-    holdout_max_absolute_score_error: float
-    holdout_display_match_rate: float
+    holdout_max_absolute_score_error: float | None
+    holdout_display_match_rate: float | None
     exact_balanced_package_sizes: tuple[int, ...]
     sources: tuple[WorkbookSource, ...]
 
@@ -83,29 +84,48 @@ class TradeWorkbookContext:
             raise ValueError("scenario_count must be a positive integer")
         if (
             type(self.methodology_holdout_count) is not int
-            or self.methodology_holdout_count < 1
+            or self.methodology_holdout_count < 0
         ):
-            raise ValueError("methodology_holdout_count must be a positive integer")
-        error = _finite(
-            "holdout_max_absolute_score_error",
-            self.holdout_max_absolute_score_error,
-        )
-        rate = _finite("holdout_display_match_rate", self.holdout_display_match_rate)
-        if error < 0 or not 0 <= rate <= 1:
-            raise ValueError("workbook holdout quality metrics are invalid")
-        object.__setattr__(self, "holdout_max_absolute_score_error", error)
-        object.__setattr__(self, "holdout_display_match_rate", rate)
-        if self.power_engine_mode not in {"exact", "surrogate"}:
-            raise ValueError("power_engine_mode must be exact or surrogate")
+            raise ValueError("methodology_holdout_count must be non-negative")
+        if self.power_engine_mode not in {"exact", "surrogate", "independent"}:
+            raise ValueError(
+                "power_engine_mode must be exact, surrogate, or independent"
+            )
         exact = self.power_engine_mode == "exact"
-        if (
-            self.calibration_status != self.power_engine_mode
-            or self.methodology_evidence_kind
-            != ("exact_attestation" if exact else "surrogate_disclosure")
-            or self.formula_action
-            not in ({"reuse", "recalibrate"} if exact else {"recalibrate"})
-        ):
-            raise ValueError("workbook power-method provenance is inconsistent")
+        independent = self.power_engine_mode == "independent"
+        if independent:
+            if (
+                self.calibration_status != "independent"
+                or self.methodology_evidence_kind != "independent_disclosure"
+                or self.formula_action != "independent_policy"
+                or self.methodology_holdout_count != 0
+                or self.holdout_max_absolute_score_error is not None
+                or self.holdout_display_match_rate is not None
+            ):
+                raise ValueError(
+                    "independent workbook provenance is inconsistent"
+                )
+        else:
+            if (
+                self.calibration_status != self.power_engine_mode
+                or self.methodology_evidence_kind
+                != ("exact_attestation" if exact else "surrogate_disclosure")
+                or self.formula_action
+                not in ({"reuse", "recalibrate"} if exact else {"recalibrate"})
+                or self.methodology_holdout_count < 1
+            ):
+                raise ValueError("workbook power-method provenance is inconsistent")
+            error = _finite(
+                "holdout_max_absolute_score_error",
+                self.holdout_max_absolute_score_error,
+            )
+            rate = _finite(
+                "holdout_display_match_rate", self.holdout_display_match_rate
+            )
+            if error < 0 or not 0 <= rate <= 1:
+                raise ValueError("workbook holdout quality metrics are invalid")
+            object.__setattr__(self, "holdout_max_absolute_score_error", error)
+            object.__setattr__(self, "holdout_display_match_rate", rate)
         sizes = tuple(self.exact_balanced_package_sizes)
         if any(type(value) is not int or value < 1 for value in sizes) or len(
             set(sizes)
@@ -196,10 +216,11 @@ class WorkbookTradeRow:
             "extrapolated",
             "surrogate",
             "surrogate_extrapolated",
+            "independent",
         }:
             raise ValueError(
                 "power_methodology_status must be exact, extrapolated, surrogate, "
-                "or surrogate_extrapolated"
+                "surrogate_extrapolated, or independent"
             )
 
     @property
@@ -259,7 +280,9 @@ class WorkbookTradeRows(Sequence[WorkbookTradeRow]):
     outcome: LeagueSearchOutcome
     team_names: Mapping[str, str]
     player_names: Mapping[str, str]
-    methodology_evidence: MethodologyAttestation | SurrogateDisclosure
+    methodology_evidence: (
+        MethodologyAttestation | SurrogateDisclosure | IndependentPowerDisclosure
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.outcome, LeagueSearchOutcome):
@@ -272,7 +295,7 @@ class WorkbookTradeRows(Sequence[WorkbookTradeRow]):
         )
         if not isinstance(
             self.methodology_evidence,
-            (MethodologyAttestation, SurrogateDisclosure),
+            (MethodologyAttestation, SurrogateDisclosure, IndependentPowerDisclosure),
         ):
             raise ValueError("methodology_evidence has an invalid type")
 
@@ -407,7 +430,9 @@ def workbook_trade_rows(
     outcome: LeagueSearchOutcome,
     team_names: Mapping[str, str],
     player_names: Mapping[str, str],
-    methodology_evidence: MethodologyAttestation | SurrogateDisclosure,
+    methodology_evidence: (
+        MethodologyAttestation | SurrogateDisclosure | IndependentPowerDisclosure
+    ),
 ) -> WorkbookTradeRows:
     return WorkbookTradeRows(
         outcome,

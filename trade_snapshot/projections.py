@@ -30,10 +30,11 @@ class ProjectionStatus(str, Enum):
 
 
 class RemainingSeasonOrigin(str, Enum):
-    """Whether a ROS value came from a provider or complete weekly rows."""
+    """How a remaining-season total was obtained."""
 
     PROVIDER_PUBLISHED = "provider_published"
     DERIVED_WEEKLY = "derived_weekly"
+    DERIVED_FULL_SEASON = "derived_full_season"
 
 
 class WeeklyProjectionOrigin(str, Enum):

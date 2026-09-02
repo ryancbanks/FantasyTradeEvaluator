@@ -73,9 +73,13 @@ Still to validate:
 
 Until held-out absolute-score error is below `1e-6` and displayed changes agree exactly, results must be labeled **FantasyPros surrogate**, not exact FantasyPros output. Surrogate publication is an explicit, default-off fallback and is permitted only for a converged, identifiable fit with exact-tolerance training error and the complete diverse blind design. Its separate content-addressed disclosure persists the blind maximum score error, display-match rate, holdout identities/sizes, and `source_fit_id`; that fit ID binds the full solver diagnostics evaluated by the healthy-fit publication gate. Results inside an observed balanced/no-adjustment shape are labeled `surrogate`, while other shapes are `surrogate_extrapolated`. Neither is exact.
 
-## Independent playoff-projection ensemble
+## Projection aggregation and independent power
 
-This mode combines captured FantasyPros, ESPN, and Yahoo projections for game scores, projected records, and playoff probabilities. ESPN, Yahoo, and the cross-provider ensemble are explicitly excluded from the FantasyPros-style power formula. They therefore cannot distort the methodology calibration to chase a proprietary output.
+Forecast source selection is separate from power selection. Broad consensus equal-averages accepted independent publishers—ESPN, Yahoo, CBS, FFToday, and FantasySharks—once per player-week. Multiple pages, positions, or horizons from one publisher never create multiple votes. FantasyPros and FFA are composite products and cannot be averaged with those publishers in broad-consensus mode. This implements the central result of the [FFA projection-accuracy study](https://fantasyfootballanalytics.net/which-projections-are-most-accurate): simple multi-source aggregation is more stable than betting on whichever individual source most recently led one position.
+
+With broad consensus off, FantasyPros mode uses the established FantasyPros + ESPN + Yahoo core ensemble, while independent mode uses ESPN + Yahoo. The user supplies a Yahoo league or player-list link so the app can verify reception scoring and capture numeric player projections from that league view. Yahoo editorial ranks are not converted into fantasy points. CBS and FFToday full-season projections are schedule-adjusted to the remaining verified games before weekly materialization. A best-effort publisher is accepted only when its planned safe horizon coverage succeeds; the later player/week quorum still rejects data holes. A rejected publisher receives no vote, and missing data never becomes zero.
+
+In FantasyPros power mode, the independent forecast providers are explicitly excluded from the FantasyPros-style strength formula and therefore cannot distort methodology calibration to chase a proprietary output. With FantasyPros off, the app builds a separately disclosed local power score from remaining ensemble points, exact lineup eligibility, starter roles, and depth roles. That model is always labeled independent, never FantasyPros-exact.
 
 For every player and remaining NFL week, retain:
 
@@ -125,8 +129,8 @@ Completed-trade timing remains a separate evidence layer. An elapsed scoring per
 
 ## Implemented calculation path
 
-1. Capture and validate one immutable weekly evidence set.
-2. Revalidate or recalibrate the FantasyPros power formula against blind ordinary-power holdouts.
+1. Capture and validate one immutable weekly evidence set and freeze its accepted one-vote-per-publisher forecast set.
+2. In FantasyPros mode, revalidate or recalibrate the FantasyPros power formula against blind ordinary-power holdouts. In independent mode, build the documented local remaining-points power model instead.
 3. Fuse the player-week projection ensemble and solve legal lineups.
 4. Build the shared record, standings, and playoff scenarios.
 5. Enumerate and checkpoint the requested local trade space lazily. Three-team enumeration uses exact subtree counts so it can seek to a checkpoint without replaying preceding candidates.

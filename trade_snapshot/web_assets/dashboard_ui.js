@@ -393,7 +393,12 @@ window.DashboardUi = (() => {
     const scenarioLabel = sampling?.capped
       ? `${dashboard.scenario_count.toLocaleString()} local scenarios (bounded from ${sampling.bundle_scenario_count.toLocaleString()})`
       : `${dashboard.scenario_count.toLocaleString()} local scenarios`;
-    $("dashboardSubtitle").textContent = `${dashboard.teams.length} teams · ${scenarioLabel} · ${dashboard.power_engine_mode === "exact" ? "exact-method power" : "surrogate power"}`;
+    const powerLabel = dashboard.power_engine_mode === "exact"
+      ? "exact-method power"
+      : dashboard.power_engine_mode === "independent"
+        ? "independent local power"
+        : "surrogate power";
+    $("dashboardSubtitle").textContent = `${dashboard.teams.length} teams · ${scenarioLabel} · ${powerLabel}`;
     populateTeamPicker();
     renderKpis(team);
     renderStandings();

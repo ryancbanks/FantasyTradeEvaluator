@@ -505,8 +505,8 @@ def make_state(slots, roster_cap):
 def projection(player, points, *, stddev=3, nfl_team="NFL-A", game="G1", bye=False):
     status = ProjectionStatus.BYE if bye else ProjectionStatus.OBSERVED
     observation = ProviderObservation(
-        provider="ensemble-source",
-        provider_player_id=f"source-{player}",
+        provider="espn",
+        provider_player_id=f"espn-{player}",
         status=status,
         projected_fantasy_points=None if bye else points,
         weight=1,

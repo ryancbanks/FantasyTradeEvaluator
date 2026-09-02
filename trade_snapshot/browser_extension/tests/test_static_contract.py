@@ -32,6 +32,12 @@ HOST_PERMISSIONS = [
     "https://fantasy.espn.com/*",
     "https://lm-api-reads.fantasy.espn.com/*",
     "https://football.fantasysports.yahoo.com/*",
+    "https://cbssports.com/*",
+    "https://www.cbssports.com/*",
+    "https://fftoday.com/*",
+    "https://www.fftoday.com/*",
+    "https://fantasysharks.com/*",
+    "https://www.fantasysharks.com/*",
 ]
 
 
@@ -46,6 +52,7 @@ class ExtensionStaticContractTests(unittest.TestCase):
 
     def test_manifest_has_minimal_fixed_surface(self) -> None:
         self.assertEqual(self.manifest["manifest_version"], 3)
+        self.assertEqual(self.manifest["version"], "0.2.0")
         self.assertEqual(self.manifest["permissions"], ["storage"])
         self.assertEqual(self.manifest["host_permissions"], HOST_PERMISSIONS)
         self.assertNotIn("<all_urls>", json.dumps(self.manifest))
@@ -73,6 +80,18 @@ class ExtensionStaticContractTests(unittest.TestCase):
         advertised = re.findall(r'"([a-z_.]+)"', match.group(1))
         self.assertEqual(advertised, OPERATIONS)
         self.assertIn("validateOperationEnvelope", source)
+
+    def test_yahoo_projection_and_scoring_are_in_the_live_extension_contract(self) -> None:
+        manifest_text = json.dumps(self.manifest)
+        protocol = self.javascript["protocol.js"]
+        providers = re.search(
+            r"providers: Object\.freeze\(\[(.*?)\]\)", protocol, re.DOTALL
+        )
+        self.assertIsNotNone(providers)
+        self.assertIn("yahoo.scoring", OPERATIONS)
+        self.assertIn("https://football.fantasysports.yahoo.com/*", manifest_text)
+        self.assertIn("collectors/yahoo.js", manifest_text)
+        self.assertIn("yahoo", re.findall(r'"([a-z]+)"', providers.group(1)))
 
     def test_dynamic_code_and_credential_reads_are_absent(self) -> None:
         forbidden = {
@@ -147,7 +166,14 @@ class ExtensionStaticContractTests(unittest.TestCase):
 
     def test_packaged_collectors_retain_existing_safety_checks(self) -> None:
         analyzer = self.javascript["collectors/analyzer_main.js"]
-        projection = self.javascript["collectors/projection.js"]
+        projection = "\n".join(
+            self.javascript[name]
+            for name in (
+                "collectors/projection_configure.js",
+                "collectors/projection_read.js",
+                "collectors/projection_advance.js",
+            )
+        )
         league = self.javascript["collectors/league_main.js"]
         espn = self.javascript["collectors/espn_main.js"]
         self.assertIn("/v2/ajax/myplaybook.php", analyzer)
@@ -162,6 +188,10 @@ class ExtensionStaticContractTests(unittest.TestCase):
         self.assertIn("roster_positions", league)
         self.assertIn("proTeamSchedules_wl", espn)
         self.assertIn('credentials: "include"', espn)
+        self.assertIn(
+            'handlers["yahoo.scoring"]',
+            self.javascript["collectors/yahoo.js"],
+        )
 
     def test_no_patch_directives_were_embedded(self) -> None:
         for path in ROOT.rglob("*"):

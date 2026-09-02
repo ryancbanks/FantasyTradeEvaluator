@@ -59,7 +59,7 @@
           <li>Open <strong>chrome://extensions</strong> in Chrome, turn on <strong>Developer mode</strong>, and choose <strong>Load unpacked</strong>.</li>
           <li>Select the extracted folder—the one containing <strong>manifest.json</strong>—then return here, refresh this page once, and click <strong>Connect extension</strong>.</li>
           <li>Open the extension from Chrome’s Extensions menu, confirm that its four-character code matches the code shown here, and choose <strong>Pair with app</strong>.</li>
-          <li>Before scanning, sign in to FantasyPros, ESPN, and Yahoo normally in this same browser, then close those sign-in tabs.</li>
+          <li>Before scanning, sign in to ESPN and Yahoo normally in this same browser. Sign in to FantasyPros too when its option below is on; then close those sign-in tabs.</li>
         </ol>
         <p>Microsoft Edge works too: use <strong>edge://extensions</strong> and the same steps.</p>
       </details>
@@ -69,19 +69,29 @@
           <label><span>Season</span><input id="collectionSeason" type="number" min="2012" max="9999" required></label>
           <label><span>Current week</span><input id="collectionWeek" type="number" min="1" max="25" value="1" required></label>
           <label><span>Scoring</span><select id="collectionScoring"><option value="PPR">PPR</option><option value="HALF">Half PPR</option><option value="STD">Standard</option></select></label>
-          <label class="wide-field"><span>ESPN league link <small>(recommended)</small></span><input id="hostLeagueUrl" type="url" placeholder="Paste any page inside this ESPN Fantasy Football league"></label>
+          <label class="wide-field"><span>ESPN league link <small id="espnLinkRequirement">(recommended)</small></span><input id="hostLeagueUrl" type="url" placeholder="Paste any page inside this ESPN Fantasy Football league"></label>
           <label class="wide-field"><span>Yahoo league or player-list link</span><input id="yahooProjectionUrl" type="url" placeholder="League home, numeric team, Players, or Player List page" required></label>
         </div>
         <div class="collection-actions">
-          <label class="check"><input id="includeFutureWeekly" type="checkbox"><span>Try every future week too (advanced; all three sites must publish it)</span></label>
-          <label class="check surrogate-consent"><input id="allowSurrogatePower" type="checkbox"><span>If exact replication fails, publish a <strong>SURROGATE</strong> weekly engine. Its power scores are approximations and will never be labeled exact.</span></label>
+          <div class="collection-options">
+            <label class="check"><input id="useFantasyPros" type="checkbox" checked><span>Use FantasyPros for ECR and replicated power. Turn this off for a completely independent ESPN + Yahoo engine with optional public publishers.</span></label>
+            <label class="check"><input id="useBroadConsensus" type="checkbox" checked><span>Broad projection consensus (recommended): equal-average independent ESPN, Yahoo, CBS, FFToday, and FantasySharks projections when available. Each publisher receives one vote.</span></label>
+            <label class="check"><input id="includeFutureWeekly" type="checkbox"><span>Try every future week too (advanced; required sources must publish it)</span></label>
+            <label class="check surrogate-consent"><input id="allowSurrogatePower" type="checkbox"><span>If exact FantasyPros replication fails, publish a <strong>SURROGATE</strong> weekly engine. Its power scores are approximations and will never be labeled exact.</span></label>
+          </div>
           <div class="action-row compact-actions">
             <button id="collectButton" type="submit" class="primary">Scan league &amp; collect</button>
             <button id="cancelCollectionButton" type="button" class="danger hidden">Stop collection</button>
           </div>
         </div>
-        <p class="field-help">League size, every team, and every roster are detected from your signed-in FantasyPros league and cross-checked against ESPN. Paste ESPN League Home—or any page inside that fantasy-football league; only its numeric league ID is retained. Yahoo links may be league home, numeric team, Players, or Player List pages; the app safely switches Yahoo to All Players. The extension reuses one scan tab in your regular browser and closes it when collection finishes.</p>
+        <p id="collectionModeHelp" class="field-help">League size, every team, and every roster are detected automatically, including custom lineup slots and IR capacity. Paste one ESPN league link and one Yahoo league or player-list link; CBS, FFToday, and FantasySharks pages are selected automatically when broad consensus is on. Only numeric league IDs are retained. The extension reuses one scan tab in your regular browser and closes it when collection finishes.</p>
       </form>
+
+      <details id="sourceDebug" class="source-debug">
+        <summary>Automatic source links &amp; debug</summary>
+        <p id="sourceDebugMode">Checking the URLs this scan will use…</p>
+        <div id="sourceDebugList" class="source-debug-list" aria-live="polite"></div>
+      </details>
 
       <div id="collectionProgress" class="collection-progress hidden" aria-live="polite">
         <div class="progress-track"><div id="collectionProgressBar" class="progress-bar"></div></div>
@@ -480,7 +490,7 @@
             <label><span>Season simulations per candidate</span><input id="scenarioCount" type="number" min="100" max="1000000" step="100" value="10000"></label>
           </fieldset>
         </div>
-        <p id="threeTeamRulesHelp" class="field-help three-team-rules hidden">In three-team mode, size, balance, imbalance, power, and no-drop rules apply to every team. Maximum total players counts each player moved once. Count combinations before starting. Three-team power is always extrapolated beyond the attested two-team trade shapes; a surrogate week is surrogate-extrapolated.</p>
+        <p id="threeTeamRulesHelp" class="field-help three-team-rules hidden">In three-team mode, size, balance, imbalance, power, and no-drop rules apply to every team. Maximum total players counts each player moved once. Count combinations before starting. Independent weeks use the disclosed local power model; FantasyPros exact and surrogate formulas are labeled as extrapolated beyond their attested two-team trade shapes.</p>
         <p id="freeAgentAllocationHelp" class="field-help roster-adjustment-warning hidden">Automatic roster adjustments are enabled. <span id="freeAgentAllocationPolicy"></span></p>
 
         <div class="action-row">

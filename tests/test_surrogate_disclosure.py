@@ -95,7 +95,7 @@ class SurrogateDisclosureTests(unittest.TestCase):
         bundle = surrogate_bundle()
         record = bundle.to_record()
 
-        self.assertEqual(record["schema_version"], 7)
+        self.assertEqual(record["schema_version"], 8)
         self.assertIsNone(record["methodology_attestation"])
         self.assertEqual(EngineBundle.from_record(record), bundle)
 

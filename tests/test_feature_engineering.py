@@ -5,8 +5,8 @@ import unittest
 from unittest.mock import patch
 
 import trade_snapshot.feature_engineering as feature_module
-from trade_snapshot.ecr import EcrPeriod, EcrPlayerRanking, EcrSnapshot
 from trade_snapshot._ensemble_math import weighted_metrics
+from trade_snapshot.ecr import EcrPeriod, EcrPlayerRanking, EcrSnapshot
 from trade_snapshot.ensemble import EnsembleProjection, ProviderObservation
 from trade_snapshot.feature_engineering import build_strength_features, feature_names
 from trade_snapshot.projections import ProjectionStatus
@@ -130,6 +130,7 @@ class StrengthFeatureEngineeringTests(unittest.TestCase):
 
         self.assertEqual(result.weeks, (1, 2))
         self.assertEqual(result.feature_names, feature_names())
+        self.assertEqual(result.provider_names, ("fantasypros", "espn", "yahoo"))
         self.assertEqual(len(result.feature_names), 35)
         self.assertEqual(p1["projection_espn_current_points"], 12)
         self.assertEqual(p1["projection_espn_remaining_points"], 34)
@@ -166,6 +167,7 @@ class StrengthFeatureEngineeringTests(unittest.TestCase):
             snapshots,
             (projections[0], unpublished, *projections[2:]),
             eligibility,
+            provider_names=PROVIDERS,
         )
         p1 = next(
             row.values for row in result.player_features if row.player_id == "p1"
@@ -186,18 +188,12 @@ class StrengthFeatureEngineeringTests(unittest.TestCase):
 
     def test_rejects_missing_provider_rows_incomplete_grid_and_identity_drift(self):
         snapshots, projections, eligibility = inputs()
-        partial_observations = projections[0].provider_observations[:2]
-        mean, disagreement, predictive = weighted_metrics(partial_observations, 0)
-        missing_provider = replace(
-            projections[0],
-            provider_observations=partial_observations,
-            projected_fantasy_points=mean,
-            between_provider_stddev=disagreement,
-            predictive_stddev=predictive,
-        )
         with self.assertRaisesRegex(ValueError, "explicit provider evidence"):
             build_strength_features(
-                snapshots, (missing_provider, *projections[1:]), eligibility
+                snapshots,
+                projections,
+                eligibility,
+                provider_names=("espn", "cbs"),
             )
         with self.assertRaisesRegex(ValueError, "complete grid"):
             build_strength_features(snapshots, projections[:-1], eligibility)
