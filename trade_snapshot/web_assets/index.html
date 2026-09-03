@@ -9,6 +9,7 @@
   <title>Fantasy Trade Evaluator</title>
   <link rel="stylesheet" href="/styles.css">
   <link rel="stylesheet" href="/dashboard.css">
+  <link rel="stylesheet" href="/gm_insights.css">
   <link rel="stylesheet" href="/player_lab.css">
 </head>
 <body>
@@ -186,9 +187,77 @@
       </div>
     </section>
 
+    <section id="gmInsightsPanel" class="panel gm-insights-panel" aria-labelledby="gmInsightsHeading">
+      <div class="section-heading">
+        <div><span class="step">3</span><h2 id="gmInsightsHeading">General Manager Insights</h2></div>
+        <p>Compare current roster fit separately from completed-deal history, value patterns, and roster habits.</p>
+      </div>
+
+      <div id="gmInsightsEmpty" class="gm-insights-state" aria-live="polite">
+        Select a ready week to inspect team and general-manager tendencies.
+      </div>
+      <div id="gmInsightsLoading" class="gm-insights-state gm-insights-loading hidden" aria-live="polite">
+        <span class="gm-insights-spinner" aria-hidden="true"></span>
+        <span>Analyzing verified league activity on this computer…</span>
+      </div>
+      <div id="gmInsightsContent" class="gm-insights-content hidden">
+        <div class="gm-insights-toolbar">
+          <div>
+            <p class="gm-insights-kicker">CURRENT FIT + VERIFIED HISTORY</p>
+            <h3>Team and GM-unit profiles</h3>
+            <p id="gmInsightsCoverageSummary" class="gm-insights-subtitle"></p>
+          </div>
+          <div class="gm-insights-controls">
+            <label><span>Inspect one team</span><select id="gmInsightsTeamSelect"></select></label>
+            <label><span>Sort comparison by</span><select id="gmInsightsSort"><option value="current_fit">Fit with your team</option><option value="trade_accessibility">Completed-deal accessibility</option><option value="counterparty_value">Counterparty value opportunity</option><option value="roster_activity">Roster activity</option><option value="lineup_consistency">Lineup consistency</option><option value="team_name">Team name</option></select></label>
+          </div>
+        </div>
+
+        <div id="gmInsightsCoverage" class="gm-insights-coverage" aria-live="polite"></div>
+
+        <div class="gm-insights-table-heading">
+          <div><h3>League comparison</h3><p>Current fit, completed activity, and at-time value are separate measures. No combined manager score is created.</p></div>
+          <p class="gm-insights-table-help">Select a team for the full profile</p>
+        </div>
+        <div class="table-wrap gm-insights-table-wrap" role="region" aria-label="Scrollable general manager comparison" tabindex="0">
+          <table class="gm-insights-table">
+            <caption class="gm-insights-sr-only">Team comparison of current roster compatibility, completed-deal accessibility, counterparty value opportunity, roster activity, lineup consistency, and evidence strength</caption>
+            <thead><tr><th>Team</th><th>Fit with your team</th><th>Completed-deal accessibility</th><th>Completed trades</th><th>Counterparty value opportunity</th><th>Roster moves</th><th>Lineup consistency</th><th>History evidence</th></tr></thead>
+            <tbody id="gmInsightsTableBody"></tbody>
+          </table>
+        </div>
+
+        <article class="gm-insights-profile-card" aria-labelledby="gmInsightsProfileHeading">
+          <h3 id="gmInsightsProfileHeading" class="gm-insights-sr-only">Selected team profile</h3>
+          <div id="gmInsightsProfile" class="gm-insights-profile"></div>
+          <section class="gm-insights-decision-section" aria-labelledby="gmInsightsDecisionHeading">
+            <div class="gm-insights-subheading"><h4 id="gmInsightsDecisionHeading">Three separate questions</h4><p>Each answer has its own evidence boundary. They are never blended into one score.</p></div>
+            <div id="gmInsightsDecisionSignals" class="gm-insights-decision-grid"></div>
+          </section>
+          <section class="gm-insights-compatibility" aria-labelledby="gmInsightsCompatibilityHeading">
+            <div class="gm-insights-subheading"><h4 id="gmInsightsCompatibilityHeading">Current compatibility partner ranking</h4><p>Current rosters only · 1-for-1 discovery screen</p></div>
+            <div id="gmInsightsCompatibility"></div>
+          </section>
+          <div class="gm-insights-profile-grid">
+            <section class="gm-insights-detail-card" aria-labelledby="gmInsightsTradeHeading"><h4 id="gmInsightsTradeHeading">Completed trade history</h4><p class="gm-insights-card-scope">Activity and at-time value remain separate; completed deals do not reveal rejected offers.</p><div id="gmInsightsTradeBehavior"></div></section>
+            <section class="gm-insights-detail-card" aria-labelledby="gmInsightsAcquisitionHeading"><h4 id="gmInsightsAcquisitionHeading">Waivers and free agents</h4><div id="gmInsightsAcquisitionHabits"></div></section>
+            <section class="gm-insights-detail-card" aria-labelledby="gmInsightsRosterHeading"><h4 id="gmInsightsRosterHeading">How they build a roster</h4><div id="gmInsightsRosterHabits"></div></section>
+            <section class="gm-insights-detail-card" aria-labelledby="gmInsightsLineupHeading"><h4 id="gmInsightsLineupHeading">How they set lineups</h4><div id="gmInsightsLineupHabits"></div></section>
+            <section class="gm-insights-detail-card" aria-labelledby="gmInsightsHindsightHeading"><h4 id="gmInsightsHindsightHeading">Injury-screened hindsight</h4><div id="gmInsightsHindsight"></div></section>
+            <section class="gm-insights-detail-card gm-insights-guidance" aria-labelledby="gmInsightsGuidanceHeading"><h4 id="gmInsightsGuidanceHeading">History-based proposal guidance</h4><div id="gmInsightsTradeApproach"></div><button id="gmInsightsUseTradePartner" type="button" class="primary">Search trades with this team</button></section>
+          </div>
+          <details class="gm-insights-evidence-disclosure">
+            <summary>Evidence behind this profile</summary>
+            <div id="gmInsightsEvidence" class="gm-insights-evidence"></div>
+          </details>
+          <p id="gmInsightsMethodNote" class="gm-insights-method-note"></p>
+        </article>
+      </div>
+    </section>
+
     <section id="playerLabPanel" class="panel player-lab-panel" aria-labelledby="playerLabHeading">
       <div class="section-heading">
-        <div><span class="step">3</span><h2 id="playerLabHeading">Player Lab</h2></div>
+        <div><span class="step">4</span><h2 id="playerLabHeading">Player Lab</h2></div>
         <p>Inspect every rostered player and captured waiver candidate without leaving the local app.</p>
       </div>
 
@@ -239,7 +308,7 @@
 
     <section class="panel">
       <div class="section-heading">
-        <div><span class="step">4</span><h2>Choose the search</h2></div>
+        <div><span class="step">5</span><h2>Choose the search</h2></div>
         <p>Counts are exact before the run starts. Playoff simulations happen only after the fast power filter.</p>
       </div>
       <form id="searchForm">
@@ -351,7 +420,7 @@
 
     <section id="progressPanel" class="panel hidden">
       <div class="section-heading">
-        <div><span class="step">5</span><h2>Search progress</h2></div>
+        <div><span class="step">6</span><h2>Search progress</h2></div>
         <p id="progressText">Preparing the shared season simulation…</p>
       </div>
       <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
@@ -360,7 +429,7 @@
 
     <section id="resultsPanel" class="panel hidden">
       <div class="section-heading results-heading">
-        <div><span class="step">6</span><h2>Best local results</h2></div>
+        <div><span class="step">7</span><h2>Best local results</h2></div>
         <button id="exportButton" class="primary">Download Excel workbook</button>
       </div>
       <p id="resultsNote" class="results-note"></p>
@@ -381,9 +450,12 @@
     </section>
   </main>
 
-  <footer>All candidate scoring and season simulation run on this computer. Weekly source evidence stays in the selected bundle.</footer>
+  <footer>All candidate scoring, season simulation, and manager analysis run on this computer. Weekly engines and league history stay local.</footer>
   <script src="/dashboard_charts.js" defer></script>
   <script src="/dashboard_ui.js" defer></script>
+  <script src="/gm_insights_format.js" defer></script>
+  <script src="/gm_insights_evidence_ui.js" defer></script>
+  <script src="/gm_insights_ui.js" defer></script>
   <script src="/player_lab_ui.js" defer></script>
   <script src="/three_way_ui.js" defer></script>
   <script src="/trade_filter_ui.js" defer></script>

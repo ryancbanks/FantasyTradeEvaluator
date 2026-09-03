@@ -38,6 +38,13 @@ from trade_snapshot.browser_capture import (
 )
 from trade_snapshot.identity import IdentityRegistry
 from trade_snapshot.identity_io import load_identity_registry
+from trade_snapshot.league_history import (
+    HistoryBundleBinding,
+    HistoryTeam,
+    HistoryTeamRoster,
+    LeagueHistoryCapture,
+    make_league_key,
+)
 from trade_snapshot.production_calibration import (
     BrowserCalibrationFactory,
     CalibrationCaptureContext,
@@ -52,6 +59,7 @@ from trade_snapshot.production_collection import (
 from trade_snapshot.weekly_assembly import AssembledWeeklyEvidence
 from trade_snapshot.weekly_collection import (
     WeeklyCollectionError,
+    WeeklyCollectionPublication,
     WeeklyCollectionRequest,
 )
 
@@ -142,6 +150,16 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
             records["refresh"] = evidence, kwargs
             return SimpleNamespace(bundle=bundle)
 
+        activity = object()
+
+        def activity_adapter(payload, **kwargs):
+            records["activity"] = payload, kwargs
+            return activity
+
+        def history_adapter(source, assembled_value, bundle_value, **kwargs):
+            records["history"] = source, assembled_value, bundle_value, kwargs
+            return _history_pair(bundle_value)
+
         workflow = ProductionWeeklyCollectionWorkflow(
             sign_in_gate=_Gate(),
             calibration_factory=calibration_factory,
@@ -152,6 +170,8 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
             plan_builder=_small_plan,
             assembler=assembler,
             refresher=refresher,
+            activity_adapter=activity_adapter,
+            history_adapter=history_adapter,
             now=lambda: NOW,
         )
         progress = []
@@ -163,8 +183,10 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
             )
             self.assertEqual(load_identity_registry(identity_path), assembled.identities)
 
-        self.assertIs(result, bundle)
+        self.assertIsInstance(result, WeeklyCollectionPublication)
+        self.assertIs(result.bundle, bundle)
         self.assertEqual(records["read"][:2], (2026, "123"))
+        self.assertEqual(records["activity"], ({"league": True}, {"captured_at": NOW}))
         self.assertEqual(records["adapter"][2]["expected_team_count"], 2)
         self.assertEqual(records["adapter"][2]["captured_at"], NOW)
         self.assertEqual(records["schedule"][0], {"pro_teams": True})
@@ -176,6 +198,10 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
         self.assertIs(records["refresh"][1]["calibrate"], callbacks.calibrate)
         self.assertIs(records["refresh"][1]["verify_reuse"], callbacks.verify_reuse)
         self.assertTrue(records["refresh"][1]["allow_surrogate_power"])
+        self.assertIs(records["history"][0], activity)
+        self.assertIs(records["history"][1], assembled)
+        self.assertIs(records["history"][2], bundle)
+        self.assertEqual(records["history"][3], {"bundle_captured_at": NOW})
         self.assertEqual(len(collector.calls), 2)
         self.assertEqual(len(collector.open_calls), 1)
         self.assertEqual(collector.close_count, 1)
@@ -545,10 +571,18 @@ class EspnFreeReadClientTests(unittest.TestCase):
         first = calls[0][0]
         self.assertEqual(first.get_method(), "GET")
         self.assertIn("/seasons/2026/segments/0/leagues/123?", first.full_url)
-        self.assertEqual(first.full_url.count("view="), 5)
+        self.assertEqual(first.full_url.count("view="), 6)
+        self.assertIn("view=mTransactions2", first.full_url)
         self.assertTrue(calls[1][0].full_url.endswith("?view=proTeamSchedules_wl"))
         headers = {key.casefold() for key, _ in first.header_items()}
-        self.assertFalse({"cookie", "authorization", "x-fantasy-filter"} & headers)
+        self.assertFalse({"cookie", "authorization"} & headers)
+        self.assertIn("x-fantasy-filter", headers)
+        self.assertEqual(
+            dict(first.header_items())["X-fantasy-filter"],
+            '{"transactions":{"limit":1000}}',
+        )
+        second_headers = {key.casefold() for key, _ in calls[1][0].header_items()}
+        self.assertNotIn("x-fantasy-filter", second_headers)
         self.assertEqual({timeout for _, timeout in calls}, {7.0})
 
     def test_distinguishes_only_an_explicit_access_denial(self):
@@ -793,6 +827,31 @@ def _assembled():
     return value
 
 
+def _history_pair(bundle):
+    league_key = make_league_key("espn", "123")
+    capture = LeagueHistoryCapture(
+        league_key=league_key,
+        season=bundle.state.season,
+        captured_at=NOW,
+        coverage_start=NOW,
+        coverage_end=NOW,
+        transaction_history_complete=True,
+        roster_complete=False,
+        lineup_complete=False,
+        teams=tuple(HistoryTeam(team.team_id, team.name) for team in bundle.state.teams),
+        transactions=(),
+        rosters=tuple(
+            HistoryTeamRoster(roster.team_id, ()) for roster in bundle.rosters
+        ),
+    )
+    return capture, HistoryBundleBinding(
+        league_key,
+        bundle.state.season,
+        bundle.bundle_id,
+        NOW,
+    )
+
+
 def _workflow(
     *, collector, host=None, assembler=None, refresher=None, espn_reader=None
 ):
@@ -808,6 +867,10 @@ def _workflow(
         assembler=assembler or (lambda **_kwargs: assembled),
         refresher=refresher or (
             lambda *_args, **_kwargs: SimpleNamespace(bundle=engine_bundle())
+        ),
+        activity_adapter=lambda *_args, **_kwargs: object(),
+        history_adapter=(
+            lambda _activity, _assembled, bundle, **_kwargs: _history_pair(bundle)
         ),
         now=lambda: NOW,
     )

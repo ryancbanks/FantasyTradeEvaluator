@@ -21,6 +21,8 @@ from ._app_support import (
 )
 from .dashboard import build_league_dashboard
 from .engine_bundle import EngineBundle, load_engine_bundle, save_engine_bundle
+from .gm_insights import build_gm_insights
+from .league_history import LeagueHistoryStore
 from .league_search import LeagueSearchOutcome, LeagueSearchProgress, ResumableLeagueTradeSearch
 from .player_outlook import build_player_outlook
 from .roster_adjustment import (
@@ -52,6 +54,7 @@ from .three_way_xlsx import (
     require_three_way_exportable_count,
 )
 from .weekly_collection import (
+    LEAGUE_HISTORY_FILENAME,
     WeeklyCollectionJobs,
     WeeklyCollectionRequest,
     WeeklyCollectionWorkflow,
@@ -66,6 +69,7 @@ from .xlsx_export import export_trade_workbook
 
 _MAX_DASHBOARD_SCENARIOS = 10_000
 _MAX_PLAYER_OUTLOOK_CACHE_SIZE = 4
+_MAX_GM_INSIGHTS_CACHE_SIZE = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +253,15 @@ class LocalAppService:
         self._dashboard_futures: dict[str, Future[dict[str, object]]] = {}
         self._player_outlook_cache: OrderedDict[str, dict[str, object]] = OrderedDict()
         self._player_outlook_futures: dict[str, Future[dict[str, object]]] = {}
+        self._gm_insights_cache: OrderedDict[
+            tuple[str, str | None], dict[str, object]
+        ] = OrderedDict()
+        self._gm_insights_futures: dict[
+            tuple[str, str | None], Future[dict[str, object]]
+        ] = {}
+        self._history_store = LeagueHistoryStore(
+            self.data_directory / LEAGUE_HISTORY_FILENAME
+        )
         self._collections = WeeklyCollectionJobs(
             self.data_directory,
             self.bundle_directory,
@@ -366,6 +379,51 @@ class LocalAppService:
             with self._lock:
                 if self._player_outlook_futures.get(bundle_id) is future:
                     del self._player_outlook_futures[bundle_id]
+
+    def gm_insights(self, bundle_id: str) -> dict[str, object]:
+        """Return evidence-backed team tendencies for one bound league history."""
+
+        bundle = load_engine_bundle(self._bundle_path(bundle_id))
+        history = self._history_store.snapshot_for_bundle(bundle_id)
+        revision = None if history is None else history.history_revision
+        cache_key = bundle_id, revision
+        with self._lock:
+            cached = self._gm_insights_cache.get(cache_key)
+            if cached is not None:
+                self._gm_insights_cache.move_to_end(cache_key)
+                return cached
+            future = self._gm_insights_futures.get(cache_key)
+            owns_calculation = future is None
+            if owns_calculation:
+                future = Future()
+                self._gm_insights_futures[cache_key] = future
+        assert future is not None
+        if not owns_calculation:
+            return future.result()
+
+        try:
+            insights = build_gm_insights(
+                bundle,
+                history,
+                bundle_loader=lambda source_id: load_engine_bundle(
+                    self._bundle_path(source_id)
+                ),
+            )
+        except BaseException as error:
+            future.set_exception(error)
+            raise
+        else:
+            with self._lock:
+                self._gm_insights_cache[cache_key] = insights
+                self._gm_insights_cache.move_to_end(cache_key)
+                while len(self._gm_insights_cache) > _MAX_GM_INSIGHTS_CACHE_SIZE:
+                    self._gm_insights_cache.popitem(last=False)
+            future.set_result(insights)
+            return insights
+        finally:
+            with self._lock:
+                if self._gm_insights_futures.get(cache_key) is future:
+                    del self._gm_insights_futures[cache_key]
 
     def _bundle_readiness(self, bundles) -> dict[str, object]:
         ready_count = sum(row.get("status") == "ready" for row in bundles)

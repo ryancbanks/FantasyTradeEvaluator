@@ -294,7 +294,26 @@ function changeBundle() {
   threeTeamEstimateSignature = null;
   renderBundle();
   void DashboardUi.setBundle(currentBundle(), {request: api, onError: showError});
+  void GmInsightsUi.setBundle(currentBundle(), {
+    request: api,
+    onError: showError,
+    primaryTeamId: $("primaryTeam").value || null,
+    onUseTradePartner: chooseTradePartnerFromInsights
+  });
   void PlayerLabUi.setBundle(currentBundle(), {request: api, onError: showError});
+}
+
+function chooseTradePartnerFromInsights(teamId) {
+  const target = [...$("counterparties").options].find(option => option.value === teamId);
+  if (!target || target.disabled) return;
+  $("twoTeamFormat").checked = true;
+  changeTradeFormat();
+  for (const option of $("counterparties").options) option.selected = option === target;
+  populatePackageFilters();
+  invalidateSearchEstimate();
+  $("counterparties").focus({preventScroll: true});
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  $("searchForm").scrollIntoView({behavior: reducedMotion ? "auto" : "smooth", block: "start"});
 }
 
 function syncCounterparties() {
@@ -719,7 +738,10 @@ $("bundleFile").addEventListener("change", async event => {
   } catch (error) { showError(error); }
 });
 $("bundleSelect").addEventListener("change", changeBundle);
-$("primaryTeam").addEventListener("change", syncCounterparties);
+$("primaryTeam").addEventListener("change", () => {
+  syncCounterparties();
+  GmInsightsUi.setPrimaryTeam($("primaryTeam").value);
+});
 $("counterparties").addEventListener("change", populatePackageFilters);
 for (const option of document.querySelectorAll('input[name="tradeFormat"]')) {
   option.addEventListener("change", changeTradeFormat);

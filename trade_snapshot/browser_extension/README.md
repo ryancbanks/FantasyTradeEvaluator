@@ -84,7 +84,7 @@ omitted, redirects are rejected, and no URL contains a pair or session token.
   "pair_code": "one-time-code",
   "protocol_version": 1,
   "capabilities": ["the exact operation list below"],
-  "extension_version": "0.1.0"
+  "extension_version": "0.2.0"
 }
 ```
 
