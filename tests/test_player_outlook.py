@@ -2,6 +2,7 @@ from dataclasses import replace
 from datetime import timedelta
 import json
 import unittest
+from unittest.mock import patch
 
 from tests.test_engine_bundle import NOW, engine_bundle
 from trade_snapshot.ecr import EcrPeriod
@@ -11,7 +12,7 @@ from trade_snapshot.ensemble import (
     ProviderWeight,
     fuse_weekly_projections,
 )
-from trade_snapshot.player_outlook import build_player_outlook
+from trade_snapshot.player_outlook import _EvidenceIndex, build_player_outlook
 from trade_snapshot.projections import (
     ProjectionStatus,
     RemainingSeasonOrigin,
@@ -240,6 +241,27 @@ def _player(result, player_id):
 
 
 class PlayerOutlookTests(unittest.TestCase):
+    def test_nfl_team_lookup_does_not_scan_all_weekly_evidence(self):
+        bundle = player_bundle()
+        expected = build_player_outlook(bundle)
+
+        class NoFullScan(dict):
+            def items(self):
+                raise AssertionError("weekly evidence was scanned")
+
+        class ScanGuardEvidenceIndex(_EvidenceIndex):
+            def __init__(self, rows):
+                super().__init__(rows)
+                self.weekly = NoFullScan(self.weekly)
+
+        with patch(
+            "trade_snapshot.player_outlook._EvidenceIndex",
+            ScanGuardEvidenceIndex,
+        ):
+            actual = build_player_outlook(bundle)
+
+        self.assertEqual(actual, expected)
+
     def test_valid_bundle_without_matching_raw_provider_keeps_provenance_unknown(self):
         result = build_player_outlook(engine_bundle())
         self.assertEqual(result["providers"], [{

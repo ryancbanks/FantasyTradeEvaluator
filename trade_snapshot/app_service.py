@@ -9,7 +9,6 @@ from pathlib import Path
 from threading import Event, Lock, RLock, Thread
 from uuid import uuid4
 
-from ._scenario_random import SAFE_INTEGER, content_id
 from ._app_support import (
     BUNDLE_ID_PATTERN,
     boolean,
@@ -19,16 +18,23 @@ from ._app_support import (
     three_way_search_result_record,
     workbook_sources,
 )
+from ._scenario_random import SAFE_INTEGER, content_id
 from .dashboard import build_league_dashboard
-from .engine_bundle import EngineBundle, load_engine_bundle, save_engine_bundle
 from .draft_service import DraftLabService
-from .league_search import LeagueSearchOutcome, LeagueSearchProgress, ResumableLeagueTradeSearch
+from .engine_bundle import EngineBundle, load_engine_bundle, save_engine_bundle
+from .gm_insights import build_gm_insights
 from .job_retention import (
     ACTIVE_JOB_STATUSES,
     DEFAULT_TERMINAL_JOB_LIMIT,
     TERMINAL_JOB_STATUSES,
     has_active_jobs,
     prune_terminal_jobs,
+)
+from .league_history import LeagueHistoryStore
+from .league_search import (
+    LeagueSearchOutcome,
+    LeagueSearchProgress,
+    ResumableLeagueTradeSearch,
 )
 from .player_outlook import build_player_outlook
 from .roster_adjustment import (
@@ -39,6 +45,18 @@ from .scenario_config import CorrelatedScenarioConfig
 from .search_runner import TradeSearchSettings
 from .season import SeasonProjection
 from .surrogate_disclosure import SURROGATE_QUALITY_GATE
+from .three_way_search import (
+    PreparedThreeWayTrade,
+    ResumableThreeWayTradeSearch,
+    ThreeWaySearchOutcome,
+    ThreeWaySearchProgress,
+)
+from .three_way_trade import ThreeWayTradeSpace
+from .three_way_workbook import ThreeWayExportProvenance, three_way_workbook_rows
+from .three_way_xlsx import (
+    export_three_way_trade_workbook,
+    require_three_way_exportable_count,
+)
 from .trade_filters import (
     TradeFilterExpression,
     TradeFilterMode,
@@ -48,19 +66,8 @@ from .trade_filters import (
 )
 from .trade_impact import PreparedSeasonBaseline, prepare_season_baseline
 from .trade_space import TeamRoster, TradeConstraints, TradeSpace
-from .three_way_trade import ThreeWayTradeSpace
-from .three_way_search import (
-    PreparedThreeWayTrade,
-    ResumableThreeWayTradeSearch,
-    ThreeWaySearchOutcome,
-    ThreeWaySearchProgress,
-)
-from .three_way_workbook import ThreeWayExportProvenance, three_way_workbook_rows
-from .three_way_xlsx import (
-    export_three_way_trade_workbook,
-    require_three_way_exportable_count,
-)
 from .weekly_collection import (
+    LEAGUE_HISTORY_FILENAME,
     WeeklyCollectionJobs,
     WeeklyCollectionRequest,
     WeeklyCollectionWorkflow,
@@ -72,13 +79,13 @@ from .workbook_model import (
 )
 from .xlsx_export import export_trade_workbook
 
-
 _MAX_DASHBOARD_SCENARIOS = 10_000
 _MAX_BUNDLE_CACHE_SIZE = 4
 _MAX_DASHBOARD_CACHE_SIZE = 4
 _MAX_BASELINE_CACHE_SIZE = 1
 _MAX_PLAYER_OUTLOOK_CACHE_SIZE = 4
 _MAX_RETAINED_SEARCH_JOBS = DEFAULT_TERMINAL_JOB_LIMIT
+_MAX_GM_INSIGHTS_CACHE_SIZE = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +285,11 @@ class LocalAppService:
         self._export_in_progress = False
         self._player_outlook_cache: OrderedDict[str, dict[str, object]] = OrderedDict()
         self._player_outlook_futures: dict[str, Future[dict[str, object]]] = {}
+        self._gm_insights_cache: OrderedDict[
+            tuple[str, str | None], dict[str, object]
+        ] = OrderedDict()
+        self._gm_insights_futures: dict[str, Future[dict[str, object]]] = {}
+        self._history_store: LeagueHistoryStore | None = None
         self._collections = WeeklyCollectionJobs(
             self.data_directory,
             self.bundle_directory,
@@ -299,6 +311,7 @@ class LocalAppService:
                 self._export_in_progress
                 or self._dashboard_futures
                 or self._player_outlook_futures
+                or self._gm_insights_futures
                 or self._baseline_futures
                 or self._collections.is_running
                 or has_active_jobs(self._jobs)
@@ -354,10 +367,11 @@ class LocalAppService:
                 or has_active_jobs(self._jobs)
                 or self._dashboard_futures
                 or self._player_outlook_futures
+                or self._gm_insights_futures
                 or self._export_in_progress
             ):
                 raise RuntimeError(
-                    "weekly collection, trade search, export, league dashboard, or Player Lab must finish before Draft Lab starts"
+                    "weekly collection, trade search, export, league dashboard, Player Lab, or General Manager Insights must finish before Draft Lab starts"
                 )
 
     def import_bundle(self, record: Mapping[str, object]) -> dict[str, object]:
@@ -406,10 +420,11 @@ class LocalAppService:
                 if (
                     self._export_in_progress
                     or self._collections.is_running
+                    or self._gm_insights_futures
                     or has_active_jobs(self._jobs)
                 ):
                     raise RuntimeError(
-                        "weekly collection, trade search, or export must finish before building a league dashboard"
+                        "weekly collection, trade search, export, or General Manager Insights must finish before building a league dashboard"
                     )
                 if self._player_outlook_futures:
                     raise RuntimeError(
@@ -438,6 +453,7 @@ class LocalAppService:
                 bundle,
                 baseline.season_projection,
                 baseline.scenarios,
+                baseline.iter_baseline_scenarios(),
             )
         except BaseException as error:
             future.set_exception(error)
@@ -474,10 +490,11 @@ class LocalAppService:
                     self._export_in_progress
                     or self._collections.is_running
                     or self._dashboard_futures
+                    or self._gm_insights_futures
                     or has_active_jobs(self._jobs)
                 ):
                     raise RuntimeError(
-                        "weekly collection, trade search, export, or league dashboard must finish before opening Player Lab"
+                        "weekly collection, trade search, export, league dashboard, or General Manager Insights must finish before opening Player Lab"
                     )
                 future = Future()
                 self._player_outlook_futures[bundle_id] = future
@@ -502,6 +519,71 @@ class LocalAppService:
             with self._lock:
                 if self._player_outlook_futures.get(bundle_id) is future:
                     del self._player_outlook_futures[bundle_id]
+
+    def gm_insights(self, bundle_id: str) -> dict[str, object]:
+        """Return evidence-backed team tendencies for one bound league history."""
+
+        self._bundle_path(bundle_id)
+        with self._lock:
+            future = self._gm_insights_futures.get(bundle_id)
+            owns_calculation = future is None
+            if owns_calculation:
+                if self.draft_lab.is_busy:
+                    raise RuntimeError(
+                        "Draft Lab training or benchmark must finish before General Manager Insights starts"
+                    )
+                if (
+                    self._export_in_progress
+                    or self._collections.is_running
+                    or self._dashboard_futures
+                    or self._player_outlook_futures
+                    or has_active_jobs(self._jobs)
+                ):
+                    raise RuntimeError(
+                        "weekly collection, trade search, export, league dashboard, or Player Lab must finish before General Manager Insights starts"
+                    )
+                if self._gm_insights_futures:
+                    raise RuntimeError(
+                        "another General Manager Insights calculation is already running"
+                    )
+                future = Future()
+                self._gm_insights_futures[bundle_id] = future
+        assert future is not None
+        if not owns_calculation:
+            return future.result()
+
+        try:
+            bundle = self._load_bundle(bundle_id)
+            history = self._league_history_store().snapshot_for_bundle(bundle_id)
+            revision = None if history is None else history.history_revision
+            cache_key = bundle_id, revision
+            with self._lock:
+                cached = self._gm_insights_cache.get(cache_key)
+                if cached is not None:
+                    self._gm_insights_cache.move_to_end(cache_key)
+            if cached is not None:
+                future.set_result(cached)
+                return cached
+            insights = build_gm_insights(
+                bundle,
+                history,
+                bundle_loader=self._load_bundle,
+            )
+        except BaseException as error:
+            future.set_exception(error)
+            raise
+        else:
+            with self._lock:
+                self._gm_insights_cache[cache_key] = insights
+                self._gm_insights_cache.move_to_end(cache_key)
+                while len(self._gm_insights_cache) > _MAX_GM_INSIGHTS_CACHE_SIZE:
+                    self._gm_insights_cache.popitem(last=False)
+            future.set_result(insights)
+            return insights
+        finally:
+            with self._lock:
+                if self._gm_insights_futures.get(bundle_id) is future:
+                    del self._gm_insights_futures[bundle_id]
 
     def _bundle_readiness(self, bundles) -> dict[str, object]:
         ready_count = sum(row.get("status") == "ready" for row in bundles)
@@ -554,6 +636,10 @@ class LocalAppService:
                 raise RuntimeError(
                     "league dashboard or Player Lab calculation must finish before collecting"
                 )
+            if self._gm_insights_futures:
+                raise RuntimeError(
+                    "General Manager Insights calculation must finish before collecting"
+                )
             if has_active_jobs(self._jobs):
                 raise RuntimeError("stop the local trade search before collecting a new week")
             return self._collections.start(request)
@@ -587,6 +673,10 @@ class LocalAppService:
                 )
             if self._player_outlook_futures:
                 raise RuntimeError("Player Lab calculation must finish before a trade search")
+            if self._gm_insights_futures:
+                raise RuntimeError(
+                    "General Manager Insights calculation must finish before a trade search"
+                )
             if self._export_in_progress:
                 raise RuntimeError("trade export must finish before another trade search")
             if self._collections.is_running:
@@ -709,6 +799,10 @@ class LocalAppService:
             if self._dashboard_futures or self._player_outlook_futures:
                 raise RuntimeError(
                     "league dashboard or Player Lab calculation must finish before export"
+                )
+            if self._gm_insights_futures:
+                raise RuntimeError(
+                    "General Manager Insights calculation must finish before trade export"
                 )
             if self._export_in_progress:
                 raise RuntimeError("another trade export is already running")
@@ -943,6 +1037,16 @@ class LocalAppService:
         return self._remember_bundle(
             load_engine_bundle(self._bundle_path(bundle_id)), bundle_id
         )
+
+    def _league_history_store(self) -> LeagueHistoryStore:
+        """Open optional league history only when General Manager Insights needs it."""
+
+        with self._lock:
+            if self._history_store is None:
+                self._history_store = LeagueHistoryStore(
+                    self.data_directory / LEAGUE_HISTORY_FILENAME
+                )
+            return self._history_store
 
     def _bundle_path(self, bundle_id: str) -> Path:
         if not isinstance(bundle_id, str) or not BUNDLE_ID_PATTERN.fullmatch(bundle_id):

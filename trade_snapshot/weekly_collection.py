@@ -1,16 +1,16 @@
 """Cancellable background boundary for publishing one weekly engine bundle."""
 
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-import re
 from threading import Event, RLock, Thread
 from typing import Protocol
 from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
-from .engine_bundle import EngineBundle, save_engine_bundle
+from .engine_bundle import EngineBundle, load_engine_bundle, save_engine_bundle
 from .job_retention import (
     ACTIVE_JOB_STATUSES,
     DEFAULT_TERMINAL_JOB_LIMIT,
@@ -18,8 +18,15 @@ from .job_retention import (
     has_active_jobs,
     prune_terminal_jobs,
 )
+from .league_history import (
+    HistoryBundleBinding,
+    LeagueHistoryCapture,
+    LeagueHistoryStore,
+)
 
-
+LEAGUE_HISTORY_FILENAME = "league-history.sqlite3"
+_PUBLICATION_STAGING_DIRECTORY = ".weekly-publications"
+_ENGINE_BUNDLE_ID = re.compile(r"^engine_[0-9a-f]{64}$")
 _MAX_RETAINED_COLLECTION_JOBS = DEFAULT_TERMINAL_JOB_LIMIT
 
 
@@ -134,6 +141,33 @@ class WeeklyCollectionError(RuntimeError):
     """Expected collection failure whose message is safe to show locally."""
 
 
+@dataclass(frozen=True, slots=True)
+class WeeklyCollectionPublication:
+    """One weekly engine and the activity evidence bound to that exact engine."""
+
+    bundle: EngineBundle
+    history_capture: LeagueHistoryCapture
+    history_binding: HistoryBundleBinding
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.bundle, EngineBundle):
+            raise ValueError("publication bundle must be an EngineBundle")
+        if not isinstance(self.history_capture, LeagueHistoryCapture):
+            raise ValueError("publication history_capture must be a LeagueHistoryCapture")
+        if not isinstance(self.history_binding, HistoryBundleBinding):
+            raise ValueError("publication history_binding must be a HistoryBundleBinding")
+        if self.history_binding.bundle_id != self.bundle.bundle_id:
+            raise ValueError("publication history binding does not match the bundle")
+        if (
+            self.history_binding.league_key,
+            self.history_binding.season,
+        ) != (
+            self.history_capture.league_key,
+            self.history_capture.season,
+        ):
+            raise ValueError("publication history binding does not match the capture")
+
+
 class WeeklyCollectionWorkflow(Protocol):
     """External-data workflow; ordinary trade search never calls this seam."""
 
@@ -144,7 +178,7 @@ class WeeklyCollectionWorkflow(Protocol):
         data_directory: Path,
         progress: Callable[[WeeklyCollectionProgress], None],
         cancelled: Callable[[], bool],
-    ) -> EngineBundle: ...
+    ) -> EngineBundle | WeeklyCollectionPublication: ...
 
 
 @dataclass(slots=True)
@@ -169,10 +203,18 @@ class WeeklyCollectionJobs:
     ) -> None:
         self._data_directory = Path(data_directory).resolve()
         self._bundle_directory = Path(bundle_directory).resolve()
+        self._publication_staging_directory = (
+            self._bundle_directory / _PUBLICATION_STAGING_DIRECTORY
+        ).resolve()
+        if self._publication_staging_directory.parent != self._bundle_directory:
+            raise ValueError(
+                "weekly publication staging path is outside the bundle directory"
+            )
         self._workflow = workflow
         self._lock = RLock()
         self._jobs: dict[str, _CollectionJob] = {}
         self._pending_terminal_job_id: str | None = None
+        self._recover_staged_publications()
 
     @property
     def available(self) -> bool:
@@ -284,14 +326,22 @@ class WeeklyCollectionJobs:
             if job.cancel.is_set():
                 self._update(job, status="cancelled")
                 return
-            bundle = self._workflow(
+            result = self._workflow(
                 job.request,
                 data_directory=self._data_directory,
                 progress=lambda value: self._progress(job, value),
                 cancelled=job.cancel.is_set,
             )
-            if not isinstance(bundle, EngineBundle):
-                raise TypeError("weekly collection workflow did not return an EngineBundle")
+            if isinstance(result, WeeklyCollectionPublication):
+                publication = result
+                bundle = result.bundle
+            elif isinstance(result, EngineBundle):
+                publication = None
+                bundle = result
+            else:
+                raise TypeError(
+                    "weekly collection workflow did not return an EngineBundle publication"
+                )
             if job.cancel.is_set():
                 self._update(job, status="cancelled")
                 return
@@ -303,10 +353,10 @@ class WeeklyCollectionJobs:
                     "Saving the complete weekly engine for offline searches",
                 ),
             )
-            save_engine_bundle(
-                bundle,
-                self._bundle_directory / f"{bundle.bundle_id}.json",
-            )
+            if publication is None:
+                save_engine_bundle(bundle, self._bundle_path(bundle.bundle_id))
+            else:
+                self._publish_bound_publication(publication)
             self._update(
                 job,
                 status="complete",
@@ -324,6 +374,93 @@ class WeeklyCollectionJobs:
                 job,
                 "Weekly collection stopped unexpectedly. No new weekly bundle was published.",
             )
+
+    def _publish_bound_publication(
+        self, publication: WeeklyCollectionPublication
+    ) -> None:
+        """Keep a validated recovery copy until binding and final save both succeed."""
+
+        staged_path = self._staged_bundle_path(publication.bundle.bundle_id)
+        staged_bundle = self._stage_exact_bundle(publication.bundle, staged_path)
+        LeagueHistoryStore(
+            self._data_directory / LEAGUE_HISTORY_FILENAME
+        ).ingest(
+            publication.history_capture,
+            bundle=publication.history_binding,
+        )
+        self._publish_staged_bundle(staged_bundle, staged_path)
+
+    def _stage_exact_bundle(self, bundle: EngineBundle, path: Path) -> EngineBundle:
+        save_engine_bundle(bundle, path)
+        staged = load_engine_bundle(path)
+        if (
+            staged.bundle_id != bundle.bundle_id
+            or staged.to_record() != bundle.to_record()
+        ):
+            raise ValueError(
+                "staged weekly bundle does not match the validated publication"
+            )
+        return staged
+
+    def _publish_staged_bundle(self, bundle: EngineBundle, staged_path: Path) -> None:
+        final_path = self._bundle_path(bundle.bundle_id)
+        save_engine_bundle(bundle, final_path)
+        published = load_engine_bundle(final_path)
+        if (
+            published.bundle_id != bundle.bundle_id
+            or published.to_record() != bundle.to_record()
+        ):
+            raise ValueError(
+                "published weekly bundle does not match its staged publication"
+            )
+        try:
+            staged_path.unlink(missing_ok=True)
+        except OSError:
+            # A retained bound stage is safe and will be cleaned on a later recovery.
+            pass
+
+    def _recover_staged_publications(self) -> None:
+        """Finish only stages whose content address already has a history binding."""
+
+        try:
+            staged_paths = tuple(
+                sorted(self._publication_staging_directory.glob("*.json"))
+            )
+        except OSError:
+            return
+        if not staged_paths:
+            return
+        try:
+            history = LeagueHistoryStore(
+                self._data_directory / LEAGUE_HISTORY_FILENAME
+            )
+        except RuntimeError:
+            return
+        for staged_path in staged_paths:
+            if staged_path.is_symlink() or not _ENGINE_BUNDLE_ID.fullmatch(
+                staged_path.stem
+            ):
+                continue
+            try:
+                bundle = load_engine_bundle(staged_path)
+                if staged_path.name != self._bundle_path(bundle.bundle_id).name:
+                    continue
+                if history.snapshot_for_bundle(bundle.bundle_id) is None:
+                    continue
+                self._publish_staged_bundle(bundle, staged_path)
+            except (OSError, RuntimeError, ValueError):
+                # Invalid, unbound, or temporarily unpublishable stages remain private.
+                continue
+
+    def _bundle_path(self, bundle_id: str) -> Path:
+        if not isinstance(bundle_id, str) or not _ENGINE_BUNDLE_ID.fullmatch(
+            bundle_id
+        ):
+            raise ValueError("weekly bundle id is invalid")
+        return self._bundle_directory / f"{bundle_id}.json"
+
+    def _staged_bundle_path(self, bundle_id: str) -> Path:
+        return self._publication_staging_directory / self._bundle_path(bundle_id).name
 
     def _progress(self, job: _CollectionJob, value: WeeklyCollectionProgress) -> None:
         if job.cancel.is_set():
@@ -555,9 +692,11 @@ def _league_number(value: str) -> bool:
 
 
 __all__ = (
+    "LEAGUE_HISTORY_FILENAME",
     "WeeklyCollectionError",
     "WeeklyCollectionJobs",
     "WeeklyCollectionProgress",
+    "WeeklyCollectionPublication",
     "WeeklyCollectionRequest",
     "WeeklyCollectionStage",
     "WeeklyCollectionWorkflow",

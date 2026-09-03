@@ -2,9 +2,13 @@ import copy
 from dataclasses import replace
 import json
 import unittest
+from unittest.mock import patch
 
 from tests.draft_fixtures import small_draft_config, small_historical_corpus
 from trade_snapshot._scenario_random import content_id
+from trade_snapshot.draft_config import score_raw_stats
+from trade_snapshot.draft_history import ActualWeekStatus
+from trade_snapshot.draft_season import _prepare_scoring_context
 from trade_snapshot.draft_training import (
     EvolutionConfig,
     GenerationSummary,
@@ -31,6 +35,32 @@ def evolution(generations=2):
 
 
 class DraftTrainingTests(unittest.TestCase):
+    def test_season_scoring_is_prepared_once_across_generations_and_arenas(self):
+        corpus = small_historical_corpus()
+        settings = replace(
+            evolution(2), appearances_per_generation=2
+        )
+        played_week_count = sum(
+            week.status is ActualWeekStatus.PLAYED
+            for player in corpus.seasons[0].players
+            for week in player.actual_weeks
+        )
+
+        with (
+            patch(
+                "trade_snapshot.draft_training._prepare_scoring_context",
+                wraps=_prepare_scoring_context,
+            ) as prepare,
+            patch(
+                "trade_snapshot.draft_season.score_raw_stats",
+                wraps=score_raw_stats,
+            ) as score,
+        ):
+            run_training_batch(corpus, small_draft_config(), settings)
+
+        self.assertEqual(prepare.call_count, 1)
+        self.assertEqual(score.call_count, played_week_count)
+
     def test_runs_evolution_retains_champion_showcase_and_round_trips(self):
         checkpoint = run_training_batch(
             small_historical_corpus(), small_draft_config(), evolution()

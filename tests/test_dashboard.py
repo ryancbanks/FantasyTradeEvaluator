@@ -28,6 +28,7 @@ def build_dashboard(bundle, baseline):
         bundle,
         baseline.season_projection,
         baseline.scenarios,
+        baseline.iter_baseline_scenarios(),
     )
 
 

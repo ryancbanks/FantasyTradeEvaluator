@@ -4,6 +4,7 @@ from threading import Event, Thread
 import unittest
 
 from trade_snapshot.extension_bridge import (
+    MINIMUM_EXTENSION_VERSION,
     PROTOCOL_VERSION,
     V1_CAPABILITIES,
     BridgeAuthenticationError,
@@ -18,6 +19,7 @@ from trade_snapshot.extension_bridge import (
     BridgeStateError,
     BridgeTimeoutError,
     ExtensionCommandBridge,
+    extension_version_is_supported,
     is_valid_loopback_host,
 )
 
@@ -174,6 +176,24 @@ class ExtensionBridgePairingTests(unittest.TestCase):
                 capabilities=V1_CAPABILITIES,
                 extension_version="bad version with spaces",
             )
+
+    def test_minimum_collector_version_uses_chrome_version_rules(self):
+        self.assertEqual(MINIMUM_EXTENSION_VERSION, "0.2.0")
+        for version in ("0.2", "0.2.0", "0.2.0.0", "1", "1.2.3"):
+            with self.subTest(version=version):
+                self.assertTrue(extension_version_is_supported(version))
+        for version in (
+            None,
+            "",
+            "0.1.9999",
+            "00.2.0",
+            "0.02.0",
+            "0.2.0.0.0",
+            "0.2.beta",
+            "65536.0",
+        ):
+            with self.subTest(version=version):
+                self.assertFalse(extension_version_is_supported(version))
 
     def test_pair_code_expires_and_can_be_rotated(self):
         clock = _Clock()

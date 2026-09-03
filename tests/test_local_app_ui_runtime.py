@@ -8,6 +8,7 @@ from tests.test_app_service import payload
 from tests.test_engine_bundle import engine_bundle
 from trade_snapshot.app_service import LocalSearchRequest
 from trade_snapshot.draft_training import EvolutionConfig
+from trade_snapshot.extension_bridge import PROTOCOL_VERSION, V1_CAPABILITIES
 from trade_snapshot.local_server import create_local_server
 from trade_snapshot.weekly_collection import (
     WeeklyCollectionError,
@@ -27,6 +28,52 @@ except ImportError:  # The release CI installs the browser-test extra.
 
 @unittest.skipIf(sync_playwright is None, "Playwright browser tests are not installed")
 class LocalAppUiRuntimeTests(unittest.TestCase):
+    def test_outdated_extension_is_blocked_with_reconnect_guidance(self):
+        with TemporaryDirectory() as directory:
+            server = create_local_server(directory)
+            offer = server.extension_bridge.create_pairing()
+            server.extension_bridge.connect(
+                offer["pair_code"],
+                protocol_version=PROTOCOL_VERSION,
+                capabilities=V1_CAPABILITIES,
+                extension_version="0.1.0",
+            )
+            serving = Thread(
+                target=server.serve_forever,
+                kwargs={"poll_interval": 0.02},
+                daemon=True,
+            )
+            serving.start()
+            try:
+                with sync_playwright() as playwright:
+                    browser = _launch_browser(playwright)
+                    try:
+                        page = browser.new_page()
+                        page_errors = []
+                        page.on("pageerror", lambda error: page_errors.append(str(error)))
+                        page.goto(server.app_url, wait_until="networkidle")
+                        page.locator(
+                            "#extensionStatus", has_text="update required"
+                        ).wait_for()
+                        self.assertTrue(page.locator("#collectButton").is_disabled())
+                        self.assertFalse(
+                            page.locator("#connectExtensionButton").is_disabled()
+                        )
+                        self.assertEqual(
+                            page.locator("#connectExtensionButton").text_content(),
+                            "Reconnect updated extension",
+                        )
+                        help_text = page.locator("#extensionHelp").text_content()
+                        self.assertIn("Version 0.2.0 or newer", help_text)
+                        self.assertIn("Reload", help_text)
+                        self.assertEqual(page_errors, [])
+                    finally:
+                        browser.close()
+            finally:
+                server.shutdown()
+                serving.join(timeout=2)
+                server.server_close()
+
     def test_trade_player_dashboard_and_draft_surfaces_work_together(self):
         with TemporaryDirectory() as directory:
             server = create_local_server(directory)
@@ -44,7 +91,14 @@ class LocalAppUiRuntimeTests(unittest.TestCase):
                     try:
                         page = browser.new_page()
                         page_errors = []
+                        gm_requests = []
                         page.on("pageerror", lambda error: page_errors.append(str(error)))
+                        page.on(
+                            "request",
+                            lambda request: gm_requests.append(request.url)
+                            if request.url.endswith("/gm-insights")
+                            else None,
+                        )
                         page.goto(server.app_url, wait_until="networkidle")
                         page.locator("#health", has_text="running").wait_for()
 
@@ -52,6 +106,8 @@ class LocalAppUiRuntimeTests(unittest.TestCase):
                         self.assertFalse(page.locator("#draftLabPanel").is_visible())
                         self.assertFalse(page.locator("#dashboardContent").is_visible())
                         self.assertFalse(page.locator("#playerLabContent").is_visible())
+                        self.assertFalse(page.locator("#gmInsightsContent").is_visible())
+                        self.assertEqual(gm_requests, [])
 
                         page.locator("#playerLabLoadButton").click()
                         page.locator("#playerLabContent").wait_for(state="visible")
@@ -66,6 +122,15 @@ class LocalAppUiRuntimeTests(unittest.TestCase):
                         self.assertGreater(
                             page.locator("#dashboardStandingsBody tr").count(), 0
                         )
+
+                        page.locator("#gmInsightsLoadButton").click()
+                        page.locator("#gmInsightsContent").wait_for(
+                            state="visible", timeout=15_000
+                        )
+                        self.assertGreater(
+                            page.locator("#gmInsightsTableBody tr").count(), 0
+                        )
+                        self.assertEqual(len(gm_requests), 1)
 
                         page.locator("#maxOutgoing").fill("1")
                         page.locator("#maxIncoming").fill("1")

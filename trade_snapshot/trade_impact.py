@@ -1,6 +1,6 @@
 """Paired before/after season projections using common random numbers."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 
 from ._scenario_random import content_id
@@ -9,7 +9,12 @@ from .league_state import LeagueState
 from .scenario_config import CorrelatedScenarioConfig, PlayerEligibility
 from .scenario_score_cache import ScenarioScoreCache, ScenarioScoreCacheBuilder
 from .score_scenarios import PreparedScoreScenarios, prepare_score_scenarios
-from .season import SeasonProjection, TeamSeasonProjection, project_remaining_season
+from .season import (
+    ScoreScenario,
+    SeasonProjection,
+    TeamSeasonProjection,
+    project_remaining_season,
+)
 from .trade_space import TeamRoster
 
 
@@ -189,12 +194,15 @@ class PreparedSeasonBaseline:
         else:
             after = self.scenarios.with_rosters(after_roster_rows)
             _validate_common_draw_space(self.scenarios, after)
-            if self._score_cache.recomputed_cell_count(after) == 0:
+            recomputed_cell_count, score_scenarios = (
+                self._score_cache.prepare_projection(after)
+            )
+            if recomputed_cell_count == 0:
                 after_projection = self.season_projection
             else:
                 after_projection = project_remaining_season(
                     self.state,
-                    self._score_cache.iter_scenarios(after),
+                    score_scenarios,
                     score_decimal_places=self.score_decimal_places,
                     random_seed=self.tiebreak_random_seed,
                 )
@@ -205,6 +213,13 @@ class PreparedSeasonBaseline:
             self.season_projection,
             after_projection,
         )
+
+    def iter_baseline_scenarios(self) -> Iterator[ScoreScenario]:
+        """Replay realized baseline scores without regenerating cached player draws."""
+
+        if self._score_cache is None:
+            return iter(self.scenarios)
+        return self._score_cache.iter_scenarios(self.scenarios)
 
 
 def prepare_season_baseline(

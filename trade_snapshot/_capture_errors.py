@@ -9,6 +9,10 @@ class BrowserCaptureDependencyError(BrowserCaptureError):
     """The optional browser runtime is unavailable."""
 
 
+class BrowserExtensionUpgradeRequired(BrowserCaptureDependencyError):
+    """The paired browser extension predates required capture evidence."""
+
+
 class BrowserCaptureCancelled(BrowserCaptureError):
     """The caller cancelled collection."""
 
@@ -23,5 +27,5 @@ class YahooScoringError(BrowserCaptureError):
 
 __all__ = (
     "BrowserCaptureCancelled", "BrowserCaptureDependencyError", "BrowserCaptureError",
-    "BrowserCaptureTimeout", "YahooScoringError",
+    "BrowserCaptureTimeout", "BrowserExtensionUpgradeRequired", "YahooScoringError",
 )

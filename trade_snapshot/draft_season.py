@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 import math
+from types import MappingProxyType
 
 from .draft_config import DraftLeagueConfig, score_raw_stats
 from .draft_features import resolve_preseason_projection
@@ -123,36 +124,38 @@ class _Record:
     points_for: float = 0.0
     points_against: float = 0.0
 
+
+@dataclass(frozen=True, slots=True)
+class _PreparedScoringContext:
+    """Immutable season/config scoring facts shared by repeated simulations."""
+
+    season: HistoricalSeason
+    config_id: str
+    players: Mapping[str, PreseasonPlayer]
+    actual_scores: Mapping[tuple[str, int], float]
+    preseason_scores: Mapping[str, float]
+    prior_played_averages: Mapping[tuple[str, int], float]
+
+
 def simulate_historical_season(
     rosters: Sequence[Sequence[str]],
     season: HistoricalSeason,
     config: DraftLeagueConfig,
+    *,
+    _prepared: _PreparedScoringContext | None = None,
 ) -> HistoricalSeasonTrace:
     """Score one draft without using current or future outcomes to choose lineups."""
 
-    if not isinstance(season, HistoricalSeason) or not isinstance(config, DraftLeagueConfig):
-        raise ValueError("season and config must use draft domain types")
-    playoff_rounds = max(1, math.ceil(math.log2(config.playoff_team_count)))
-    if len(config.playoff_weeks) != playoff_rounds:
-        raise ValueError("season simulation requires exactly one playoff week per round")
-    required_weeks = set(config.regular_season_weeks) | set(config.playoff_weeks)
-    if not required_weeks.issubset(season.available_weeks):
-        raise ValueError("historical season does not have the configured week coverage")
-    if any(
-        row.week in required_weeks and row.status is ActualWeekStatus.MISSING
-        for player in season.players
-        for row in player.actual_weeks
-    ):
-        raise ValueError("historical season has missing outcomes in configured weeks")
-    players = {row.player_id: row for row in season.players}
+    context = (
+        _prepare_scoring_context(season, config)
+        if _prepared is None
+        else _validated_scoring_context(_prepared, season, config)
+    )
+    players = context.players
     normalized = _validate_rosters(rosters, config, players)
     team_ids = tuple(f"drafter-{index}" for index in range(1, config.team_count + 1))
     names = {team_id: f"Drafter #{index}" for index, team_id in enumerate(team_ids, 1)}
     roster_by_team = dict(zip(team_ids, normalized))
-    actual_by_player = {player.player_id: {row.week: row for row in player.actual_weeks}
-                        for player in season.players}
-    preseason = {player.player_id: _preseason_weekly_score(player, config)
-                 for player in season.players}
 
     records = {team_id: _Record() for team_id in team_ids}
     week_rows: dict[str, list[TeamWeekResult]] = {team_id: [] for team_id in team_ids}
@@ -162,8 +165,7 @@ def simulate_historical_season(
         key = (team_id, week)
         if key not in lineup_cache:
             lineup_cache[key] = _select_lineup(
-                roster_by_team[team_id], week, config, players,
-                actual_by_player, preseason,
+                roster_by_team[team_id], week, config, context,
             )
         return lineup_cache[key]
 
@@ -240,6 +242,81 @@ def simulate_historical_season(
     )
 
 
+def _prepare_scoring_context(
+    season: HistoricalSeason,
+    config: DraftLeagueConfig,
+) -> _PreparedScoringContext:
+    """Score immutable historical facts once for every repeated roster arena."""
+
+    _validate_scoring_inputs(season, config)
+    players = {row.player_id: row for row in season.players}
+    actual_scores: dict[tuple[str, int], float] = {}
+    preseason_scores: dict[str, float] = {}
+    prior_averages: dict[tuple[str, int], float] = {}
+    required_weeks = tuple(sorted({*config.regular_season_weeks, *config.playoff_weeks}))
+
+    for player in season.players:
+        preseason_scores[player.player_id] = _preseason_weekly_score(player, config)
+        played_scores: list[tuple[int, float]] = []
+        for outcome in player.actual_weeks:
+            score = (
+                score_raw_stats(outcome.stats, config.scoring_weights)
+                if outcome.status is ActualWeekStatus.PLAYED
+                else 0.0
+            )
+            actual_scores[player.player_id, outcome.week] = score
+            if outcome.status is ActualWeekStatus.PLAYED:
+                played_scores.append((outcome.week, score))
+        prior: list[float] = []
+        played_index = 0
+        for week in required_weeks:
+            # A lineup lock may see completed prior weeks, never this week.
+            while (
+                played_index < len(played_scores)
+                and played_scores[played_index][0] < week
+            ):
+                prior.append(played_scores[played_index][1])
+                played_index += 1
+            if prior:
+                prior_averages[player.player_id, week] = math.fsum(prior) / len(prior)
+
+    return _PreparedScoringContext(
+        season,
+        config.config_id,
+        MappingProxyType(players),
+        MappingProxyType(actual_scores),
+        MappingProxyType(preseason_scores),
+        MappingProxyType(prior_averages),
+    )
+
+
+def _validate_scoring_inputs(season, config):
+    if not isinstance(season, HistoricalSeason) or not isinstance(config, DraftLeagueConfig):
+        raise ValueError("season and config must use draft domain types")
+    playoff_rounds = max(1, math.ceil(math.log2(config.playoff_team_count)))
+    if len(config.playoff_weeks) != playoff_rounds:
+        raise ValueError("season simulation requires exactly one playoff week per round")
+    required_weeks = set(config.regular_season_weeks) | set(config.playoff_weeks)
+    if not required_weeks.issubset(season.available_weeks):
+        raise ValueError("historical season does not have the configured week coverage")
+    if any(
+        row.week in required_weeks and row.status is ActualWeekStatus.MISSING
+        for player in season.players
+        for row in player.actual_weeks
+    ):
+        raise ValueError("historical season has missing outcomes in configured weeks")
+
+
+def _validated_scoring_context(context, season, config):
+    if not isinstance(context, _PreparedScoringContext):
+        raise ValueError("prepared scoring context is invalid")
+    if context.config_id != config.config_id or not (
+        context.season is season or context.season == season
+    ):
+        raise ValueError("prepared scoring context does not match season and config")
+    return context
+
+
 def _validate_rosters(rosters, config, players):
     if isinstance(rosters, (str, bytes)):
         raise ValueError("rosters must contain every configured team")
@@ -272,38 +349,29 @@ def _validate_rosters(rosters, config, players):
     return result
 
 
-def _select_lineup(roster, week, config, players, actual_by_player, preseason):
+def _select_lineup(roster, week, config, context):
     weights = {}
     for player_id in roster:
-        player = players[player_id]
+        player = context.players[player_id]
         # Bye weeks are part of the preseason snapshot. Same-week inactive or
         # played status is an outcome and must not influence a historical lock.
         if player.bye_week == week:
             continue
-        prior = [
-            score_raw_stats(row.stats, config.scoring_weights)
-            for prior_week, row in actual_by_player[player_id].items()
-            if prior_week < week and row.status is ActualWeekStatus.PLAYED
-        ]
+        prior_average = context.prior_played_averages.get((player_id, week))
         weights[player_id] = (
-            preseason[player_id]
-            if not prior
-            else (preseason[player_id] + math.fsum(prior) / len(prior)) / 2
+            context.preseason_scores[player_id]
+            if prior_average is None
+            else (context.preseason_scores[player_id] + prior_average) / 2
         )
-    optimized = _optimize(roster, config, players, weights)
+    optimized = _optimize(roster, config, context.players, weights)
     slots = []
     actual_scores = []
     for assignment in optimized.assignments:
         player_id = assignment.player_id
-        outcome = None if player_id is None else actual_by_player[player_id][week]
-        actual = (
-            0.0
-            if outcome is None or outcome.status is not ActualWeekStatus.PLAYED
-            else score_raw_stats(outcome.stats, config.scoring_weights)
-        )
+        actual = 0.0 if player_id is None else context.actual_scores[player_id, week]
         slots.append(LineupSlotResult(
             assignment.slot_index, assignment.slot, player_id,
-            None if player_id is None else players[player_id].display_name,
+            None if player_id is None else context.players[player_id].display_name,
             assignment.weight, actual,
         ))
         actual_scores.append(actual)

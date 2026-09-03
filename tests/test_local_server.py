@@ -213,6 +213,22 @@ class LocalServerTests(unittest.TestCase):
         status, _, _ = self.request("GET", player_outlook_path, token=False)
         self.assertEqual(status, 403)
 
+        gm_insights_path = f"/api/bundles/{bundle.bundle_id}/gm-insights"
+        status, _, raw = self.request("GET", gm_insights_path)
+        gm_insights = json.loads(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(gm_insights["bundle_id"], bundle.bundle_id)
+        self.assertEqual(gm_insights["status"], "not_collected")
+        self.assertEqual(
+            {row["team_id"] for row in gm_insights["teams"]},
+            {row.team_id for row in bundle.state.teams},
+        )
+        for row in gm_insights["teams"]:
+            self.assertEqual(row["history_insights"]["status"], "not_collected")
+            self.assertIn("partners", row["roster_compatibility"])
+        status, _, _ = self.request("GET", gm_insights_path, token=False)
+        self.assertEqual(status, 403)
+
         status, _, raw = self.request(
             "POST", "/api/searches/estimate", value=payload(bundle.bundle_id)
         )
@@ -293,6 +309,9 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b"Collection may still be running locally", body)
         self.assertIn(b"improve all three playoff chances", body)
         self.assertIn(b"free_agent_allocation_policy", body)
+        self.assertIn(b"GmInsightsUi.setBundle", body)
+        self.assertIn(b"onUseTradePartner: chooseTradePartnerFromInsights", body)
+        self.assertIn(b"GmInsightsUi.setPrimaryTeam", body)
         self.assertIn(b"Count this specific three-team search", body)
         self.assertNotIn(b"Count this exact three-team search", body)
         self.assertNotIn(b"expected_team_count", body)
@@ -341,6 +360,17 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b"Every result requires all three teams", page)
         self.assertIn(b'id="resultsHeaderRow"', page)
         self.assertIn(b'id="dashboardPanel"', page)
+        self.assertIn(b'id="gmInsightsPanel"', page)
+        self.assertIn(b'id="gmInsightsTeamSelect"', page)
+        self.assertIn(b'id="gmInsightsTableBody"', page)
+        self.assertIn(b'id="gmInsightsProfile"', page)
+        self.assertIn(b'id="gmInsightsDecisionSignals"', page)
+        self.assertIn(b'id="gmInsightsCompatibility"', page)
+        self.assertIn(b'id="gmInsightsHindsight"', page)
+        self.assertIn(b'id="gmInsightsEvidence"', page)
+        self.assertIn(b"Three separate questions", page)
+        self.assertIn(b"Fit with your team", page)
+        self.assertIn(b"Counterparty value opportunity", page)
         self.assertIn(b'id="playerLabPanel"', page)
         self.assertIn(b'id="playerLabSearch"', page)
         self.assertIn(b'id="playerLabTableBody"', page)
@@ -355,9 +385,15 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b'aria-label="Scrollable final rank probability table"', page)
         self.assertIn(b'src="/dashboard_charts.js"', page)
         self.assertIn(b'src="/dashboard_ui.js"', page)
+        self.assertIn(b'src="/gm_insights_format.js"', page)
+        self.assertIn(b'src="/gm_insights_evidence_ui.js"', page)
+        self.assertIn(b'src="/gm_insights_ui.js"', page)
         self.assertIn(b'src="/player_lab_ui.js"', page)
         self.assertLess(page.index(b'/dashboard_charts.js'), page.index(b'/dashboard_ui.js'))
         self.assertLess(page.index(b'/dashboard_ui.js'), page.index(b'/app.js'))
+        self.assertLess(page.index(b'/gm_insights_format.js'), page.index(b'/gm_insights_evidence_ui.js'))
+        self.assertLess(page.index(b'/gm_insights_evidence_ui.js'), page.index(b'/gm_insights_ui.js'))
+        self.assertLess(page.index(b'/gm_insights_ui.js'), page.index(b'/app.js'))
         self.assertLess(page.index(b'/player_lab_ui.js'), page.index(b'/app.js'))
         self.assertLess(page.index(b'/three_way_ui.js'), page.index(b'/app.js'))
         self.assertNotIn(b'id="expectedTeamCount"', page)
@@ -402,6 +438,60 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b"replacement?.focus()", dashboard_ui)
         self.assertIn(b"bindHorizontalScroll(container)", dashboard_ui)
         self.assertNotIn(b"innerHTML", dashboard_ui)
+
+        status, headers, gm_insights_format = self.request(
+            "GET", "/gm_insights_format.js", token=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/javascript", headers["Content-Type"])
+        self.assertIn(b"window.GmInsightsFormat", gm_insights_format)
+        self.assertIn(b"source_health_capture_missing", gm_insights_format)
+        self.assertNotIn(b"innerHTML", gm_insights_format)
+
+        status, headers, gm_insights_evidence_ui = self.request(
+            "GET", "/gm_insights_evidence_ui.js", token=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/javascript", headers["Content-Type"])
+        self.assertIn(b"window.GmInsightsEvidenceUi", gm_insights_evidence_ui)
+        self.assertIn(b"Showing ${shown} of ${items.length}", gm_insights_evidence_ui)
+        self.assertIn(b"gmInsightsShowMoreEvidence", gm_insights_evidence_ui)
+        self.assertIn(b"Now, same package and pre-trade roster", gm_insights_evidence_ui)
+        self.assertIn(b"First seen completed", gm_insights_evidence_ui)
+        self.assertIn(b"Playoff change unavailable", gm_insights_evidence_ui)
+        self.assertIn(b"foresight_ineligibility_reasons", gm_insights_evidence_ui)
+        self.assertNotIn(b"innerHTML", gm_insights_evidence_ui)
+
+        status, headers, gm_insights_ui = self.request(
+            "GET", "/gm_insights_ui.js", token=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/javascript", headers["Content-Type"])
+        self.assertIn(b"window.GmInsightsUi", gm_insights_ui)
+        self.assertIn(b"gm-insights", gm_insights_ui)
+        self.assertIn(b"Current roster compatibility", gm_insights_ui)
+        self.assertIn(b"never an acceptance probability", gm_insights_ui)
+        self.assertIn(b"EVIDENCE_PAGE_SIZE = 10", gm_insights_ui)
+        self.assertIn(b"GmInsightsEvidenceUi.render", gm_insights_ui)
+        self.assertIn(b"activeBundleId === bundle.bundle_id", gm_insights_ui)
+        self.assertIn(b"activeBundleId = null", gm_insights_ui)
+        self.assertIn(b'row.classList.add("is-selected")', gm_insights_ui)
+        self.assertNotIn(b'row.setAttribute("aria-selected"', gm_insights_ui)
+        self.assertNotIn(b"innerHTML", gm_insights_ui)
+
+        status, headers, gm_insights_styles = self.request(
+            "GET", "/gm_insights.css", token=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/css", headers["Content-Type"])
+        self.assertIn(b".gm-insights-panel", gm_insights_styles)
+        self.assertIn(b".gm-insights-decision-grid", gm_insights_styles)
+        self.assertIn(b".gm-insights-partner-list", gm_insights_styles)
+        self.assertIn(b".gm-insights-valuation-comparison", gm_insights_styles)
+        self.assertIn(b".gm-insights-show-more", gm_insights_styles)
+        self.assertIn(b"tr.is-selected", gm_insights_styles)
+        self.assertIn(b"prefers-reduced-motion", gm_insights_styles)
+        self.assertIn(b"@media", gm_insights_styles)
 
         status, headers, player_lab_ui = self.request(
             "GET", "/player_lab_ui.js", token=False

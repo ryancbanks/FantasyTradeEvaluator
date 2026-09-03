@@ -13,7 +13,11 @@ from .draft_config import DraftLeagueConfig, DraftStrategy
 from .draft_features import build_baseline_brain, fit_feature_schema
 from .draft_history import HistoricalCorpus
 from .draft_history import ActualWeekStatus
-from .draft_season import HistoricalSeasonTrace, simulate_historical_season
+from .draft_season import (
+    HistoricalSeasonTrace,
+    _prepare_scoring_context,
+    simulate_historical_season,
+)
 from .draft_simulation import DraftResult, simulate_snake_draft
 
 
@@ -378,9 +382,12 @@ def run_training_batch(
             return resume
 
     latest = resume
+    scoring_contexts = tuple(
+        _prepare_scoring_context(season, config) for season in seasons
+    )
     for generation in range(generation_start, evolution.generations + 1):
         performances, summary, showcase = _evaluate_population(
-            population, baseline, seasons, config, evolution, generation,
+            population, baseline, scoring_contexts, config, evolution, generation,
             should_cancel, on_arena,
         )
         ranked = sorted(
@@ -405,7 +412,7 @@ def run_training_batch(
 
 
 def _evaluate_population(
-    population, baseline, seasons, config, evolution, generation,
+    population, baseline, scoring_contexts, config, evolution, generation,
     should_cancel, on_arena,
 ):
     totals = [[0.0, 0, 0, 0, 0.0, 0.0] for _ in population]
@@ -418,18 +425,19 @@ def _evaluate_population(
     expected_arenas = (
         group_count
         * evolution.appearances_per_generation
-        * len(seasons)
+        * len(scoring_contexts)
         * 2
     )
     for appearance in range(evolution.appearances_per_generation):
-        for season_index, season in enumerate(seasons):
+        for season_index, scoring_context in enumerate(scoring_contexts):
+            season = scoring_context.season
             # A step coprime to every population size visits distinct seats
             # instead of aliasing at sizes such as 31.
             exposure = (
                 (generation - 1)
                 * evolution.appearances_per_generation
-                * len(seasons)
-                + appearance * len(seasons)
+                * len(scoring_contexts)
+                + appearance * len(scoring_contexts)
                 + season_index
             )
             offset = exposure * rotation_step % len(indices)
@@ -460,7 +468,9 @@ def _evaluate_population(
                     season, config, brains, seed=arena_seed,
                     candidate_window=evolution.candidate_window, should_cancel=should_cancel,
                 )
-                trace = simulate_historical_season(draft.rosters, season, config)
+                trace = simulate_historical_season(
+                    draft.rosters, season, config, _prepared=scoring_context
+                )
                 control_draft = simulate_snake_draft(
                     season, config, (baseline,) * config.team_count,
                     seed=arena_seed,
@@ -468,7 +478,8 @@ def _evaluate_population(
                     should_cancel=should_cancel,
                 )
                 control_trace = simulate_historical_season(
-                    control_draft.rosters, season, config
+                    control_draft.rosters, season, config,
+                    _prepared=scoring_context,
                 )
                 arena_count += 2
                 by_team = _arena_team_scores(trace, config)

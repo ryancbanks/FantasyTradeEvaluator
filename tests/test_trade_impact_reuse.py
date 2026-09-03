@@ -19,6 +19,7 @@ from trade_snapshot.scenario_config import (
     FactorLoadings,
     PlayerEligibility,
 )
+from trade_snapshot.scenario_score_cache import ScenarioScoreCache
 from trade_snapshot.score_scenarios import PreparedScoreScenarios
 from trade_snapshot.trade_impact import (
     PreparedSeasonBaseline,
@@ -33,6 +34,48 @@ WEEKS = (11, 12)
 
 
 class PreparedSeasonBaselineReuseTests(unittest.TestCase):
+    def test_candidate_cache_layout_is_validated_once_per_projection(self):
+        baseline = make_baseline()
+        after_rosters = reroute_players(
+            baseline.scenarios.rosters,
+            {"a-rb": "b", "b-rb": "a"},
+        )
+        original = ScenarioScoreCache._validated_candidate_lineups
+        calls = []
+
+        def recording_validation(cache, prepared):
+            calls.append(prepared)
+            return original(cache, prepared)
+
+        with patch.object(
+            ScenarioScoreCache,
+            "_validated_candidate_lineups",
+            recording_validation,
+        ):
+            baseline.project(after_rosters)
+
+        self.assertEqual(len(calls), 1)
+
+    def test_realized_baseline_stream_replays_without_rescoring(self):
+        baseline = make_baseline()
+        expected = tuple(baseline.scenarios)
+        calls = []
+        original = PreparedScoreScenarios._team_week_score
+
+        def recording_score(prepared, team_id, week, scenario_index, draw_cache):
+            calls.append((team_id, week, scenario_index))
+            return original(prepared, team_id, week, scenario_index, draw_cache)
+
+        with patch.object(
+            PreparedScoreScenarios,
+            "_team_week_score",
+            recording_score,
+        ):
+            actual = tuple(baseline.iter_baseline_scenarios())
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(calls, [])
+
     def test_two_changed_teams_match_uncached_projection_with_selective_scoring(self):
         baseline = make_baseline()
         after_rosters = reroute_players(

@@ -41,6 +41,9 @@ _DASHBOARD_PATH = re.compile(r"^/api/bundles/(engine_[0-9a-f]{64})/dashboard$")
 _PLAYER_OUTLOOK_PATH = re.compile(
     r"^/api/bundles/(engine_[0-9a-f]{64})/player-outlook$"
 )
+_GM_INSIGHTS_PATH = re.compile(
+    r"^/api/bundles/(engine_[0-9a-f]{64})/gm-insights$"
+)
 _COLLECTION_PATH = re.compile(r"^/api/weekly-collections/([0-9a-f]{32})$")
 _COLLECTION_CANCEL_PATH = re.compile(
     r"^/api/weekly-collections/([0-9a-f]{32})/cancel$"
@@ -72,6 +75,10 @@ _STATIC = {
     "/dashboard_ui.js": ("dashboard_ui.js", "text/javascript; charset=utf-8"),
     "/draft_lab.css": ("draft_lab.css", "text/css; charset=utf-8"),
     "/draft_lab.js": ("draft_lab.js", "text/javascript; charset=utf-8"),
+    "/gm_insights.css": ("gm_insights.css", "text/css; charset=utf-8"),
+    "/gm_insights_evidence_ui.js": ("gm_insights_evidence_ui.js", "text/javascript; charset=utf-8"),
+    "/gm_insights_format.js": ("gm_insights_format.js", "text/javascript; charset=utf-8"),
+    "/gm_insights_ui.js": ("gm_insights_ui.js", "text/javascript; charset=utf-8"),
     "/player_lab.css": ("player_lab.css", "text/css; charset=utf-8"),
     "/player_lab_ui.js": ("player_lab_ui.js", "text/javascript; charset=utf-8"),
     "/trade_filter_ui.js": ("trade_filter_ui.js", "text/javascript; charset=utf-8"),
@@ -309,6 +316,13 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
             self._json(
                 HTTPStatus.OK,
                 self.server.app_service.player_outlook(matched.group(1)),
+            )
+            return
+        matched = _GM_INSIGHTS_PATH.fullmatch(path)
+        if matched:
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.gm_insights(matched.group(1)),
             )
             return
         if path == "/api/browser-extension/status":

@@ -5,6 +5,7 @@ regular-season ranking rules.  Championship probability is a disclosed proxy:
 the bundle has no postseason player projections or bracket outcomes to simulate.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
 from math import fsum, sqrt
@@ -24,7 +25,7 @@ from ._season_ranking import (
 )
 from .engine_bundle import EngineBundle
 from .score_scenarios import PreparedScoreScenarios
-from .season import SeasonProjection
+from .season import ScoreScenario, SeasonProjection
 
 
 _SCHEMA_VERSION = 1
@@ -55,6 +56,7 @@ def build_league_dashboard(
     bundle: EngineBundle,
     baseline_projection: SeasonProjection,
     scenarios: PreparedScoreScenarios,
+    realized_scenarios: Iterable[ScoreScenario] | None = None,
 ) -> dict[str, object]:
     """Build the complete standalone dashboard contract for one weekly bundle."""
 
@@ -88,7 +90,7 @@ def build_league_dashboard(
     weekly, win_points, title_totals = _scenario_summaries(
         bundle,
         baseline_projection,
-        scenarios,
+        scenarios if realized_scenarios is None else realized_scenarios,
         power_scores,
     )
     championship = {

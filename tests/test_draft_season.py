@@ -17,6 +17,7 @@ from trade_snapshot.draft_season import (
     GameOutcome,
     SeasonStage,
     _Record,
+    _prepare_scoring_context,
     _preseason_weekly_score,
     _winning_percentage,
     simulate_historical_season,
@@ -24,6 +25,38 @@ from trade_snapshot.draft_season import (
 
 
 class HistoricalSeasonSimulationTests(unittest.TestCase):
+    def test_prepared_scoring_context_matches_public_fallback(self):
+        weeks = (1, 2, 3, 4, 5)
+        season = historical(
+            tuple(
+                player(
+                    f"p{index}",
+                    projected=100 - index,
+                    points={week: index * week for week in weeks},
+                )
+                for index in range(1, 9)
+            ),
+            weeks,
+        )
+        config = league_config(
+            4, regular=(1, 2, 3), playoffs=(4, 5), bench_slots=1
+        )
+        rosters = tuple(
+            (f"p{index}", f"p{index + 1}") for index in range(1, 9, 2)
+        )
+
+        expected = simulate_historical_season(rosters, season, config)
+        prepared = _prepare_scoring_context(season, config)
+
+        self.assertEqual(
+            simulate_historical_season(
+                rosters, season, config, _prepared=prepared
+            ),
+            expected,
+        )
+        with self.assertRaises(TypeError):
+            prepared.actual_scores["p1", 1] = 0.0
+
     def test_season_projection_totals_use_resolved_projected_game_horizon(self):
         points_config = league_config(
             4, regular=(1, 2, 3), playoffs=(4, 5)

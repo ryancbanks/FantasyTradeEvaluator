@@ -1,5 +1,6 @@
 import http.client
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
@@ -10,10 +11,22 @@ from unittest.mock import patch
 from tests.test_app_service import payload, wait_for_job
 from tests.test_engine_bundle import engine_bundle
 from trade_snapshot.app_service import LocalAppService, LocalSearchRequest
+from trade_snapshot.engine_bundle import load_engine_bundle, save_engine_bundle
 from trade_snapshot.local_server import create_local_server
+from trade_snapshot.league_history import (
+    HistoryBundleBinding,
+    HistoryRosterPlayer,
+    HistoryTeam,
+    HistoryTeamRoster,
+    LeagueHistoryCapture,
+    LeagueHistoryStore,
+    make_league_key,
+)
 from trade_snapshot.weekly_collection import (
+    LEAGUE_HISTORY_FILENAME,
     WeeklyCollectionError,
     WeeklyCollectionJobs,
+    WeeklyCollectionPublication,
     WeeklyCollectionProgress,
     WeeklyCollectionRequest,
     WeeklyCollectionStage,
@@ -103,6 +116,55 @@ class InteractiveWorkflow(SuccessfulWorkflow):
         self.pending = None
         self.confirmed.append(provider)
         return provider
+
+
+class HistoryWorkflow(SuccessfulWorkflow):
+    def __call__(self, request, *, data_directory, progress, cancelled):
+        bundle = super().__call__(
+            request,
+            data_directory=data_directory,
+            progress=progress,
+            cancelled=cancelled,
+        )
+        return history_publication(bundle)
+
+
+def history_publication(bundle):
+    captured_at = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    league_key = make_league_key("espn", "test-private-league")
+    names = {team.team_id: team.name for team in bundle.state.teams}
+    capture = LeagueHistoryCapture(
+        league_key=league_key,
+        season=bundle.state.season,
+        captured_at=captured_at,
+        coverage_start=captured_at,
+        coverage_end=captured_at,
+        transaction_history_complete=True,
+        roster_complete=True,
+        lineup_complete=True,
+        teams=tuple(HistoryTeam(team_id, names[team_id]) for team_id in names),
+        transactions=(),
+        rosters=tuple(
+            HistoryTeamRoster(
+                roster.team_id,
+                tuple(
+                    HistoryRosterPlayer(player_id, "BENCH")
+                    for player_id in roster.player_ids
+                ),
+            )
+            for roster in bundle.rosters
+        ),
+    )
+    return WeeklyCollectionPublication(
+        bundle,
+        capture,
+        HistoryBundleBinding(
+            league_key,
+            bundle.state.season,
+            bundle.bundle_id,
+            captured_at,
+        ),
+    )
 
 
 class WeeklyCollectionRequestTests(unittest.TestCase):
@@ -362,6 +424,126 @@ class WeeklyCollectionJobTests(unittest.TestCase):
         self.assertIsNone(finished["request"]["expected_team_count"])
         self.assertFalse(finished["request"]["allow_surrogate_power"])
         self.assertEqual(len(workflow.calls), 1)
+
+    def test_publishes_bound_history_before_exposing_the_weekly_bundle(self):
+        workflow = HistoryWorkflow()
+        expected = engine_bundle()
+        observed = {}
+        original_ingest = LeagueHistoryStore.ingest
+
+        def observing_ingest(store, capture, *, bundle=None):
+            staged_path = (
+                Path(directory)
+                / "bundles"
+                / ".weekly-publications"
+                / f"{expected.bundle_id}.json"
+            )
+            observed["staged_bundle"] = load_engine_bundle(staged_path)
+            observed["final_existed"] = (
+                Path(directory) / "bundles" / f"{expected.bundle_id}.json"
+            ).exists()
+            return original_ingest(store, capture, bundle=bundle)
+
+        with TemporaryDirectory() as directory, patch(
+            "trade_snapshot.weekly_collection.LeagueHistoryStore.ingest",
+            new=observing_ingest,
+        ):
+            jobs = WeeklyCollectionJobs(directory, Path(directory) / "bundles", workflow)
+            started = jobs.start(valid_request())
+            finished = wait_for_collection(jobs.job, started["job_id"])
+            history = LeagueHistoryStore(
+                Path(directory) / LEAGUE_HISTORY_FILENAME
+            ).snapshot_for_bundle(finished["bundle_id"])
+            bundle_exists = (
+                Path(directory) / "bundles" / f"{finished['bundle_id']}.json"
+            ).is_file()
+
+        self.assertEqual(finished["status"], "complete")
+        self.assertEqual(observed["staged_bundle"].to_record(), expected.to_record())
+        self.assertFalse(observed["final_existed"])
+        self.assertTrue(bundle_exists)
+        self.assertIsNotNone(history)
+        self.assertEqual(history.bundle_id, finished["bundle_id"])
+
+    def test_history_failure_does_not_expose_an_unbound_bundle(self):
+        workflow = HistoryWorkflow()
+        with TemporaryDirectory() as directory, patch(
+            "trade_snapshot.weekly_collection.LeagueHistoryStore.ingest",
+            side_effect=RuntimeError("history unavailable"),
+        ):
+            jobs = WeeklyCollectionJobs(directory, Path(directory) / "bundles", workflow)
+            started = jobs.start(valid_request())
+            finished = wait_for_collection(jobs.job, started["job_id"])
+            bundles = tuple((Path(directory) / "bundles").glob("*.json"))
+
+        self.assertEqual(finished["status"], "failed")
+        self.assertEqual(bundles, ())
+        self.assertNotIn("history unavailable", finished["error"])
+
+    def test_final_save_failure_keeps_a_bound_exact_stage_and_startup_recovers(self):
+        workflow = HistoryWorkflow()
+        expected = engine_bundle()
+        real_save = save_engine_bundle
+
+        def fail_final_save(bundle, path):
+            target = Path(path)
+            if target.parent.name == ".weekly-publications":
+                return real_save(bundle, target)
+            raise OSError("simulated final publication failure")
+
+        with TemporaryDirectory() as directory:
+            bundle_directory = Path(directory) / "bundles"
+            staged_path = (
+                bundle_directory
+                / ".weekly-publications"
+                / f"{expected.bundle_id}.json"
+            )
+            final_path = bundle_directory / f"{expected.bundle_id}.json"
+            with patch(
+                "trade_snapshot.weekly_collection.save_engine_bundle",
+                side_effect=fail_final_save,
+            ):
+                jobs = WeeklyCollectionJobs(directory, bundle_directory, workflow)
+                started = jobs.start(valid_request())
+                failed = wait_for_collection(jobs.job, started["job_id"])
+
+            bound_history = LeagueHistoryStore(
+                Path(directory) / LEAGUE_HISTORY_FILENAME
+            ).snapshot_for_bundle(expected.bundle_id)
+            staged_record = load_engine_bundle(staged_path).to_record()
+            final_existed_before_recovery = final_path.exists()
+
+            recovered_jobs = WeeklyCollectionJobs(directory, bundle_directory, None)
+            recovered_record = load_engine_bundle(final_path).to_record()
+            stage_exists_after_recovery = staged_path.exists()
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertNotIn("simulated final", failed["error"])
+        self.assertIsNotNone(bound_history)
+        self.assertEqual(staged_record, expected.to_record())
+        self.assertFalse(final_existed_before_recovery)
+        self.assertEqual(recovered_record, expected.to_record())
+        self.assertFalse(stage_exists_after_recovery)
+        self.assertFalse(recovered_jobs.available)
+
+    def test_startup_does_not_promote_an_unbound_private_stage(self):
+        expected = engine_bundle()
+        with TemporaryDirectory() as directory:
+            bundle_directory = Path(directory) / "bundles"
+            staged_path = (
+                bundle_directory
+                / ".weekly-publications"
+                / f"{expected.bundle_id}.json"
+            )
+            final_path = bundle_directory / f"{expected.bundle_id}.json"
+            save_engine_bundle(expected, staged_path)
+
+            WeeklyCollectionJobs(directory, bundle_directory, None)
+            final_exists = final_path.exists()
+            stage_remains_private = staged_path.exists()
+
+        self.assertFalse(final_exists)
+        self.assertTrue(stage_remains_private)
 
     def test_cancellation_and_expected_failure_publish_nothing(self):
         entered = Event()

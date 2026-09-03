@@ -36,6 +36,7 @@ class _EvidenceIndex:
         self.weekly = {}
         self.remaining = {}
         self.weekly_by_pair = defaultdict(list)
+        self.weekly_nfl_teams_by_player = defaultdict(list)
         self.rows_by_provider = defaultdict(list)
         self.provider_ids = {}
         for row in rows:
@@ -53,6 +54,8 @@ class _EvidenceIndex:
                     raise ValueError("projection evidence contains duplicate weekly evidence")
                 self.weekly[key] = row
                 self.weekly_by_pair[pair].append(row)
+                if row.nfl_team_id is not None:
+                    self.weekly_nfl_teams_by_player[player_id].append(row.nfl_team_id)
             elif isinstance(row, RemainingSeasonProjection):
                 if pair in self.remaining:
                     raise ValueError(
@@ -387,11 +390,7 @@ def _player_record(
 
 def _player_nfl_team(player_id, rows, evidence, waiver_players):
     values = [row.nfl_team_id for row in rows if row.nfl_team_id is not None]
-    values.extend(
-        row.nfl_team_id
-        for (raw_player_id, _, _), row in evidence.weekly.items()
-        if raw_player_id == player_id and row.nfl_team_id is not None
-    )
+    values.extend(evidence.weekly_nfl_teams_by_player.get(player_id, ()))
     waiver = waiver_players.get(player_id)
     if waiver is not None:
         values.append(waiver.nfl_team_id)

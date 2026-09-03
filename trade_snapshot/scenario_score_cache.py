@@ -189,14 +189,20 @@ class ScenarioScoreCache:
     def recomputed_cell_count(self, prepared: PreparedScoreScenarios) -> int:
         """Return exact candidate team-week score evaluations for a full run."""
 
-        candidate_lineups = self._validated_candidate_lineups(prepared)
-        changed = sum(
-            candidate != baseline
-            for candidate, baseline in zip(
-                candidate_lineups, self._baseline_lineups, strict=True
-            )
-        )
+        changed = self._reuse_mask(prepared).count(False)
         return changed * self._scenario_count
+
+    def prepare_projection(
+        self,
+        prepared: PreparedScoreScenarios,
+    ) -> tuple[int, Iterator[ScoreScenario]]:
+        """Validate one candidate once and return its work count and score stream."""
+
+        reused = self._reuse_mask(prepared)
+        return (
+            reused.count(False) * self._scenario_count,
+            self._iter_scenarios(prepared, reused, 0, self._scenario_count),
+        )
 
     def iter_scenarios(
         self,
@@ -206,15 +212,29 @@ class ScenarioScoreCache:
     ) -> Iterator[ScoreScenario]:
         """Yield candidate scores, reusing every unchanged baseline team-week cell."""
 
-        candidate_lineups = self._validated_candidate_lineups(prepared)
         end = self._scenario_count if stop is None else stop
         _validate_slice(start, end, self._scenario_count)
-        reused = tuple(
+        reused = self._reuse_mask(prepared)
+        return self._iter_scenarios(prepared, reused, start, end)
+
+    def _reuse_mask(
+        self, prepared: PreparedScoreScenarios
+    ) -> tuple[bool, ...]:
+        candidate_lineups = self._validated_candidate_lineups(prepared)
+        return tuple(
             candidate == baseline
             for candidate, baseline in zip(
                 candidate_lineups, self._baseline_lineups, strict=True
             )
         )
+
+    def _iter_scenarios(
+        self,
+        prepared: PreparedScoreScenarios,
+        reused: tuple[bool, ...],
+        start: int,
+        end: int,
+    ) -> Iterator[ScoreScenario]:
         cell_count = len(self._layout)
         for scenario_index in range(start, end):
             offset = scenario_index * cell_count

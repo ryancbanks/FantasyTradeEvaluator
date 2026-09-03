@@ -28,6 +28,7 @@ from typing import TypeAlias, cast
 
 
 PROTOCOL_VERSION = 1
+MINIMUM_EXTENSION_VERSION = "0.2.0"
 SESSION_TOKEN_HEADER = "X-FTE-Extension-Token"
 PAIR_REQUEST_MAX_BYTES = 4 * 1024
 POLL_WAIT_MAX_SECONDS = 20.0
@@ -576,6 +577,26 @@ def is_valid_loopback_host(host: str, expected_port: int) -> bool:
     )
 
 
+def extension_version_is_supported(value: object) -> bool:
+    """Return whether a Chrome-style version contains current capture evidence."""
+
+    if not isinstance(value, str):
+        return False
+    parts = value.split(".")
+    if not 1 <= len(parts) <= 4 or any(
+        not part.isascii()
+        or not part.isdigit()
+        or (len(part) > 1 and part.startswith("0"))
+        or int(part) > 65_535
+        for part in parts
+    ):
+        return False
+    version = tuple(int(part) for part in parts) + (0,) * (4 - len(parts))
+    minimum_parts = tuple(int(part) for part in MINIMUM_EXTENSION_VERSION.split("."))
+    minimum = minimum_parts + (0,) * (4 - len(minimum_parts))
+    return version >= minimum
+
+
 def _require_protocol(
     protocol_version: object,
     capabilities: object,
@@ -726,6 +747,7 @@ def _accepted_completion(command_id: str) -> dict[str, JsonValue]:
 __all__ = [
     "COMMAND_PAYLOAD_MAX_BYTES",
     "COMMAND_RESULT_MAX_BYTES",
+    "MINIMUM_EXTENSION_VERSION",
     "PAIR_REQUEST_MAX_BYTES",
     "POLL_WAIT_MAX_SECONDS",
     "PROTOCOL_VERSION",
@@ -745,5 +767,6 @@ __all__ = [
     "BridgeTimeoutError",
     "ExtensionBridgeError",
     "ExtensionCommandBridge",
+    "extension_version_is_supported",
     "is_valid_loopback_host",
 ]

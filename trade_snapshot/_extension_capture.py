@@ -10,6 +10,7 @@ from ._capture_errors import (
     BrowserCaptureDependencyError,
     BrowserCaptureError,
     BrowserCaptureTimeout,
+    BrowserExtensionUpgradeRequired,
     YahooScoringError,
 )
 from ._capture_task_policy import (
@@ -42,6 +43,8 @@ from .extension_bridge import (
     BridgeStateError,
     BridgeTimeoutError,
     ExtensionCommandBridge,
+    MINIMUM_EXTENSION_VERSION,
+    extension_version_is_supported,
 )
 
 
@@ -61,6 +64,21 @@ class ExtensionCaptureBackend:
     ) -> "_ExtensionSession":
         if not isinstance(options, BrowserCaptureOptions):
             raise ValueError("options must be BrowserCaptureOptions")
+        status_reader = getattr(self._bridge, "public_status", None)
+        if callable(status_reader):
+            status = status_reader()
+            if (
+                isinstance(status, Mapping)
+                and status.get("state") == "paired"
+                and not extension_version_is_supported(
+                    status.get("extension_version")
+                )
+            ):
+                raise BrowserExtensionUpgradeRequired(
+                    "Update the Fantasy Trade Evaluator browser extension to "
+                    f"version {MINIMUM_EXTENSION_VERSION} or newer, reload it in "
+                    "Chrome or Edge, then reconnect before collecting this week."
+                )
         result = _execute(
             self._bridge,
             "session.open",

@@ -9,6 +9,10 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 _READ_ROOT = "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl"
+_TRANSACTION_FILTER = json.dumps(
+    {"transactions": {"limit": 1000}},
+    separators=(",", ":"),
+)
 
 
 class EspnFreeReadError(RuntimeError):
@@ -48,7 +52,11 @@ class EspnFreeReadClient:
     ) -> tuple[Mapping[str, object], Mapping[str, object]]:
         league_url, pro_team_url = self.urls(season, league_id)
         _check_cancelled(cancelled)
-        league = self._read(league_url, cancelled)
+        league = self._read(
+            league_url,
+            cancelled,
+            extra_headers={"X-Fantasy-Filter": _TRANSACTION_FILTER},
+        )
         _check_cancelled(cancelled)
         pro_teams = self._read(pro_team_url, cancelled)
         _check_cancelled(cancelled)
@@ -86,7 +94,14 @@ class EspnFreeReadClient:
 
     @staticmethod
     def _league_url(season: int, league_id: str) -> str:
-        views = ("mTeam", "mRoster", "mSettings", "mMatchup", "mStandings")
+        views = (
+            "mTeam",
+            "mRoster",
+            "mSettings",
+            "mMatchup",
+            "mStandings",
+            "mTransactions2",
+        )
         query = urlencode(tuple(("view", view) for view in views))
         return f"{_READ_ROOT}/seasons/{season}/segments/0/leagues/{league_id}?{query}"
 
@@ -94,13 +109,22 @@ class EspnFreeReadClient:
     def _pro_team_url(season: int) -> str:
         return f"{_READ_ROOT}/seasons/{season}?view=proTeamSchedules_wl"
 
-    def _read(self, expected_url: str, cancelled) -> Mapping[str, object]:
+    def _read(
+        self,
+        expected_url: str,
+        cancelled,
+        *,
+        extra_headers: Mapping[str, str] | None = None,
+    ) -> Mapping[str, object]:
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "fantasy-trade-evaluator/0.1",
+        }
+        if extra_headers is not None:
+            headers.update(extra_headers)
         request = Request(
             expected_url,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "fantasy-trade-evaluator/0.1",
-            },
+            headers=headers,
             method="GET",
         )
         try:

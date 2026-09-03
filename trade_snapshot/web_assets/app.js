@@ -19,6 +19,7 @@ let activeSearchFormat = "two_team";
 let activeSearchTeamIds = [];
 let activeInsight = null;
 let dashboardBundleId = null;
+let gmInsightsBundleId = null;
 let playerLabBundleId = null;
 let exportBusy = false;
 let draftWorkBusy = false;
@@ -26,6 +27,7 @@ let publishedTradeBusy = null;
 let recoveredSearchScopeOnly = false;
 const heartbeatInterval = 20000;
 const extensionProtocolVersion = 1;
+const minimumHistoryExtensionVersion = [0, 2, 0, 0];
 
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
@@ -136,22 +138,52 @@ function populatePackageFilters() {
   });
 }
 
+function extensionVersionAtLeast(value, minimum) {
+  if (typeof value !== "string") return false;
+  const rawParts = value.split(".");
+  if (rawParts.length < 1 || rawParts.length > 4) return false;
+  if (rawParts.some(part =>
+    !/^\d+$/.test(part) ||
+    (part.length > 1 && part.startsWith("0")) ||
+    Number(part) > 65535
+  )) return false;
+  const parts = rawParts.map(Number);
+  while (parts.length < minimum.length) parts.push(0);
+  for (let index = 0; index < minimum.length; index += 1) {
+    if (parts[index] !== minimum[index]) return parts[index] > minimum[index];
+  }
+  return true;
+}
+
 function renderExtensionStatus(status) {
-  extensionConnected = status && status.state === "paired";
+  const paired = Boolean(status && status.state === "paired");
+  const updateRequired = paired && !extensionVersionAtLeast(
+    status.extension_version,
+    minimumHistoryExtensionVersion
+  );
+  extensionConnected = paired && !updateRequired;
   const pairing = extensionPairing;
+  let statusText = "Browser extension not connected";
+  let helpText = "Install the downloaded extension once, then click Connect extension before collecting weekly data.";
+  let buttonText = "Connect extension";
+  if (updateRequired) {
+    statusText = `Browser extension update required${status.extension_version ? ` · ${status.extension_version}` : ""}`;
+    helpText = "Install the newly downloaded extension, click Reload for it on the browser’s Extensions page, refresh this app, then reconnect. Version 0.2.0 or newer is required to collect verified league history.";
+    buttonText = "Reconnect updated extension";
+  } else if (extensionConnected) {
+    statusText = `Browser extension connected${status.extension_version ? ` · ${status.extension_version}` : ""}`;
+    helpText = "Ready to scan through one temporary tab in this signed-in browser. Cookies never leave the browser.";
+    buttonText = "Connected";
+  } else if (pairing) {
+    statusText = "Approve pairing in the extension…";
+    helpText = "Open Chrome’s Extensions menu, choose Fantasy Trade Evaluator Browser Bridge, and click Pair with app.";
+    buttonText = "Waiting for approval";
+  }
   $("extensionDot").classList.toggle("connected", extensionConnected);
-  $("extensionStatus").textContent = extensionConnected
-    ? `Browser extension connected${status.extension_version ? ` · ${status.extension_version}` : ""}`
-    : pairing
-      ? "Approve pairing in the extension…"
-      : "Browser extension not connected";
-  $("extensionHelp").textContent = extensionConnected
-    ? "Ready to scan through one temporary tab in this signed-in browser. Cookies never leave the browser."
-    : pairing
-      ? "Open Chrome’s Extensions menu, choose Fantasy Trade Evaluator Browser Bridge, and click Pair with app."
-    : "Install the downloaded extension once, then click Connect extension before collecting weekly data.";
+  $("extensionStatus").textContent = statusText;
+  $("extensionHelp").textContent = helpText;
   $("connectExtensionButton").disabled = extensionConnected || pairing;
-  $("connectExtensionButton").textContent = extensionConnected ? "Connected" : pairing ? "Waiting for approval" : "Connect extension";
+  $("connectExtensionButton").textContent = buttonText;
   const pairCode = $("extensionPairCode");
   const showPairCode = pairing && typeof extensionPairHint === "string";
   pairCode.textContent = showPairCode
@@ -305,11 +337,17 @@ function changeBundle() {
   threeTeamEstimateSignature = null;
   renderBundle();
   dashboardBundleId = null;
+  gmInsightsBundleId = null;
   playerLabBundleId = null;
   DashboardUi.reset(
     currentBundle()
       ? "Calculate this week's league outlook when you are ready."
       : undefined
+  );
+  GmInsightsUi.reset(
+    currentBundle()
+      ? "Open GM Insights when you want current roster fit and verified league history."
+      : "Select a ready week, then open GM Insights when you want current roster fit and verified league history."
   );
   PlayerLabUi.reset(
     currentBundle()
@@ -326,9 +364,12 @@ function updateActivityControls() {
   $("bundleFile").disabled = busy;
   $("bundleSelect").disabled = bundles.length === 0 || busy;
   $("dashboardLoadButton").disabled = !bundle || busy;
+  $("gmInsightsLoadButton").disabled = !bundle || busy;
   $("playerLabLoadButton").disabled = !bundle || busy;
   $("dashboardLoadButton").textContent =
     bundle && dashboardBundleId === bundle.bundle_id ? "Refresh league outlook" : "Calculate league outlook";
+  $("gmInsightsLoadButton").textContent =
+    bundle && gmInsightsBundleId === bundle.bundle_id ? "Refresh GM Insights" : "Open GM Insights";
   $("playerLabLoadButton").textContent =
     bundle && playerLabBundleId === bundle.bundle_id ? "Refresh Player Lab" : "Open Player Lab";
   $("collectButton").disabled =
@@ -442,6 +483,14 @@ async function loadInsight(kind) {
     if (kind === "dashboard") {
       await DashboardUi.setBundle(bundle, {request: api, onError});
       if (!failed) dashboardBundleId = bundle.bundle_id;
+    } else if (kind === "gm") {
+      await GmInsightsUi.setBundle(bundle, {
+        request: api,
+        onError,
+        primaryTeamId: $("primaryTeam").value || null,
+        onUseTradePartner: chooseTradePartnerFromInsights
+      });
+      if (!failed) gmInsightsBundleId = bundle.bundle_id;
     } else {
       await PlayerLabUi.setBundle(bundle, {request: api, onError});
       if (!failed) playerLabBundleId = bundle.bundle_id;
@@ -452,12 +501,26 @@ async function loadInsight(kind) {
   }
 }
 
+function chooseTradePartnerFromInsights(teamId) {
+  const target = [...$("counterparties").options].find(option => option.value === teamId);
+  if (!target || target.disabled) return;
+  $("twoTeamFormat").checked = true;
+  changeTradeFormat();
+  for (const option of $("counterparties").options) option.selected = option === target;
+  populatePackageFilters();
+  invalidateSearchEstimate();
+  $("counterparties").focus({preventScroll: true});
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  $("searchForm").scrollIntoView({behavior: reducedMotion ? "auto" : "smooth", block: "start"});
+}
+
 function syncCounterparties() {
   const own = $("primaryTeam").value;
   for (const option of $("counterparties").options) {
     option.disabled = option.value === own;
     if (option.disabled) option.selected = false;
   }
+  GmInsightsUi.setPrimaryTeam(own || null);
   ThreeWayUi.syncPartnerOptions(currentBundle(), own);
   populatePackageFilters();
 }
@@ -945,6 +1008,7 @@ $("collectionForm").addEventListener("submit", startCollection);
 $("cancelCollectionButton").addEventListener("click", cancelCollection);
 $("confirmSignInButton").addEventListener("click", confirmCollectionSignIn);
 $("dashboardLoadButton").addEventListener("click", () => void loadInsight("dashboard"));
+$("gmInsightsLoadButton").addEventListener("click", () => void loadInsight("gm"));
 $("playerLabLoadButton").addEventListener("click", () => void loadInsight("player"));
 $("estimateButton").addEventListener("click", estimate);
 $("searchForm").addEventListener("input", searchConfigurationChanged);

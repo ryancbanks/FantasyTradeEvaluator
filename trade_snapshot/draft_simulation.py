@@ -1,7 +1,7 @@
 """Deterministic, roster-aware snake drafts driven by anonymous draft brains."""
 
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from hashlib import sha256
 import json
@@ -87,6 +87,7 @@ class RankedDraftCandidate:
 @dataclass(slots=True)
 class _SimulationCache:
     feasibility: FeasibilityCache
+    players_by_id: dict[str, PreseasonPlayer] | None = None
     projection_hints: dict[str, float] = field(default_factory=dict)
 
 
@@ -106,9 +107,12 @@ def simulate_snake_draft(
     if type(candidate_window) is not int or not 0 <= candidate_window <= 4096:
         raise ValueError("candidate_window must be an integer from zero through 4096")
     assigned = _strategy_assignment(config, strategies, seed)
-    cache = _SimulationCache(FeasibilityCache(config.config_id))
+    players_by_id = _player_index(season.players)
+    cache = _SimulationCache(
+        FeasibilityCache(config.config_id), players_by_id=players_by_id
+    )
     rosters: list[list[str]] = [[] for _ in range(config.team_count)]
-    available = {player.player_id: player for player in season.players}
+    available = dict(players_by_id)
     required = config.team_count * config.roster_size
     if len(available) < required:
         raise ValueError(f"season needs at least {required} draftable players")
@@ -129,13 +133,13 @@ def simulate_snake_draft(
                 brains[seat],
                 assigned[seat],
                 roster_player_ids=rosters[seat],
-                available_players=tuple(available.values()),
+                available_players=available.values(),
                 round_number=round_number,
                 overall_pick=overall_pick,
                 drafter_number=seat + 1,
                 seed=seed,
                 candidate_window=candidate_window,
-                all_roster_player_ids=tuple(tuple(row) for row in rosters),
+                all_roster_player_ids=rosters,
                 all_strategies=assigned,
                 _simulation_cache=cache,
             )
@@ -174,7 +178,7 @@ def rank_draft_candidates(
     strategy: DraftStrategy,
     *,
     roster_player_ids: Sequence[str],
-    available_players: Sequence[PreseasonPlayer],
+    available_players: Iterable[PreseasonPlayer],
     round_number: int,
     overall_pick: int,
     drafter_number: int,
@@ -190,14 +194,16 @@ def rank_draft_candidates(
         raise ValueError("draft brain is not compatible with this league configuration")
     if not isinstance(strategy, DraftStrategy):
         raise ValueError("strategy must be a DraftStrategy")
-    players = {player.player_id: player for player in season.players}
+    cache = _simulation_cache or _SimulationCache(FeasibilityCache(config.config_id))
+    players = cache.players_by_id
+    if players is None:
+        players = _player_index(season.players)
     if any(player_id not in players for player_id in roster_player_ids):
         raise ValueError("roster contains a player outside the selected season")
     available = tuple(available_players)
     if len({player.player_id for player in available}) != len(available):
         raise ValueError("available players contain duplicates")
     roster = tuple(players[player_id] for player_id in roster_player_ids)
-    cache = _simulation_cache or _SimulationCache(FeasibilityCache(config.config_id))
     if cache.feasibility.config_id != config.config_id:
         raise ValueError("simulation cache does not match the league configuration")
     roster_counts = Counter(player.position for player in roster)
@@ -343,6 +349,10 @@ def _validate_inputs(season, config, brains, seed) -> None:
         raise ValueError("brains must contain exactly one DraftBrain per team")
     if any(row.league_config_fingerprint != config.config_id for row in brains):
         raise ValueError("every brain must match the league configuration")
+
+
+def _player_index(players: Iterable[PreseasonPlayer]) -> dict[str, PreseasonPlayer]:
+    return {player.player_id: player for player in players}
 
 
 def _strategy_assignment(config, strategies, seed) -> tuple[DraftStrategy, ...]:

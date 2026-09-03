@@ -18,6 +18,7 @@ from trade_snapshot.analyzer_contract import CURRENT_BUNDLE_FINGERPRINT
 from trade_snapshot.browser_capture import (
     BrowserCaptureOptions,
     BrowserCaptureDependencyError,
+    BrowserExtensionUpgradeRequired,
 )
 from trade_snapshot.capture_schema import AnalyzerCapturePhase
 from trade_snapshot.extension_bridge import BridgeStateError, V1_CAPABILITIES
@@ -159,6 +160,28 @@ class ExtensionCaptureTests(unittest.TestCase):
             ExtensionCaptureBackend(Unpaired()).open(
                 BrowserCaptureOptions(Path("unused-profile")), 5000, lambda: False
             )
+
+    def test_outdated_paired_extension_is_rejected_before_browser_work(self):
+        class Outdated:
+            def __init__(self):
+                self.calls = []
+
+            def public_status(self):
+                return {"state": "paired", "extension_version": "0.1.0"}
+
+            def execute(self, *args):
+                self.calls.append(args)
+                raise AssertionError("outdated extension must not receive commands")
+
+        bridge = Outdated()
+        with self.assertRaisesRegex(
+            BrowserExtensionUpgradeRequired,
+            r"version 0\.2\.0 or newer.*reload.*reconnect",
+        ):
+            ExtensionCaptureBackend(bridge).open(
+                BrowserCaptureOptions(Path("unused-profile")), 5000, lambda: False
+            )
+        self.assertEqual(bridge.calls, [])
 
     def test_python_bridge_and_packaged_extension_share_the_exact_operation_contract(self):
         source = (EXTENSION_ROOT / "protocol.js").read_text(encoding="utf-8")

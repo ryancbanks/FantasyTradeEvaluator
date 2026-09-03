@@ -1,18 +1,30 @@
+import time
+import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
-import time
 from types import SimpleNamespace
-import unittest
 from unittest.mock import patch
 
 import trade_snapshot.workbook_model as workbook_model_module
 from tests.test_engine_bundle import engine_bundle
-from tests.test_three_way_search import components as three_way_components
 from tests.test_surrogate_disclosure import surrogate_bundle
+from tests.test_three_way_search import components as three_way_components
 from trade_snapshot.app_service import LocalAppService, LocalSearchRequest, _SearchJob
+from trade_snapshot.league_history import (
+    HistoryBundleBinding,
+    HistoryRosterPlayer,
+    HistoryTeam,
+    HistoryTeamRoster,
+    LeagueHistoryCapture,
+    LeagueHistoryStore,
+    LeagueHistoryStoreError,
+    make_league_key,
+)
 from trade_snapshot.three_way_search import ThreeWaySearchOutcome
+from trade_snapshot.weekly_collection import LEAGUE_HISTORY_FILENAME
 
 
 def payload(bundle_id):
@@ -138,6 +150,195 @@ class LocalAppServiceTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "league dashboard"):
                 service._require_draft_capacity()
+
+        self.assertFalse(pending.done())
+
+    def test_gm_insights_supports_old_bundles_and_refreshes_for_new_history(self):
+        bundle = engine_bundle()
+        captured_at = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        league_key = make_league_key("espn", "test-private-league")
+        names = {team.team_id: team.name for team in bundle.state.teams}
+        capture = LeagueHistoryCapture(
+            league_key=league_key,
+            season=bundle.state.season,
+            captured_at=captured_at,
+            coverage_start=captured_at,
+            coverage_end=captured_at,
+            transaction_history_complete=True,
+            roster_complete=True,
+            lineup_complete=True,
+            teams=tuple(HistoryTeam(team_id, names[team_id]) for team_id in names),
+            transactions=(),
+            rosters=tuple(
+                HistoryTeamRoster(
+                    roster.team_id,
+                    tuple(
+                        HistoryRosterPlayer(player_id, "BENCH")
+                        for player_id in roster.player_ids
+                    ),
+                )
+                for roster in bundle.rosters
+            ),
+        )
+        binding = HistoryBundleBinding(
+            league_key,
+            bundle.state.season,
+            bundle.bundle_id,
+            captured_at,
+        )
+
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            old_bundle_result = service.gm_insights(bundle.bundle_id)
+            LeagueHistoryStore(
+                Path(directory) / LEAGUE_HISTORY_FILENAME
+            ).ingest(capture, bundle=binding)
+            captured_result = service.gm_insights(bundle.bundle_id)
+
+        self.assertEqual(old_bundle_result["status"], "not_collected")
+        self.assertEqual(captured_result["status"], "insufficient_sample")
+        self.assertIsNotNone(captured_result["league_history_id"])
+        self.assertEqual(len(captured_result["teams"]), len(bundle.state.teams))
+
+    def test_corrupt_optional_history_does_not_prevent_launch_or_other_features(self):
+        bundle = engine_bundle()
+        with TemporaryDirectory() as directory:
+            history_path = Path(directory) / LEAGUE_HISTORY_FILENAME
+            history_path.write_bytes(b"not a SQLite database")
+
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            self.assertTrue(service.bundle_readiness()["ready"])
+            with self.assertRaises(LeagueHistoryStoreError):
+                service.gm_insights(bundle.bundle_id)
+            self.assertFalse(service.is_busy)
+            self.assertEqual(
+                service.player_outlook(bundle.bundle_id)["bundle_id"],
+                bundle.bundle_id,
+            )
+
+    def test_concurrent_gm_insights_requests_share_one_calculation(self):
+        bundle = engine_bundle()
+        calculation_started = Event()
+        release_calculation = Event()
+
+        def delayed_build(*args, **kwargs):
+            calculation_started.set()
+            self.assertTrue(release_calculation.wait(5))
+            return {"bundle_id": args[0].bundle_id, "status": "test"}
+
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            with patch(
+                "trade_snapshot.app_service.build_gm_insights",
+                side_effect=delayed_build,
+            ) as mocked_build, ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(service.gm_insights, bundle.bundle_id)
+                self.assertTrue(calculation_started.wait(5))
+                second = pool.submit(service.gm_insights, bundle.bundle_id)
+                time.sleep(0.02)
+                self.assertFalse(second.done())
+                self.assertTrue(service.is_busy)
+                release_calculation.set()
+                first_result = first.result(timeout=5)
+                second_result = second.result(timeout=5)
+
+        self.assertIs(first_result, second_result)
+        mocked_build.assert_called_once()
+
+    def test_gm_insights_uses_bounded_bundle_loader_for_historical_models(self):
+        bundle = engine_bundle()
+        historical_id = f"engine_{'0' * 64}"
+
+        def build(_bundle, _history, *, bundle_loader):
+            self.assertIs(bundle_loader(historical_id), bundle)
+            return {"bundle_id": _bundle.bundle_id, "status": "test"}
+
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            with patch.object(service, "_bundle_path"), patch.object(
+                service, "_load_bundle", return_value=bundle
+            ) as load_bundle, patch.object(
+                service,
+                "_league_history_store",
+                return_value=SimpleNamespace(snapshot_for_bundle=lambda _bundle_id: None),
+            ), patch(
+                "trade_snapshot.app_service.build_gm_insights",
+                side_effect=build,
+            ):
+                result = service.gm_insights(bundle.bundle_id)
+
+        self.assertEqual(result["status"], "test")
+        self.assertEqual(
+            [call.args[0] for call in load_bundle.call_args_list],
+            [bundle.bundle_id, historical_id],
+        )
+
+    def test_gm_insights_cache_is_bounded_and_least_recently_used(self):
+        bundle = engine_bundle()
+        bundle_ids = tuple(f"engine_{digit * 64}" for digit in "012")
+        build_count = 0
+
+        def build(*_args, **_kwargs):
+            nonlocal build_count
+            build_count += 1
+            return {"calculation": build_count}
+
+        history = SimpleNamespace(snapshot_for_bundle=lambda _bundle_id: None)
+        with TemporaryDirectory() as directory, patch(
+            "trade_snapshot.app_service._MAX_GM_INSIGHTS_CACHE_SIZE", 2
+        ):
+            service = LocalAppService(directory)
+            with patch.object(service, "_bundle_path"), patch.object(
+                service, "_load_bundle", return_value=bundle
+            ), patch.object(
+                service, "_league_history_store", return_value=history
+            ), patch(
+                "trade_snapshot.app_service.build_gm_insights", side_effect=build
+            ):
+                first = service.gm_insights(bundle_ids[0])
+                service.gm_insights(bundle_ids[1])
+                self.assertIs(service.gm_insights(bundle_ids[0]), first)
+                service.gm_insights(bundle_ids[2])
+                self.assertIs(service.gm_insights(bundle_ids[0]), first)
+                service.gm_insights(bundle_ids[1])
+
+        self.assertEqual(build_count, 4)
+
+    def test_gm_insights_activity_blocks_every_other_heavy_feature(self):
+        bundle = engine_bundle()
+        request = LocalSearchRequest.from_payload(payload(bundle.bundle_id))
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            pending = Future()
+            service._gm_insights_futures[bundle.bundle_id] = pending
+            completed = _SearchJob(
+                "a" * 32,
+                request,
+                status="complete",
+                outcome=SimpleNamespace(),
+                context=SimpleNamespace(),
+            )
+            service._jobs[completed.job_id] = completed
+
+            self.assertTrue(service.is_busy)
+            with self.assertRaisesRegex(RuntimeError, "General Manager Insights"):
+                service._require_draft_capacity()
+            with self.assertRaisesRegex(RuntimeError, "General Manager Insights"):
+                service.league_dashboard(bundle.bundle_id)
+            with self.assertRaisesRegex(RuntimeError, "General Manager Insights"):
+                service.player_outlook(bundle.bundle_id)
+            with self.assertRaisesRegex(RuntimeError, "General Manager Insights"):
+                service.start_weekly_collection(
+                    SimpleNamespace()
+                )
+            with self.assertRaisesRegex(RuntimeError, "General Manager Insights"):
+                service.start_search(request)
+            with self.assertRaisesRegex(RuntimeError, "General Manager Insights"):
+                service.export_job(completed.job_id)
 
         self.assertFalse(pending.done())
 

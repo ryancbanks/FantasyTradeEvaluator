@@ -1,4 +1,5 @@
 from collections import Counter
+from collections.abc import ValuesView
 from dataclasses import replace
 from unittest.mock import patch
 import unittest
@@ -8,6 +9,7 @@ from tests.draft_fixtures import (
     small_draft_config,
     small_historical_corpus,
 )
+import trade_snapshot.draft_simulation as draft_simulation
 from trade_snapshot.draft_brain import (
     FeatureSchema,
     RegressionBaseline,
@@ -219,6 +221,38 @@ class DraftCompletionScalingTests(unittest.TestCase):
 
         self.assertEqual(len(ranked), len(running))
         self.assertEqual(feature_builder.call_count, 1)
+
+    def test_full_draft_reuses_player_index_and_avoids_duplicate_input_snapshots(self):
+        corpus = small_historical_corpus()
+        config = small_draft_config()
+        brain = build_baseline_brain(corpus, config, (2025,))
+        original_rank = rank_draft_candidates
+        available_inputs = []
+        roster_inputs = []
+
+        def capture_inputs(*args, **kwargs):
+            available_inputs.append(kwargs["available_players"])
+            roster_inputs.append(kwargs["all_roster_player_ids"])
+            return original_rank(*args, **kwargs)
+
+        with (
+            patch(
+                "trade_snapshot.draft_simulation._player_index",
+                wraps=draft_simulation._player_index,
+            ) as player_index,
+            patch(
+                "trade_snapshot.draft_simulation.rank_draft_candidates",
+                side_effect=capture_inputs,
+            ),
+        ):
+            result = simulate_snake_draft(
+                corpus.seasons[0], config, (brain,) * config.team_count
+            )
+
+        self.assertEqual(player_index.call_count, 1)
+        self.assertEqual(len(available_inputs), len(result.picks))
+        self.assertTrue(all(isinstance(value, ValuesView) for value in available_inputs))
+        self.assertTrue(all(value is roster_inputs[0] for value in roster_inputs))
 
     def test_global_completion_replaces_only_the_redundant_local_proof(self):
         corpus = small_historical_corpus()

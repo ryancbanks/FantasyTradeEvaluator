@@ -7,7 +7,7 @@ from typing import Protocol
 from ._analyzer_types import BundleFingerprint
 from ._capture_errors import (
     BrowserCaptureCancelled, BrowserCaptureDependencyError, BrowserCaptureError,
-    BrowserCaptureTimeout, YahooScoringError,
+    BrowserCaptureTimeout, BrowserExtensionUpgradeRequired, YahooScoringError,
 )
 from ._capture_runtime import (
     ActionPacer, BrowserCaptureOptions, ECRCaptureData, LeagueCaptureData,
@@ -39,6 +39,7 @@ from .capture_schema import (
 __all__ = (
     "BrowserCaptureCancelled", "BrowserCaptureDependencyError",
     "BrowserCaptureError", "BrowserCaptureOptions", "BrowserCaptureTimeout",
+    "BrowserExtensionUpgradeRequired",
     "BrowserCollectionSession", "BrowserCollector", "CaptureBackend", "CaptureSession", "ECRCaptureData",
     "LeagueCaptureData", "ProjectionCaptureData", "SignInGate", "YahooScoringError",
 )
