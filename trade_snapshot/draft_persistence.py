@@ -335,6 +335,7 @@ def _validated_checkpoint_summary(path: Path, record: Mapping[str, object]):
     match = _CHECKPOINT_SUMMARY_NAME.fullmatch(path.name)
     if match is None or path.name.split(".", 1)[0] != record["checkpoint_job_id"]:
         raise ValueError("draft checkpoint summary filename is invalid")
+    _require_summary_asset(path)
     if not isinstance(record["training_years"], list):
         raise ValueError("draft checkpoint training years must be an array")
     return dict(record)
@@ -348,10 +349,19 @@ def _asset_summary(path, record, kind, id_field, pattern):
         raise ValueError("draft asset summary identifier is invalid")
     if not path.name.startswith(f"{identifier}."):
         raise ValueError("draft asset summary filename does not match its identifier")
+    _require_summary_asset(path)
     return {
         key: value for key, value in record.items()
         if key not in {"kind", "schema_version"}
     }
+
+
+def _require_summary_asset(summary_path: Path) -> None:
+    asset_path = summary_path.with_name(
+        summary_path.name.replace("-summary.json", ".json")
+    )
+    if asset_path == summary_path or not asset_path.is_file():
+        raise ValueError("draft summary has no matching saved asset")
 
 
 def _read_json(path: Path, maximum: int) -> Mapping[str, object]:

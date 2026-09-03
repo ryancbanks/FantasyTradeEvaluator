@@ -19,6 +19,7 @@ from trade_snapshot.draft_config import (
     default_slot_eligibility,
 )
 from trade_snapshot.draft_features import build_baseline_brain, candidate_feature_values
+from trade_snapshot.draft_feasibility import filled_count
 from trade_snapshot.draft_matching import maximum_group_slot_fill
 from trade_snapshot.draft_simulation import rank_draft_candidates, simulate_snake_draft
 
@@ -218,6 +219,87 @@ class DraftCompletionScalingTests(unittest.TestCase):
 
         self.assertEqual(len(ranked), len(running))
         self.assertEqual(feature_builder.call_count, 1)
+
+    def test_global_completion_replaces_only_the_redundant_local_proof(self):
+        corpus = small_historical_corpus()
+        config = _config(("RB", "WR"), bench=1)
+        brain = build_baseline_brain(corpus, config, (2025,))
+        running_backs = tuple(
+            player for player in corpus.seasons[0].players
+            if player.position == "RB"
+        )
+        receivers = tuple(
+            player for player in corpus.seasons[0].players
+            if player.position == "WR"
+        )
+        roster = (running_backs[0].player_id, running_backs[1].player_id)
+        other_roster = (running_backs[2].player_id, receivers[0].player_id)
+        drafted = {*roster, *other_roster}
+        available = tuple(
+            player for player in corpus.seasons[0].players
+            if player.player_id not in drafted
+        )
+        arguments = {
+            "roster_player_ids": roster,
+            "available_players": available,
+            "round_number": 3,
+            "overall_pick": 5,
+            "drafter_number": 1,
+        }
+
+        with patch(
+            "trade_snapshot.draft_simulation.filled_count",
+            wraps=filled_count,
+        ) as local_filled_count:
+            standalone = rank_draft_candidates(
+                corpus.seasons[0], config, brain, DraftStrategy.NONE, **arguments
+            )
+        self.assertGreater(local_filled_count.call_count, 0)
+        self.assertTrue(standalone)
+        self.assertEqual(
+            {"WR"},
+            {
+                next(
+                    player.position for player in corpus.seasons[0].players
+                    if player.player_id == row.player_id
+                )
+                for row in standalone
+            },
+        )
+
+        with (
+            patch(
+                "trade_snapshot.draft_simulation.filled_count",
+                wraps=filled_count,
+            ) as local_filled_count,
+            patch("trade_snapshot.draft_simulation._can_complete") as local_completion,
+        ):
+            globally_proved = rank_draft_candidates(
+                corpus.seasons[0], config, brain, DraftStrategy.NONE,
+                all_roster_player_ids=(roster, other_roster),
+                all_strategies=(DraftStrategy.NONE, DraftStrategy.NONE),
+                **arguments,
+            )
+
+        self.assertEqual(globally_proved, standalone)
+        self.assertGreater(local_filled_count.call_count, 0)
+        self.assertEqual(local_completion.call_count, 0)
+
+        with patch(
+            "trade_snapshot.draft_simulation.filled_count",
+            wraps=filled_count,
+        ) as local_filled_count:
+            rank_draft_candidates(
+                corpus.seasons[0], config, brain, DraftStrategy.NONE,
+                roster_player_ids=(),
+                available_players=corpus.seasons[0].players,
+                round_number=1,
+                overall_pick=1,
+                drafter_number=1,
+                all_roster_player_ids=((), ()),
+                all_strategies=(DraftStrategy.NONE, DraftStrategy.NONE),
+            )
+        self.assertEqual(local_filled_count.call_count, 0)
 
     def test_namespaced_projection_shortlist_uses_an_ensemble_then_provider_mean(self):
         first = replace(

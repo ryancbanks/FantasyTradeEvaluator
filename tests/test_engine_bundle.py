@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from tests.test_search_runner import PLAYER_POINTS, components
 from trade_snapshot.analyzer_contract import BundleFingerprint
@@ -302,6 +303,14 @@ class EngineBundleTests(unittest.TestCase):
         self.assertEqual(resolved, path.resolve())
         self.assertEqual(loaded, bundle)
         self.assertEqual(leftovers, ())
+
+    def test_rejects_oversized_bundle_before_reading_it(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory, "oversized.json")
+            path.write_text("{}", encoding="utf-8")
+            with patch("trade_snapshot.engine_bundle._MAX_ENGINE_BUNDLE_BYTES", 1):
+                with self.assertRaisesRegex(ValueError, "size limit"):
+                    load_engine_bundle(path)
 
     def test_round_trip_preserves_capacity_exempt_ownership_and_identity(self):
         baseline = engine_bundle()

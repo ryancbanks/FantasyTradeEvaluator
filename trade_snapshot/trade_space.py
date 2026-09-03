@@ -1,5 +1,6 @@
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from itertools import islice
 from typing import Iterator
 
 from .trade_filters import (
@@ -222,10 +223,15 @@ class TradeSpace:
             counterparty.capacity_exempt_player_ids,
         )
         counted_pairs = tuple(
-            (pair, self._count_candidates(*pair)) for pair in self._iter_size_pairs()
+            (*pair, *self._package_counts(*pair)) for pair in self._iter_size_pairs()
         )
-        self._size_pairs = tuple(pair for pair, count in counted_pairs if count)
-        self._candidate_count = sum(count for _, count in counted_pairs)
+        self._size_pairs = tuple(
+            row for row in counted_pairs if row[2] and row[3]
+        )
+        self._candidate_count = sum(
+            outgoing_count * incoming_count
+            for _, _, outgoing_count, incoming_count in self._size_pairs
+        )
 
     @property
     def candidate_count(self) -> int:
@@ -234,19 +240,54 @@ class TradeSpace:
         return self._candidate_count
 
     def __iter__(self) -> Iterator[TradeCandidate]:
-        for outgoing_size, incoming_size in self._size_pairs:
+        return self.iter_from(0)
+
+    def iter_from(self, start_candidate_index: int) -> Iterator[TradeCandidate]:
+        """Iterate from one exact candidate index without replaying prior pairs."""
+
+        if (
+            isinstance(start_candidate_index, bool)
+            or not isinstance(start_candidate_index, int)
+            or not 0 <= start_candidate_index <= self._candidate_count
+        ):
+            raise ValueError(
+                "start_candidate_index must be between zero and candidate_count"
+            )
+        return self._iterate_from(start_candidate_index)
+
+    def _iterate_from(self, start_candidate_index: int) -> Iterator[TradeCandidate]:
+        remaining = start_candidate_index
+        for (
+            outgoing_size,
+            incoming_size,
+            outgoing_count,
+            incoming_count,
+        ) in self._size_pairs:
+            pair_count = outgoing_count * incoming_count
+            if remaining >= pair_count:
+                remaining -= pair_count
+                continue
             primary_minimum = self._minimum_active_outgoing(
                 self.primary, incoming_size
             )
             counterparty_minimum = self._minimum_active_outgoing(
                 self.counterparty, outgoing_size
             )
-            for outgoing in self._outgoing_pool.iter_packages(
+            outgoing_skip, incoming_skip = divmod(remaining, incoming_count)
+            remaining = 0
+            outgoing_packages = self._outgoing_pool.iter_packages(
                 outgoing_size, minimum_active=primary_minimum
-            ):
-                for incoming in self._incoming_pool.iter_packages(
+            )
+            for outgoing in islice(outgoing_packages, outgoing_skip, None):
+                incoming_packages = self._incoming_pool.iter_packages(
                     incoming_size, minimum_active=counterparty_minimum
-                ):
+                )
+                if incoming_skip:
+                    incoming_packages = islice(
+                        incoming_packages, incoming_skip, None
+                    )
+                    incoming_skip = 0
+                for incoming in incoming_packages:
                     yield TradeCandidate(outgoing, incoming)
 
     def _iter_size_pairs(self) -> Iterator[tuple[int, int]]:
@@ -272,18 +313,22 @@ class TradeSpace:
                     continue
                 yield pair
 
-    def _count_candidates(self, outgoing_size: int, incoming_size: int) -> int:
-        return self._outgoing_pool.count(
+    def _package_counts(
+        self, outgoing_size: int, incoming_size: int
+    ) -> tuple[int, int]:
+        outgoing_count = self._outgoing_pool.count(
             outgoing_size,
             minimum_active=self._minimum_active_outgoing(
                 self.primary, incoming_size
             ),
-        ) * self._incoming_pool.count(
+        )
+        incoming_count = self._incoming_pool.count(
             incoming_size,
             minimum_active=self._minimum_active_outgoing(
                 self.counterparty, outgoing_size
             ),
         )
+        return outgoing_count, incoming_count
 
     def _minimum_active_outgoing(
         self, roster: TeamRoster, received_size: int

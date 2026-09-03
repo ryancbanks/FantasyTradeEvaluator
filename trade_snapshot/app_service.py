@@ -6,7 +6,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Event, RLock, Thread
+from threading import Event, Lock, RLock, Thread
 from uuid import uuid4
 
 from ._scenario_random import SAFE_INTEGER, content_id
@@ -23,6 +23,13 @@ from .dashboard import build_league_dashboard
 from .engine_bundle import EngineBundle, load_engine_bundle, save_engine_bundle
 from .draft_service import DraftLabService
 from .league_search import LeagueSearchOutcome, LeagueSearchProgress, ResumableLeagueTradeSearch
+from .job_retention import (
+    ACTIVE_JOB_STATUSES,
+    DEFAULT_TERMINAL_JOB_LIMIT,
+    TERMINAL_JOB_STATUSES,
+    has_active_jobs,
+    prune_terminal_jobs,
+)
 from .player_outlook import build_player_outlook
 from .roster_adjustment import (
     MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY,
@@ -30,6 +37,7 @@ from .roster_adjustment import (
 )
 from .scenario_config import CorrelatedScenarioConfig
 from .search_runner import TradeSearchSettings
+from .season import SeasonProjection
 from .surrogate_disclosure import SURROGATE_QUALITY_GATE
 from .trade_filters import (
     TradeFilterExpression,
@@ -66,7 +74,11 @@ from .xlsx_export import export_trade_workbook
 
 
 _MAX_DASHBOARD_SCENARIOS = 10_000
+_MAX_BUNDLE_CACHE_SIZE = 4
+_MAX_DASHBOARD_CACHE_SIZE = 4
+_MAX_BASELINE_CACHE_SIZE = 1
 _MAX_PLAYER_OUTLOOK_CACHE_SIZE = 4
+_MAX_RETAINED_SEARCH_JOBS = DEFAULT_TERMINAL_JOB_LIMIT
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,8 +235,14 @@ class _SearchJob:
     progress: LeagueSearchProgress | ThreeWaySearchProgress | None = None
     error: str | None = None
     outcome: LeagueSearchOutcome | ThreeWaySearchOutcome | None = None
-    baseline: PreparedSeasonBaseline | None = None
+    context: "_CompletedSearchContext | None" = None
     cancel: Event = field(default_factory=Event)
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedSearchContext:
+    season_projection: SeasonProjection
+    scenario_run_id: str
 
 
 class LocalAppService:
@@ -245,9 +263,19 @@ class LocalAppService:
         ):
             directory.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
+        self._baseline_build_lock = Lock()
         self._jobs: dict[str, _SearchJob] = {}
-        self._dashboard_cache: dict[str, dict[str, object]] = {}
+        self._bundle_cache: OrderedDict[str, EngineBundle] = OrderedDict()
+        self._dashboard_cache: OrderedDict[str, dict[str, object]] = OrderedDict()
         self._dashboard_futures: dict[str, Future[dict[str, object]]] = {}
+        self._baseline_cache: OrderedDict[
+            tuple[str, str], PreparedSeasonBaseline
+        ] = OrderedDict()
+        self._baseline_futures: dict[
+            tuple[str, str], Future[PreparedSeasonBaseline]
+        ] = {}
+        self._pending_terminal_search_id: str | None = None
+        self._export_in_progress = False
         self._player_outlook_cache: OrderedDict[str, dict[str, object]] = OrderedDict()
         self._player_outlook_futures: dict[str, Future[dict[str, object]]] = {}
         self._collections = WeeklyCollectionJobs(
@@ -262,26 +290,93 @@ class LocalAppService:
             activity_lock=self._lock,
         )
 
+    @property
+    def is_busy(self) -> bool:
+        """Whether background work should keep the local process alive."""
+
+        with self._lock:
+            return bool(
+                self._export_in_progress
+                or self._dashboard_futures
+                or self._player_outlook_futures
+                or self._baseline_futures
+                or self._collections.is_running
+                or has_active_jobs(self._jobs)
+                or self.draft_lab.is_busy
+            )
+
+    def active_search_job(self) -> dict[str, object] | None:
+        """Return the sole resumable trade-search job, if one exists."""
+
+        with self._lock:
+            active = tuple(
+                job
+                for job in self._jobs.values()
+                if job.status in ACTIVE_JOB_STATUSES
+            )
+            if len(active) > 1:
+                raise RuntimeError("multiple trade-search jobs are active")
+            return self._job_record(active[0]) if active else None
+
+    def active_job_catalog(self) -> dict[str, object]:
+        """Return current work or the latest unsurfaced terminal search."""
+
+        with self._lock:
+            search = self.active_search_job()
+            if search is None and self._pending_terminal_search_id is not None:
+                pending = self._jobs.get(self._pending_terminal_search_id)
+                if pending is not None and pending.status in TERMINAL_JOB_STATUSES:
+                    search = self._job_record(pending)
+                else:
+                    self._pending_terminal_search_id = None
+            return {
+                "search": search,
+                "weekly_collection": self._collections.recoverable_job(),
+                "draft": self.draft_lab.recoverable_job(),
+            }
+
+    def acknowledge_search_activity(self, job_id: str) -> dict[str, object]:
+        """Mark one terminal search as surfaced without clearing a newer result."""
+
+        with self._lock:
+            job = self._require_job(job_id)
+            if job.status not in TERMINAL_JOB_STATUSES:
+                raise RuntimeError("active search activity cannot be acknowledged")
+            acknowledged = self._pending_terminal_search_id == job_id
+            if acknowledged:
+                self._pending_terminal_search_id = None
+            return {"job_id": job_id, "acknowledged": acknowledged}
+
     def _require_draft_capacity(self) -> None:
         with self._lock:
-            if self._collections.is_running or any(
-                job.status in {"queued", "running"} for job in self._jobs.values()
-            ) or self._dashboard_futures:
+            if (
+                self._collections.is_running
+                or has_active_jobs(self._jobs)
+                or self._dashboard_futures
+                or self._player_outlook_futures
+                or self._export_in_progress
+            ):
                 raise RuntimeError(
-                    "weekly collection, trade search, or league dashboard must finish before Draft Lab starts"
+                    "weekly collection, trade search, export, league dashboard, or Player Lab must finish before Draft Lab starts"
                 )
 
     def import_bundle(self, record: Mapping[str, object]) -> dict[str, object]:
         bundle = EngineBundle.from_record(record)
         path = self.bundle_directory / f"{bundle.bundle_id}.json"
         save_engine_bundle(bundle, path)
+        self._remember_bundle(bundle)
         return bundle_summary(bundle)
 
     def list_bundles(self) -> tuple[dict[str, object], ...]:
         summaries = []
         for path in sorted(self.bundle_directory.glob("*.json")):
             try:
-                summaries.append(bundle_summary(load_engine_bundle(path)))
+                bundle = (
+                    self._load_bundle(path.stem)
+                    if BUNDLE_ID_PATTERN.fullmatch(path.stem)
+                    else load_engine_bundle(path)
+                )
+                summaries.append(bundle_summary(bundle))
             except ValueError as error:
                 summaries.append({"file": path.name, "status": "invalid", "error": str(error)})
         return tuple(summaries)
@@ -299,6 +394,7 @@ class LocalAppService:
         with self._lock:
             cached = self._dashboard_cache.get(bundle_id)
             if cached is not None:
+                self._dashboard_cache.move_to_end(bundle_id)
                 return cached
             future = self._dashboard_futures.get(bundle_id)
             owns_calculation = future is None
@@ -307,6 +403,18 @@ class LocalAppService:
                     raise RuntimeError(
                         "Draft Lab training or benchmark must finish before building a league dashboard"
                     )
+                if (
+                    self._export_in_progress
+                    or self._collections.is_running
+                    or has_active_jobs(self._jobs)
+                ):
+                    raise RuntimeError(
+                        "weekly collection, trade search, or export must finish before building a league dashboard"
+                    )
+                if self._player_outlook_futures:
+                    raise RuntimeError(
+                        "Player Lab calculation must finish before building a league dashboard"
+                    )
                 future = Future()
                 self._dashboard_futures[bundle_id] = future
         assert future is not None
@@ -314,7 +422,7 @@ class LocalAppService:
             return future.result()
 
         try:
-            bundle = load_engine_bundle(self._bundle_path(bundle_id))
+            bundle = self._load_bundle(bundle_id)
             source_config = bundle.scenario_config
             dashboard_config = (
                 source_config
@@ -325,13 +433,7 @@ class LocalAppService:
                     source_config.loadings,
                 )
             )
-            baseline = prepare_season_baseline(
-                bundle.state,
-                bundle.rosters,
-                bundle.projections,
-                bundle.eligibilities,
-                dashboard_config,
-            )
+            baseline = self._season_baseline(bundle_id, bundle, dashboard_config)
             dashboard = build_league_dashboard(
                 bundle,
                 baseline.season_projection,
@@ -343,6 +445,9 @@ class LocalAppService:
         else:
             with self._lock:
                 self._dashboard_cache[bundle_id] = dashboard
+                self._dashboard_cache.move_to_end(bundle_id)
+                while len(self._dashboard_cache) > _MAX_DASHBOARD_CACHE_SIZE:
+                    self._dashboard_cache.popitem(last=False)
             future.set_result(dashboard)
             return dashboard
         finally:
@@ -361,6 +466,19 @@ class LocalAppService:
             future = self._player_outlook_futures.get(bundle_id)
             owns_calculation = future is None
             if owns_calculation:
+                if self.draft_lab.is_busy:
+                    raise RuntimeError(
+                        "Draft Lab training or benchmark must finish before opening Player Lab"
+                    )
+                if (
+                    self._export_in_progress
+                    or self._collections.is_running
+                    or self._dashboard_futures
+                    or has_active_jobs(self._jobs)
+                ):
+                    raise RuntimeError(
+                        "weekly collection, trade search, export, or league dashboard must finish before opening Player Lab"
+                    )
                 future = Future()
                 self._player_outlook_futures[bundle_id] = future
         assert future is not None
@@ -368,9 +486,7 @@ class LocalAppService:
             return future.result()
 
         try:
-            outlook = build_player_outlook(
-                load_engine_bundle(self._bundle_path(bundle_id))
-            )
+            outlook = build_player_outlook(self._load_bundle(bundle_id))
         except BaseException as error:
             future.set_exception(error)
             raise
@@ -432,9 +548,13 @@ class LocalAppService:
         with self._lock:
             if self.draft_lab.is_busy:
                 raise RuntimeError("Draft Lab training or benchmark must finish before collecting")
-            if self._dashboard_futures:
-                raise RuntimeError("league dashboard calculation must finish before collecting")
-            if any(job.status in {"queued", "running"} for job in self._jobs.values()):
+            if self._export_in_progress:
+                raise RuntimeError("trade export must finish before collecting")
+            if self._dashboard_futures or self._player_outlook_futures:
+                raise RuntimeError(
+                    "league dashboard or Player Lab calculation must finish before collecting"
+                )
+            if has_active_jobs(self._jobs):
                 raise RuntimeError("stop the local trade search before collecting a new week")
             return self._collections.start(request)
 
@@ -444,25 +564,37 @@ class LocalAppService:
     def cancel_weekly_collection(self, job_id: str) -> dict[str, object]:
         return self._collections.cancel(job_id)
 
+    def acknowledge_weekly_collection_activity(
+        self, job_id: str
+    ) -> dict[str, object]:
+        return self._collections.acknowledge_activity(job_id)
+
     def confirm_weekly_collection_sign_in(self, job_id: str) -> dict[str, object]:
         return self._collections.confirm_sign_in(job_id)
 
     def start_search(self, request: LocalSearchRequest) -> dict[str, object]:
         if not isinstance(request, LocalSearchRequest):
             raise ValueError("request must be a LocalSearchRequest")
-        bundle = load_engine_bundle(self._bundle_path(request.bundle_id))
+        bundle = self._load_bundle(request.bundle_id)
         _require_surrogate_consent(bundle, request)
         _search_scope(bundle, request)
         with self._lock:
             if self.draft_lab.is_busy:
                 raise RuntimeError("Draft Lab training or benchmark must finish before a trade search")
             if self._dashboard_futures:
-                raise RuntimeError("league dashboard calculation must finish before a trade search")
+                raise RuntimeError(
+                    "league dashboard calculation must finish before a trade search"
+                )
+            if self._player_outlook_futures:
+                raise RuntimeError("Player Lab calculation must finish before a trade search")
+            if self._export_in_progress:
+                raise RuntimeError("trade export must finish before another trade search")
             if self._collections.is_running:
                 raise RuntimeError("weekly collection must finish before a trade search starts")
-            if any(job.status in {"queued", "running"} for job in self._jobs.values()):
+            if has_active_jobs(self._jobs):
                 raise RuntimeError("another search is already running")
             job = _SearchJob(uuid4().hex, request)
+            self._pending_terminal_search_id = None
             self._jobs[job.job_id] = job
             Thread(target=self._run_search, args=(job,), daemon=True).start()
             return self._job_record(job)
@@ -470,7 +602,7 @@ class LocalAppService:
     def estimate_search(self, request: LocalSearchRequest) -> dict[str, object]:
         if not isinstance(request, LocalSearchRequest):
             raise ValueError("request must be a LocalSearchRequest")
-        bundle = load_engine_bundle(self._bundle_path(request.bundle_id))
+        bundle = self._load_bundle(request.bundle_id)
         _require_surrogate_consent(bundle, request)
         by_team, primary, selected = _search_scope(bundle, request)
         eligible_positions = {
@@ -542,16 +674,16 @@ class LocalAppService:
             if (
                 job.status != "complete"
                 or job.outcome is None
-                or job.baseline is None
+                or job.context is None
             ):
                 raise RuntimeError("search results are not ready")
-            request, outcome, baseline = job.request, job.outcome, job.baseline
-        bundle = load_engine_bundle(self._bundle_path(request.bundle_id))
+            request, outcome, context = job.request, job.outcome, job.context
+        bundle = self._load_bundle(request.bundle_id)
         if request.trade_format == "three_team":
             return three_way_search_result_record(
                 outcome,
                 bundle,
-                baseline.season_projection,
+                context.season_projection,
                 limit,
                 free_agent_allocation_policy=(
                     None
@@ -559,15 +691,37 @@ class LocalAppService:
                     else MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
                 ),
             )
-        return search_result_record(outcome, bundle, baseline.season_projection, limit)
+        return search_result_record(outcome, bundle, context.season_projection, limit)
 
     def export_job(self, job_id: str) -> dict[str, object]:
         with self._lock:
             job = self._require_job(job_id)
-            if job.status != "complete" or job.outcome is None or job.baseline is None:
+            if job.status != "complete" or job.outcome is None or job.context is None:
                 raise RuntimeError("search must complete before it can be exported")
-            request, outcome, baseline = job.request, job.outcome, job.baseline
-        bundle = load_engine_bundle(self._bundle_path(request.bundle_id))
+            if self.draft_lab.is_busy:
+                raise RuntimeError(
+                    "Draft Lab training or benchmark must finish before trade export"
+                )
+            if self._collections.is_running or has_active_jobs(self._jobs):
+                raise RuntimeError(
+                    "weekly collection or active trade search must finish before export"
+                )
+            if self._dashboard_futures or self._player_outlook_futures:
+                raise RuntimeError(
+                    "league dashboard or Player Lab calculation must finish before export"
+                )
+            if self._export_in_progress:
+                raise RuntimeError("another trade export is already running")
+            request, outcome, context = job.request, job.outcome, job.context
+            self._export_in_progress = True
+        try:
+            return self._export_completed_job(request, outcome, context)
+        finally:
+            with self._lock:
+                self._export_in_progress = False
+
+    def _export_completed_job(self, request, outcome, context) -> dict[str, object]:
+        bundle = self._load_bundle(request.bundle_id)
         team_names = {row.team_id: row.name for row in bundle.state.teams}
         if request.trade_format == "three_team":
             require_three_way_exportable_count(
@@ -582,7 +736,7 @@ class LocalAppService:
             filename = f"three-team-trade-results-{request.request_id}.xlsx"
             path = export_three_way_trade_workbook(
                 self.export_directory / filename,
-                _workbook_context(bundle, baseline, request),
+                _workbook_context(bundle, context.scenario_run_id, request),
                 ThreeWayExportProvenance.from_records(
                     request_id=request.request_id,
                     search_run_id=outcome.progress.run_id,
@@ -608,7 +762,7 @@ class LocalAppService:
                     ),
                 ),
                 rows,
-                team_outlook_rows(bundle.state, baseline.season_projection),
+                team_outlook_rows(bundle.state, context.season_projection),
             )
             return {"filename": path.name, "trade_count": len(rows)}
         rows = workbook_trade_rows(
@@ -620,9 +774,9 @@ class LocalAppService:
         filename = f"trade-results-{request.request_id}.xlsx"
         path = export_trade_workbook(
             self.export_directory / filename,
-            _workbook_context(bundle, baseline, request),
+            _workbook_context(bundle, context.scenario_run_id, request),
             rows,
-            team_outlook_rows(bundle.state, baseline.season_projection),
+            team_outlook_rows(bundle.state, context.season_projection),
         )
         return {"filename": path.name, "trade_count": len(rows)}
 
@@ -637,20 +791,14 @@ class LocalAppService:
     def _run_search(self, job: _SearchJob) -> None:
         try:
             self._set_job(job, status="running")
-            bundle = load_engine_bundle(self._bundle_path(job.request.bundle_id))
+            bundle = self._load_bundle(job.request.bundle_id)
             _require_surrogate_consent(bundle, job.request)
             config = CorrelatedScenarioConfig(
                 job.request.scenario_count,
                 job.request.seed,
                 bundle.scenario_config.loadings,
             )
-            baseline = prepare_season_baseline(
-                bundle.state,
-                bundle.rosters,
-                bundle.projections,
-                bundle.eligibilities,
-                config,
-            )
+            baseline = self._season_baseline(job.request.bundle_id, bundle, config)
             if job.request.trade_format == "three_team":
                 by_team, primary, selected = _search_scope(bundle, job.request)
                 space = ThreeWayTradeSpace(
@@ -700,14 +848,101 @@ class LocalAppService:
                     should_cancel=job.cancel.is_set,
                 )
             status = "cancelled" if outcome.progress.cancelled else "complete"
-            self._set_job(job, status=status, progress=outcome.progress, outcome=outcome, baseline=baseline)
+            self._set_job(
+                job,
+                status=status,
+                progress=outcome.progress,
+                outcome=outcome if status == "complete" else None,
+                context=(
+                    _CompletedSearchContext(
+                        baseline.season_projection,
+                        baseline.scenarios.run_id,
+                    )
+                    if status == "complete"
+                    else None
+                ),
+            )
         except Exception as error:
             self._set_job(job, status="failed", error=str(error))
 
     def _set_job(self, job, **changes) -> None:
         with self._lock:
+            was_terminal = job.status in TERMINAL_JOB_STATUSES
             for name, value in changes.items():
                 setattr(job, name, value)
+            if job.status in TERMINAL_JOB_STATUSES:
+                if not was_terminal:
+                    self._pending_terminal_search_id = job.job_id
+                prune_terminal_jobs(self._jobs, _MAX_RETAINED_SEARCH_JOBS)
+
+    def _season_baseline(
+        self,
+        bundle_id: str,
+        bundle: EngineBundle,
+        config: CorrelatedScenarioConfig,
+    ) -> PreparedSeasonBaseline:
+        """Build each immutable scenario baseline once and retain only the newest."""
+
+        key = (bundle_id, config.config_id)
+        with self._lock:
+            cached = self._baseline_cache.get(key)
+            if cached is not None:
+                self._baseline_cache.move_to_end(key)
+                return cached
+            future = self._baseline_futures.get(key)
+            owns_calculation = future is None
+            if owns_calculation:
+                future = Future()
+                self._baseline_futures[key] = future
+        assert future is not None
+        if not owns_calculation:
+            return future.result()
+
+        try:
+            with self._baseline_build_lock:
+                baseline = prepare_season_baseline(
+                    bundle.state,
+                    bundle.rosters,
+                    bundle.projections,
+                    bundle.eligibilities,
+                    config,
+                )
+        except BaseException as error:
+            future.set_exception(error)
+            raise
+        else:
+            with self._lock:
+                self._baseline_cache[key] = baseline
+                self._baseline_cache.move_to_end(key)
+                while len(self._baseline_cache) > _MAX_BASELINE_CACHE_SIZE:
+                    self._baseline_cache.popitem(last=False)
+            future.set_result(baseline)
+            return baseline
+        finally:
+            with self._lock:
+                if self._baseline_futures.get(key) is future:
+                    del self._baseline_futures[key]
+
+    def _remember_bundle(
+        self, bundle: EngineBundle, bundle_id: str | None = None
+    ) -> EngineBundle:
+        cache_key = bundle_id or bundle.bundle_id
+        with self._lock:
+            self._bundle_cache[cache_key] = bundle
+            self._bundle_cache.move_to_end(cache_key)
+            while len(self._bundle_cache) > _MAX_BUNDLE_CACHE_SIZE:
+                self._bundle_cache.popitem(last=False)
+        return bundle
+
+    def _load_bundle(self, bundle_id: str) -> EngineBundle:
+        with self._lock:
+            cached = self._bundle_cache.get(bundle_id)
+            if cached is not None:
+                self._bundle_cache.move_to_end(bundle_id)
+                return cached
+        return self._remember_bundle(
+            load_engine_bundle(self._bundle_path(bundle_id)), bundle_id
+        )
 
     def _bundle_path(self, bundle_id: str) -> Path:
         if not isinstance(bundle_id, str) or not BUNDLE_ID_PATTERN.fullmatch(bundle_id):
@@ -792,13 +1027,18 @@ class LocalAppService:
             "status": job.status,
             "error": job.error,
             "trade_format": job.request.trade_format,
+            "request": {
+                "bundle_id": job.request.bundle_id,
+                "primary_team_id": job.request.primary_team_id,
+                "counterparty_team_ids": list(job.request.counterparty_team_ids),
+            },
             "progress": progress_record,
         }
 
 
 def _workbook_context(
     bundle: EngineBundle,
-    baseline: PreparedSeasonBaseline,
+    scenario_run_id: str,
     request: LocalSearchRequest,
 ) -> TradeWorkbookContext:
     methodology = bundle.methodology_evidence
@@ -806,7 +1046,7 @@ def _workbook_context(
     return TradeWorkbookContext(
         snapshot_id=bundle.state.snapshot_id,
         strength_model_id=bundle.strength_model.model_id,
-        scenario_run_id=baseline.scenarios.run_id,
+        scenario_run_id=scenario_run_id,
         primary_team_id=request.primary_team_id,
         primary_team_name=team_names[request.primary_team_id],
         generated_at=datetime.now(timezone.utc),

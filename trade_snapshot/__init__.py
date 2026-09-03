@@ -227,6 +227,7 @@ from .workbook_model import (
     WorkbookSource,
     WorkbookTeamOutlook,
     WorkbookTradeRow,
+    WorkbookTradeRows,
     team_outlook_rows,
     workbook_trade_rows,
 )
@@ -437,4 +438,5 @@ __all__ = (
     "waiver_eligible_slots",
     "team_outlook_rows",
     "workbook_trade_rows",
+    "WorkbookTradeRows",
 )

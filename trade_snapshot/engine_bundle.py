@@ -267,9 +267,14 @@ def save_engine_bundle(bundle: EngineBundle, path: str | os.PathLike[str]) -> Pa
     return target.resolve()
 
 
+_MAX_ENGINE_BUNDLE_BYTES = 256 * 1024 * 1024
+
+
 def load_engine_bundle(path: str | os.PathLike[str]) -> EngineBundle:
     source = Path(path)
     try:
+        if source.stat().st_size > _MAX_ENGINE_BUNDLE_BYTES:
+            raise ValueError("engine bundle exceeds its size limit")
         text = source.read_text(encoding="utf-8")
         record = json.loads(text, parse_constant=_reject_constant, object_pairs_hook=_unique_object)
     except (OSError, UnicodeError, json.JSONDecodeError) as error:

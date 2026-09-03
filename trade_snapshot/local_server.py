@@ -34,7 +34,9 @@ from .weekly_collection import WeeklyCollectionRequest, WeeklyCollectionWorkflow
 
 
 _JOB_PATH = re.compile(r"^/api/searches/([0-9a-f]{32})$")
-_JOB_ACTION_PATH = re.compile(r"^/api/searches/([0-9a-f]{32})/(cancel|export|results)$")
+_JOB_ACTION_PATH = re.compile(
+    r"^/api/searches/([0-9a-f]{32})/(activity-ack|cancel|export|results)$"
+)
 _DASHBOARD_PATH = re.compile(r"^/api/bundles/(engine_[0-9a-f]{64})/dashboard$")
 _PLAYER_OUTLOOK_PATH = re.compile(
     r"^/api/bundles/(engine_[0-9a-f]{64})/player-outlook$"
@@ -46,9 +48,14 @@ _COLLECTION_CANCEL_PATH = re.compile(
 _COLLECTION_SIGN_IN_PATH = re.compile(
     r"^/api/weekly-collections/([0-9a-f]{32})/sign-in$"
 )
+_COLLECTION_ACTIVITY_ACK_PATH = re.compile(
+    r"^/api/weekly-collections/([0-9a-f]{32})/activity-ack$"
+)
 _EXPORT_PATH = re.compile(r"^/api/exports/([^/]+\.xlsx)$")
 _DRAFT_JOB_PATH = re.compile(r"^/api/draft/jobs/([0-9a-f]{32})$")
-_DRAFT_JOB_ACTION_PATH = re.compile(r"^/api/draft/jobs/([0-9a-f]{32})/(cancel|result)$")
+_DRAFT_JOB_ACTION_PATH = re.compile(
+    r"^/api/draft/jobs/([0-9a-f]{32})/(activity-ack|cancel|result)$"
+)
 _DRAFT_CHECKPOINT_ACTION_PATH = re.compile(
     r"^/api/draft/checkpoints/([0-9a-f]{32})/promote$"
 )
@@ -74,6 +81,8 @@ _STATIC = {
 _MAX_JSON_BYTES = 256 * 1024 * 1024
 _MAX_DRAFT_DATA_BYTES = 128 * 1024 * 1024
 _EXTENSION_ROOT = "/api/browser-extension/v1"
+_CLIENT_ID_HEADER = "X-FTE-Client"
+_CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 class LocalAppHTTPServer(ThreadingHTTPServer):
@@ -92,8 +101,9 @@ class LocalAppHTTPServer(ThreadingHTTPServer):
         self._lifecycle_lock = Lock()
         self._lifecycle_changed = Event()
         self._created_at = monotonic()
-        self._last_browser_ping: float | None = None
-        self._browser_close_requested: float | None = None
+        self._browser_clients: dict[str, float] = {}
+        self._last_client_departed: float | None = None
+        self._browser_connected = False
         self._lifecycle_started = False
         super().__init__(address, LocalAppRequestHandler)
 
@@ -101,15 +111,22 @@ class LocalAppHTTPServer(ThreadingHTTPServer):
     def app_url(self) -> str:
         return f"http://127.0.0.1:{self.server_address[1]}/"
 
-    def browser_ping(self) -> None:
+    def browser_ping(self, client_id: str = "legacy") -> None:
+        if not _CLIENT_ID_PATTERN.fullmatch(client_id):
+            raise ValueError("browser client ID is invalid")
         with self._lifecycle_lock:
-            self._last_browser_ping = monotonic()
-            self._browser_close_requested = None
+            self._browser_clients[client_id] = monotonic()
+            self._last_client_departed = None
+            self._browser_connected = True
         self._lifecycle_changed.set()
 
-    def browser_close(self) -> None:
+    def browser_close(self, client_id: str = "legacy") -> None:
+        if not _CLIENT_ID_PATTERN.fullmatch(client_id):
+            raise ValueError("browser client ID is invalid")
         with self._lifecycle_lock:
-            self._browser_close_requested = monotonic()
+            self._browser_clients.pop(client_id, None)
+            if self._browser_connected and not self._browser_clients:
+                self._last_client_departed = monotonic()
         self._lifecycle_changed.set()
 
     def start_browser_lifecycle(
@@ -117,7 +134,7 @@ class LocalAppHTTPServer(ThreadingHTTPServer):
         *,
         launch_timeout: float = 120.0,
         idle_timeout: float = 180.0,
-        close_grace: float = 2.0,
+        close_grace: float = 30.0,
     ) -> Thread:
         if min(launch_timeout, idle_timeout, close_grace) <= 0:
             raise ValueError("browser lifecycle timeouts must be positive")
@@ -140,14 +157,25 @@ class LocalAppHTTPServer(ThreadingHTTPServer):
         while True:
             now = monotonic()
             with self._lifecycle_lock:
-                ping = self._last_browser_ping
-                close = self._browser_close_requested
-            expired = (
-                close is not None and now - close >= close_grace
-            ) or (
-                ping is None and now - self._created_at >= launch_timeout
-            ) or (
-                ping is not None and now - ping >= idle_timeout
+                stale = [
+                    client_id
+                    for client_id, ping in self._browser_clients.items()
+                    if now - ping >= idle_timeout
+                ]
+                for client_id in stale:
+                    del self._browser_clients[client_id]
+                if stale and not self._browser_clients:
+                    self._last_client_departed = now
+                connected = self._browser_connected
+                clients_remain = bool(self._browser_clients)
+                departed = self._last_client_departed
+            expired = not connected and now - self._created_at >= launch_timeout
+            expired = expired or (
+                connected
+                and not clients_remain
+                and departed is not None
+                and now - departed >= close_grace
+                and not self.app_service.is_busy
             )
             if expired:
                 self.shutdown()
@@ -221,6 +249,12 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
         self._require_token()
         if path == "/api/health":
             self._json(HTTPStatus.OK, {"status": "ready", "version": "0.1.0"})
+            return
+        if path == "/api/activity":
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.active_job_catalog(),
+            )
             return
         if path == "/api/bundles":
             self._json(HTTPStatus.OK, self.server.app_service.bundle_catalog())
@@ -412,15 +446,22 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/session/ping":
             self._require_empty_body()
-            self.server.browser_ping()
+            self.server.browser_ping(self._browser_client_id())
             self._json(HTTPStatus.OK, {"status": "active"})
             return
         if path == "/api/session/close":
             self._require_empty_body()
-            self.server.browser_close()
+            self.server.browser_close(self._browser_client_id())
             self._json(HTTPStatus.OK, {"status": "closing"})
             return
         matched = _JOB_ACTION_PATH.fullmatch(path)
+        if matched and matched.group(2) == "activity-ack":
+            self._require_empty_body()
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.acknowledge_search_activity(matched.group(1)),
+            )
+            return
         if matched and matched.group(2) == "cancel":
             self._require_empty_body()
             self._json(HTTPStatus.OK, self.server.app_service.cancel_job(matched.group(1)))
@@ -430,6 +471,15 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.CREATED, self.server.app_service.export_job(matched.group(1)))
             return
         matched = _DRAFT_JOB_ACTION_PATH.fullmatch(path)
+        if matched and matched.group(2) == "activity-ack":
+            self._require_empty_body()
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.draft_lab.acknowledge_job_activity(
+                    matched.group(1)
+                ),
+            )
+            return
         if matched and matched.group(2) == "cancel":
             self._require_empty_body()
             self._json(
@@ -467,6 +517,16 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
             self._json(
                 HTTPStatus.OK,
                 self.server.app_service.cancel_weekly_collection(matched.group(1)),
+            )
+            return
+        matched = _COLLECTION_ACTIVITY_ACK_PATH.fullmatch(path)
+        if matched:
+            self._require_empty_body()
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.acknowledge_weekly_collection_activity(
+                    matched.group(1)
+                ),
             )
             return
         matched = _COLLECTION_SIGN_IN_PATH.fullmatch(path)
@@ -546,6 +606,12 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
         supplied = self.headers.get("X-FTE-Token", "")
         if not compare_digest(supplied, self.server.app_token):
             raise PermissionError("missing local application token")
+
+    def _browser_client_id(self) -> str:
+        client_id = self.headers.get(_CLIENT_ID_HEADER, "legacy")
+        if not _CLIENT_ID_PATTERN.fullmatch(client_id):
+            raise ValueError("browser client ID is invalid")
+        return client_id
 
     def _read_json(self, *, max_bytes: int = _MAX_JSON_BYTES):
         content_type = self.headers.get("Content-Type", "").partition(";")[0].strip().lower()

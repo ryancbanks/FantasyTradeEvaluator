@@ -134,17 +134,19 @@ class LeagueTradeSearchTests(unittest.TestCase):
             first = search.run(directory, on_progress=updates.append)
             second = search.run(directory)
             database_count = len(tuple(Path(directory).glob("*.sqlite3")))
-
-        self.assertEqual(first.progress.pair_count, 3)
-        self.assertEqual(first.progress.completed_pair_count, 3)
-        self.assertEqual(first.progress.examined_candidate_count, 3)
-        self.assertEqual(first.progress.total_candidate_count, 3)
-        self.assertEqual(first.progress.completion_fraction, 1)
-        self.assertEqual(tuple(row.counterparty_team_id for row in first.pairs), ("a", "b", "c"))
-        self.assertEqual(len(first.qualified_trades), 3)
-        self.assertEqual(first, second)
-        self.assertEqual(updates[-1], first.progress)
-        self.assertEqual(database_count, 3)
+            self.assertEqual(first.progress.pair_count, 3)
+            self.assertEqual(first.progress.completed_pair_count, 3)
+            self.assertEqual(first.progress.examined_candidate_count, 3)
+            self.assertEqual(first.progress.total_candidate_count, 3)
+            self.assertEqual(first.progress.completion_fraction, 1)
+            self.assertEqual(
+                tuple(row.counterparty_team_id for row in first.pairs),
+                ("a", "b", "c"),
+            )
+            self.assertEqual(len(first.qualified_trades), 3)
+            self.assertEqual(first, second)
+            self.assertEqual(updates[-1], first.progress)
+            self.assertEqual(database_count, 3)
 
     def test_cancel_then_resume_continues_across_pair_boundaries(self):
         search = build_search()

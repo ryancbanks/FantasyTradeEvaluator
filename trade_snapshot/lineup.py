@@ -1,8 +1,12 @@
 from dataclasses import dataclass
-from math import fsum, isfinite
+from math import isfinite, ldexp
 from numbers import Real
 from types import MappingProxyType
 from typing import Hashable, Mapping, Sequence
+
+
+_BINARY64_SIGNIFICAND_BITS = 53
+_BINARY64_UNIT_EXPONENT = 1074
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,7 @@ class LineupResult:
 class _State:
     assignments: tuple[int | None, ...]
     total_weight: float
+    total_units: int
 
 
 def optimize_lineup(
@@ -76,8 +81,17 @@ def optimize_lineup(
     lineup_slots = _normalize_slots(slots)
     lineup_players = _normalize_players(players)
     player_count = len(lineup_players)
+    used_slots = set(lineup_slots)
+    exact_weights = tuple(
+        {
+            slot: _weight_units(weight)
+            for slot, weight in player.slot_weights.items()
+            if slot in used_slots and weight >= 0
+        }
+        for player in lineup_players
+    )
     empty_assignments: tuple[int | None, ...] = (None,) * len(lineup_slots)
-    states = {0: _State(empty_assignments, 0.0)}
+    states = {0: _State(empty_assignments, 0.0, 0)}
 
     for player_index, player in enumerate(lineup_players):
         next_states = dict(states)  # Leaving the player on the bench is always legal.
@@ -96,9 +110,11 @@ def optimize_lineup(
                 assignments = list(state.assignments)
                 assignments[slot_index] = player_index
                 candidate_assignments = tuple(assignments)
+                candidate_units = state.total_units + exact_weights[player_index][slot]
                 candidate = _State(
                     candidate_assignments,
-                    _assignment_total(candidate_assignments, lineup_slots, lineup_players),
+                    _rounded_weight(candidate_units),
+                    candidate_units,
                 )
                 candidate_mask = occupied_mask | (1 << slot_index)
                 incumbent = next_states.get(candidate_mask)
@@ -106,7 +122,7 @@ def optimize_lineup(
                     next_states[candidate_mask] = candidate
         states = next_states
 
-    best = _State(empty_assignments, 0.0)
+    best = _State(empty_assignments, 0.0, 0)
     for state in states.values():
         if _is_better(state, best, player_count):
             best = state
@@ -148,17 +164,34 @@ def _normalize_players(players: Sequence[LineupPlayer]) -> tuple[LineupPlayer, .
     return normalized
 
 
-def _assignment_total(
-    assignments: tuple[int | None, ...],
-    slots: tuple[str, ...],
-    players: tuple[LineupPlayer, ...],
-) -> float:
-    try:
-        total = fsum(
-            players[player_index].slot_weights[slot]
-            for slot, player_index in zip(slots, assignments)
-            if player_index is not None
+def _weight_units(weight: float) -> int:
+    """Represent a binary64 exactly in units of its smallest subnormal."""
+
+    numerator, denominator = weight.as_integer_ratio()
+    return numerator << (_BINARY64_UNIT_EXPONENT - denominator.bit_length() + 1)
+
+
+def _rounded_weight(total_units: int) -> float:
+    """Round an exact binary64 sum once, matching ``math.fsum`` semantics."""
+
+    if not total_units:
+        return 0.0
+    sign = -1.0 if total_units < 0 else 1.0
+    magnitude = abs(total_units)
+    shift = max(0, magnitude.bit_length() - _BINARY64_SIGNIFICAND_BITS)
+    significand, remainder = divmod(magnitude, 1 << shift)
+    if shift:
+        halfway = 1 << (shift - 1)
+        round_up = remainder > halfway or (
+            remainder == halfway and significand & 1
         )
+        if round_up:
+            significand += 1
+            if significand == 1 << _BINARY64_SIGNIFICAND_BITS:
+                significand >>= 1
+                shift += 1
+    try:
+        total = ldexp(sign * float(significand), shift - _BINARY64_UNIT_EXPONENT)
     except OverflowError:
         raise ValueError("lineup weights produce a non-finite total") from None
     if not isfinite(total):

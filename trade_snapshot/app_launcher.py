@@ -13,7 +13,7 @@ from threading import Thread
 from urllib.parse import quote
 import webbrowser
 
-from .local_server import create_local_server, serve_local_app
+from .local_server import _STATIC, create_local_server, serve_local_app
 from .production_collection import create_production_weekly_collection_workflow
 from .extension_bridge import ExtensionCommandBridge
 
@@ -68,9 +68,19 @@ def main(argv: list[str] | None = None) -> int:
 def runtime_self_check() -> dict[str, object]:
     """Verify the local interface, extension package, and server lifecycle."""
 
-    page = resources.files("trade_snapshot.web_assets").joinpath("index.html")
-    if not page.read_bytes().startswith(b"<!doctype html>"):
-        raise RuntimeError("local interface assets are missing")
+    web = resources.files("trade_snapshot.web_assets")
+    try:
+        web_assets = {
+            name: web.joinpath(*PurePosixPath(name).parts).read_bytes()
+            for name in _required_web_assets()
+        }
+    except OSError:
+        raise RuntimeError("local interface assets are missing") from None
+    if (
+        not all(web_assets.values())
+        or not web_assets["index.html"].startswith(b"<!doctype html>")
+    ):
+        raise RuntimeError("local interface assets are incomplete")
     extension = resources.files("trade_snapshot.browser_extension")
     try:
         manifest = json.loads(extension.joinpath("manifest.json").read_text(encoding="utf-8"))
@@ -91,6 +101,13 @@ def runtime_self_check() -> dict[str, object]:
         "web_assets": True,
         "browser_extension": manifest.get("version"),
     }
+
+
+def _required_web_assets() -> tuple[str, ...]:
+    """Return the root page and every asset in the server's static route table."""
+
+    served = {filename for filename, _content_type in _STATIC.values()}
+    return ("index.html", *sorted(served))
 
 
 def _required_extension_assets(manifest: dict[str, object]) -> tuple[str, ...]:

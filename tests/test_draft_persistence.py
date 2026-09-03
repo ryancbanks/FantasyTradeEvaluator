@@ -73,6 +73,20 @@ class DraftPersistenceTests(unittest.TestCase):
             self.assertEqual(rows[0]["generation_completed"], 1)
             self.assertNotIn("population", rows[0])
 
+    def test_catalog_rejects_dangling_summary_sidecars(self):
+        corpus = historical_corpus()
+        with TemporaryDirectory() as directory:
+            store = DraftFileStore(directory)
+            store.import_corpus(corpus.to_record())
+            (
+                store.corpus_directory
+                / f"{corpus.corpus_id}.draftcorpus.json"
+            ).unlink()
+            row = store.list_corpora()[0]
+
+        self.assertEqual(row["status"], "invalid")
+        self.assertIn("no matching saved asset", row["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

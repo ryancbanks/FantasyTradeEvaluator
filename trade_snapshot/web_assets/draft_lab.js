@@ -5,7 +5,11 @@ window.DraftLab = (() => {
   const STRATEGIES = ["none", "streaming_qb", "streaming_te", "streaming_dst", "late_round_qb"];
   let catalog = {corpora: [], boards: [], models: [], checkpoints: [], assistant_sessions: [], league_presets: []};
   let activeJob = null, jobLaunching = false, promotionBusy = false, assistantBusy = false;
+  let pendingRecoveredJob = null;
   let assistantSyncBusy = false, assistantSyncTimer = null;
+  let draftSurfaceActive = $("draftLabTab").getAttribute("aria-selected") === "true";
+  let externalWorkBusy = Boolean(window.TradeAppBusy);
+  let publishedDraftBusy = null;
   let lastTrainingResult = null;
   let assistantStatus = null;
   let assistantPlayers = [];
@@ -171,7 +175,9 @@ window.DraftLab = (() => {
       const source = row.draft_binding ? ` · ESPN ${row.draft_binding.league_id}` : "";
       return `${model?.league_name || "Saved room"} · ${board?.season || "current"} board · Drafter #${row.user_drafter_number}${source} · ${row.pick_count} picks`;
     }
-    const source = row.source === "synced_league" ? `Synced ${row.season}` : "Built-in";
+    const source = row.source === "synced_league"
+      ? `Synced ${row.season} · Week ${row.week} · ${row.preset_id.slice(-8)}`
+      : "Built-in";
     return `${source} · ${row.config.name}`;
   }
 
@@ -218,10 +224,10 @@ window.DraftLab = (() => {
   }
 
   function updateSavedControls() {
-    const checkpointUnavailable = Boolean(activeJob) || jobLaunching || promotionBusy || !$("draftCheckpoint").value;
+    const checkpointUnavailable = externalWorkBusy || Boolean(activeJob) || jobLaunching || promotionBusy || !$("draftCheckpoint").value;
     $("draftResumeButton").disabled = checkpointUnavailable;
     $("draftPromoteButton").disabled = checkpointUnavailable;
-    $("assistantOpen").disabled = assistantBusy || !$("assistantSession").value;
+    $("assistantOpen").disabled = externalWorkBusy || assistantBusy || !$("assistantSession").value;
   }
 
   function selectCheckpoint() {
@@ -283,8 +289,10 @@ window.DraftLab = (() => {
     clearDraftError();
     const file = input.files[0];
     if (!file) return;
-    if (type === "corpus" && file.size > 128 * 1024 * 1024) {
-      reportError(new Error("Historical corpus files must be 128 MB or smaller."));
+    const maximumBytes = {corpus: 128, board: 128, model: 16}[type] * 1024 * 1024;
+    if (file.size > maximumBytes) {
+      const labels = {corpus: "Historical corpus", board: "Current board", model: "Draft model"};
+      reportError(new Error(`${labels[type]} files must be ${maximumBytes / 1024 / 1024} MB or smaller.`));
       input.value = "";
       return;
     }
@@ -306,12 +314,27 @@ window.DraftLab = (() => {
   }
 
   function setJobRunning(running, kind = "") {
-    $("draftEstimateButton").disabled = running;
-    $("draftStartButton").disabled = running;
-    $("draftBenchmarkButton").disabled = running;
+    const blocked = running || externalWorkBusy;
+    $("draftEstimateButton").disabled = blocked;
+    $("draftStartButton").disabled = blocked;
+    $("draftBenchmarkButton").disabled = blocked;
     $("draftCancelButton").classList.toggle("hidden", !running || !activeJob);
     $("draftCancelButton").textContent = kind === "benchmark" ? "Stop benchmark" : "Stop and keep last autosave";
     updateSavedControls();
+    publishDraftActivity();
+  }
+
+  function publishDraftActivity() {
+    const busy = Boolean(activeJob) || Boolean(pendingRecoveredJob) || jobLaunching || promotionBusy || assistantBusy || assistantSyncBusy;
+    if (publishedDraftBusy === busy) return;
+    publishedDraftBusy = busy;
+    window.dispatchEvent(new CustomEvent("draftactivitychange", {detail: {busy}}));
+  }
+
+  function applyExternalWorkState(busy) {
+    externalWorkBusy = Boolean(busy);
+    setJobRunning(Boolean(activeJob) || jobLaunching, activeJob?.kind || "");
+    filterAssistantPlayers();
   }
 
   function renderJob(job) {
@@ -331,10 +354,19 @@ window.DraftLab = (() => {
       : training ? "Autosaved after every completed generation" : "Benchmark results are published when all paired trials finish";
   }
 
+  async function acknowledgeJobActivity(jobId) {
+    try {
+      await api(`/api/draft/jobs/${jobId}/activity-ack`, {method: "POST", body: ""});
+    } catch (_) {
+      /* Keep the retained result recoverable if acknowledgement is interrupted. */
+    }
+  }
+
   async function monitorJob(job) {
     activeJob = {jobId: job.job_id, kind: job.kind};
     setJobRunning(true, job.kind);
     $("draftProgress").classList.remove("hidden");
+    renderJob(job);
     while (activeJob?.jobId === job.job_id) {
       const current = await api(`/api/draft/jobs/${job.job_id}`);
       renderJob(current);
@@ -346,12 +378,33 @@ window.DraftLab = (() => {
           const result = await api(`/api/draft/jobs/${job.job_id}/result`);
           if (current.kind === "training") await renderTrainingResult(result);
           else renderBenchmarkResult(result);
-        } else if (current.status === "failed") throw new Error(current.error || "Draft Lab job failed.");
-        else $("draftProgressText").textContent = current.error || "Stopped safely.";
+        } else if (current.status === "failed") {
+          $("draftProgressText").textContent = "Draft Lab job failed.";
+          reportError(new Error(current.error || "Draft Lab job failed."));
+        } else {
+          $("draftProgressText").textContent = current.error || "Stopped safely.";
+        }
+        await acknowledgeJobActivity(job.job_id);
         return;
       }
       await new Promise(resolve => setTimeout(resolve, 400));
     }
+  }
+
+  function restoreDraftJob(job) {
+    if (!job || activeJob || jobLaunching) return;
+    pendingRecoveredJob = null;
+    void monitorJob(job).catch(error => {
+      if (activeJob?.jobId === job.job_id) {
+        setJobRunning(true, job.kind);
+        reportError(new Error(
+          `${error.message} Draft Lab may still be running locally; refresh this page to reconnect.`
+        ));
+      } else {
+        setJobRunning(false);
+        reportError(error);
+      }
+    });
   }
 
   async function estimateTraining() {
@@ -383,13 +436,24 @@ window.DraftLab = (() => {
   }
 
   async function launchJob(path, payload, kind) {
-    if (jobLaunching || activeJob) return;
+    if (externalWorkBusy || jobLaunching || activeJob) return;
     jobLaunching = true; setJobRunning(true, kind);
     try {
       const job = await api(path, {method: "POST", body: JSON.stringify(payload)});
       jobLaunching = false;
       await monitorJob(job);
-    } catch (error) { jobLaunching = false; activeJob = null; setJobRunning(false); reportError(error); }
+    } catch (error) {
+      jobLaunching = false;
+      if (activeJob) {
+        setJobRunning(true, activeJob.kind);
+        reportError(new Error(
+          `${error.message} Draft Lab may still be running locally; refresh this page to reconnect.`
+        ));
+      } else {
+        setJobRunning(false);
+        reportError(error);
+      }
+    }
   }
 
   async function startTraining(event) {
@@ -411,10 +475,11 @@ window.DraftLab = (() => {
   }
 
   async function promoteCheckpoint() {
-    if (promotionBusy) return;
+    if (externalWorkBusy || promotionBusy) return;
     clearDraftError();
     promotionBusy = true;
     updateSavedControls();
+    publishDraftActivity();
     try {
       const checkpointId = $("draftCheckpoint").value;
       if (!checkpointId) throw new Error("Choose a saved training checkpoint first.");
@@ -427,7 +492,7 @@ window.DraftLab = (() => {
       $("draftEstimate").textContent = `Generation ${model.generation} champion is ready as a portable model.`;
       await refreshCatalog({selectModelId: model.model_id, selectCheckpointId: checkpointId});
     } catch (error) { reportError(error); }
-    finally { promotionBusy = false; updateSavedControls(); }
+    finally { promotionBusy = false; updateSavedControls(); publishDraftActivity(); }
   }
 
   async function cancelJob() {
@@ -563,7 +628,7 @@ window.DraftLab = (() => {
       select.add(new Option(`${player.name} · ${player.position}`, player.player_id));
     }
     if ([...select.options].some(option => option.value === previous)) select.value = previous;
-    $("assistantRecordPick").disabled = assistantBusy || assistantStatus?.complete || !select.value;
+    $("assistantRecordPick").disabled = externalWorkBusy || assistantBusy || assistantStatus?.complete || !select.value;
   }
 
   function applyAssistantDraftBinding(status, {resetUnbound = false} = {}) {
@@ -576,7 +641,7 @@ window.DraftLab = (() => {
     } else if (resetUnbound) {
       league.value = "";
       season.value = String(
-        catalog.boards.find(row => row.board_id === status.board_id)?.season || 2026
+        catalog.boards.find(row => row.board_id === status.board_id)?.season || new Date().getFullYear()
       );
     }
     league.readOnly = Boolean(binding);
@@ -604,7 +669,7 @@ window.DraftLab = (() => {
       : (syncDetail || "Enter picks manually or connect a public ESPN draft.");
     $("assistantPickDrafter").value = status.next_drafter_number == null ? "" : String(status.next_drafter_number);
     $("assistantPickDrafter").disabled = status.complete;
-    $("assistantUndo").disabled = assistantBusy || !status.picks.length;
+    $("assistantUndo").disabled = externalWorkBusy || assistantBusy || !status.picks.length;
     const pickBody = $("assistantPickBody");
     pickBody.replaceChildren();
     for (const pick of status.picks) {
@@ -641,13 +706,14 @@ window.DraftLab = (() => {
   }
 
   async function syncEspnDraft({quiet = false} = {}) {
-    if (assistantSyncBusy || !assistantStatus || assistantStatus.complete || document.hidden) return;
+    if (externalWorkBusy || assistantSyncBusy || !assistantStatus || assistantStatus.complete || document.hidden || !draftSurfaceActive) return;
     const leagueId = $("assistantEspnLeague").value.trim();
     if (!/^[0-9]+$/.test(leagueId)) {
       if (!quiet) reportError(new Error("Enter the numeric ESPN league ID."));
       return;
     }
     assistantSyncBusy = true;
+    publishDraftActivity();
     $("assistantEspnSync").disabled = true;
     try {
       const status = await api(`/api/draft/assistants/${assistantStatus.session_id}/espn-sync`, {
@@ -664,13 +730,14 @@ window.DraftLab = (() => {
       else $("assistantLiveNotice").textContent = `Automatic ESPN refresh stopped: ${error.message}`;
     } finally {
       assistantSyncBusy = false;
-      $("assistantEspnSync").disabled = Boolean(assistantStatus?.complete);
+      $("assistantEspnSync").disabled = externalWorkBusy || Boolean(assistantStatus?.complete);
+      publishDraftActivity();
     }
   }
 
   function updateAssistantAutoSync() {
     stopAssistantAutoSync();
-    if (!$("assistantEspnAuto").checked) return;
+    if (!$("assistantEspnAuto").checked || !draftSurfaceActive) return;
     void syncEspnDraft();
     assistantSyncTimer = setInterval(() => void syncEspnDraft({quiet: true}), 15000);
   }
@@ -682,10 +749,11 @@ window.DraftLab = (() => {
   }
 
   async function assistantAction(work) {
-    if (assistantBusy) return; assistantBusy = true;
+    if (externalWorkBusy || assistantBusy) return; assistantBusy = true;
+    publishDraftActivity();
     for (const id of ["assistantCreate", "assistantOpen", "assistantRecordPick", "assistantUndo"]) $(id).disabled = true;
     try { await work(); } catch (error) { reportError(error); }
-    finally { assistantBusy = false; $("assistantCreate").disabled = false; updateSavedControls(); filterAssistantPlayers(); $("assistantUndo").disabled = !assistantStatus?.picks.length; }
+    finally { assistantBusy = false; $("assistantCreate").disabled = externalWorkBusy; updateSavedControls(); filterAssistantPlayers(); $("assistantUndo").disabled = externalWorkBusy || !assistantStatus?.picks.length; publishDraftActivity(); }
   }
 
   async function createAssistant(event) {
@@ -787,8 +855,16 @@ window.DraftLab = (() => {
     });
   }
 
-  async function init() {
+  async function init(activitySnapshot = null) {
     bind();
+    const activity = activitySnapshot || await api("/api/activity");
+    pendingRecoveredJob = activity.draft || null;
+    applyExternalWorkState(Boolean(
+      ["queued", "running"].includes(activity.search?.status) ||
+        ["queued", "running"].includes(activity.weekly_collection?.status) ||
+        window.TradeAppBusy
+    ));
+    $("assistantEspnSeason").value = String(new Date().getFullYear());
     updateStrategyTotal();
     emptyRow($("draftHistoryBody"), 6, "No completed training batch yet.");
     for (const [id, columns, message] of [
@@ -797,9 +873,49 @@ window.DraftLab = (() => {
       ["draftStandingsBody", 5, "Choose a completed showcase."],
       ["draftBracketBody", 4, "Choose a completed showcase."],
     ]) emptyRow($(id), columns, message);
-    await refreshCatalog();
+    try {
+      await refreshCatalog();
+    } finally {
+      restoreDraftJob(pendingRecoveredJob);
+    }
   }
 
-  void init().catch(reportError);
-  return {refreshCatalog};
+  let initialization = null;
+  function ensureInitialized(activitySnapshot = null) {
+    if (!initialization) initialization = init(activitySnapshot).catch(reportError);
+    return initialization;
+  }
+
+  window.addEventListener("appsurfacechange", event => {
+    draftSurfaceActive = event.detail?.surface === "draft";
+    if (!draftSurfaceActive) {
+      stopAssistantAutoSync();
+      return;
+    }
+    void ensureInitialized().then(() => {
+      if ($("assistantEspnAuto").checked) updateAssistantAutoSync();
+    });
+  });
+  window.addEventListener("serveractivitychange", event => {
+    const activity = event.detail || {};
+    if (activity.draft) pendingRecoveredJob = activity.draft;
+    if (initialization) {
+      applyExternalWorkState(Boolean(
+        ["queued", "running"].includes(activity.search?.status) ||
+          ["queued", "running"].includes(activity.weekly_collection?.status) ||
+          window.TradeAppBusy
+      ));
+    }
+    if (activity.draft) {
+      void ensureInitialized(activity).then(() => restoreDraftJob(activity.draft));
+    }
+  });
+  window.addEventListener("tradeactivitychange", event => {
+    applyExternalWorkState(event.detail?.busy);
+  });
+  if (draftSurfaceActive) {
+    void ensureInitialized();
+  }
+
+  return {ensureInitialized};
 })();

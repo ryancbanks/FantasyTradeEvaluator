@@ -1,10 +1,12 @@
 "use strict";
 
 const token = document.querySelector('meta[name="app-token"]').content;
+const browserClientId = crypto.randomUUID();
 const $ = id => document.getElementById(id);
 let bundles = [];
 let activeJob = null;
 let activeCollection = null;
+let collectionLaunching = false;
 let collectionAvailable = false;
 let extensionConnected = false;
 let extensionPairing = false;
@@ -15,12 +17,20 @@ let threeTeamEstimateSignature = null;
 let searchRunning = false;
 let activeSearchFormat = "two_team";
 let activeSearchTeamIds = [];
+let activeInsight = null;
+let dashboardBundleId = null;
+let playerLabBundleId = null;
+let exportBusy = false;
+let draftWorkBusy = false;
+let publishedTradeBusy = null;
+let recoveredSearchScopeOnly = false;
 const heartbeatInterval = 20000;
 const extensionProtocolVersion = 1;
 
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
   headers.set("X-FTE-Token", token);
+  headers.set("X-FTE-Client", browserClientId);
   if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   const response = await fetch(path, {...options, headers});
   const type = response.headers.get("Content-Type") || "";
@@ -38,7 +48,7 @@ window.addEventListener("pagehide", event => {
   if (event.persisted) return;
   fetch("/api/session/close", {
     method: "POST",
-    headers: {"X-FTE-Token": token},
+    headers: {"X-FTE-Token": token, "X-FTE-Client": browserClientId},
     body: "",
     keepalive: true
   }).catch(() => {});
@@ -148,7 +158,7 @@ function renderExtensionStatus(status) {
     ? `Pairing code ends in ${extensionPairHint} — confirm the same code in the extension.`
     : "";
   pairCode.classList.toggle("hidden", !showPairCode);
-  if (!activeCollection) $("collectButton").disabled = !collectionAvailable || !extensionConnected;
+  updateActivityControls();
 }
 
 async function refreshExtensionStatus() {
@@ -285,6 +295,7 @@ function renderBundle() {
 
 function changeBundle() {
   clearError();
+  recoveredSearchScopeOnly = false;
   activeJob = null;
   $("progressPanel").classList.add("hidden");
   $("resultsPanel").classList.add("hidden");
@@ -293,8 +304,152 @@ function changeBundle() {
   $("estimate").textContent = "Choose a ready week, then count the combinations.";
   threeTeamEstimateSignature = null;
   renderBundle();
-  void DashboardUi.setBundle(currentBundle(), {request: api, onError: showError});
-  void PlayerLabUi.setBundle(currentBundle(), {request: api, onError: showError});
+  dashboardBundleId = null;
+  playerLabBundleId = null;
+  DashboardUi.reset(
+    currentBundle()
+      ? "Calculate this week's league outlook when you are ready."
+      : undefined
+  );
+  PlayerLabUi.reset(
+    currentBundle()
+      ? "Open Player Lab when you want the player-level projection evidence."
+      : undefined
+  );
+  updateActivityControls();
+}
+
+function updateActivityControls() {
+  const bundle = currentBundle();
+  const tradeBusy = searchRunning || collectionLaunching || Boolean(activeCollection) || Boolean(activeInsight) || exportBusy;
+  const busy = tradeBusy || draftWorkBusy;
+  $("bundleFile").disabled = busy;
+  $("bundleSelect").disabled = bundles.length === 0 || busy;
+  $("dashboardLoadButton").disabled = !bundle || busy;
+  $("playerLabLoadButton").disabled = !bundle || busy;
+  $("dashboardLoadButton").textContent =
+    bundle && dashboardBundleId === bundle.bundle_id ? "Refresh league outlook" : "Calculate league outlook";
+  $("playerLabLoadButton").textContent =
+    bundle && playerLabBundleId === bundle.bundle_id ? "Refresh Player Lab" : "Open Player Lab";
+  $("collectButton").disabled =
+    !collectionAvailable || !extensionConnected || busy;
+  window.TradeAppBusy = tradeBusy;
+  if (publishedTradeBusy !== tradeBusy) {
+    publishedTradeBusy = tradeBusy;
+    window.dispatchEvent(new CustomEvent("tradeactivitychange", {detail: {busy: tradeBusy}}));
+  }
+}
+
+function jobIsActive(job) {
+  return Boolean(job && ["queued", "running"].includes(job.status));
+}
+
+function restoreSearchScope(search) {
+  recoveredSearchScopeOnly = true;
+  const request = search.request || {};
+  activeSearchFormat = search.trade_format === "three_team" ? "three_team" : "two_team";
+  activeSearchTeamIds = [
+    request.primary_team_id,
+    ...(Array.isArray(request.counterparty_team_ids) ? request.counterparty_team_ids : [])
+  ].filter(Boolean);
+
+  const bundle = bundles.find(item => item.bundle_id === request.bundle_id);
+  if (!bundle) {
+    $("bundleSelect").value = "";
+    renderBundle();
+    $("estimate").textContent = "Recovered a saved search, but its weekly bundle is no longer available in the selector. Its status and retained results remain attached.";
+    return;
+  }
+  if ($("bundleSelect").value !== bundle.bundle_id) {
+    $("bundleSelect").value = bundle.bundle_id;
+    renderBundle();
+  }
+
+  const teamIds = new Set(bundle.teams.map(team => team.team_id));
+  if (teamIds.has(request.primary_team_id)) {
+    $("primaryTeam").value = request.primary_team_id;
+  }
+  $(activeSearchFormat === "three_team" ? "threeTeamFormat" : "twoTeamFormat").checked = true;
+  syncCounterparties();
+  ThreeWayUi.syncFormatControls(bundle);
+
+  const counterparties = activeSearchTeamIds.slice(1).filter(teamId =>
+    teamIds.has(teamId) && teamId !== $("primaryTeam").value
+  );
+  if (activeSearchFormat === "three_team" && counterparties.length === 2) {
+    $("partnerTeamA").value = counterparties[0];
+    ThreeWayUi.syncPartnerOptions(bundle, $("primaryTeam").value, "a");
+    $("partnerTeamB").value = counterparties[1];
+    ThreeWayUi.syncPartnerOptions(bundle, $("primaryTeam").value, "b");
+  } else if (activeSearchFormat === "two_team") {
+    const selected = new Set(counterparties);
+    for (const option of $("counterparties").options) {
+      option.selected = selected.has(option.value);
+    }
+  }
+  populatePackageFilters();
+  $("estimate").textContent = "Reattached to this saved search. Only its week, teams, and format are restored above. Every other original filter and setting remains fixed in the saved job and is not reconstructed here. Count the displayed form before starting a different search.";
+}
+
+async function restoreActiveWork(activity) {
+  const collection = activity.weekly_collection;
+  const search = activity.search;
+  draftWorkBusy = jobIsActive(activity.draft);
+  const restoreCollection = collection && !collectionLaunching && !activeCollection;
+  const restoreSearch = search && !searchRunning && !activeJob;
+  if (restoreSearch && jobIsActive(search)) {
+    searchRunning = true;
+    updateSearchStartButton();
+  }
+
+  if (restoreCollection) {
+    activeCollection = collection.job_id;
+    const collectionRunning = jobIsActive(collection);
+    setCollectionRunning(collectionRunning);
+    renderCollectionProgress(collection);
+    if (collectionRunning) void pollCollection().catch(showError);
+    else await finishCollection(collection).catch(showError);
+  }
+  if (restoreSearch) {
+    restoreSearchScope(search);
+    activeJob = search.job_id;
+    searchRunning = jobIsActive(search);
+    $("progressPanel").classList.remove("hidden");
+    $("resultsPanel").classList.add("hidden");
+    $("cancelButton").classList.toggle("hidden", !searchRunning);
+    renderProgress(search);
+    updateSearchStartButton();
+    if (searchRunning) void pollJob().catch(showError);
+    else void finishSearch(search).catch(showError);
+  }
+
+  updateSearchStartButton();
+  window.dispatchEvent(new CustomEvent("serveractivitychange", {detail: activity}));
+}
+
+async function loadInsight(kind) {
+  const bundle = currentBundle();
+  if (!bundle || activeInsight || searchRunning || activeCollection || exportBusy || draftWorkBusy) return;
+  clearError();
+  activeInsight = kind;
+  updateActivityControls();
+  let failed = false;
+  const onError = error => {
+    failed = true;
+    showError(error);
+  };
+  try {
+    if (kind === "dashboard") {
+      await DashboardUi.setBundle(bundle, {request: api, onError});
+      if (!failed) dashboardBundleId = bundle.bundle_id;
+    } else {
+      await PlayerLabUi.setBundle(bundle, {request: api, onError});
+      if (!failed) playerLabBundleId = bundle.bundle_id;
+    }
+  } finally {
+    activeInsight = null;
+    updateSearchStartButton();
+  }
 }
 
 function syncCounterparties() {
@@ -350,7 +505,10 @@ function updateSearchStartButton() {
     threeTeamEstimateSignature !== null &&
     threeTeamEstimateSignature === searchConfigurationSignature()
   );
-  $("startButton").disabled = !bundleReady || Boolean(activeCollection) || searchRunning || !estimateCurrent;
+  const busy = Boolean(activeCollection) || Boolean(activeInsight) || searchRunning || exportBusy || draftWorkBusy;
+  $("startButton").disabled = !bundleReady || busy || !estimateCurrent || recoveredSearchScopeOnly;
+  $("estimateButton").disabled = !bundleReady || busy;
+  updateActivityControls();
 }
 
 function invalidateSearchEstimate() {
@@ -377,7 +535,10 @@ function collectionPayload() {
 
 async function startCollection(event) {
   event.preventDefault();
+  if (collectionLaunching || activeCollection || draftWorkBusy) return;
   clearError();
+  collectionLaunching = true;
+  setCollectionRunning(true);
   try {
     if (!extensionConnected) throw new Error("Connect the browser extension before scanning the league.");
     const job = await api("/api/weekly-collections", {
@@ -385,11 +546,13 @@ async function startCollection(event) {
       body: JSON.stringify(collectionPayload())
     });
     activeCollection = job.job_id;
+    collectionLaunching = false;
     setCollectionRunning(true);
     renderCollectionProgress(job);
     await pollCollection();
   } catch (error) {
-    setCollectionRunning(false);
+    collectionLaunching = false;
+    if (!activeCollection) setCollectionRunning(false);
     showError(error);
   }
 }
@@ -398,21 +561,39 @@ async function pollCollection() {
   while (activeCollection) {
     let job;
     try { job = await api(`/api/weekly-collections/${activeCollection}`); }
-    catch (error) { showError(error); break; }
+    catch (error) {
+      showError(new Error(
+        `${error.message} Collection may still be running locally; refresh this page to reconnect.`
+      ));
+      return;
+    }
     renderCollectionProgress(job);
-    if (!["queued", "running"].includes(job.status)) {
-      const selectedBundle = job.bundle_id;
-      activeCollection = null;
-      setCollectionRunning(false);
-      if (job.status === "complete") await refreshBundles(selectedBundle);
-      else if (job.status === "failed") showError(job.error || "No new weekly bundle was published.");
-      else $("collectionProgressText").textContent = "Collection stopped safely. No incomplete week was published.";
+    if (!jobIsActive(job)) {
+      await finishCollection(job);
       return;
     }
     await new Promise(resolve => setTimeout(resolve, 500));
   }
   activeCollection = null;
   setCollectionRunning(false);
+}
+
+async function finishCollection(job) {
+  activeCollection = null;
+  setCollectionRunning(false);
+  if (job.status === "complete") {
+    await refreshBundles(job.bundle_id);
+  } else if (job.status === "failed") {
+    $("collectionProgressText").textContent = "Collection failed. No new weekly bundle was published.";
+    showError(job.error || "No new weekly bundle was published.");
+  } else {
+    $("collectionProgressText").textContent = "Collection stopped safely. No incomplete week was published.";
+  }
+  try {
+    await api(`/api/weekly-collections/${job.job_id}/activity-ack`, {method: "POST", body: ""});
+  } catch (_) {
+    /* Keep the terminal status recoverable if acknowledgement is interrupted. */
+  }
 }
 
 function renderCollectionProgress(job) {
@@ -490,6 +671,7 @@ async function estimate() {
     } else {
       $("estimate").textContent = `${compactNumber(candidateCount)} combinations counted exactly across ${value.pair_count} team matchups.${caution}`;
     }
+    recoveredSearchScopeOnly = false;
     updateSearchStartButton();
   } catch (error) {
     threeTeamEstimateSignature = null;
@@ -500,6 +682,7 @@ async function estimate() {
 
 async function startSearch(event) {
   event.preventDefault();
+  if (searchRunning || draftWorkBusy) return;
   clearError();
   try {
     const payload = requestPayload();
@@ -521,8 +704,6 @@ async function startSearch(event) {
   } catch (error) {
     searchRunning = false;
     updateSearchStartButton();
-    $("collectButton").disabled = !collectionAvailable || !extensionConnected;
-    $("bundleSelect").disabled = bundles.length === 0;
     showError(error);
   }
 }
@@ -532,27 +713,37 @@ async function pollJob() {
     let job;
     try { job = await api(`/api/searches/${activeJob}`); }
     catch (error) {
-      searchRunning = false;
       updateSearchStartButton();
-      $("collectButton").disabled = !collectionAvailable || !extensionConnected;
-      $("bundleSelect").disabled = bundles.length === 0;
-      $("cancelButton").classList.add("hidden");
-      showError(error);
+      showError(new Error(
+        `${error.message} The search may still be running locally; refresh this page to reconnect.`
+      ));
       return;
     }
     renderProgress(job);
-    if (!["queued", "running"].includes(job.status)) {
-      searchRunning = false;
-      updateSearchStartButton();
-      $("collectButton").disabled = !collectionAvailable || !extensionConnected;
-      $("bundleSelect").disabled = bundles.length === 0;
-      $("cancelButton").classList.add("hidden");
-      if (job.status === "complete") await loadResults();
-      else if (job.status === "failed") showError(job.error || "The search failed.");
-      else $("progressText").textContent = "Stopped safely. Start again later to resume from this checkpoint.";
+    if (!jobIsActive(job)) {
+      await finishSearch(job);
       break;
     }
     await new Promise(resolve => setTimeout(resolve, 500));
+  }
+}
+
+async function finishSearch(job) {
+  searchRunning = false;
+  updateSearchStartButton();
+  $("cancelButton").classList.add("hidden");
+  if (job.status === "complete") {
+    await loadResults();
+  } else if (job.status === "failed") {
+    $("progressText").textContent = "Search failed.";
+    showError(job.error || "The search failed.");
+  } else {
+    $("progressText").textContent = "Stopped safely. Start again later to resume from this checkpoint.";
+  }
+  try {
+    await api(`/api/searches/${job.job_id}/activity-ack`, {method: "POST", body: ""});
+  } catch (_) {
+    /* Keep the retained result recoverable if acknowledgement is interrupted. */
   }
 }
 
@@ -680,7 +871,11 @@ async function cancelSearch() {
 }
 
 async function exportWorkbook() {
+  if (exportBusy) return;
   clearError();
+  exportBusy = true;
+  $("exportButton").disabled = true;
+  updateSearchStartButton();
   try {
     const result = await api(`/api/searches/${activeJob}/export`, {method: "POST", body: ""});
     const blob = await api(`/api/exports/${encodeURIComponent(result.filename)}`);
@@ -689,7 +884,13 @@ async function exportWorkbook() {
     link.download = result.filename;
     link.click();
     setTimeout(() => URL.revokeObjectURL(link.href), 1000);
-  } catch (error) { showError(error); }
+  } catch (error) {
+    showError(error);
+  } finally {
+    exportBusy = false;
+    $("exportButton").disabled = false;
+    updateSearchStartButton();
+  }
 }
 
 function changeTradeFormat() {
@@ -708,11 +909,22 @@ function searchConfigurationChanged(event) {
   invalidateSearchEstimate();
 }
 
+window.addEventListener("draftactivitychange", event => {
+  draftWorkBusy = Boolean(event.detail?.busy);
+  updateSearchStartButton();
+});
+
 $("bundleFile").addEventListener("change", async event => {
   clearError();
   const file = event.target.files[0];
   if (!file) return;
   try {
+    if (searchRunning || activeCollection || activeInsight || exportBusy) {
+      throw new Error("Wait for the current local calculation before changing weekly data.");
+    }
+    if (file.size > 256 * 1024 * 1024) {
+      throw new Error("Weekly bundle files must be 256 MB or smaller.");
+    }
     const record = JSON.parse(await file.text());
     const summary = await api("/api/bundles/import", {method: "POST", body: JSON.stringify(record)});
     await refreshBundles(summary.bundle_id);
@@ -732,6 +944,8 @@ $("connectExtensionButton").addEventListener("click", connectExtension);
 $("collectionForm").addEventListener("submit", startCollection);
 $("cancelCollectionButton").addEventListener("click", cancelCollection);
 $("confirmSignInButton").addEventListener("click", confirmCollectionSignIn);
+$("dashboardLoadButton").addEventListener("click", () => void loadInsight("dashboard"));
+$("playerLabLoadButton").addEventListener("click", () => void loadInsight("player"));
 $("estimateButton").addEventListener("click", estimate);
 $("searchForm").addEventListener("input", searchConfigurationChanged);
 $("searchForm").addEventListener("change", searchConfigurationChanged);
@@ -745,8 +959,11 @@ $("exportButton").addEventListener("click", exportWorkbook);
     await pingLifecycle();
     await api("/api/health");
     $("health").textContent = "App running locally";
+    const activity = await api("/api/activity");
+    draftWorkBusy = jobIsActive(activity.draft);
     await refreshExtensionStatus();
-    await refreshBundles();
+    await refreshBundles(activity.search?.request?.bundle_id || null);
+    await restoreActiveWork(activity);
     setInterval(refreshExtensionStatus, 5000);
   } catch (error) {
     $("health").textContent = "Needs attention";

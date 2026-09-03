@@ -151,15 +151,20 @@ def completion_after_pick(problem, player) -> bool:
     if problem.blocked or problem.pending_team is None:
         return False
     team = problem.pending_team
-    roster = (*problem.roster_players[team], player)
-    if len(problem.config.starting_slots) - filled_count(
-        roster, problem.config, problem.cache
-    ) > len(problem.future_rounds[team]):
+    if not candidate_preserves_starter_deadline(
+        problem.roster_players[team],
+        player,
+        len(problem.future_rounds[team]),
+        problem.config,
+        problem.cache,
+    ):
         return False
     capacity_key = team, player.position
     remaining_capacity = problem.position_remaining.get(capacity_key, 0)
     if remaining_capacity <= 0:
         return False
+    if _completion_group_is_surplus(problem, player):
+        return True
 
     available_groups = problem.available_groups.copy()
     available_key = problem.available_keys[player.position, player.eligible_positions]
@@ -184,6 +189,23 @@ def completion_after_pick(problem, player) -> bool:
 def completion_group_is_surplus(problem, player) -> bool:
     """Prove a pick safe when identical players cover every possible use."""
 
+    if problem.blocked or problem.pending_team is None:
+        return False
+    team = problem.pending_team
+    if not candidate_preserves_starter_deadline(
+        problem.roster_players[team],
+        player,
+        len(problem.future_rounds[team]),
+        problem.config,
+        problem.cache,
+    ):
+        return False
+    if problem.position_remaining.get((team, player.position), 0) <= 0:
+        return False
+    return _completion_group_is_surplus(problem, player)
+
+
+def _completion_group_is_surplus(problem, player) -> bool:
     key = problem.available_keys[player.position, player.eligible_positions]
     if key is None:
         return False
@@ -208,6 +230,26 @@ def completion_group_is_surplus(problem, player) -> bool:
                 problem.position_capacities.get((team, primary), 0),
             )
     return problem.available_groups[key] >= total_demand
+
+
+def candidate_preserves_starter_deadline(
+    roster, player, picks_left, config, cache, *, current_filled=None
+) -> bool:
+    """Check the local starter deadline without repeating the whole-pool proof."""
+
+    starter_count = len(config.starting_slots)
+    if picks_left >= starter_count:
+        return True
+    if current_filled is None:
+        filled_after = filled_count((*roster, player), config, cache)
+        return starter_count - filled_after <= picks_left
+    missing = starter_count - current_filled
+    if missing <= picks_left:
+        return True
+    return (
+        missing == picks_left + 1
+        and filled_count((*roster, player), config, cache) > current_filled
+    )
 
 
 def filled_count(players, config, cache) -> int:

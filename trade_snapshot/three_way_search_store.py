@@ -1,13 +1,17 @@
 """Versioned SQLite checkpoints for three-team trade searches."""
 
+from collections.abc import Iterable
 from contextlib import closing
 from dataclasses import dataclass
+from heapq import nsmallest
+from itertools import islice
 import json
 import os
 from pathlib import Path
 import sqlite3
 
 from ._search_store_records import _canonical_json, _strict_json_loads
+from ._writer_lock import ExclusiveWriterLock, WriterOwnershipError
 from .three_way_search_records import (
     ThreeWayQualifiedResult,
     ThreeWaySearchRunDefinition,
@@ -17,6 +21,7 @@ from .three_way_search_records import (
 
 THREE_WAY_DATABASE_SCHEMA_VERSION = 1
 THREE_WAY_DATABASE_APPLICATION_ID = 1177769811  # ASCII "F3WS"
+MAX_QUALIFIED_RESULT_BATCH_SIZE = 1_000
 
 
 class ThreeWaySearchStoreError(RuntimeError):
@@ -47,7 +52,11 @@ class ThreeWaySearchStore:
         self.path = _path(database_path)
         self.run = run
         self._connection: sqlite3.Connection | None = None
+        self._writer_lock: ExclusiveWriterLock | None = None
         try:
+            writer_lock = ExclusiveWriterLock(self.path)
+            writer_lock.acquire()
+            self._writer_lock = writer_lock
             connection = sqlite3.connect(self.path, timeout=30.0)
             connection.row_factory = sqlite3.Row
             self._connection = connection
@@ -58,6 +67,9 @@ class ThreeWaySearchStore:
         except ThreeWaySearchStoreError:
             self.close()
             raise
+        except WriterOwnershipError as error:
+            self.close()
+            raise ThreeWaySearchStoreError(str(error)) from None
         except (OSError, sqlite3.Error, TypeError, ValueError) as error:
             self.close()
             raise ThreeWaySearchStoreError(
@@ -72,9 +84,14 @@ class ThreeWaySearchStore:
         self.close()
 
     def close(self) -> None:
-        if self._connection is not None:
-            self._connection.close()
-            self._connection = None
+        try:
+            if self._connection is not None:
+                self._connection.close()
+                self._connection = None
+        finally:
+            if self._writer_lock is not None:
+                self._writer_lock.close()
+                self._writer_lock = None
 
     def checkpoint(self, next_candidate_index: int) -> None:
         target = self._checked_checkpoint(next_candidate_index)
@@ -88,27 +105,59 @@ class ThreeWaySearchStore:
         *,
         next_candidate_index: int | None = None,
     ) -> None:
+        if next_candidate_index is not None:
+            self.upsert_qualified_results(
+                (result,), next_candidate_index=next_candidate_index
+            )
+            return
+        values = self._result_values(result)
+        connection = self._require_open()
+        with connection:
+            connection.execute(_UPSERT_RESULT_SQL, values)
+
+    def upsert_qualified_results(
+        self,
+        results: Iterable[ThreeWayQualifiedResult],
+        *,
+        next_candidate_index: int,
+    ) -> None:
+        """Atomically persist one bounded result batch and its checkpoint."""
+
+        rows = _bounded_result_batch(results)
+        target = self._checked_checkpoint(next_candidate_index)
+        seen_indexes = set()
+        values = []
+        for result in rows:
+            if isinstance(result, ThreeWayQualifiedResult):
+                if result.candidate_index in seen_indexes:
+                    raise ValueError("results contain a duplicate candidate_index")
+                seen_indexes.add(result.candidate_index)
+            values.append(self._result_values(result, target=target))
+
+        connection = self._require_open()
+        with connection:
+            connection.executemany(_UPSERT_RESULT_SQL, values)
+            self._advance_checkpoint(connection, target)
+
+    def _result_values(
+        self,
+        result: ThreeWayQualifiedResult,
+        *,
+        target: int | None = None,
+    ) -> tuple[object, ...]:
         if not isinstance(result, ThreeWayQualifiedResult):
             raise ValueError("result must be a ThreeWayQualifiedResult")
         _require_result_run(result, self.run)
         if result.candidate_index >= self.run.total_candidate_count:
             raise ValueError("candidate_index is outside this search run")
-        target = None
-        if next_candidate_index is not None:
-            target = self._checked_checkpoint(next_candidate_index)
-            if target <= result.candidate_index:
-                raise ValueError("next_candidate_index must be after the saved candidate")
-        connection = self._require_open()
-        values = (
+        if target is not None and target <= result.candidate_index:
+            raise ValueError("next_candidate_index must be after the saved candidate")
+        return (
             str(result.candidate_index),
             _canonical_json(result.to_record()),
             int(result.all_teams_gain),
             result.combined_playoff_delta,
         )
-        with connection:
-            connection.execute(_UPSERT_RESULT_SQL, values)
-            if target is not None:
-                self._advance_checkpoint(connection, target)
 
     def resume(self) -> ThreeWayResumeState:
         connection = self._require_open()
@@ -125,6 +174,10 @@ class ThreeWaySearchStore:
                 "combined_playoff_delta FROM qualified_result"
             ):
                 result = _decode_result(saved, self.run)
+                if result.candidate_index >= next_index:
+                    raise ValueError(
+                        "stored result is at or beyond the search checkpoint"
+                    )
                 qualified_count += 1
                 gain_count += int(result.all_teams_gain)
         except (ValueError, TypeError, json.JSONDecodeError, sqlite3.Error) as error:
@@ -229,15 +282,41 @@ class ThreeWaySearchStore:
         return self._connection
 
 
+def _bounded_result_batch(
+    values: Iterable[ThreeWayQualifiedResult],
+) -> tuple[ThreeWayQualifiedResult, ...]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError("results must be an iterable of qualified results")
+    try:
+        iterator = iter(values)
+    except TypeError:
+        raise ValueError("results must be an iterable of qualified results") from None
+    rows = tuple(islice(iterator, MAX_QUALIFIED_RESULT_BATCH_SIZE + 1))
+    if len(rows) > MAX_QUALIFIED_RESULT_BATCH_SIZE:
+        raise ValueError(
+            "results must contain at most "
+            f"{MAX_QUALIFIED_RESULT_BATCH_SIZE} values"
+        )
+    return rows
+
+
 def read_three_way_results(
     database_path: str | os.PathLike[str],
     limit: int | None = None,
     *,
     expected_run_id: str | None = None,
+    expected_result_count: int | None = None,
+    maximum_candidate_index: int | None = None,
 ) -> tuple[ThreeWayQualifiedResult, ...]:
-    """Read best-first results after the search connection has closed."""
+    """Read one immutable best-first checkpoint snapshot."""
 
     _limit_clause(limit)
+    expected_count = _optional_count(
+        "expected_result_count", expected_result_count
+    )
+    maximum_index = _optional_count(
+        "maximum_candidate_index", maximum_candidate_index
+    )
     path = _path(database_path)
     if not path.is_file():
         raise ThreeWaySearchStoreError("three-way search result store does not exist")
@@ -245,12 +324,19 @@ def read_three_way_results(
         with closing(sqlite3.connect(path)) as connection:
             _require_existing_schema(connection)
             connection.row_factory = sqlite3.Row
-            run, _ = _load_run(connection)
+            run, checkpoint = _load_run(connection)
             if expected_run_id is not None and run.run_id != expected_run_id:
                 raise ThreeWaySearchRunMismatchError(
                     "three-way search result store belongs to a different run"
                 )
-            return _query_results(connection, limit, run)
+            _validate_snapshot_watermark(maximum_index, checkpoint, run)
+            return _query_results(
+                connection,
+                limit,
+                run,
+                expected_result_count=expected_count,
+                maximum_candidate_index=maximum_index,
+            )
     except ThreeWaySearchStoreError:
         raise
     except (OSError, sqlite3.Error, TypeError, ValueError) as error:
@@ -263,39 +349,40 @@ def _query_results(
     connection: sqlite3.Connection,
     limit: int | None,
     run: ThreeWaySearchRunDefinition,
+    *,
+    expected_result_count: int | None = None,
+    maximum_candidate_index: int | None = None,
 ):
-    clause, parameters = _limit_clause(limit)
+    _limit_clause(limit)
     try:
+        selected_count = 0
+
+        def selected_results():
+            nonlocal selected_count
+            for row in connection.execute(
+                "SELECT candidate_index_text, result_json, all_teams_gain, "
+                "combined_playoff_delta FROM qualified_result"
+            ):
+                result = _decode_result(row, run)
+                if (
+                    maximum_candidate_index is None
+                    or result.candidate_index < maximum_candidate_index
+                ):
+                    selected_count += 1
+                    yield result
+
         if limit is None:
-            results = [
-                _decode_result(row, run)
-                for row in connection.execute(
-                    "SELECT candidate_index_text, result_json, all_teams_gain, "
-                    "combined_playoff_delta FROM qualified_result"
-                )
-            ]
-            results.sort(
-                key=lambda result: (
-                    not result.all_teams_gain,
-                    -result.combined_playoff_delta,
-                    result.candidate_index,
-                )
-            )
-            return tuple(results)
-        for row in connection.execute(
-            "SELECT candidate_index_text, result_json, all_teams_gain, "
-            "combined_playoff_delta FROM qualified_result"
+            results = sorted(selected_results(), key=_result_rank_key)
+        else:
+            results = nsmallest(limit, selected_results(), key=_result_rank_key)
+        if (
+            expected_result_count is not None
+            and selected_count != expected_result_count
         ):
-            _decode_result(row, run)
-        rows = connection.execute(
-            "SELECT candidate_index_text, result_json, all_teams_gain, "
-            "combined_playoff_delta FROM qualified_result "
-            "ORDER BY all_teams_gain DESC, combined_playoff_delta DESC, "
-            "LENGTH(candidate_index_text), candidate_index_text"
-            + clause,
-            parameters,
-        )
-        return tuple(_decode_result(row, run) for row in rows)
+            raise ValueError(
+                "stored result count does not match three-way search progress"
+            )
+        return tuple(results)
     except (ValueError, TypeError, json.JSONDecodeError, sqlite3.Error) as error:
         raise ThreeWaySearchStoreError(
             f"stored three-way result is invalid: {error}"
@@ -308,6 +395,38 @@ def _limit_clause(limit: int | None) -> tuple[str, tuple[int, ...]]:
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise ValueError("limit must be a positive integer or None")
     return " LIMIT ?", (limit,)
+
+
+def _optional_count(name: str, value: int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer or None")
+    return value
+
+
+def _result_rank_key(
+    result: ThreeWayQualifiedResult,
+) -> tuple[bool, float, int]:
+    return (
+        not result.all_teams_gain,
+        -result.combined_playoff_delta,
+        result.candidate_index,
+    )
+
+
+def _validate_snapshot_watermark(
+    maximum_candidate_index: int | None,
+    checkpoint: int,
+    run: ThreeWaySearchRunDefinition,
+) -> None:
+    if maximum_candidate_index is not None and (
+        maximum_candidate_index > checkpoint
+        or maximum_candidate_index > run.total_candidate_count
+    ):
+        raise ThreeWaySearchStoreError(
+            "three-way result snapshot exceeds its stored checkpoint"
+        )
 
 
 def _path(value: object) -> Path:

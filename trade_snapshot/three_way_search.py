@@ -16,6 +16,7 @@ from .three_way_search_records import (
     _nonnegative_integer,
 )
 from .three_way_search_store import (
+    MAX_QUALIFIED_RESULT_BATCH_SIZE,
     THREE_WAY_DATABASE_SCHEMA_VERSION,
     ThreeWayResumeState,
     ThreeWaySearchRunMismatchError,
@@ -137,6 +138,8 @@ class ThreeWaySearchOutcome:
             self.database_path,
             limit,
             expected_run_id=self.progress.run_id,
+            expected_result_count=self.progress.power_qualified_count,
+            maximum_candidate_index=self.progress.next_candidate_index,
         )
 
 
@@ -201,12 +204,16 @@ class ResumableThreeWayTradeSearch:
             next_index = state.next_candidate_index
             qualified_count = state.qualified_result_count
             gain_count = state.all_playoff_gain_count
+            pending_results: list[ThreeWayQualifiedResult] = []
             cancelled = False
             for index, candidate in enumerate(
                 self.space.iter_from(next_index), start=next_index
             ):
                 if should_cancel is not None and should_cancel():
-                    store.checkpoint(index)
+                    store.upsert_qualified_results(
+                        pending_results, next_candidate_index=index
+                    )
+                    pending_results.clear()
                     next_index, cancelled = index, True
                     break
                 power = self.prepared.evaluate(candidate, candidate_index=index)
@@ -214,13 +221,17 @@ class ResumableThreeWayTradeSearch:
                 qualified = self._power_qualifies(power)
                 if qualified:
                     result = self._simulate_candidate(power)
-                    store.upsert_qualified_result(
-                        result, next_candidate_index=next_index
-                    )
+                    pending_results.append(result)
                     qualified_count += 1
                     gain_count += int(result.all_teams_gain)
-                elif next_index % self.settings.checkpoint_interval == 0:
-                    store.checkpoint(next_index)
+                if (
+                    len(pending_results) >= MAX_QUALIFIED_RESULT_BATCH_SIZE
+                    or next_index % self.settings.checkpoint_interval == 0
+                ):
+                    store.upsert_qualified_results(
+                        pending_results, next_candidate_index=next_index
+                    )
+                    pending_results.clear()
                 if on_progress is not None and (
                     qualified or next_index % self.settings.checkpoint_interval == 0
                 ):
@@ -228,8 +239,11 @@ class ResumableThreeWayTradeSearch:
                         self._progress(next_index, qualified_count, gain_count, False)
                     )
             else:
-                store.checkpoint(self.space.candidate_count)
                 next_index = self.space.candidate_count
+                store.upsert_qualified_results(
+                    pending_results, next_candidate_index=next_index
+                )
+                pending_results.clear()
             final = store.resume()
             if final.next_candidate_index != next_index:
                 raise AssertionError("search checkpoint did not advance as expected")

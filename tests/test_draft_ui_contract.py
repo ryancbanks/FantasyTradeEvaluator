@@ -104,6 +104,23 @@ class DraftUiContractTests(unittest.TestCase):
         self.assertIn("Stop and keep last autosave", self.page)
         self.assertIn("Stop and keep last autosave", self.draft)
 
+    def test_active_draft_job_reattaches_to_the_existing_monitor(self):
+        self.assertIn('api("/api/activity")', self.draft)
+        self.assertIn("restoreDraftJob(activity.draft)", self.draft)
+        self.assertIn('addEventListener("serveractivitychange"', self.draft)
+        self.assertIn("void monitorJob(job)", self.draft)
+        self.assertIn("Boolean(pendingRecoveredJob)", self.draft)
+        claim = self.draft.index("pendingRecoveredJob = activity.draft || null")
+        self.assertLess(
+            claim,
+            self.draft.index("await refreshCatalog()", claim),
+        )
+        self.assertIn("Draft Lab may still be running locally", self.draft)
+        self.assertIn("activity-ack", self.draft)
+        self.assertIn("if (!job || activeJob || jobLaunching) return", self.draft)
+        self.assertNotIn("setInterval(monitorJob", self.draft)
+        self.assertNotIn("FteActiveJobs", self.draft)
+
     def test_public_espn_sync_is_optional_credential_free_and_guarded(self):
         self.assertIn("Public ESPN snake drafts only", self.page)
         self.assertIn("No cookies or credentials", self.page)

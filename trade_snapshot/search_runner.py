@@ -1,24 +1,28 @@
 """Resumable power-prefiltered trade search with paired playoff simulation."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
+from copy import deepcopy
 from dataclasses import dataclass
-from itertools import islice
 from math import isfinite
 from numbers import Real
 from pathlib import Path
 
 from .search import PreparedTradePair, TradePowerEvaluation
 from .search_store import (
+    MAX_QUALIFIED_RESULT_BATCH_SIZE,
     QualifiedSearchResult,
-    SearchResumeState,
     SearchRunDefinition,
     SearchStore,
+    iter_search_results,
+    read_search_results,
+    search_result_rank_key,
 )
 from .trade_impact import PreparedSeasonBaseline
 from .trade_space import TeamRoster, TradeSpace
 
 
 SEARCH_ALGORITHM = "local-power-paired-playoffs-v2"
+MAX_INLINE_OUTCOME_RESULTS = 1_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,14 +82,208 @@ class TradeSearchProgress:
         return self.next_candidate_index / self.total_candidate_count
 
 
-@dataclass(frozen=True, slots=True)
-class TradeSearchOutcome:
+class _TradeSearchOutcomeStorage:
+    __slots__ = ("_database_path",)
+
+
+@dataclass(frozen=True, slots=True, init=False, eq=False, repr=False)
+class TradeSearchOutcome(_TradeSearchOutcomeStorage):
+    """Immutable checkpoint view with bounded inline compatibility storage.
+
+    Small result sets are retained in the outcome so legacy callers may discard
+    a temporary database. Larger sets stay lazy and require ``database_path`` to
+    remain available, avoiding an unbounded memory copy.
+    """
+
     progress: TradeSearchProgress
     results: tuple[QualifiedSearchResult, ...]
 
+    def __init__(
+        self,
+        progress: TradeSearchProgress,
+        results: Iterable[QualifiedSearchResult],
+    ) -> None:
+        if not isinstance(progress, TradeSearchProgress):
+            raise ValueError("progress must be TradeSearchProgress")
+        try:
+            rows = tuple(results)
+        except TypeError:
+            raise ValueError("results must be an iterable of qualified results") from None
+        if any(not isinstance(row, QualifiedSearchResult) for row in rows):
+            raise ValueError("results must contain QualifiedSearchResult values")
+        object.__setattr__(self, "progress", progress)
+        object.__setattr__(self, "results", rows)
+        object.__setattr__(self, "_database_path", None)
+
+    @classmethod
+    def from_database(
+        cls,
+        progress: TradeSearchProgress,
+        database_path: str | Path,
+    ) -> "TradeSearchOutcome":
+        if not isinstance(progress, TradeSearchProgress):
+            raise ValueError("progress must be TradeSearchProgress")
+        try:
+            path = Path(database_path).resolve()
+        except TypeError:
+            raise ValueError("database_path must be a filesystem path") from None
+        outcome = object.__new__(cls)
+        object.__setattr__(outcome, "progress", progress)
+        rows = None
+        if progress.power_qualified_count <= MAX_INLINE_OUTCOME_RESULTS:
+            rows = read_search_results(
+                path,
+                expected_run_id=progress.run_id,
+                expected_result_count=progress.power_qualified_count,
+                maximum_candidate_index=progress.next_candidate_index,
+            )
+        object.__setattr__(outcome, "results", rows)
+        object.__setattr__(outcome, "_database_path", path)
+        return outcome
+
+    @property
+    def database_path(self) -> Path | None:
+        return self._database_path
+
+    def __getattribute__(self, name: str):
+        if name != "results":
+            return object.__getattribute__(self, name)
+        stored = object.__getattribute__(self, "results")
+        if stored is not None:
+            return stored
+        progress = object.__getattribute__(self, "progress")
+        return read_search_results(
+            object.__getattribute__(self, "_database_path"),
+            expected_run_id=progress.run_id,
+            expected_result_count=progress.power_qualified_count,
+            maximum_candidate_index=progress.next_candidate_index,
+        )
+
     @property
     def mutual_playoff_gains(self) -> tuple[QualifiedSearchResult, ...]:
-        return tuple(row for row in self.results if _is_mutual_gain(row))
+        stored = object.__getattribute__(self, "results")
+        if stored is not None:
+            return tuple(row for row in stored if _is_mutual_gain(row))
+        return read_search_results(
+            self.database_path,
+            expected_run_id=self.progress.run_id,
+            expected_result_count=self.progress.power_qualified_count,
+            maximum_candidate_index=self.progress.next_candidate_index,
+            mutual_only=True,
+        )
+
+    def best_results(
+        self,
+        limit: int | None = None,
+        *,
+        mutual_only: bool = False,
+    ) -> tuple[QualifiedSearchResult, ...]:
+        """Return a bounded best-first snapshot without materializing all rows."""
+
+        stored = object.__getattribute__(self, "results")
+        if stored is not None:
+            rows = (
+                row
+                for row in stored
+                if not mutual_only or _is_mutual_gain(row)
+            )
+            ranked = tuple(sorted(rows, key=search_result_rank_key))
+            return ranked if limit is None else ranked[:_positive_limit(limit)]
+        return read_search_results(
+            self.database_path,
+            limit,
+            expected_run_id=self.progress.run_id,
+            expected_result_count=self.progress.power_qualified_count,
+            maximum_candidate_index=self.progress.next_candidate_index,
+            best_first=True,
+            mutual_only=mutual_only,
+        )
+
+    def iter_best_results(
+        self,
+        limit: int | None = None,
+        *,
+        mutual_only: bool = False,
+    ) -> Iterator[QualifiedSearchResult]:
+        """Stream a best-first snapshot for exports."""
+
+        if object.__getattribute__(self, "results") is not None:
+            return iter(self.best_results(limit, mutual_only=mutual_only))
+        return iter_search_results(
+            self.database_path,
+            limit,
+            expected_run_id=self.progress.run_id,
+            expected_result_count=self.progress.power_qualified_count,
+            maximum_candidate_index=self.progress.next_candidate_index,
+            best_first=True,
+            mutual_only=mutual_only,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, TradeSearchOutcome):
+            return NotImplemented
+        return self.progress == other.progress and self.results == other.results
+
+    def __hash__(self) -> int:
+        return hash(self.progress)
+
+    def __repr__(self) -> str:
+        stored = object.__getattribute__(self, "results")
+        location = object.__getattribute__(self, "_database_path")
+        if stored is None:
+            result_summary = (
+                f"<{self.progress.power_qualified_count} persisted results>"
+            )
+        else:
+            result_summary = f"<{len(stored)} in-memory results>"
+        path_summary = "None" if location is None else repr(location)
+        return (
+            f"TradeSearchOutcome(progress={self.progress!r}, "
+            f"results={result_summary}, database_path={path_summary})"
+        )
+
+    def __copy__(self) -> "TradeSearchOutcome":
+        return _restore_trade_search_outcome(
+            self.progress,
+            object.__getattribute__(self, "results"),
+            object.__getattribute__(self, "_database_path"),
+        )
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "TradeSearchOutcome":
+        existing = memo.get(id(self))
+        if isinstance(existing, TradeSearchOutcome):
+            return existing
+        outcome = _restore_trade_search_outcome(
+            deepcopy(self.progress, memo),
+            deepcopy(object.__getattribute__(self, "results"), memo),
+            deepcopy(object.__getattribute__(self, "_database_path"), memo),
+        )
+        memo[id(self)] = outcome
+        return outcome
+
+    def __reduce_ex__(self, _protocol: int):
+        return (
+            _restore_trade_search_outcome,
+            (
+                self.progress,
+                object.__getattribute__(self, "results"),
+                object.__getattribute__(self, "_database_path"),
+            ),
+        )
+
+
+def _restore_trade_search_outcome(
+    progress: TradeSearchProgress,
+    results: tuple[QualifiedSearchResult, ...] | None,
+    database_path: Path | None,
+) -> TradeSearchOutcome:
+    """Rebuild an outcome without accidentally resolving its lazy result field."""
+
+    outcome = object.__new__(TradeSearchOutcome)
+    object.__setattr__(outcome, "progress", progress)
+    object.__setattr__(outcome, "results", results)
+    object.__setattr__(outcome, "_database_path", database_path)
+    return outcome
 
 
 class ResumableTradeSearch:
@@ -182,15 +380,21 @@ class ResumableTradeSearch:
         if should_cancel is not None and not callable(should_cancel):
             raise ValueError("should_cancel must be callable")
         with SearchStore(database_path, self.run_definition) as store:
-            state = store.resume()
+            state = store.resume_summary()
             next_index = state.next_candidate_index
-            saved_results = list(state.qualified_results)
+            qualified_count = state.qualified_result_count
+            playoff_evaluated_count = state.playoff_evaluated_count
+            mutual_gain_count = state.mutual_playoff_gain_count
+            pending_results: list[QualifiedSearchResult] = []
             cancelled = False
             for index, candidate in enumerate(
-                islice(iter(self.trade_space), next_index, None), next_index
+                self.trade_space.iter_from(next_index), next_index
             ):
                 if should_cancel is not None and should_cancel():
-                    store.checkpoint(index)
+                    store.upsert_qualified_results(
+                        pending_results, next_candidate_index=index
+                    )
+                    pending_results.clear()
                     next_index = index
                     cancelled = True
                     break
@@ -199,29 +403,58 @@ class ResumableTradeSearch:
                 qualified = self._power_qualifies(power)
                 if qualified:
                     saved = self._simulate_candidate(power)
-                    store.upsert_qualified_result(saved, next_candidate_index=next_index)
-                    saved_results.append(saved)
-                elif next_index % self.settings.checkpoint_interval == 0:
-                    store.checkpoint(next_index)
+                    pending_results.append(saved)
+                    qualified_count += 1
+                    playoff_evaluated_count += int(
+                        saved.primary_playoff_before is not None
+                    )
+                    mutual_gain_count += int(_is_mutual_gain(saved))
+                if (
+                    len(pending_results) >= MAX_QUALIFIED_RESULT_BATCH_SIZE
+                    or next_index % self.settings.checkpoint_interval == 0
+                ):
+                    store.upsert_qualified_results(
+                        pending_results, next_candidate_index=next_index
+                    )
+                    pending_results.clear()
                 if on_progress is not None and (
                     qualified
                     or next_index % self.settings.checkpoint_interval == 0
                 ):
                     on_progress(
                         self._progress_values(
-                            next_index, tuple(saved_results), cancelled=False
+                            next_index,
+                            qualified_count,
+                            playoff_evaluated_count,
+                            mutual_gain_count,
+                            cancelled=False,
                         )
                     )
             else:
-                store.checkpoint(self.trade_space.candidate_count)
                 next_index = self.trade_space.candidate_count
-            final_state = store.resume()
+                store.upsert_qualified_results(
+                    pending_results, next_candidate_index=next_index
+                )
+                pending_results.clear()
+            final_state = store.persisted_summary()
             if final_state.next_candidate_index != next_index:
                 raise AssertionError("search checkpoint did not advance to the expected index")
-            progress = self._progress(final_state, cancelled=cancelled)
+            if final_state.qualified_result_count != qualified_count:
+                raise AssertionError("search result count did not match persisted results")
+            if final_state.playoff_evaluated_count != playoff_evaluated_count:
+                raise AssertionError("playoff evaluation count did not match persisted results")
+            if final_state.mutual_playoff_gain_count != mutual_gain_count:
+                raise AssertionError("mutual gain count did not match persisted results")
+            progress = self._progress_values(
+                next_index,
+                qualified_count,
+                playoff_evaluated_count,
+                mutual_gain_count,
+                cancelled=cancelled,
+            )
             if on_progress is not None:
                 on_progress(progress)
-            return TradeSearchOutcome(progress, final_state.qualified_results)
+            return TradeSearchOutcome.from_database(progress, store.path)
 
     def _power_qualifies(self, result: TradePowerEvaluation) -> bool:
         threshold = self.settings.minimum_displayed_power_delta
@@ -262,19 +495,12 @@ class ResumableTradeSearch:
             counterparty_playoff_after=counterparty.after.playoff_probability * 100,
         )
 
-    def _progress(
-        self, state: SearchResumeState, *, cancelled: bool
-    ) -> TradeSearchProgress:
-        return self._progress_values(
-            state.next_candidate_index,
-            state.qualified_results,
-            cancelled=cancelled,
-        )
-
     def _progress_values(
         self,
         next_candidate_index: int,
-        results: tuple[QualifiedSearchResult, ...],
+        qualified_count: int,
+        playoff_evaluated_count: int,
+        mutual_gain_count: int,
         *,
         cancelled: bool,
     ) -> TradeSearchProgress:
@@ -282,9 +508,9 @@ class ResumableTradeSearch:
             run_id=self.run_definition.run_id,
             next_candidate_index=next_candidate_index,
             total_candidate_count=self.run_definition.total_candidate_count,
-            power_qualified_count=len(results),
-            playoff_evaluated_count=sum(row.primary_playoff_before is not None for row in results),
-            mutual_playoff_gain_count=sum(_is_mutual_gain(row) for row in results),
+            power_qualified_count=qualified_count,
+            playoff_evaluated_count=playoff_evaluated_count,
+            mutual_playoff_gain_count=mutual_gain_count,
             cancelled=cancelled,
         )
 
@@ -316,6 +542,12 @@ def _is_mutual_gain(result: QualifiedSearchResult) -> bool:
     ):
         return False
     return primary_after > primary_before and counterparty_after > counterparty_before
+
+
+def _positive_limit(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("limit must be a positive integer or None")
+    return value
 
 
 def _same_roster(left: TeamRoster, right: TeamRoster) -> bool:

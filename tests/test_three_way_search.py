@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+import trade_snapshot.three_way_search_store as three_way_store_module
 from trade_snapshot.ensemble import EnsembleProjection, ProviderObservation
 from trade_snapshot.league_state import (
     FantasyMatchup,
@@ -51,7 +52,9 @@ from trade_snapshot.three_way_trade import (
     TradeTransfer,
 )
 from trade_snapshot.three_way_search_store import (
+    MAX_QUALIFIED_RESULT_BATCH_SIZE,
     THREE_WAY_DATABASE_APPLICATION_ID,
+    read_three_way_results,
 )
 from trade_snapshot.trade_impact import PreparedSeasonBaseline, prepare_season_baseline
 from trade_snapshot.trade_space import TeamRoster, TradeConstraints
@@ -429,15 +432,112 @@ class ThreeWayRunnerTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "resume.sqlite3"
             partial = runner.run(path, should_cancel=cancel_after_three)
+            partial_before_resume = partial.results()
             complete = runner.run(path)
+            partial_after_resume = partial.results()
 
         self.assertTrue(partial.progress.cancelled)
         self.assertEqual(partial.progress.next_candidate_index, 3)
+        self.assertEqual(partial_after_resume, partial_before_resume)
+        self.assertEqual(len(partial_after_resume), partial.progress.power_qualified_count)
+        self.assertTrue(
+            all(
+                row.candidate_index < partial.progress.next_candidate_index
+                for row in partial_after_resume
+            )
+        )
         self.assertFalse(complete.progress.cancelled)
         self.assertEqual(starts, [0, 3])
 
+    def test_store_rejects_a_second_writer_and_releases_ownership(self):
+        definition = run_definition()
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "exclusive.sqlite3"
+            with ThreeWaySearchStore(path, definition):
+                with self.assertRaisesRegex(
+                    ThreeWaySearchStoreError, "active writer"
+                ):
+                    ThreeWaySearchStore(path, definition)
+            with ThreeWaySearchStore(path, definition) as reopened:
+                self.assertEqual(reopened.resume().next_candidate_index, 0)
+
+    def test_qualified_results_are_persisted_in_checkpoint_batches(self):
+        _, _, _, runner = components(checkpoint_interval=5)
+        batches = []
+        original_upsert = ThreeWaySearchStore.upsert_qualified_results
+
+        def record_batch(store, results, *, next_candidate_index):
+            rows = tuple(results)
+            batches.append(
+                (tuple(row.candidate_index for row in rows), next_candidate_index)
+            )
+            return original_upsert(
+                store, rows, next_candidate_index=next_candidate_index
+            )
+
+        with TemporaryDirectory() as directory, patch.object(
+            ThreeWaySearchStore, "upsert_qualified_results", record_batch
+        ):
+            outcome = runner.run(Path(directory) / "batch-run.sqlite3")
+            rows = outcome.results()
+
+        self.assertEqual([len(batch) for batch, _ in batches], [5, 5, 5, 1])
+        self.assertEqual([checkpoint for _, checkpoint in batches], [5, 10, 15, 16])
+        self.assertEqual(len(rows), 16)
+
 
 class ThreeWayStoreTests(unittest.TestCase):
+    def test_resume_rejects_a_result_beyond_the_durable_checkpoint(self):
+        definition = run_definition()
+        with TemporaryDirectory() as directory:
+            with ThreeWaySearchStore(
+                Path(directory) / "uncheckpointed.sqlite3", definition
+            ) as store:
+                store.upsert_qualified_result(saved_result(0))
+                with self.assertRaisesRegex(
+                    ThreeWaySearchStoreError, "checkpoint"
+                ):
+                    store.resume()
+
+    def test_checkpoint_reader_holds_an_old_snapshot_after_later_results(self):
+        definition = run_definition()
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "snapshot.sqlite3"
+            with ThreeWaySearchStore(path, definition) as store:
+                store.upsert_qualified_results(
+                    (saved_result(1), saved_result(2)),
+                    next_candidate_index=3,
+                )
+            snapshot = {
+                "expected_run_id": definition.run_id,
+                "expected_result_count": 2,
+                "maximum_candidate_index": 3,
+            }
+            before = read_three_way_results(path, **snapshot)
+            with ThreeWaySearchStore(path, definition) as store:
+                store.upsert_qualified_result(
+                    saved_result(4), next_candidate_index=5
+                )
+            after = read_three_way_results(path, **snapshot)
+            with patch.object(
+                three_way_store_module,
+                "_decode_result",
+                wraps=three_way_store_module._decode_result,
+            ) as decode:
+                preview = read_three_way_results(path, 1, **snapshot)
+
+            self.assertEqual(after, before)
+            self.assertEqual(preview, before[:1])
+            self.assertEqual(decode.call_count, 3)
+            with self.assertRaisesRegex(ThreeWaySearchStoreError, "count"):
+                read_three_way_results(
+                    path,
+                    expected_result_count=1,
+                    maximum_candidate_index=3,
+                )
+            with self.assertRaisesRegex(ThreeWaySearchStoreError, "checkpoint"):
+                read_three_way_results(path, maximum_candidate_index=6)
+
     def test_result_rejects_conflicting_adjustment_players(self):
         original = saved_result(1)
         first, second, third = original.team_results
@@ -488,11 +588,13 @@ class ThreeWayStoreTests(unittest.TestCase):
                 progress=runner_progress(definition, state), database_path=path
             )
             rows = outcome.results()
+            preview = outcome.results(1)
             with self.assertRaises(ValueError):
                 outcome.results(0)
 
         self.assertEqual(state.next_candidate_index, high + 1)
         self.assertEqual(tuple(row.candidate_index for row in rows), (high, 3))
+        self.assertEqual(tuple(row.candidate_index for row in preview), (high,))
         self.assertEqual(
             ThreeWaySearchRunDefinition.from_record(definition.to_record()), definition
         )
@@ -500,6 +602,72 @@ class ThreeWayStoreTests(unittest.TestCase):
         invalid_record["total_candidate_count"] = "١٠٠"
         with self.assertRaisesRegex(ValueError, "canonical"):
             ThreeWaySearchRunDefinition.from_record(invalid_record)
+
+    def test_batch_upsert_is_bounded_atomic_idempotent_and_can_checkpoint_empty(self):
+        definition = run_definition()
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "batch.sqlite3"
+            with ThreeWaySearchStore(path, definition) as store:
+                batch = (saved_result(5), saved_result(2))
+                store.upsert_qualified_results(batch, next_candidate_index=6)
+                store.upsert_qualified_results(batch, next_candidate_index=6)
+                store.upsert_qualified_results((), next_candidate_index=9)
+                store.upsert_qualified_results((), next_candidate_index=3)
+                state = store.resume()
+                rows = store.results()
+
+        self.assertEqual(state.next_candidate_index, 9)
+        self.assertEqual(state.qualified_result_count, 2)
+        self.assertEqual({row.candidate_index for row in rows}, {2, 5})
+
+    def test_batch_validates_every_row_and_rejects_duplicates_before_writes(self):
+        definition = run_definition()
+        yielded = 0
+
+        def oversized():
+            nonlocal yielded
+            for _ in range(MAX_QUALIFIED_RESULT_BATCH_SIZE + 2):
+                yielded += 1
+                yield saved_result(0)
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid-batch.sqlite3"
+            with ThreeWaySearchStore(path, definition) as store:
+                with self.assertRaisesRegex(ValueError, "at most"):
+                    store.upsert_qualified_results(
+                        oversized(), next_candidate_index=1
+                    )
+                self.assertEqual(yielded, MAX_QUALIFIED_RESULT_BATCH_SIZE + 1)
+                with self.assertRaisesRegex(ValueError, "iterable"):
+                    store.upsert_qualified_results(
+                        "not-results", next_candidate_index=1
+                    )
+                with self.assertRaisesRegex(ValueError, "duplicate"):
+                    store.upsert_qualified_results(
+                        (saved_result(1), saved_result(1)),
+                        next_candidate_index=2,
+                    )
+                with self.assertRaisesRegex(ValueError, "outside"):
+                    store.upsert_qualified_results(
+                        (saved_result(1), saved_result(100)),
+                        next_candidate_index=100,
+                    )
+                with closing(sqlite3.connect(path)) as database:
+                    database.execute(
+                        "CREATE TRIGGER reject_second_result BEFORE INSERT "
+                        "ON qualified_result WHEN NEW.candidate_index_text='2' "
+                        "BEGIN SELECT RAISE(ABORT, 'rejected'); END"
+                    )
+                    database.commit()
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.upsert_qualified_results(
+                        (saved_result(1), saved_result(2)),
+                        next_candidate_index=3,
+                    )
+                state = store.resume()
+
+        self.assertEqual(state.next_candidate_index, 0)
+        self.assertEqual(state.qualified_result_count, 0)
 
     def test_store_binds_results_and_closed_reads_to_one_run(self):
         definition = run_definition()

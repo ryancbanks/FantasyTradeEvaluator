@@ -11,8 +11,8 @@ from .draft_config import DraftLeagueConfig, DraftStrategy
 from .draft_features import candidate_feature_values, resolve_preseason_projection
 from .draft_feasibility import (
     FeasibilityCache,
+    candidate_preserves_starter_deadline,
     completion_after_pick,
-    completion_group_is_surplus,
     filled_count,
     position_limit,
     prepare_completion,
@@ -204,9 +204,21 @@ def rank_draft_candidates(
     counts = Counter(player.position for player in available)
     picks_left_after = config.roster_size - len(roster) - 1
     next_pick = _picks_until_next(config.team_count, overall_pick, drafter_number)
-    pool_can_fill = filled_count(
-        (*roster, *available), config, cache.feasibility
-    ) == len(config.starting_slots)
+    global_completion = (
+        all_roster_player_ids is not None and all_strategies is not None
+    )
+    if global_completion:
+        # This cheap deadline state stays before the projection shortlist so
+        # replacing the redundant whole-pool proof cannot change its members.
+        current_filled = (
+            None
+            if picks_left_after >= len(config.starting_slots)
+            else filled_count(roster, config, cache.feasibility)
+        )
+    else:
+        pool_can_fill = filled_count(
+            (*roster, *available), config, cache.feasibility
+        ) == len(config.starting_slots)
     legal = []
     local_completion: dict[tuple[str, ...], bool] = {}
     for player in available:
@@ -219,10 +231,20 @@ def rank_draft_candidates(
             continue
         completion = local_completion.get(player.eligible_positions)
         if completion is None:
-            completion = _can_complete(
-                (*roster, player), picks_left_after, pool_can_fill,
-                config, cache.feasibility,
-            )
+            if global_completion:
+                completion = candidate_preserves_starter_deadline(
+                    roster,
+                    player,
+                    picks_left_after,
+                    config,
+                    cache.feasibility,
+                    current_filled=current_filled,
+                )
+            else:
+                completion = _can_complete(
+                    (*roster, player), picks_left_after, pool_can_fill,
+                    config, cache.feasibility,
+                )
             local_completion[player.eligible_positions] = completion
         if not completion:
             continue
@@ -248,10 +270,7 @@ def rank_draft_candidates(
             known = completion_by_signature.get(signature)
             if known is not None:
                 return known
-            feasible = (
-                not completion_problem.blocked
-                and completion_group_is_surplus(completion_problem, player)
-            ) or completion_after_pick(completion_problem, player)
+            feasible = completion_after_pick(completion_problem, player)
             completion_by_signature[signature] = feasible
             return feasible
 

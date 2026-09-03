@@ -84,6 +84,85 @@ class TradeSpaceTests(unittest.TestCase):
             )
         )
 
+    def test_iter_from_matches_every_filtered_no_drop_suffix(self):
+        primary = TeamRoster(
+            "primary", ("p0", "p1", "p-ir"), 3, 2, {"p-ir"}
+        )
+        counterparty = TeamRoster(
+            "counterparty", ("c0", "c1", "c-ir"), 3, 2, {"c-ir"}
+        )
+        outgoing = TradeFilterExpression(
+            "or",
+            tuple(
+                TradePackageFilter(frozenset({player_id}), "include")
+                for player_id in ("p0", "p1")
+            ),
+        )
+        incoming = TradeFilterExpression(
+            "or",
+            tuple(
+                TradePackageFilter(frozenset({player_id}), "include")
+                for player_id in ("c0", "c1")
+            ),
+        )
+        space = TradeSpace(
+            primary,
+            counterparty,
+            TradeConstraints(
+                min_outgoing=1,
+                max_outgoing=2,
+                min_incoming=1,
+                max_incoming=2,
+                require_no_drops=True,
+                outgoing_filter=outgoing,
+                incoming_filter=incoming,
+            ),
+        )
+        candidates = tuple(space)
+
+        for index in range(space.candidate_count + 1):
+            with self.subTest(index=index):
+                self.assertEqual(tuple(space.iter_from(index)), candidates[index:])
+        for invalid in (-1, space.candidate_count + 1, 1.5, True):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "start_candidate_index"):
+                    space.iter_from(invalid)
+
+    def test_iter_from_skips_prior_cartesian_blocks_without_building_candidates(self):
+        space = TradeSpace(
+            roster("primary", ("a", "b", "c")),
+            roster("counterparty", ("x", "y", "z")),
+            TradeConstraints(
+                min_outgoing=1,
+                max_outgoing=2,
+                min_incoming=1,
+                max_incoming=2,
+            ),
+        )
+        expected = tuple(space)[-1]
+
+        with (
+            patch(
+                "trade_snapshot.trade_space.TradeCandidate", wraps=TradeCandidate
+            ) as candidate_type,
+            patch.object(
+                space._outgoing_pool,
+                "iter_packages",
+                wraps=space._outgoing_pool.iter_packages,
+            ) as outgoing_packages,
+            patch.object(
+                space._incoming_pool,
+                "iter_packages",
+                wraps=space._incoming_pool.iter_packages,
+            ) as incoming_packages,
+        ):
+            actual = tuple(space.iter_from(space.candidate_count - 1))
+
+        self.assertEqual(actual, (expected,))
+        self.assertEqual(candidate_type.call_count, 1)
+        self.assertEqual(outgoing_packages.call_count, 1)
+        self.assertEqual(incoming_packages.call_count, 1)
+
     def test_combines_size_total_imbalance_and_exclusion_filters(self):
         space = TradeSpace(
             roster("primary", tuple(f"p{number}" for number in range(5))),

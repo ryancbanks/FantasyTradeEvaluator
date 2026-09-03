@@ -1,9 +1,14 @@
+from copy import copy, deepcopy
 from datetime import datetime, timezone
+from dataclasses import asdict, fields, replace
 import math
 from pathlib import Path
+import pickle
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
+import trade_snapshot.search_runner as search_runner_module
 from trade_snapshot.ensemble import EnsembleProjection, ProviderObservation
 from trade_snapshot.league_state import (
     FantasyMatchup,
@@ -21,6 +26,7 @@ from trade_snapshot.scenario_config import (
     PlayerEligibility,
 )
 from trade_snapshot.search import PreparedTradePair
+from trade_snapshot.search_store import SearchStore
 from trade_snapshot.search_runner import (
     ResumableTradeSearch,
     TradeSearchProgress,
@@ -195,19 +201,83 @@ class ResumableTradeSearchTests(unittest.TestCase):
             database = Path(directory) / "search.sqlite3"
             first = runner.run(database, on_progress=progress_updates.append)
             second = runner.run(database)
+            self.assertEqual(first.progress.next_candidate_index, 4)
+            self.assertEqual(first.progress.total_candidate_count, 4)
+            self.assertEqual(first.progress.completion_fraction, 1)
+            self.assertEqual(first.progress.power_qualified_count, 4)
+            self.assertEqual(first.progress.playoff_evaluated_count, 4)
+            self.assertFalse(first.progress.cancelled)
+            self.assertEqual(first.database_path, database.resolve())
+            self.assertEqual(len(first.results), 4)
+            self.assertEqual(
+                tuple(field.name for field in fields(first)),
+                ("progress", "results"),
+            )
+            self.assertEqual(len(asdict(first)["results"]), 4)
+            replaced = replace(first, progress=first.progress)
+            self.assertEqual(replaced.results, first.results)
+            self.assertIsNone(replaced.database_path)
+            self.assertEqual(first, second)
+            self.assertEqual(progress_updates[-1], first.progress)
+            self.assertTrue(
+                all(row.primary_playoff_before is not None for row in first.results)
+            )
 
-        self.assertEqual(first.progress.next_candidate_index, 4)
-        self.assertEqual(first.progress.total_candidate_count, 4)
-        self.assertEqual(first.progress.completion_fraction, 1)
-        self.assertEqual(first.progress.power_qualified_count, 4)
-        self.assertEqual(first.progress.playoff_evaluated_count, 4)
-        self.assertFalse(first.progress.cancelled)
-        self.assertEqual(len(first.results), 4)
-        self.assertEqual(first, second)
-        self.assertEqual(progress_updates[-1], first.progress)
-        self.assertTrue(
-            all(row.primary_playoff_before is not None for row in first.results)
-        )
+    def test_small_outcome_keeps_bounded_results_after_caller_directory_is_gone(self):
+        runner = components()
+        with TemporaryDirectory() as directory:
+            outcome = runner.run(Path(directory) / "ephemeral.sqlite3")
+            expected = tuple(row.candidate_index for row in outcome.results)
+
+        self.assertFalse(outcome.database_path.exists())
+        self.assertEqual(tuple(row.candidate_index for row in outcome.results), expected)
+
+    def test_lazy_outcome_repr_copy_and_pickle_preserve_storage_without_loading(self):
+        runner = components()
+        with TemporaryDirectory() as directory, patch.object(
+            search_runner_module, "MAX_INLINE_OUTCOME_RESULTS", 0
+        ):
+            outcome = runner.run(Path(directory) / "lazy.sqlite3")
+            with patch.object(
+                search_runner_module,
+                "read_search_results",
+                side_effect=AssertionError("metadata operations must stay lazy"),
+            ) as read_results:
+                rendered = repr(outcome)
+                shallow = copy(outcome)
+                deep = deepcopy(outcome)
+                restored = pickle.loads(pickle.dumps(outcome))
+
+            self.assertEqual(read_results.call_count, 0)
+            self.assertLess(len(rendered), 500)
+            self.assertIn("4 persisted results", rendered)
+            for replica in (shallow, deep, restored):
+                self.assertEqual(replica.progress, outcome.progress)
+                self.assertEqual(replica.database_path, outcome.database_path)
+                self.assertEqual(
+                    tuple(row.candidate_index for row in replica.results),
+                    (0, 1, 2, 3),
+                )
+
+    def test_lazy_cancelled_outcome_remains_a_snapshot_after_resume(self):
+        runner = components(checkpoint_interval=100)
+        cancel_calls = 0
+
+        def cancel_after_two():
+            nonlocal cancel_calls
+            cancel_calls += 1
+            return cancel_calls > 2
+
+        with TemporaryDirectory() as directory, patch.object(
+            search_runner_module, "MAX_INLINE_OUTCOME_RESULTS", 0
+        ):
+            database = Path(directory) / "snapshot.sqlite3"
+            partial = runner.run(database, should_cancel=cancel_after_two)
+            runner.run(database)
+            self.assertEqual(
+                tuple(row.candidate_index for row in partial.results),
+                (0, 1),
+            )
 
     def test_cancel_checkpoint_resumes_from_exact_next_candidate(self):
         runner = components(checkpoint_interval=100)
@@ -222,23 +292,102 @@ class ResumableTradeSearchTests(unittest.TestCase):
             database = Path(directory) / "search.sqlite3"
             partial = runner.run(database, should_cancel=cancel_after_two)
             complete = runner.run(database)
+            self.assertTrue(partial.progress.cancelled)
+            self.assertEqual(partial.progress.next_candidate_index, 2)
+            self.assertEqual(
+                tuple(row.candidate_index for row in partial.results), (0, 1)
+            )
+            self.assertFalse(complete.progress.cancelled)
+            self.assertEqual(complete.progress.next_candidate_index, 4)
+            self.assertEqual(
+                tuple(row.candidate_index for row in complete.results),
+                (0, 1, 2, 3),
+            )
 
-        self.assertTrue(partial.progress.cancelled)
-        self.assertEqual(partial.progress.next_candidate_index, 2)
-        self.assertEqual(tuple(row.candidate_index for row in partial.results), (0, 1))
-        self.assertFalse(complete.progress.cancelled)
-        self.assertEqual(complete.progress.next_candidate_index, 4)
-        self.assertEqual(tuple(row.candidate_index for row in complete.results), (0, 1, 2, 3))
+    def test_progress_counts_resume_results_once_then_update_incrementally(self):
+        runner = components(checkpoint_interval=100)
+        cancel_calls = 0
+
+        def cancel_after_two():
+            nonlocal cancel_calls
+            cancel_calls += 1
+            return cancel_calls > 2
+
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "search.sqlite3"
+            partial = runner.run(database, should_cancel=cancel_after_two)
+            updates = []
+            with patch.object(
+                SearchStore,
+                "resume",
+                side_effect=AssertionError("runner must not materialize resume results"),
+            ), patch(
+                "trade_snapshot.search_runner._is_mutual_gain",
+                wraps=search_runner_module._is_mutual_gain,
+            ) as mutual_gain:
+                complete = runner.run(database, on_progress=updates.append)
+            self.assertEqual(len(partial.results), 2)
+            self.assertEqual(mutual_gain.call_count, 2)
+            self.assertEqual(updates[-1], complete.progress)
+            self.assertEqual(
+                complete.progress.mutual_playoff_gain_count,
+                len(complete.mutual_playoff_gains),
+            )
+
+    def test_abrupt_failure_replays_only_the_uncommitted_batch(self):
+        runner = components(checkpoint_interval=100)
+
+        def fail_after_first_result(_progress):
+            raise RuntimeError("simulated process failure")
+
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "search.sqlite3"
+            fresh_database = Path(directory) / "fresh.sqlite3"
+            with self.assertRaisesRegex(RuntimeError, "simulated process failure"):
+                runner.run(database, on_progress=fail_after_first_result)
+            with SearchStore(database, runner.run_definition) as store:
+                durable = store.resume()
+            resumed = runner.run(database)
+            fresh = runner.run(fresh_database)
+            self.assertEqual(durable.next_candidate_index, 0)
+            self.assertEqual(durable.qualified_results, ())
+            self.assertEqual(resumed, fresh)
+
+    def test_qualified_results_are_persisted_in_checkpoint_batches(self):
+        runner = components(checkpoint_interval=3)
+        batches = []
+        original_upsert = SearchStore.upsert_qualified_results
+
+        def record_batch(store, results, *, next_candidate_index):
+            rows = tuple(results)
+            batches.append(
+                (tuple(row.candidate_index for row in rows), next_candidate_index)
+            )
+            return original_upsert(
+                store, rows, next_candidate_index=next_candidate_index
+            )
+
+        with TemporaryDirectory() as directory, patch.object(
+            SearchStore, "upsert_qualified_results", record_batch
+        ):
+            outcome = runner.run(Path(directory) / "search.sqlite3")
+            self.assertEqual(
+                batches,
+                [((0, 1, 2), 3), ((3,), 4)],
+            )
+            self.assertEqual(
+                tuple(row.candidate_index for row in outcome.results),
+                (0, 1, 2, 3),
+            )
 
     def test_power_threshold_avoids_every_playoff_simulation(self):
         runner = components(threshold=1000)
         with TemporaryDirectory() as directory:
             outcome = runner.run(Path(directory) / "search.sqlite3")
-
-        self.assertEqual(outcome.progress.next_candidate_index, 4)
-        self.assertEqual(outcome.progress.power_qualified_count, 0)
-        self.assertEqual(outcome.progress.playoff_evaluated_count, 0)
-        self.assertEqual(outcome.results, ())
+            self.assertEqual(outcome.progress.next_candidate_index, 4)
+            self.assertEqual(outcome.progress.power_qualified_count, 0)
+            self.assertEqual(outcome.progress.playoff_evaluated_count, 0)
+            self.assertEqual(outcome.results, ())
 
     def test_semantically_equal_rosters_accept_different_input_order_safely(self):
         original = components()

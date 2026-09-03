@@ -1,6 +1,8 @@
 """Application service for local Draft Lab jobs, files, and assistant sessions."""
 
+from collections import OrderedDict
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import json
@@ -41,10 +43,19 @@ from .draft_training import (
     training_estimate,
 )
 from .engine_bundle import load_engine_bundle
+from .job_retention import (
+    ACTIVE_JOB_STATUSES,
+    DEFAULT_TERMINAL_JOB_LIMIT,
+    TERMINAL_JOB_STATUSES,
+    has_active_jobs,
+    prune_terminal_jobs,
+)
 
 
-_MAX_RETAINED_TERMINAL_JOBS = 24
-_TERMINAL_JOB_STATUSES = frozenset({"complete", "cancelled", "failed"})
+_MAX_RETAINED_TERMINAL_JOBS = DEFAULT_TERMINAL_JOB_LIMIT
+_MAX_ASSISTANT_SESSION_BYTES = 16 * 1024 * 1024
+_MAX_CACHED_ASSETS_PER_KIND = 2
+_MAX_CACHED_LEAGUE_PRESETS = 64
 
 
 @dataclass(slots=True)
@@ -76,6 +87,11 @@ class DraftLabService:
         self._lock = RLock()
         self._recommendation_lock = RLock()
         self._jobs: dict[str, _DraftJob] = {}
+        self._pending_terminal_job_id: str | None = None
+        self._corpus_cache = OrderedDict()
+        self._model_cache = OrderedDict()
+        self._board_cache = OrderedDict()
+        self._league_preset_cache = OrderedDict()
         self._heavy_work_guard = heavy_work_guard
         self._activity_lock = activity_lock or RLock()
         self._espn_draft_adapter = (
@@ -89,7 +105,46 @@ class DraftLabService:
     @property
     def is_busy(self) -> bool:
         with self._lock:
-            return any(row.status in {"queued", "running"} for row in self._jobs.values())
+            return has_active_jobs(self._jobs)
+
+    def active_job(self) -> dict[str, object] | None:
+        """Return the sole resumable Draft Lab job, if one exists."""
+
+        with self._lock:
+            active = tuple(
+                job
+                for job in self._jobs.values()
+                if job.status in ACTIVE_JOB_STATUSES
+            )
+            if len(active) > 1:
+                raise RuntimeError("multiple Draft Lab jobs are active")
+            return self._job_record(active[0]) if active else None
+
+    def recoverable_job(self) -> dict[str, object] | None:
+        """Return active work or the latest terminal job not yet surfaced by the UI."""
+
+        with self._lock:
+            active = self.active_job()
+            if active is not None:
+                return active
+            pending_id = self._pending_terminal_job_id
+            pending = self._jobs.get(pending_id) if pending_id is not None else None
+            if pending is not None and pending.status in TERMINAL_JOB_STATUSES:
+                return self._job_record(pending)
+            self._pending_terminal_job_id = None
+            return None
+
+    def acknowledge_job_activity(self, job_id: str) -> dict[str, object]:
+        """Mark one terminal job as surfaced without clearing a newer result."""
+
+        with self._lock:
+            job = self._require_job(job_id)
+            if job.status not in TERMINAL_JOB_STATUSES:
+                raise RuntimeError("active Draft Lab activity cannot be acknowledged")
+            acknowledged = self._pending_terminal_job_id == job_id
+            if acknowledged:
+                self._pending_terminal_job_id = None
+            return {"job_id": job_id, "acknowledged": acknowledged}
 
     def catalog(self) -> dict[str, object]:
         return {
@@ -149,6 +204,7 @@ class DraftLabService:
                     job.progress = {
                         "generation": 0, "generation_count": evolution.generations
                     }
+                    self._pending_terminal_job_id = None
                     self._jobs[job.job_id] = job
         Thread(
             target=self._run_training,
@@ -201,8 +257,8 @@ class DraftLabService:
             with self._lock:
                 if self.is_busy:
                     raise RuntimeError("another Draft Lab training or benchmark job is running")
-            model = self.store.load_model(payload["model_id"])
-            corpus = self.store.load_corpus(model.corpus_id)
+            model = self._load_model(payload["model_id"])
+            corpus = self._load_corpus(model.corpus_id)
             with self._recommendation_lock:
                 with self._lock:
                     if self.is_busy:
@@ -211,6 +267,7 @@ class DraftLabService:
                         )
                     job = _DraftJob(uuid4().hex, "benchmark")
                     job.progress = {"trial": 0, "trial_count": options["trials"]}
+                    self._pending_terminal_job_id = None
                     self._jobs[job.job_id] = job
         Thread(
             target=self._run_benchmark, args=(job, model, corpus, options),
@@ -241,8 +298,8 @@ class DraftLabService:
             "assistant", payload,
             {"model_id", "board_id", "user_drafter_number", "strategy"},
         )
-        model = self.store.load_model(payload["model_id"])
-        board = self.store.load_board(payload["board_id"])
+        model = self._load_model(payload["model_id"])
+        board = self._load_board(payload["board_id"])
         try:
             strategy = DraftStrategy(payload["strategy"])
         except (TypeError, ValueError):
@@ -401,6 +458,7 @@ class DraftLabService:
                     return summary
             artifact = _checkpoint_model_artifact(checkpoint)
             self.store.save_model(artifact)
+            self._remember_asset(self._model_cache, artifact.model_id, artifact)
             return artifact.summary()
 
     def _run_training(self, job, corpus, config, evolution, resume):
@@ -456,6 +514,7 @@ class DraftLabService:
             )
             artifact = _checkpoint_model_artifact(checkpoint)
             self.store.save_model(artifact)
+            self._remember_asset(self._model_cache, artifact.model_id, artifact)
             self._set_job(job, status="complete", result={
                 "model": artifact.summary(),
                 "showcase": checkpoint.to_record()["showcase"],
@@ -503,7 +562,7 @@ class DraftLabService:
             "corpus_id", "league_config", "evolution_config"
         }.issubset(payload):
             raise ValueError("training request fields are invalid")
-        corpus = self.store.load_corpus(payload["corpus_id"])
+        corpus = self._load_corpus(payload["corpus_id"])
         config = _league_config(payload["league_config"])
         evolution = _evolution_config(payload["evolution_config"])
         resume_id = payload.get("resume_checkpoint_job_id")
@@ -523,37 +582,84 @@ class DraftLabService:
             ),
         }]
         for path in sorted(self.bundle_directory.glob("*.json")):
-            try:
-                bundle = load_engine_bundle(path)
-                config = config_from_engine_bundle(bundle)
-                records.append({
-                    "preset_id": bundle.bundle_id, "source": "synced_league",
-                    "season": bundle.state.season, "config": config.to_record(),
-                    "compatibility_notice": (
-                        "Team count, roster size, starter slots, regular-season end, "
-                        "playoff field, weeks, and linear scoring were imported. "
-                        "Review division berths, standings tiebreakers, and playoff "
-                        "reseeding; Draft Lab v1 does not model those three host rules."
-                    ),
-                })
-            except ValueError as error:
-                records.append({
-                    "preset_id": path.stem,
-                    "source": "synced_league",
-                    "status": "unsupported",
-                    "compatibility_notice": f"This synced league needs manual review: {error}",
-                })
+            records.append(self._league_preset(path))
         return records
+
+    def _league_preset(self, path):
+        try:
+            metadata = path.stat()
+        except OSError as error:
+            return self._unsupported_league_preset(path, error)
+        signature = metadata.st_mtime_ns, metadata.st_size
+        cache_key = path.name
+        with self._lock:
+            cached = self._league_preset_cache.get(cache_key)
+            if cached is not None and cached[0] == signature:
+                self._league_preset_cache.move_to_end(cache_key)
+                return deepcopy(cached[1])
+        try:
+            bundle = load_engine_bundle(path)
+            config = config_from_engine_bundle(bundle)
+            record = {
+                "preset_id": bundle.bundle_id,
+                "source": "synced_league",
+                "season": bundle.state.season,
+                "week": bundle.state.first_remaining_week,
+                "config": config.to_record(),
+                "compatibility_notice": (
+                    "Team count, roster size, starter slots, regular-season end, "
+                    "playoff field, weeks, and linear scoring were imported. "
+                    "Review division berths, standings tiebreakers, and playoff "
+                    "reseeding; Draft Lab v1 does not model those three host rules."
+                ),
+            }
+        except ValueError as error:
+            record = self._unsupported_league_preset(path, error)
+        with self._lock:
+            self._league_preset_cache[cache_key] = signature, record
+            self._league_preset_cache.move_to_end(cache_key)
+            while len(self._league_preset_cache) > _MAX_CACHED_LEAGUE_PRESETS:
+                self._league_preset_cache.popitem(last=False)
+        return deepcopy(record)
+
+    @staticmethod
+    def _unsupported_league_preset(path, error):
+        return {
+            "preset_id": path.stem,
+            "source": "synced_league",
+            "status": "unsupported",
+            "compatibility_notice": (
+                f"This synced league needs manual review: {error}"
+            ),
+        }
 
     def _assistant_inputs(self, session_id):
         session = self._load_session(session_id)
-        return session, self.store.load_model(session.model_id), self.store.load_board(session.board_id)
+        return session, self._load_model(session.model_id), self._load_board(session.board_id)
 
     def _session_catalog(self):
         records = []
+        coverages = {}
         for path in sorted(self.session_directory.glob("*.json")):
             try:
-                session, model, board = self._assistant_inputs(path.stem)
+                session = self._load_session(path.stem)
+                model = self._load_model(session.model_id)
+                board = self._load_board(session.board_id)
+                coverage_key = (
+                    session.model_id,
+                    session.board_id,
+                    session.user_drafter_number,
+                    session.strategy,
+                )
+                coverage = coverages.get(coverage_key)
+                if coverage is None:
+                    coverage = assistant_board_coverage(
+                        model,
+                        board,
+                        user_drafter_number=session.user_drafter_number,
+                        strategy=session.strategy,
+                    )
+                    coverages[coverage_key] = coverage
                 records.append({
                     "session_id": session.session_id,
                     "model_id": session.model_id,
@@ -561,12 +667,7 @@ class DraftLabService:
                     "user_drafter_number": session.user_drafter_number,
                     "strategy": session.strategy.value,
                     "pick_count": len(session.picks),
-                    "board_coverage": assistant_board_coverage(
-                        model,
-                        board,
-                        user_drafter_number=session.user_drafter_number,
-                        strategy=session.strategy,
-                    ),
+                    "board_coverage": deepcopy(coverage),
                     "draft_binding": (
                         None if session.draft_binding is None
                         else session.draft_binding.to_record()
@@ -595,6 +696,8 @@ class DraftLabService:
     def _load_session(self, session_id):
         path = self._session_path(session_id)
         try:
+            if path.stat().st_size > _MAX_ASSISTANT_SESSION_BYTES:
+                raise ValueError("assistant session exceeds its size limit")
             return DraftAssistantSession.from_record(json.loads(
                 path.read_text(encoding="utf-8"),
                 object_pairs_hook=_unique_json_object,
@@ -606,6 +709,33 @@ class DraftLabService:
             raise
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise ValueError(f"could not read assistant session: {error}") from None
+
+    def _load_corpus(self, corpus_id):
+        return self._load_asset(self._corpus_cache, corpus_id, self.store.load_corpus)
+
+    def _load_model(self, model_id):
+        return self._load_asset(self._model_cache, model_id, self.store.load_model)
+
+    def _load_board(self, board_id):
+        return self._load_asset(self._board_cache, board_id, self.store.load_board)
+
+    def _load_asset(self, cache, identifier, loader):
+        if not isinstance(identifier, str):
+            return loader(identifier)
+        with self._lock:
+            cached = cache.get(identifier)
+            if cached is not None:
+                cache.move_to_end(identifier)
+                return cached
+        return self._remember_asset(cache, identifier, loader(identifier))
+
+    def _remember_asset(self, cache, identifier, value):
+        with self._lock:
+            cache[identifier] = value
+            cache.move_to_end(identifier)
+            while len(cache) > _MAX_CACHED_ASSETS_PER_KIND:
+                cache.popitem(last=False)
+        return value
 
     def _ensure_recommendations_available(self, session, model):
         total_picks = model.league_config.team_count * model.league_config.roster_size
@@ -634,21 +764,13 @@ class DraftLabService:
 
     def _set_job(self, job, **changes):
         with self._lock:
+            was_terminal = job.status in TERMINAL_JOB_STATUSES
             for name, value in changes.items():
                 setattr(job, name, value)
-            if job.status in _TERMINAL_JOB_STATUSES:
-                self._prune_terminal_jobs_locked()
-
-    def _prune_terminal_jobs_locked(self):
-        """Retain recent results without allowing completed jobs to grow forever."""
-
-        terminal_ids = [
-            job_id
-            for job_id, candidate in self._jobs.items()
-            if candidate.status in _TERMINAL_JOB_STATUSES
-        ]
-        for job_id in terminal_ids[:-_MAX_RETAINED_TERMINAL_JOBS]:
-            del self._jobs[job_id]
+            if job.status in TERMINAL_JOB_STATUSES:
+                if not was_terminal:
+                    self._pending_terminal_job_id = job.job_id
+                prune_terminal_jobs(self._jobs, _MAX_RETAINED_TERMINAL_JOBS)
 
     @staticmethod
     def _job_record(job):

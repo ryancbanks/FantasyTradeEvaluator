@@ -7,10 +7,11 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import trade_snapshot.workbook_model as workbook_model_module
 from tests.test_engine_bundle import engine_bundle
 from tests.test_three_way_search import components as three_way_components
 from tests.test_surrogate_disclosure import surrogate_bundle
-from trade_snapshot.app_service import LocalAppService, LocalSearchRequest
+from trade_snapshot.app_service import LocalAppService, LocalSearchRequest, _SearchJob
 from trade_snapshot.three_way_search import ThreeWaySearchOutcome
 
 
@@ -60,6 +61,75 @@ def wait_for_job(service, job_id):
 
 
 class LocalAppServiceTests(unittest.TestCase):
+    def test_active_job_catalog_exposes_safe_search_context_and_enforces_one_owner(self):
+        bundle = engine_bundle()
+        request = LocalSearchRequest.from_payload(payload(bundle.bundle_id))
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            active = _SearchJob("a" * 32, request, status="running")
+            service._jobs[active.job_id] = active
+
+            catalog = service.active_job_catalog()
+            self.assertEqual(
+                catalog,
+                {
+                    "search": service.job(active.job_id),
+                    "weekly_collection": None,
+                    "draft": None,
+                },
+            )
+            self.assertEqual(
+                catalog["search"]["request"],
+                {
+                    "bundle_id": bundle.bundle_id,
+                    "primary_team_id": "primary",
+                    "counterparty_team_ids": [],
+                },
+            )
+            self.assertNotIn("host_league_url", catalog["search"]["request"])
+
+            second = _SearchJob("b" * 32, request, status="queued")
+            service._jobs[second.job_id] = second
+            with self.assertRaisesRegex(RuntimeError, "multiple trade-search"):
+                service.active_job_catalog()
+
+            active.status = "complete"
+            second.status = "complete"
+            self.assertIsNone(service.active_search_job())
+
+    def test_latest_terminal_search_is_recoverable_until_the_ui_acknowledges_it(self):
+        bundle = engine_bundle()
+        request = LocalSearchRequest.from_payload(payload(bundle.bundle_id))
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            first = _SearchJob("a" * 32, request, status="running")
+            service._jobs[first.job_id] = first
+            service._set_job(first, status="complete")
+
+            self.assertEqual(
+                service.active_job_catalog()["search"]["job_id"],
+                first.job_id,
+            )
+
+            second = _SearchJob("b" * 32, request, status="running")
+            service._jobs[second.job_id] = second
+            service._set_job(second, status="failed", error="test failure")
+
+            self.assertFalse(
+                service.acknowledge_search_activity(first.job_id)["acknowledged"]
+            )
+            self.assertEqual(
+                service.active_job_catalog()["search"]["job_id"],
+                second.job_id,
+            )
+            self.assertTrue(
+                service.acknowledge_search_activity(second.job_id)["acknowledged"]
+            )
+            self.assertIsNone(service.active_job_catalog()["search"])
+            self.assertFalse(
+                service.acknowledge_search_activity(second.job_id)["acknowledged"]
+            )
+
     def test_dashboard_calculation_blocks_other_heavy_work(self):
         with TemporaryDirectory() as directory:
             service = LocalAppService(directory)
@@ -160,6 +230,118 @@ class LocalAppServiceTests(unittest.TestCase):
                 service.player_outlook(bundle_ids[1])
 
         self.assertEqual(build_count, 4)
+
+    def test_dashboard_cache_is_bounded_and_least_recently_used(self):
+        bundle = engine_bundle()
+        bundle_ids = tuple(f"engine_{digit * 64}" for digit in "012")
+        build_count = 0
+
+        def build(*_args):
+            nonlocal build_count
+            build_count += 1
+            return {"calculation": build_count}
+
+        with TemporaryDirectory() as directory, patch(
+            "trade_snapshot.app_service._MAX_DASHBOARD_CACHE_SIZE", 2
+        ):
+            service = LocalAppService(directory)
+            with patch.object(service, "_load_bundle", return_value=bundle), patch.object(
+                service, "_season_baseline"
+            ) as season_baseline, patch(
+                "trade_snapshot.app_service.build_league_dashboard",
+                side_effect=build,
+            ):
+                from trade_snapshot.trade_impact import prepare_season_baseline
+
+                season_baseline.return_value = prepare_season_baseline(
+                    bundle.state,
+                    bundle.rosters,
+                    bundle.projections,
+                    bundle.eligibilities,
+                    bundle.scenario_config,
+                )
+                first = service.league_dashboard(bundle_ids[0])
+                service.league_dashboard(bundle_ids[1])
+                self.assertIs(service.league_dashboard(bundle_ids[0]), first)
+                service.league_dashboard(bundle_ids[2])
+                self.assertIs(service.league_dashboard(bundle_ids[0]), first)
+                service.league_dashboard(bundle_ids[1])
+
+        self.assertEqual(build_count, 4)
+
+    def test_matching_dashboard_and_search_share_one_season_baseline(self):
+        bundle = engine_bundle()
+        request_payload = payload(bundle.bundle_id)
+        request_payload.update(
+            scenario_count=bundle.scenario_config.scenario_count,
+            seed=bundle.scenario_config.seed,
+        )
+        request = LocalSearchRequest.from_payload(request_payload)
+
+        from trade_snapshot.trade_impact import prepare_season_baseline as prepare
+
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            with patch(
+                "trade_snapshot.app_service.prepare_season_baseline",
+                wraps=prepare,
+            ) as prepared:
+                service.league_dashboard(bundle.bundle_id)
+                started = service.start_search(request)
+                finished = wait_for_job(service, started["job_id"])
+
+            retained = service._jobs[started["job_id"]]
+
+        self.assertEqual(finished["status"], "complete")
+        prepared.assert_called_once()
+        self.assertIsNotNone(retained.context)
+        self.assertFalse(hasattr(retained, "baseline"))
+
+    def test_search_and_player_dashboard_work_are_coordinated_both_directions(self):
+        bundle = engine_bundle()
+        request = LocalSearchRequest.from_payload(payload(bundle.bundle_id))
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            service._player_outlook_futures["busy"] = Future()
+            with self.assertRaisesRegex(RuntimeError, "Player Lab"):
+                service.start_search(request)
+            with self.assertRaisesRegex(RuntimeError, "Player Lab"):
+                service._require_draft_capacity()
+            service._player_outlook_futures.clear()
+
+            service._dashboard_futures["busy"] = Future()
+            with self.assertRaisesRegex(RuntimeError, "league dashboard"):
+                service.start_search(request)
+            service._dashboard_futures.clear()
+
+            service._jobs["active"] = SimpleNamespace(status="running")
+            with self.assertRaisesRegex(RuntimeError, "trade search"):
+                service.league_dashboard(bundle.bundle_id)
+            with self.assertRaisesRegex(RuntimeError, "trade search"):
+                service.player_outlook(bundle.bundle_id)
+
+    def test_terminal_search_job_history_is_bounded(self):
+        bundle = engine_bundle()
+        request = LocalSearchRequest.from_payload(payload(bundle.bundle_id))
+        job_ids = []
+        with TemporaryDirectory() as directory, patch(
+            "trade_snapshot.app_service._MAX_RETAINED_SEARCH_JOBS", 2
+        ):
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            for _ in range(3):
+                started = service.start_search(request)
+                job_ids.append(started["job_id"])
+                self.assertEqual(
+                    wait_for_job(service, started["job_id"])["status"],
+                    "complete",
+                )
+
+            with self.assertRaises(KeyError):
+                service.job(job_ids[0])
+            self.assertEqual(set(service._jobs), set(job_ids[1:]))
 
     def test_league_dashboard_is_available_without_a_search_and_cached(self):
         bundle = engine_bundle()
@@ -380,8 +562,14 @@ class LocalAppServiceTests(unittest.TestCase):
             started = service.start_search(request)
             finished = wait_for_job(service, started["job_id"])
             preview = service.job_results(started["job_id"])
+            with patch(
+                "trade_snapshot.workbook_model._trade_row",
+                wraps=workbook_model_module._trade_row,
+            ) as converted:
+                limited_preview = service.job_results(started["job_id"], limit=1)
             exported = service.export_job(started["job_id"])
             export_path = service.export_path(exported["filename"])
+            outcome = service._jobs[started["job_id"]].outcome
 
             resumed = service.start_search(request)
             resumed_finished = wait_for_job(service, resumed["job_id"])
@@ -412,6 +600,13 @@ class LocalAppServiceTests(unittest.TestCase):
         self.assertEqual(exported["trade_count"], 4)
         self.assertEqual(preview["total_count"], 4)
         self.assertEqual(len(preview["rows"]), 4)
+        self.assertEqual(limited_preview["total_count"], 4)
+        self.assertEqual(limited_preview["shown_count"], 1)
+        self.assertEqual(len(limited_preview["rows"]), 1)
+        self.assertEqual(converted.call_count, 1)
+        self.assertTrue(
+            all(pair.search.database_path is not None for pair in outcome.pairs)
+        )
         self.assertEqual(
             {row["power_methodology_status"] for row in preview["rows"]},
             {"exact"},

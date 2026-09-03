@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 from threading import Event, Thread
 import time
 import unittest
+from unittest.mock import patch
 
 from tests.test_app_service import payload, wait_for_job
 from tests.test_engine_bundle import engine_bundle
@@ -251,6 +252,77 @@ class WeeklyCollectionRequestTests(unittest.TestCase):
 
 
 class WeeklyCollectionJobTests(unittest.TestCase):
+    def test_active_catalog_tracks_only_the_single_running_collection(self):
+        entered = Event()
+
+        def blocking(_request, *, data_directory, progress, cancelled):
+            entered.set()
+            while not cancelled():
+                time.sleep(0.005)
+            raise WeeklyCollectionError("cancelled")
+
+        with TemporaryDirectory() as directory:
+            jobs = WeeklyCollectionJobs(
+                directory,
+                Path(directory) / "bundles",
+                blocking,
+            )
+            started = jobs.start(valid_request())
+            self.assertTrue(entered.wait(1))
+            self.assertEqual(jobs.active_job()["job_id"], started["job_id"])
+            with self.assertRaisesRegex(RuntimeError, "already running"):
+                jobs.start(valid_request())
+            jobs.cancel(started["job_id"])
+            wait_for_collection(jobs.job, started["job_id"])
+            self.assertIsNone(jobs.active_job())
+
+    def test_terminal_job_history_is_bounded(self):
+        with TemporaryDirectory() as directory, patch(
+            "trade_snapshot.weekly_collection._MAX_RETAINED_COLLECTION_JOBS", 2
+        ):
+            jobs = WeeklyCollectionJobs(
+                directory,
+                Path(directory) / "bundles",
+                SuccessfulWorkflow(),
+            )
+            job_ids = []
+            for _ in range(3):
+                started = jobs.start(valid_request())
+                job_ids.append(started["job_id"])
+                self.assertEqual(
+                    wait_for_collection(jobs.job, started["job_id"])["status"],
+                    "complete",
+                )
+
+            with self.assertRaises(KeyError):
+                jobs.job(job_ids[0])
+            self.assertEqual(set(jobs._jobs), set(job_ids[1:]))
+
+    def test_latest_terminal_collection_is_recoverable_until_acknowledged(self):
+        with TemporaryDirectory() as directory:
+            jobs = WeeklyCollectionJobs(
+                directory,
+                Path(directory) / "bundles",
+                SuccessfulWorkflow(),
+            )
+            first = jobs.start(valid_request())
+            wait_for_collection(jobs.job, first["job_id"])
+            self.assertEqual(jobs.recoverable_job()["job_id"], first["job_id"])
+
+            second = jobs.start(valid_request())
+            wait_for_collection(jobs.job, second["job_id"])
+            self.assertFalse(
+                jobs.acknowledge_activity(first["job_id"])["acknowledged"]
+            )
+            self.assertEqual(jobs.recoverable_job()["job_id"], second["job_id"])
+            self.assertTrue(
+                jobs.acknowledge_activity(second["job_id"])["acknowledged"]
+            )
+            self.assertIsNone(jobs.recoverable_job())
+            self.assertFalse(
+                jobs.acknowledge_activity(second["job_id"])["acknowledged"]
+            )
+
     def test_interactive_sign_in_status_and_confirmation_are_job_scoped(self):
         workflow = InteractiveWorkflow()
         with TemporaryDirectory() as directory:

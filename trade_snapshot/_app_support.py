@@ -169,6 +169,7 @@ def search_result_record(
         bundle.player_names,
         bundle.methodology_evidence,
     )
+    preview = rows.preview(limit)
     outlook = team_outlook_rows(bundle.state, projection)
     return {
         "total_count": len(rows),
@@ -197,7 +198,7 @@ def search_result_record(
                 "mutual_gain": row.is_mutual_gain,
                 "power_methodology_status": row.power_methodology_status,
             }
-            for row in rows[:limit]
+            for row in preview
         ],
     }
 

@@ -3,6 +3,7 @@ from hashlib import sha256
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import tempfile
@@ -13,6 +14,7 @@ from unittest.mock import patch
 
 import release_build
 from trade_snapshot import app_launcher
+from trade_snapshot.local_server import _STATIC
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -74,6 +76,18 @@ class AppLauncherTests(unittest.TestCase):
             with patch("builtins.print") as output:
                 self.assertEqual(app_launcher.main(["--self-check"]), 0)
         self.assertEqual(json.loads(output.call_args.args[0]), ready)
+
+    def test_runtime_self_check_fails_when_any_required_web_asset_is_missing(self):
+        with (
+            patch.object(
+                app_launcher,
+                "_required_web_assets",
+                return_value=("index.html", "missing-feature.js"),
+            ),
+            patch.object(app_launcher, "_lifecycle_self_check"),
+            self.assertRaisesRegex(RuntimeError, "local interface assets"),
+        ):
+            app_launcher.runtime_self_check()
 
 
 class ReleaseBuildTests(unittest.TestCase):
@@ -175,6 +189,31 @@ class ReleaseBuildTests(unittest.TestCase):
             set(app_launcher._required_extension_assets(manifest)),
             expected,
         )
+
+    def test_self_check_inventory_covers_every_served_and_linked_web_asset(self):
+        root = PROJECT_ROOT / "trade_snapshot" / "web_assets"
+        page = (root / "index.html").read_text(encoding="utf-8")
+        linked = {
+            match.removeprefix("/")
+            for match in re.findall(r'(?:href|src)="(/[^"?]+\.(?:css|js))"', page)
+        }
+        packaged = {
+            path.name
+            for path in root.iterdir()
+            if path.is_file() and path.suffix.casefold() in {".css", ".html", ".js"}
+        }
+        required = set(app_launcher._required_web_assets())
+
+        self.assertEqual(required, {"index.html", *linked})
+        self.assertEqual(required, packaged)
+        self.assertEqual(set(_STATIC), {f"/{name}" for name in linked})
+        self.assertEqual({value[0] for value in _STATIC.values()}, linked)
+
+    def test_wheel_smoke_uses_the_runtime_web_asset_inventory(self):
+        smoke = (PROJECT_ROOT / "packaging" / "smoke_wheel.py").read_text()
+
+        self.assertIn("_required_web_assets", smoke)
+        self.assertNotIn("('index.html','app.js','styles.css')", smoke)
 
     def test_release_notice_allowlist_excludes_source_only_browser_test_runtime(self):
         retired = {

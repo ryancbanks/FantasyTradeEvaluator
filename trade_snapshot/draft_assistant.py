@@ -1,8 +1,11 @@
 """Persistent, conflict-aware manual draft assistant sessions."""
 
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from math import isfinite
+from threading import RLock
 import re
 from uuid import uuid4
 
@@ -14,6 +17,9 @@ from .draft_simulation import rank_draft_candidates
 
 
 _SESSION_ID = re.compile(r"^[0-9a-f]{32}$")
+_MAX_BOARD_COVERAGE_CACHE_SIZE = 128
+_BOARD_COVERAGE_CACHE = OrderedDict()
+_BOARD_COVERAGE_CACHE_LOCK = RLock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -434,6 +440,17 @@ def assistant_board_coverage(
         or not isinstance(strategy, DraftStrategy)
     ):
         raise ValueError("assistant drafter or strategy is invalid")
+    cache_key = (
+        model.model_id,
+        board.board_id,
+        user_drafter_number,
+        strategy.value,
+    )
+    with _BOARD_COVERAGE_CACHE_LOCK:
+        cached = _BOARD_COVERAGE_CACHE.get(cache_key)
+        if cached is not None:
+            _BOARD_COVERAGE_CACHE.move_to_end(cache_key)
+            return deepcopy(cached)
     required_players = model.league_config.team_count * model.league_config.roster_size
     if len(board.players) < required_players:
         raise ValueError(f"draft board needs at least {required_players} players")
@@ -471,7 +488,7 @@ def assistant_board_coverage(
         for index in range(model.league_config.team_count)
     )
     validate_player_supply(board.players, model.league_config, strategies)
-    return {
+    coverage = {
         "status": "ready",
         "board_player_count": len(board.players),
         "usable_player_count": usable_players,
@@ -480,12 +497,24 @@ def assistant_board_coverage(
         "feasibility": {
             "status": "ready",
             "scope": "all_teams",
+            # Schema-v1 compatibility: retain the original starter-only metric
+            # while exposing the stronger all-roster validation separately.
             "starting_slots_checked": (
                 model.league_config.team_count
                 * len(model.league_config.starting_slots)
             ),
+            "roster_slots_checked": (
+                model.league_config.team_count
+                * model.league_config.roster_size
+            ),
         },
     }
+    with _BOARD_COVERAGE_CACHE_LOCK:
+        _BOARD_COVERAGE_CACHE[cache_key] = coverage
+        _BOARD_COVERAGE_CACHE.move_to_end(cache_key)
+        while len(_BOARD_COVERAGE_CACHE) > _MAX_BOARD_COVERAGE_CACHE_SIZE:
+            _BOARD_COVERAGE_CACHE.popitem(last=False)
+    return deepcopy(coverage)
 
 
 def _session_board_coverage(session, model, board):

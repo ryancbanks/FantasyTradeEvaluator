@@ -3,13 +3,25 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 from zipfile import ZipFile
 
+from tests.test_engine_bundle import engine_bundle
+from tests.test_search_store import definition, qualified
+from trade_snapshot.league_search import (
+    LeagueSearchOutcome,
+    LeagueSearchProgress,
+    TeamPairSearchOutcome,
+)
+from trade_snapshot.search_runner import TradeSearchOutcome, TradeSearchProgress
+from trade_snapshot.search_store import SearchStore
 from trade_snapshot.workbook_model import (
     TradeWorkbookContext,
     WorkbookSource,
     WorkbookTeamOutlook,
     WorkbookTradeRow,
+    WorkbookTradeRows,
+    workbook_trade_rows,
 )
 from trade_snapshot.xlsx_export import export_trade_workbook
 
@@ -134,6 +146,30 @@ class ExcelExportTests(unittest.TestCase):
 
         self.assertNotEqual(first_size, second_size)
 
+    def test_large_workbooks_stream_rows_and_keep_filters_without_tables(self):
+        with TemporaryDirectory() as directory, patch(
+            "trade_snapshot.xlsx_export._MAX_IN_MEMORY_TRADE_ROWS", 1
+        ):
+            target = Path(directory) / "streaming-results.xlsx"
+            export_trade_workbook(
+                target,
+                context(),
+                (trade(), trade(mutual=False, candidate_index=1)),
+                outlook(),
+            )
+            with ZipFile(target) as archive:
+                names = set(archive.namelist())
+                worksheets = "".join(
+                    archive.read(name).decode("utf-8")
+                    for name in names
+                    if name.startswith("xl/worksheets/sheet")
+                    and name.endswith(".xml")
+                )
+
+        self.assertFalse(any(name.startswith("xl/tables/") for name in names))
+        self.assertGreaterEqual(worksheets.count("<autoFilter"), 3)
+        self.assertIn("MAX(T8:T9)", worksheets)
+
     def test_surrogate_workbook_has_no_exact_scope_and_repeats_the_warning(self):
         row = replace(trade(), power_methodology_status="surrogate")
         extrapolated = replace(
@@ -160,6 +196,74 @@ class ExcelExportTests(unittest.TestCase):
                 export_trade_workbook(Path(directory) / "results.csv", context(), (), outlook())
         with self.assertRaisesRegex(ValueError, "between 0 and 1"):
             WorkbookTeamOutlook("t", "Team", 0, 0, 0, 1, 1, 0, 1, 1.1)
+
+    def test_restartable_rows_stream_to_the_same_workbook_as_a_materialized_tuple(self):
+        bundle = engine_bundle()
+        results = (
+            qualified(
+                0,
+                outgoing_player_ids=("p1",),
+                incoming_player_ids=("q1",),
+                primary_playoff_before=20,
+                primary_playoff_after=25,
+                counterparty_playoff_before=30,
+                counterparty_playoff_after=35,
+            ),
+            qualified(
+                1,
+                outgoing_player_ids=("p2",),
+                incoming_player_ids=("q2",),
+                primary_playoff_before=20,
+                primary_playoff_after=40,
+                counterparty_playoff_before=30,
+                counterparty_playoff_after=25,
+            ),
+        )
+        with TemporaryDirectory() as directory:
+            run = definition(total_candidate_count=2)
+            database = Path(directory) / "results.sqlite3"
+            with SearchStore(database, run) as store:
+                store.upsert_qualified_results(results, next_candidate_index=2)
+            pair_progress = TradeSearchProgress(run.run_id, 2, 2, 2, 2, 1)
+            outcome = LeagueSearchOutcome(
+                LeagueSearchProgress(1, 1, None, 2, 2, 2, 1),
+                (
+                    TeamPairSearchOutcome(
+                        "other",
+                        TradeSearchOutcome.from_database(pair_progress, database),
+                    ),
+                ),
+            )
+            rows = workbook_trade_rows(
+                outcome,
+                {team.team_id: team.name for team in bundle.state.teams},
+                bundle.player_names,
+                bundle.methodology_evidence,
+            )
+            self.assertIsInstance(rows, WorkbookTradeRows)
+            materialized = tuple(rows)
+            self.assertEqual(rows, materialized)
+            streamed_path = Path(directory) / "streamed.xlsx"
+            materialized_path = Path(directory) / "materialized.xlsx"
+            with patch(
+                "trade_snapshot.search_runner.read_search_results",
+                side_effect=AssertionError("export must stream stored results"),
+            ):
+                export_trade_workbook(streamed_path, context(), rows, outlook())
+            export_trade_workbook(
+                materialized_path, context(), materialized, outlook()
+            )
+            with ZipFile(streamed_path) as streamed, ZipFile(
+                materialized_path
+            ) as eager:
+                comparable_names = {
+                    name
+                    for name in streamed.namelist()
+                    if name.startswith("xl/")
+                }
+                self.assertEqual(comparable_names, set(eager.namelist()).intersection(comparable_names))
+                for name in comparable_names:
+                    self.assertEqual(streamed.read(name), eager.read(name), name)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,52 @@
 import math
+import random
 import unittest
 
 from trade_snapshot.lineup import LineupPlayer, optimize_lineup
+
+
+def _prior_dp_lineup(slots, players):
+    player_count = len(players)
+    empty = (None,) * len(slots)
+    states = {0: (empty, 0.0)}
+
+    def tie_key(assignment):
+        return tuple(
+            player_count if index is None else index for index in assignment
+        )
+
+    for player_index, player in enumerate(players):
+        next_states = dict(states)
+        for occupied, (assignment, _) in states.items():
+            considered = set()
+            for slot_index, slot in enumerate(slots):
+                if occupied & (1 << slot_index) or slot in considered:
+                    continue
+                considered.add(slot)
+                weight = player.slot_weights.get(slot)
+                if weight is None or weight < 0:
+                    continue
+                candidate_assignment = list(assignment)
+                candidate_assignment[slot_index] = player_index
+                candidate_assignment = tuple(candidate_assignment)
+                candidate_total = math.fsum(
+                    players[index].slot_weights[candidate_slot]
+                    for candidate_slot, index in zip(slots, candidate_assignment)
+                    if index is not None
+                )
+                mask = occupied | (1 << slot_index)
+                incumbent = next_states.get(mask)
+                if incumbent is None or (
+                    candidate_total > incumbent[1]
+                    or candidate_total == incumbent[1]
+                    and tie_key(candidate_assignment) < tie_key(incumbent[0])
+                ):
+                    next_states[mask] = candidate_assignment, candidate_total
+        states = next_states
+    return min(
+        states.values(),
+        key=lambda row: (-row[1], tie_key(row[0])),
+    )
 
 
 class LineupOptimizerTests(unittest.TestCase):
@@ -97,6 +142,60 @@ class LineupOptimizerTests(unittest.TestCase):
             ("first", "second"),
         )
 
+    def test_score_and_tie_break_match_exact_slot_order_summation(self):
+        slots = ("A", "B", "C")
+        players = (
+            LineupPlayer("large", {"A": 1e16}),
+            LineupPlayer("small-b", {"B": 1.0}),
+            LineupPlayer("small-c", {"C": 1.0}),
+        )
+
+        result = optimize_lineup(slots, players)
+
+        self.assertEqual(result.total_weight.hex(), math.fsum((1e16, 1.0, 1.0)).hex())
+        self.assertEqual(
+            tuple(row.player_id for row in result.assignments),
+            ("large", "small-b", "small-c"),
+        )
+
+    def test_randomized_results_match_the_prior_dp_contract(self):
+        generator = random.Random(4217)
+        slots = ("A", "B", "C")
+        values = (
+            0.0,
+            math.ulp(0.0),
+            0.1,
+            1.0,
+            math.nextafter(1.0, 2.0),
+            1e16,
+            float.fromhex("0x1.fffffffffffffp+1020"),
+        )
+        for case in range(80):
+            players = tuple(
+                LineupPlayer(
+                    f"p{index}",
+                    {
+                        slot: generator.choice(values)
+                        for slot in slots
+                        if generator.randrange(4) != 0
+                    },
+                )
+                for index in range(5)
+            )
+            expected_assignment, expected_total = _prior_dp_lineup(slots, players)
+
+            result = optimize_lineup(slots, players)
+
+            with self.subTest(case=case):
+                self.assertEqual(result.total_weight.hex(), expected_total.hex())
+                self.assertEqual(
+                    tuple(row.player_id for row in result.assignments),
+                    tuple(
+                        None if index is None else players[index].player_id
+                        for index in expected_assignment
+                    ),
+                )
+
     def test_rejects_duplicate_or_unhashable_player_ids(self):
         with self.assertRaisesRegex(ValueError, "duplicate player_id"):
             optimize_lineup(
@@ -126,6 +225,16 @@ class LineupOptimizerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "mapping"):
             LineupPlayer("player", (("QB", 10),))
+
+        maximum = float.fromhex("0x1.fffffffffffffp+1023")
+        with self.assertRaisesRegex(ValueError, "non-finite total"):
+            optimize_lineup(
+                ("QB", "RB"),
+                (
+                    LineupPlayer("maximum-qb", {"QB": maximum}),
+                    LineupPlayer("maximum-rb", {"RB": maximum}),
+                ),
+            )
 
 
 if __name__ == "__main__":

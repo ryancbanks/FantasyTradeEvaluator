@@ -11,6 +11,16 @@ from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
 from .engine_bundle import EngineBundle, save_engine_bundle
+from .job_retention import (
+    ACTIVE_JOB_STATUSES,
+    DEFAULT_TERMINAL_JOB_LIMIT,
+    TERMINAL_JOB_STATUSES,
+    has_active_jobs,
+    prune_terminal_jobs,
+)
+
+
+_MAX_RETAINED_COLLECTION_JOBS = DEFAULT_TERMINAL_JOB_LIMIT
 
 
 class WeeklyCollectionStage(str, Enum):
@@ -162,6 +172,7 @@ class WeeklyCollectionJobs:
         self._workflow = workflow
         self._lock = RLock()
         self._jobs: dict[str, _CollectionJob] = {}
+        self._pending_terminal_job_id: str | None = None
 
     @property
     def available(self) -> bool:
@@ -170,7 +181,46 @@ class WeeklyCollectionJobs:
     @property
     def is_running(self) -> bool:
         with self._lock:
-            return any(job.status in {"queued", "running"} for job in self._jobs.values())
+            return has_active_jobs(self._jobs)
+
+    def active_job(self) -> dict[str, object] | None:
+        """Return the sole resumable collection job, if one exists."""
+
+        with self._lock:
+            active = tuple(
+                job
+                for job in self._jobs.values()
+                if job.status in ACTIVE_JOB_STATUSES
+            )
+            if len(active) > 1:
+                raise RuntimeError("multiple weekly collection jobs are active")
+            return self._record(active[0]) if active else None
+
+    def recoverable_job(self) -> dict[str, object] | None:
+        """Return active work or the latest terminal job not yet surfaced by the UI."""
+
+        with self._lock:
+            active = self.active_job()
+            if active is not None:
+                return active
+            pending_id = self._pending_terminal_job_id
+            pending = self._jobs.get(pending_id) if pending_id is not None else None
+            if pending is not None and pending.status in TERMINAL_JOB_STATUSES:
+                return self._record(pending)
+            self._pending_terminal_job_id = None
+            return None
+
+    def acknowledge_activity(self, job_id: str) -> dict[str, object]:
+        """Mark one terminal job as surfaced without clearing a newer result."""
+
+        with self._lock:
+            job = self._require(job_id)
+            if job.status not in TERMINAL_JOB_STATUSES:
+                raise RuntimeError("active weekly collection cannot be acknowledged")
+            acknowledged = self._pending_terminal_job_id == job_id
+            if acknowledged:
+                self._pending_terminal_job_id = None
+            return {"job_id": job_id, "acknowledged": acknowledged}
 
     def start(self, request: WeeklyCollectionRequest) -> dict[str, object]:
         if not isinstance(request, WeeklyCollectionRequest):
@@ -184,6 +234,7 @@ class WeeklyCollectionJobs:
             if self.is_running:
                 raise RuntimeError("another weekly collection is already running")
             job = _CollectionJob(uuid4().hex, request)
+            self._pending_terminal_job_id = None
             self._jobs[job.job_id] = job
             Thread(target=self._run, args=(job,), name="weekly-collection", daemon=True).start()
             return self._record(job)
@@ -197,7 +248,7 @@ class WeeklyCollectionJobs:
 
         with self._lock:
             job = self._require(job_id)
-            if job.status not in {"queued", "running"}:
+            if job.status not in ACTIVE_JOB_STATUSES:
                 raise RuntimeError("weekly collection is not waiting for sign-in")
             gate = getattr(self._workflow, "sign_in_gate", None)
             confirm = getattr(gate, "confirm", None)
@@ -215,7 +266,7 @@ class WeeklyCollectionJobs:
     def cancel(self, job_id: str) -> dict[str, object]:
         with self._lock:
             job = self._require(job_id)
-            if job.status in {"queued", "running"}:
+            if job.status in ACTIVE_JOB_STATUSES:
                 job.cancel.set()
             return self._record(job)
 
@@ -308,8 +359,13 @@ class WeeklyCollectionJobs:
 
     def _update(self, job: _CollectionJob, **changes: object) -> None:
         with self._lock:
+            was_terminal = job.status in TERMINAL_JOB_STATUSES
             for name, value in changes.items():
                 setattr(job, name, value)
+            if job.status in TERMINAL_JOB_STATUSES:
+                if not was_terminal:
+                    self._pending_terminal_job_id = job.job_id
+                prune_terminal_jobs(self._jobs, _MAX_RETAINED_COLLECTION_JOBS)
 
     def _require(self, job_id: str) -> _CollectionJob:
         try:
@@ -322,7 +378,7 @@ class WeeklyCollectionJobs:
         sign_in = None
         gate = getattr(self._workflow, "sign_in_gate", None)
         status = getattr(gate, "status", None)
-        if callable(status) and job.status in {"queued", "running"}:
+        if callable(status) and job.status in ACTIVE_JOB_STATUSES:
             sign_in = _sign_in_record(status())
         return {
             "job_id": job.job_id,

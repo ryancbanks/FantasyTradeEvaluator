@@ -1,13 +1,15 @@
 """Validated, presentation-neutral records for the Excel results workbook."""
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from heapq import heappop, heappush
+from itertools import islice
 from math import isfinite
 from numbers import Real
 from types import MappingProxyType
 
-from .league_search import LeagueSearchOutcome
+from .league_search import LeagueQualifiedTrade, LeagueSearchOutcome
 from .league_state import LeagueState
 from .methodology_attestation import MethodologyAttestation
 from .season import SeasonProjection
@@ -250,34 +252,177 @@ class WorkbookTeamOutlook:
             object.__setattr__(self, name, value)
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class WorkbookTradeRows(Sequence[WorkbookTradeRow]):
+    """Restartable, sized workbook rows backed by pair result stores."""
+
+    outcome: LeagueSearchOutcome
+    team_names: Mapping[str, str]
+    player_names: Mapping[str, str]
+    methodology_evidence: MethodologyAttestation | SurrogateDisclosure
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outcome, LeagueSearchOutcome):
+            raise ValueError("outcome must be a LeagueSearchOutcome")
+        object.__setattr__(
+            self, "team_names", _name_map("team_names", self.team_names)
+        )
+        object.__setattr__(
+            self, "player_names", _name_map("player_names", self.player_names)
+        )
+        if not isinstance(
+            self.methodology_evidence,
+            (MethodologyAttestation, SurrogateDisclosure),
+        ):
+            raise ValueError("methodology_evidence has an invalid type")
+
+    def __len__(self) -> int:
+        return self.outcome.progress.qualified_trade_count
+
+    def __iter__(self) -> Iterator[WorkbookTradeRow]:
+        return self._iter_ranked(mutual_only=False, per_pair_limit=None)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            if key < 0:
+                return tuple(self)[key]
+            iterator = iter(self)
+            try:
+                return next(islice(iterator, key, key + 1))
+            except StopIteration:
+                raise IndexError("workbook trade row index out of range") from None
+            finally:
+                iterator.close()
+        if not isinstance(key, slice):
+            raise TypeError("workbook trade row indices must be integers or slices")
+        start, stop, step = key.indices(len(self))
+        if step < 0:
+            return tuple(self)[key]
+        iterator = iter(self)
+        try:
+            return tuple(islice(iterator, start, stop, step))
+        finally:
+            iterator.close()
+
+    @property
+    def mutual_count(self) -> int:
+        return self.outcome.progress.mutual_playoff_gain_count
+
+    def preview(self, limit: int) -> tuple[WorkbookTradeRow, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        iterator = self._iter_ranked(mutual_only=False, per_pair_limit=limit)
+        try:
+            return tuple(islice(iterator, limit))
+        finally:
+            iterator.close()
+
+    def iter_mutual(self) -> Iterator[WorkbookTradeRow]:
+        return self._iter_ranked(mutual_only=True, per_pair_limit=None)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, WorkbookTradeRows):
+            return tuple(self) == tuple(other)
+        if isinstance(other, tuple):
+            return tuple(self) == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(tuple(self))
+
+    def _iter_ranked(
+        self,
+        *,
+        mutual_only: bool,
+        per_pair_limit: int | None,
+    ) -> Iterator[WorkbookTradeRow]:
+        def generate() -> Iterator[WorkbookTradeRow]:
+            iterators = []
+            heap = []
+            try:
+                for pair_index, pair in enumerate(self.outcome.pairs):
+                    results = pair.search.iter_best_results(
+                        per_pair_limit,
+                        mutual_only=mutual_only,
+                    )
+                    iterator = _mapped_trade_rows(
+                        pair.counterparty_team_id,
+                        results,
+                        self.team_names,
+                        self.player_names,
+                        self.methodology_evidence,
+                    )
+                    iterators.append(iterator)
+                    first = next(iterator, None)
+                    if first is not None:
+                        heappush(
+                            heap,
+                            (_trade_sort_key(first), pair_index, first, iterator),
+                        )
+                while heap:
+                    _, pair_index, row, iterator = heappop(heap)
+                    yield row
+                    following = next(iterator, None)
+                    if following is not None:
+                        heappush(
+                            heap,
+                            (
+                                _trade_sort_key(following),
+                                pair_index,
+                                following,
+                                iterator,
+                            ),
+                        )
+            finally:
+                for iterator in iterators:
+                    close = getattr(iterator, "close", None)
+                    if close is not None:
+                        close()
+
+        return generate()
+
+
+def _mapped_trade_rows(
+    counterparty_team_id,
+    results,
+    team_names,
+    player_names,
+    methodology_evidence,
+) -> Iterator[WorkbookTradeRow]:
+    try:
+        for result in results:
+            yield _trade_row(
+                LeagueQualifiedTrade(counterparty_team_id, result),
+                team_names,
+                player_names,
+                methodology_evidence,
+            )
+    finally:
+        close = getattr(results, "close", None)
+        if close is not None:
+            close()
+
+
 def workbook_trade_rows(
     outcome: LeagueSearchOutcome,
     team_names: Mapping[str, str],
     player_names: Mapping[str, str],
     methodology_evidence: MethodologyAttestation | SurrogateDisclosure,
-) -> tuple[WorkbookTradeRow, ...]:
-    if not isinstance(outcome, LeagueSearchOutcome):
-        raise ValueError("outcome must be a LeagueSearchOutcome")
-    teams = _name_map("team_names", team_names)
-    players = _name_map("player_names", player_names)
-    if not isinstance(
-        methodology_evidence, (MethodologyAttestation, SurrogateDisclosure)
-    ):
-        raise ValueError("methodology_evidence has an invalid type")
-    rows = tuple(
-        _trade_row(row, teams, players, methodology_evidence)
-        for row in outcome.qualified_trades
+) -> WorkbookTradeRows:
+    return WorkbookTradeRows(
+        outcome,
+        team_names,
+        player_names,
+        methodology_evidence,
     )
-    return tuple(
-        sorted(
-            rows,
-            key=lambda row: (
-                not row.is_mutual_gain,
-                -row.combined_playoff_delta,
-                row.counterparty_team_name.casefold(),
-                row.candidate_index,
-            ),
-        )
+
+
+def _trade_sort_key(row: WorkbookTradeRow) -> tuple[bool, float, str, int]:
+    return (
+        not row.is_mutual_gain,
+        -row.combined_playoff_delta,
+        row.counterparty_team_name.casefold(),
+        row.candidate_index,
     )
 
 

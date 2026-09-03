@@ -110,7 +110,10 @@
     <section id="dashboardPanel" class="panel dashboard-panel" aria-labelledby="dashboardHeading">
       <div class="section-heading dashboard-heading">
         <div><span class="step">2</span><h2 id="dashboardHeading">League dashboard</h2></div>
-        <p>Power, standings, playoff paths, and roster trends from the selected weekly model.</p>
+        <div class="section-action">
+          <p>Power, standings, playoff paths, and roster trends from the selected weekly model.</p>
+          <button id="dashboardLoadButton" class="secondary" type="button" disabled>Calculate league outlook</button>
+        </div>
       </div>
 
       <div id="dashboardEmpty" class="dashboard-state" aria-live="polite">
@@ -198,7 +201,10 @@
     <section id="playerLabPanel" class="panel player-lab-panel" aria-labelledby="playerLabHeading">
       <div class="section-heading">
         <div><span class="step">3</span><h2 id="playerLabHeading">Player Lab</h2></div>
-        <p>Inspect every rostered player and captured waiver candidate without leaving the local app.</p>
+        <div class="section-action">
+          <p>Inspect every rostered player and captured waiver candidate without leaving the local app.</p>
+          <button id="playerLabLoadButton" class="secondary" type="button" disabled>Open Player Lab</button>
+        </div>
       </div>
 
       <div id="playerLabEmpty" class="player-lab-state" aria-live="polite">
@@ -215,7 +221,7 @@
           <label class="player-lab-search"><span>Find a player</span><input id="playerLabSearch" type="search" autocomplete="off" placeholder="Name, NFL team, or fantasy team"></label>
           <label><span>Owner</span><select id="playerLabOwnerFilter"><option value="all">All teams and available</option></select></label>
           <label><span>Position</span><select id="playerLabPositionFilter"><option value="all">All positions</option></select></label>
-          <label><span>Sort by</span><select id="playerLabSort"><option value="remaining_points">Remaining points</option><option value="weekly_ecr">Weekly ECR</option><option value="rest_of_season_ecr">ROS ECR</option><option value="disagreement">Provider disagreement</option><option value="name">Player name</option></select></label>
+          <label><span>Sort by</span><select id="playerLabSort"><option value="ros_points">Remaining points</option><option value="weekly_ecr">Weekly ECR</option><option value="ros_ecr">ROS ECR</option><option value="disagreement">Provider disagreement</option><option value="name">Player name</option></select></label>
         </div>
 
         <p id="playerLabCount" class="player-lab-count" aria-live="polite"></p>
@@ -582,7 +588,7 @@
         </div>
         <div class="draft-restore draft-live-controls" aria-label="Optional ESPN public draft sync">
           <label><span>ESPN league ID</span><input id="assistantEspnLeague" inputmode="numeric" pattern="[0-9]+" placeholder="Public league ID"></label>
-          <label><span>Draft season</span><input id="assistantEspnSeason" type="number" min="2012" max="9999" value="2026"></label>
+          <label><span>Draft season</span><input id="assistantEspnSeason" type="number" min="2012" max="9999"></label>
           <button id="assistantEspnSync" class="secondary" type="button">Sync ESPN public draft</button>
           <label class="check"><input id="assistantEspnAuto" type="checkbox"><span>Auto-refresh every 15 seconds</span></label>
         </div>

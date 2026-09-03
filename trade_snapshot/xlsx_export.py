@@ -10,11 +10,16 @@ from .workbook_model import (
     TradeWorkbookContext,
     WorkbookTeamOutlook,
     WorkbookTradeRow,
+    WorkbookTradeRows,
 )
 from .surrogate_disclosure import SURROGATE_NOTICE
 
 
 MAX_EXCEL_DATA_ROWS = 1_000_000
+# XlsxWriter's ordinary mode retains every worksheet cell until close. Switch
+# larger exports to its row-streaming mode before that becomes the dominant
+# memory cost; smaller workbooks retain native Excel tables.
+_MAX_IN_MEMORY_TRADE_ROWS = 10_000
 TRADE_HEADERS = (
     "Other Team",
     "You Give",
@@ -52,9 +57,14 @@ def export_trade_workbook(
 
     if not isinstance(context, TradeWorkbookContext):
         raise ValueError("context must be a TradeWorkbookContext")
-    trades = tuple(trade_rows)
+    if isinstance(trade_rows, WorkbookTradeRows):
+        trades = trade_rows
+    else:
+        trades = tuple(trade_rows)
     outlook = tuple(team_outlook)
-    if any(not isinstance(row, WorkbookTradeRow) for row in trades):
+    if not isinstance(trades, WorkbookTradeRows) and any(
+        not isinstance(row, WorkbookTradeRow) for row in trades
+    ):
         raise ValueError("trade_rows must contain WorkbookTradeRow values")
     if any(not isinstance(row, WorkbookTeamOutlook) for row in outlook):
         raise ValueError("team_outlook must contain WorkbookTeamOutlook values")
@@ -81,10 +91,11 @@ def _write_workbook(path, context, trades, outlook):
     except ImportError:
         raise RuntimeError("Excel export support is not installed") from None
 
+    constant_memory = len(trades) > _MAX_IN_MEMORY_TRADE_ROWS
     workbook = xlsxwriter.Workbook(
         path,
         {
-            "constant_memory": False,
+            "constant_memory": constant_memory,
             "strings_to_formulas": False,
             "strings_to_urls": False,
         },
@@ -99,25 +110,39 @@ def _write_workbook(path, context, trades, outlook):
             }
         )
         formats = _formats(workbook)
-        mutual = tuple(row for row in trades if row.is_mutual_gain)
+        if isinstance(trades, WorkbookTradeRows):
+            mutual_count = trades.mutual_count
+            mutual = trades.iter_mutual()
+        else:
+            mutual = tuple(row for row in trades if row.is_mutual_gain)
+            mutual_count = len(mutual)
+            mutual = tuple(
+                sorted(mutual, key=lambda row: -row.combined_playoff_delta)
+            )
         _trade_sheet(
             workbook,
             "Best Trades",
-            tuple(sorted(mutual, key=lambda row: -row.combined_playoff_delta)),
+            mutual,
+            mutual_count,
+            mutual_count,
             context,
             formats,
             "BestTradesTable",
+            use_table=not constant_memory,
         )
         _trade_sheet(
             workbook,
             "All Qualified",
             trades,
+            len(trades),
+            mutual_count,
             context,
             formats,
             "QualifiedTradesTable",
+            use_table=not constant_memory,
         )
-        _outlook_sheet(workbook, outlook, formats)
-        _details_sheet(workbook, context, len(trades), len(mutual), formats)
+        _outlook_sheet(workbook, outlook, formats, use_table=not constant_memory)
+        _details_sheet(workbook, context, len(trades), mutual_count, formats)
     finally:
         workbook.close()
 
@@ -167,42 +192,75 @@ def _formats(workbook):
     }
 
 
-def _trade_sheet(workbook, name, rows, context, formats, table_name):
+def _trade_sheet(
+    workbook,
+    name,
+    rows,
+    row_count,
+    mutual_count,
+    context,
+    formats,
+    table_name,
+    *,
+    use_table,
+):
     sheet = workbook.add_worksheet(name)
     sheet.hide_gridlines(2)
     sheet.set_tab_color("#0F766E" if name == "Best Trades" else "#246B7B")
     sheet.set_row(0, 30)
     sheet.merge_range(0, 0, 0, len(TRADE_HEADERS) - 1, f"{name} — {context.primary_team_name}", formats["title"])
-    best_gain = max((row.combined_playoff_delta for row in rows), default=0)
-    cards = (
-        (0, "Trades", len(rows), "card_number"),
-        (3, "Mutual gains", sum(row.is_mutual_gain for row in rows), "card_number"),
-        (6, "Best combined odds gain", best_gain, "card_percent"),
-    )
-    for column, label, value, format_name in cards:
-        sheet.write(2, column, label, formats["card_label"])
-        sheet.write(3, column, value, formats[format_name])
-    generated = context.generated_at.astimezone(timezone.utc).replace(tzinfo=None)
+    sheet.write(2, 0, "Trades", formats["card_label"])
+    sheet.write(2, 3, "Mutual gains", formats["card_label"])
+    sheet.write(2, 6, "Best combined odds gain", formats["card_label"])
     sheet.write(2, 9, "Generated (UTC)", formats["card_label"])
-    sheet.write_datetime(3, 9, generated, formats["datetime"])
+    sheet.write(3, 0, row_count, formats["card_number"])
+    sheet.write(3, 3, mutual_count, formats["card_number"])
     header_row = 6
+    if row_count:
+        first_excel_row = header_row + 2
+        last_excel_row = header_row + row_count + 1
+        sheet.write_formula(
+            3,
+            6,
+            f"=MAX(T{first_excel_row}:T{last_excel_row})",
+            formats["card_percent"],
+            0,
+        )
+    else:
+        sheet.write(3, 6, 0, formats["card_percent"])
+    generated = context.generated_at.astimezone(timezone.utc).replace(tzinfo=None)
+    sheet.write_datetime(3, 9, generated, formats["datetime"])
     for column, header in enumerate(TRADE_HEADERS):
         sheet.write(header_row, column, header, formats["header"])
+    written_count = 0
     for offset, row in enumerate(rows, start=1):
+        if not isinstance(row, WorkbookTradeRow):
+            raise ValueError("trade_rows must contain WorkbookTradeRow values")
         _write_trade_row(sheet, header_row + offset, row, formats)
-    if rows:
-        sheet.add_table(
-            header_row,
-            0,
-            header_row + len(rows),
-            len(TRADE_HEADERS) - 1,
-            {
-                "name": table_name,
-                "style": "Table Style Medium 2",
-                "columns": [{"header": header} for header in TRADE_HEADERS],
-            },
-        )
-        first, last = header_row + 1, header_row + len(rows)
+        written_count = offset
+    if written_count != row_count:
+        raise ValueError("trade row count changed while the workbook was written")
+    if row_count:
+        if use_table:
+            sheet.add_table(
+                header_row,
+                0,
+                header_row + row_count,
+                len(TRADE_HEADERS) - 1,
+                {
+                    "name": table_name,
+                    "style": "Table Style Medium 2",
+                    "columns": [{"header": header} for header in TRADE_HEADERS],
+                },
+            )
+        else:
+            sheet.autofilter(
+                header_row,
+                0,
+                header_row + row_count,
+                len(TRADE_HEADERS) - 1,
+            )
+        first, last = header_row + 1, header_row + row_count
         _trade_conditional_formats(sheet, first, last, formats)
     else:
         sheet.write(header_row + 1, 0, "No trades met these filters.", formats["muted"])
@@ -254,7 +312,7 @@ def _trade_widths(sheet):
     sheet.set_default_row(18)
 
 
-def _outlook_sheet(workbook, rows, formats):
+def _outlook_sheet(workbook, rows, formats, *, use_table):
     sheet = workbook.add_worksheet("Team Outlook")
     sheet.hide_gridlines(2)
     sheet.set_row(0, 30)
@@ -268,7 +326,10 @@ def _outlook_sheet(workbook, rows, formats):
             fmt = formats["text"] if column == 0 else formats["percent"] if column == 8 else formats["decimal"] if column >= 4 else formats["integer"]
             sheet.write(index, column, value, fmt)
     if rows:
-        sheet.add_table(2, 0, 2 + len(rows), len(headers) - 1, {"name": "TeamOutlookTable", "style": "Table Style Medium 2", "columns": [{"header": value} for value in headers]})
+        if use_table:
+            sheet.add_table(2, 0, 2 + len(rows), len(headers) - 1, {"name": "TeamOutlookTable", "style": "Table Style Medium 2", "columns": [{"header": value} for value in headers]})
+        else:
+            sheet.autofilter(2, 0, 2 + len(rows), len(headers) - 1)
         sheet.conditional_format(3, 8, 2 + len(rows), 8, {"type": "data_bar", "bar_color": "#2A9D8F"})
     sheet.freeze_panes(3, 1)
     sheet.set_column(0, 0, 24)

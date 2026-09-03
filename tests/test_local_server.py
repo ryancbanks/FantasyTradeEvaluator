@@ -3,14 +3,21 @@ from io import BytesIO
 import json
 from tempfile import TemporaryDirectory
 from threading import Thread
+import time
+from types import SimpleNamespace
 import unittest
 from zipfile import ZipFile
 
 from tests.test_app_service import filter_expression, payload, player_filter
 from tests.test_engine_bundle import engine_bundle
 from tests.test_surrogate_disclosure import surrogate_bundle
+from trade_snapshot.draft_service import _DraftJob
 from trade_snapshot.extension_bridge import SESSION_TOKEN_HEADER, V1_CAPABILITIES
 from trade_snapshot.local_server import create_local_server
+from trade_snapshot.weekly_collection import (
+    WeeklyCollectionRequest,
+    _CollectionJob,
+)
 
 
 class LocalServerTests(unittest.TestCase):
@@ -63,6 +70,113 @@ class LocalServerTests(unittest.TestCase):
             "GET", "/api/health", host="attacker.example", token=True
         )
         self.assertEqual(status, 400)
+
+    def test_active_job_catalog_is_authenticated_and_read_only(self):
+        status, _, raw = self.request("GET", "/api/activity")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(raw),
+            {"search": None, "weekly_collection": None, "draft": None},
+        )
+
+        status, _, raw = self.request("GET", "/api/activity", token=False)
+        self.assertEqual(status, 403)
+        self.assertIn(b"missing local application token", raw)
+
+        status, _, _ = self.request("POST", "/api/activity")
+        self.assertEqual(status, 404)
+
+    def test_completed_search_can_be_recovered_then_acknowledged_once(self):
+        bundle = engine_bundle()
+        status, _, _ = self.request(
+            "POST", "/api/bundles/import", value=bundle.to_record()
+        )
+        self.assertEqual(status, 201)
+        status, _, raw = self.request(
+            "POST", "/api/searches", value=payload(bundle.bundle_id)
+        )
+        self.assertEqual(status, 202)
+        job_id = json.loads(raw)["job_id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status, _, raw = self.request("GET", f"/api/searches/{job_id}")
+            job = json.loads(raw)
+            if job["status"] not in {"queued", "running"}:
+                break
+            time.sleep(0.01)
+        self.assertEqual(status, 200)
+        self.assertEqual(job["status"], "complete", job)
+
+        status, _, raw = self.request("GET", "/api/activity")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["search"]["job_id"], job_id)
+        self.assertEqual(
+            self.request("GET", f"/api/searches/{job_id}/results")[0],
+            200,
+        )
+
+        ack_path = f"/api/searches/{job_id}/activity-ack"
+        self.assertEqual(self.request("POST", ack_path, token=False)[0], 403)
+        status, _, raw = self.request("POST", ack_path)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(raw)["acknowledged"])
+        status, _, raw = self.request("GET", "/api/activity")
+        self.assertEqual(status, 200)
+        self.assertIsNone(json.loads(raw)["search"])
+
+    def test_completed_draft_job_can_be_recovered_then_acknowledged_once(self):
+        job = _DraftJob(
+            "d" * 32,
+            "benchmark",
+            status="running",
+            progress={"trial": 1, "trial_count": 1},
+        )
+        self.server.app_service.draft_lab._jobs[job.job_id] = job
+        self.server.app_service.draft_lab._set_job(
+            job,
+            status="complete",
+            result={"verdict": "better"},
+        )
+
+        status, _, raw = self.request("GET", "/api/activity")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["draft"]["job_id"], job.job_id)
+        self.assertEqual(
+            self.request("GET", f"/api/draft/jobs/{job.job_id}/result")[0],
+            200,
+        )
+
+        ack_path = f"/api/draft/jobs/{job.job_id}/activity-ack"
+        self.assertEqual(self.request("POST", ack_path, token=False)[0], 403)
+        status, _, raw = self.request("POST", ack_path)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(raw)["acknowledged"])
+        status, _, raw = self.request("GET", "/api/activity")
+        self.assertEqual(status, 200)
+        self.assertIsNone(json.loads(raw)["draft"])
+
+    def test_failed_collection_can_be_recovered_then_acknowledged_once(self):
+        job = _CollectionJob(
+            "c" * 32,
+            WeeklyCollectionRequest(2026, 1, "PPR"),
+            status="running",
+        )
+        collections = self.server.app_service._collections
+        collections._jobs[job.job_id] = job
+        collections._update(job, status="failed", error="Collection failed safely")
+
+        status, _, raw = self.request("GET", "/api/activity")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["weekly_collection"]["job_id"], job.job_id)
+
+        ack_path = f"/api/weekly-collections/{job.job_id}/activity-ack"
+        self.assertEqual(self.request("POST", ack_path, token=False)[0], 403)
+        status, _, raw = self.request("POST", ack_path)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(raw)["acknowledged"])
+        status, _, raw = self.request("GET", "/api/activity")
+        self.assertEqual(status, 200)
+        self.assertIsNone(json.loads(raw)["weekly_collection"])
 
     def test_bundle_import_and_candidate_estimate_routes(self):
         bundle = engine_bundle()
@@ -165,6 +279,18 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b'format === "three_team"', body)
         self.assertIn(b"candidate_count_text", body)
         self.assertIn(b"threeTeamEstimateSignature", body)
+        self.assertIn(b'api("/api/activity")', body)
+        self.assertIn(b"restoreActiveWork(activity)", body)
+        self.assertIn(b"restoreSearchScope(search)", body)
+        self.assertIn(b"finishCollection(collection)", body)
+        self.assertIn(b"activity-ack", body)
+        self.assertIn(b"not reconstructed", body)
+        self.assertIn(b"recoveredSearchScopeOnly", body)
+        self.assertIn(b"void pollCollection()", body)
+        self.assertIn(b"void pollJob()", body)
+        self.assertIn(b"search.request || {}", body)
+        self.assertIn(b"search may still be running locally", body)
+        self.assertIn(b"Collection may still be running locally", body)
         self.assertIn(b"improve all three playoff chances", body)
         self.assertIn(b"free_agent_allocation_policy", body)
         self.assertIn(b"Count this specific three-team search", body)
@@ -365,6 +491,49 @@ class LocalServerTests(unittest.TestCase):
         self.assertEqual(status, 403)
         status, _, _ = self.request("POST", "/api/session/close")
         self.assertEqual(status, 200)
+        self.thread.join(timeout=1)
+        self.assertFalse(self.thread.is_alive())
+
+    def test_closing_one_browser_client_keeps_other_client_alive(self):
+        self.server.start_browser_lifecycle(
+            launch_timeout=2, idle_timeout=2, close_grace=0.05
+        )
+        for client_id in ("client-a", "client-b"):
+            status, _, _ = self.request(
+                "POST",
+                "/api/session/ping",
+                extra_headers={"X-FTE-Client": client_id},
+            )
+            self.assertEqual(status, 200)
+        status, _, _ = self.request(
+            "POST",
+            "/api/session/close",
+            extra_headers={"X-FTE-Client": "client-a"},
+        )
+        self.assertEqual(status, 200)
+        time.sleep(0.12)
+        self.assertTrue(self.thread.is_alive())
+        self.assertEqual(self.request("GET", "/api/health")[0], 200)
+
+        self.request(
+            "POST",
+            "/api/session/close",
+            extra_headers={"X-FTE-Client": "client-b"},
+        )
+        self.thread.join(timeout=1)
+        self.assertFalse(self.thread.is_alive())
+
+    def test_browser_close_waits_for_background_work(self):
+        self.server.start_browser_lifecycle(
+            launch_timeout=2, idle_timeout=2, close_grace=0.05
+        )
+        self.request("POST", "/api/session/ping")
+        self.server.app_service._jobs["busy"] = SimpleNamespace(status="running")
+        self.request("POST", "/api/session/close")
+        time.sleep(0.12)
+        self.assertTrue(self.thread.is_alive())
+
+        self.server.app_service._jobs["busy"].status = "complete"
         self.thread.join(timeout=1)
         self.assertFalse(self.thread.is_alive())
 

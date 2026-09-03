@@ -125,9 +125,16 @@ class RosterAdjustmentTests(unittest.TestCase):
         )
         with TemporaryDirectory() as directory:
             outcome = runner.run(Path(directory) / "search.sqlite3")
-        self.assertEqual(outcome.progress.total_candidate_count, 2)
-        self.assertTrue(all(row.primary_dropped_player_ids for row in outcome.results))
-        self.assertTrue(all(row.counterparty_added_player_ids == ("fa1",) for row in outcome.results))
+            self.assertEqual(outcome.progress.total_candidate_count, 2)
+            self.assertTrue(
+                all(row.primary_dropped_player_ids for row in outcome.results)
+            )
+            self.assertTrue(
+                all(
+                    row.counterparty_added_player_ids == ("fa1",)
+                    for row in outcome.results
+                )
+            )
 
     def test_drop_is_optimized_in_the_post_trade_depth_context(self):
         values = {

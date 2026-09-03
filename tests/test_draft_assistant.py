@@ -1,10 +1,13 @@
 from dataclasses import replace
 import unittest
+from unittest.mock import patch
 
+import trade_snapshot.draft_assistant as draft_assistant_module
 from tests.draft_fixtures import small_draft_config, small_historical_corpus
 from trade_snapshot.draft_assistant import (
     AssistantDraftBinding,
     DraftAssistantSession,
+    assistant_board_coverage,
     assistant_status,
     bind_assistant_draft,
     create_assistant_session,
@@ -52,6 +55,7 @@ class DraftAssistantTests(unittest.TestCase):
                 "status": "ready",
                 "scope": "all_teams",
                 "starting_slots_checked": 16,
+                "roster_slots_checked": 20,
             },
         })
         chosen = first["recommendations"][0]["player_id"]
@@ -67,6 +71,32 @@ class DraftAssistantTests(unittest.TestCase):
         self.assertEqual(restored, session)
         self.assertEqual(session.to_record()["schema_version"], 2)
         self.assertEqual(undo_assistant_pick(session).picks, ())
+
+    def test_board_coverage_cache_is_copy_safe(self):
+        with draft_assistant_module._BOARD_COVERAGE_CACHE_LOCK:
+            draft_assistant_module._BOARD_COVERAGE_CACHE.clear()
+        original = draft_assistant_module.validate_player_supply
+        with patch.object(
+            draft_assistant_module,
+            "validate_player_supply",
+            wraps=original,
+        ) as validate:
+            first = assistant_board_coverage(
+                self.model,
+                self.board,
+                user_drafter_number=1,
+                strategy=draft_assistant_module.DraftStrategy.NONE,
+            )
+            first["feasibility"]["status"] = "changed by caller"
+            second = assistant_board_coverage(
+                self.model,
+                self.board,
+                user_drafter_number=1,
+                strategy=draft_assistant_module.DraftStrategy.NONE,
+            )
+
+        self.assertEqual(validate.call_count, 1)
+        self.assertEqual(second["feasibility"]["status"], "ready")
 
     def test_reconciliation_is_idempotent_and_conflicts_fail(self):
         session = create_assistant_session(

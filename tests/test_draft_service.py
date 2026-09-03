@@ -5,9 +5,18 @@ from threading import Event
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
+import trade_snapshot.draft_service as draft_service_module
 from tests.draft_fixtures import small_draft_config, small_historical_corpus
+from tests.test_engine_bundle import engine_bundle
+from trade_snapshot.draft_assistant import (
+    DraftAssistantSession,
+    assistant_board_coverage,
+)
+from trade_snapshot.draft_config import DraftStrategy
 from trade_snapshot.draft_espn_live import EspnDraftObservation, EspnDraftSyncError
+from trade_snapshot.draft_features import build_baseline_brain
 from trade_snapshot.draft_history import DraftPlayerBoard
 from trade_snapshot.draft_persistence import DraftModelArtifact
 from trade_snapshot.draft_service import (
@@ -16,6 +25,7 @@ from trade_snapshot.draft_service import (
     _MAX_RETAINED_TERMINAL_JOBS,
 )
 from trade_snapshot.draft_training import EvolutionConfig, run_training_batch
+from trade_snapshot.engine_bundle import save_engine_bundle
 
 
 class _EspnDraftAdapterStub:
@@ -54,6 +64,41 @@ class DraftLabServiceTests(unittest.TestCase):
                 return job
             time.sleep(0.01)
         self.fail("Draft Lab job did not finish")
+
+    def test_active_catalog_tracks_one_draft_job_and_rejects_corrupt_ownership(self):
+        active = _DraftJob("a" * 32, "training", status="running")
+        self.service._jobs[active.job_id] = active
+        self.assertEqual(self.service.active_job(), self.service.job(active.job_id))
+
+        second = _DraftJob("b" * 32, "benchmark", status="queued")
+        self.service._jobs[second.job_id] = second
+        with self.assertRaisesRegex(RuntimeError, "multiple Draft Lab"):
+            self.service.active_job()
+
+        active.status = "complete"
+        second.status = "cancelled"
+        self.assertIsNone(self.service.active_job())
+
+    def test_latest_terminal_job_is_recoverable_until_the_ui_acknowledges_it(self):
+        first = _DraftJob("a" * 32, "training", status="running")
+        self.service._jobs[first.job_id] = first
+        self.service._set_job(first, status="complete", result={"model": {}})
+        self.assertEqual(self.service.recoverable_job()["job_id"], first.job_id)
+
+        second = _DraftJob("b" * 32, "benchmark", status="running")
+        self.service._jobs[second.job_id] = second
+        self.service._set_job(second, status="failed", error="test failure")
+        self.assertFalse(
+            self.service.acknowledge_job_activity(first.job_id)["acknowledged"]
+        )
+        self.assertEqual(self.service.recoverable_job()["job_id"], second.job_id)
+        self.assertTrue(
+            self.service.acknowledge_job_activity(second.job_id)["acknowledged"]
+        )
+        self.assertIsNone(self.service.recoverable_job())
+        self.assertFalse(
+            self.service.acknowledge_job_activity(second.job_id)["acknowledged"]
+        )
 
     def test_catalog_estimate_background_training_autosave_and_model(self):
         evolution = EvolutionConfig(4, 1, 1, 0.25, 0.1, 1_000, 4, (2025,), 2)
@@ -106,6 +151,13 @@ class DraftLabServiceTests(unittest.TestCase):
         )
         with self.assertRaises(FileNotFoundError):
             self.service.job("0" * 32)
+
+    def test_rejects_oversized_assistant_session_before_reading_it(self):
+        session_id = "e" * 32
+        self.service._session_path(session_id).write_text("{}", encoding="utf-8")
+        with patch("trade_snapshot.draft_service._MAX_ASSISTANT_SESSION_BYTES", 1):
+            with self.assertRaisesRegex(ValueError, "size limit"):
+                self.service._load_session(session_id)
 
     def test_autosaved_champion_can_be_promoted_without_more_training(self):
         evolution = EvolutionConfig(4, 1, 1, 0.25, 0.1, 1_000, 4, (2025,), 2)
@@ -216,6 +268,105 @@ class DraftLabServiceTests(unittest.TestCase):
             })
 
         self.assertEqual(self.service.catalog()["assistant_sessions"], ())
+
+    def test_catalog_reuses_shared_assets_and_equivalent_coverage(self):
+        brain = build_baseline_brain(self.corpus, self.config, (2025,))
+        model = DraftModelArtifact(
+            brain,
+            self.config,
+            self.corpus.corpus_id,
+            (2025,),
+            0,
+            {"fitness": 0.0},
+            "2026-09-02T12:00:00+00:00",
+        )
+        self.service.store.save_model(model)
+        board = DraftPlayerBoard(
+            2026,
+            "2026-08-01T00:00:00+00:00",
+            "2026-09-01T00:00:00+00:00",
+            tuple(
+                replace(player, player_id=f"catalog-{player.player_id}", actual_weeks=())
+                for player in self.corpus.seasons[0].players
+            ),
+        )
+        self.service.import_board(board.to_record())
+        for index, drafter_number in enumerate((1, 1, 2)):
+            self.service._save_session(DraftAssistantSession(
+                f"{index:032x}",
+                model.model_id,
+                board.board_id,
+                drafter_number,
+                DraftStrategy.NONE,
+            ))
+
+        with (
+            patch.object(
+                self.service.store,
+                "load_model",
+                wraps=self.service.store.load_model,
+            ) as load_model,
+            patch.object(
+                self.service.store,
+                "load_board",
+                wraps=self.service.store.load_board,
+            ) as load_board,
+            patch(
+                "trade_snapshot.draft_service.assistant_board_coverage",
+                wraps=assistant_board_coverage,
+            ) as coverage,
+        ):
+            sessions = self.service.catalog()["assistant_sessions"]
+            repeated = self.service.catalog()["assistant_sessions"]
+
+        self.assertEqual(load_model.call_count, 1)
+        self.assertEqual(load_board.call_count, 1)
+        self.assertEqual(coverage.call_count, 4)
+        self.assertEqual(repeated, sessions)
+        self.assertEqual(sessions[0]["board_coverage"], sessions[1]["board_coverage"])
+        self.assertIsNot(
+            sessions[0]["board_coverage"], sessions[1]["board_coverage"]
+        )
+        self.assertIsNot(
+            sessions[0]["board_coverage"]["feasibility"],
+            sessions[1]["board_coverage"]["feasibility"],
+        )
+
+    def test_asset_cache_is_bounded_and_least_recently_used(self):
+        loaded = []
+
+        def load(identifier):
+            loaded.append(identifier)
+            return object()
+
+        with patch("trade_snapshot.draft_service._MAX_CACHED_ASSETS_PER_KIND", 2):
+            cache = self.service._model_cache
+            first = self.service._load_asset(cache, "first", load)
+            self.service._load_asset(cache, "second", load)
+            self.assertIs(self.service._load_asset(cache, "first", load), first)
+            self.service._load_asset(cache, "third", load)
+            self.service._load_asset(cache, "second", load)
+
+        self.assertEqual(loaded, ["first", "second", "third", "second"])
+        self.assertEqual(tuple(cache), ("third", "second"))
+
+    def test_synced_league_presets_do_not_reload_unchanged_bundles(self):
+        bundle = engine_bundle()
+        save_engine_bundle(
+            bundle,
+            self.service.bundle_directory / f"{bundle.bundle_id}.json",
+        )
+        with patch(
+            "trade_snapshot.draft_service.load_engine_bundle",
+            wraps=draft_service_module.load_engine_bundle,
+        ) as load:
+            first = self.service.catalog()["league_presets"]
+            second = self.service.catalog()["league_presets"]
+
+        self.assertEqual(load.call_count, 1)
+        self.assertEqual(first, second)
+        synced = next(row for row in first if row["source"] == "synced_league")
+        self.assertEqual(synced["preset_id"], bundle.bundle_id)
 
     def test_manual_assistant_and_benchmark_jobs(self):
         evolution = EvolutionConfig(4, 1, 1, 0.25, 0.1, 1_000, 4, (2025,), 3)
