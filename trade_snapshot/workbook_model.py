@@ -3,10 +3,11 @@
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from math import isfinite
+from math import fsum, isfinite
 from numbers import Real
 from types import MappingProxyType
 
+from .data_readiness import DataReadinessSnapshot
 from .league_search import LeagueSearchOutcome
 from .league_state import LeagueState
 from .methodology_attestation import MethodologyAttestation
@@ -29,6 +30,9 @@ class WorkbookSource:
 @dataclass(frozen=True, slots=True)
 class TradeWorkbookContext:
     snapshot_id: str
+    scoring_profile_id: str
+    nfl_schedule_id: str
+    ensemble_config_id: str
     strength_model_id: str
     scenario_run_id: str
     primary_team_id: str
@@ -49,12 +53,16 @@ class TradeWorkbookContext:
     methodology_holdout_count: int
     holdout_max_absolute_score_error: float
     holdout_display_match_rate: float
-    exact_balanced_package_sizes: tuple[int, ...]
+    holdout_validated_balanced_package_sizes: tuple[int, ...]
+    data_readiness: DataReadinessSnapshot
     sources: tuple[WorkbookSource, ...]
 
     def __post_init__(self) -> None:
         for name in (
             "snapshot_id",
+            "scoring_profile_id",
+            "nfl_schedule_id",
+            "ensemble_config_id",
             "strength_model_id",
             "scenario_run_id",
             "primary_team_id",
@@ -93,29 +101,42 @@ class TradeWorkbookContext:
             raise ValueError("workbook holdout quality metrics are invalid")
         object.__setattr__(self, "holdout_max_absolute_score_error", error)
         object.__setattr__(self, "holdout_display_match_rate", rate)
-        if self.power_engine_mode not in {"exact", "surrogate"}:
-            raise ValueError("power_engine_mode must be exact or surrogate")
-        exact = self.power_engine_mode == "exact"
+        if self.power_engine_mode not in {"holdout_validated", "surrogate"}:
+            raise ValueError(
+                "power_engine_mode must be holdout_validated or surrogate"
+            )
+        attested = self.power_engine_mode == "holdout_validated"
         if (
-            self.calibration_status != self.power_engine_mode
+            self.calibration_status != ("exact" if attested else "surrogate")
             or self.methodology_evidence_kind
-            != ("exact_attestation" if exact else "surrogate_disclosure")
+            != (
+                "blind_holdout_attestation"
+                if attested
+                else "surrogate_disclosure"
+            )
             or self.formula_action
-            not in ({"reuse", "recalibrate"} if exact else {"recalibrate"})
+            not in ({"reuse", "recalibrate"} if attested else {"recalibrate"})
         ):
             raise ValueError("workbook power-method provenance is inconsistent")
-        sizes = tuple(self.exact_balanced_package_sizes)
+        sizes = tuple(self.holdout_validated_balanced_package_sizes)
         if any(type(value) is not int or value < 1 for value in sizes) or len(
             set(sizes)
         ) != len(sizes):
             raise ValueError(
-                "exact_balanced_package_sizes must contain distinct positive integers"
+                "holdout_validated_balanced_package_sizes must contain distinct "
+                "positive integers"
             )
-        if (self.power_engine_mode == "exact") != bool(sizes):
+        if attested != bool(sizes):
             raise ValueError(
-                "only an exact engine may declare exact balanced package sizes"
+                "only a holdout-validated engine may declare validated package sizes"
             )
-        object.__setattr__(self, "exact_balanced_package_sizes", tuple(sorted(sizes)))
+        object.__setattr__(
+            self,
+            "holdout_validated_balanced_package_sizes",
+            tuple(sorted(sizes)),
+        )
+        if not isinstance(self.data_readiness, DataReadinessSnapshot):
+            raise ValueError("data_readiness must be a DataReadinessSnapshot")
         sources = tuple(self.sources)
         if any(not isinstance(row, WorkbookSource) for row in sources):
             raise ValueError("sources must contain WorkbookSource values")
@@ -190,14 +211,14 @@ class WorkbookTradeRow:
         if type(self.candidate_index) is not int or self.candidate_index < 0:
             raise ValueError("candidate_index must be a non-negative integer")
         if self.power_methodology_status not in {
-            "exact",
+            "holdout_validated",
             "extrapolated",
             "surrogate",
             "surrogate_extrapolated",
         }:
             raise ValueError(
-                "power_methodology_status must be exact, extrapolated, surrogate, "
-                "or surrogate_extrapolated"
+                "power_methodology_status must be holdout_validated, extrapolated, "
+                "surrogate, or surrogate_extrapolated"
             )
 
     @property
@@ -229,6 +250,11 @@ class WorkbookTeamOutlook:
     expected_final_ties: float
     mean_rank: float
     playoff_probability: float
+    current_rank: int | None = None
+    expected_final_points_for: float | None = None
+    expected_final_points_against: float | None = None
+    rank_distribution: tuple[float, ...] = ()
+    seed_distribution: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "team_id", _text("team_id", self.team_id))
@@ -248,6 +274,26 @@ class WorkbookTeamOutlook:
             if name == "playoff_probability" and not 0 <= value <= 1:
                 raise ValueError("playoff_probability must be between 0 and 1")
             object.__setattr__(self, name, value)
+        if self.current_rank is not None and (
+            type(self.current_rank) is not int or self.current_rank < 1
+        ):
+            raise ValueError("current_rank must be a positive integer or None")
+        for name in ("expected_final_points_for", "expected_final_points_against"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _finite(name, value))
+        rank_distribution = _distribution(
+            "rank_distribution",
+            self.rank_distribution,
+            expected_total=1.0,
+        )
+        seed_distribution = _distribution(
+            "seed_distribution",
+            self.seed_distribution,
+            expected_total=self.playoff_probability,
+        )
+        object.__setattr__(self, "rank_distribution", rank_distribution)
+        object.__setattr__(self, "seed_distribution", seed_distribution)
 
 
 def workbook_trade_rows(
@@ -286,13 +332,34 @@ def team_outlook_rows(
 ) -> tuple[WorkbookTeamOutlook, ...]:
     if not isinstance(state, LeagueState) or not isinstance(projection, SeasonProjection):
         raise ValueError("state and projection must be league projection values")
-    if state.snapshot_id != projection.snapshot_id:
-        raise ValueError("state and projection snapshot IDs do not match")
+    if (
+        state.snapshot_id != projection.snapshot_id
+        or state.scoring_profile_id != projection.scoring_profile_id
+    ):
+        raise ValueError("state and projection identities do not match")
     names = {team.team_id: team.name for team in state.teams}
     standings = {row.team_id: row for row in state.standings}
+    projected_rows = tuple(projection.teams)
+    projected_ids = tuple(row.team_id for row in projected_rows)
+    if len(set(projected_ids)) != len(projected_ids) or set(projected_ids) != set(names):
+        raise ValueError("projection teams must exactly cover the league")
     rows = []
-    for projected in projection.teams:
+    for projected in projected_rows:
         standing = standings[projected.team_id]
+        if projected.current_standing != standing:
+            raise ValueError("projected current standing does not match league state")
+        if (
+            len(projected.rank_distribution) != len(names)
+            or len(projected.seed_distribution)
+            != state.playoff_rules.qualifier_count
+        ):
+            raise ValueError("projected distribution dimensions do not match league rules")
+        mean_rank = fsum(
+            rank * probability
+            for rank, probability in enumerate(projected.rank_distribution, 1)
+        )
+        if abs(mean_rank - projected.mean_rank) > 1e-9:
+            raise ValueError("projected mean rank does not match rank distribution")
         rows.append(
             WorkbookTeamOutlook(
                 projected.team_id,
@@ -305,6 +372,11 @@ def team_outlook_rows(
                 projected.expected_final_ties,
                 projected.mean_rank,
                 projected.playoff_probability,
+                current_rank=projected.current_rank,
+                expected_final_points_for=projected.expected_final_points_for,
+                expected_final_points_against=projected.expected_final_points_against,
+                rank_distribution=projected.rank_distribution,
+                seed_distribution=projected.seed_distribution,
             )
         )
     return tuple(sorted(rows, key=lambda row: (row.mean_rank, row.team_name.casefold())))
@@ -427,6 +499,26 @@ def _finite(name: str, value: object) -> float:
         raise ValueError(f"{name} must be a finite number") from None
     if not isfinite(result):
         raise ValueError(f"{name} must be a finite number")
+    return result
+
+
+def _distribution(
+    name: str,
+    values: Iterable[float],
+    *,
+    expected_total: float,
+) -> tuple[float, ...]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f"{name} must be an iterable")
+    try:
+        result = tuple(_finite(name, value) for value in values)
+    except TypeError:
+        raise ValueError(f"{name} must be an iterable") from None
+    if any(value < 0 or value > 1 for value in result):
+        raise ValueError(f"{name} values must be between 0 and 1")
+    total = fsum(result)
+    if result and abs(total - expected_total) > 1e-9:
+        raise ValueError(f"{name} values have the wrong probability total")
     return result
 
 

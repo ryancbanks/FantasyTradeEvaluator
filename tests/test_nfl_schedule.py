@@ -1,11 +1,14 @@
 from copy import deepcopy
 from datetime import datetime, timezone
+import json
 import unittest
 
 from trade_snapshot.nfl_schedule import (
+    NflSchedule,
     NflTeamWeekStatus,
     canonical_nfl_game_id,
     parse_espn_pro_team_schedule,
+    validate_complete_regular_season,
 )
 
 
@@ -75,6 +78,20 @@ def pro_team_payload():
 
 
 class NflScheduleTests(unittest.TestCase):
+    def test_complete_horizon_rejects_a_truncated_regular_season(self):
+        schedule = parse_espn_pro_team_schedule(
+            pro_team_payload(), season=2026, captured_at=NOW
+        )
+        truncated = NflSchedule(
+            schedule.season,
+            schedule.captured_at,
+            schedule.source_provider,
+            tuple(row for row in schedule.team_weeks if row.week < 18),
+        )
+
+        with self.assertRaisesRegex(ValueError, "through week 18"):
+            validate_complete_regular_season(truncated)
+
     def test_parses_complete_reciprocal_games_and_keeps_byes_explicit(self):
         result = parse_espn_pro_team_schedule(
             pro_team_payload(), season=2026, captured_at=NOW
@@ -140,6 +157,52 @@ class NflScheduleTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "explicit bye"):
             parse_espn_pro_team_schedule(payload, season=2026, captured_at=NOW)
+
+    def test_strict_json_record_round_trip_is_lossless_and_content_addressed(self):
+        schedule = parse_espn_pro_team_schedule(
+            pro_team_payload(), season=2026, captured_at=NOW
+        )
+
+        record = schedule.to_record()
+
+        json.dumps(record, allow_nan=False)
+        self.assertEqual(NflSchedule.from_record(record), schedule)
+        self.assertEqual(record["schema_version"], 1)
+        self.assertEqual(record["schedule_id"], schedule.schedule_id)
+
+        mutations = []
+        extra = deepcopy(record)
+        extra["extra"] = True
+        mutations.append(("unknown top-level field", extra))
+        boolean_version = deepcopy(record)
+        boolean_version["schema_version"] = True
+        mutations.append(("boolean schema version", boolean_version))
+        changed_id = deepcopy(record)
+        changed_id["schedule_id"] = "nfl-schedule_tampered"
+        mutations.append(("changed content ID", changed_id))
+        changed_content = deepcopy(record)
+        changed_content["source_provider"] = "tampered"
+        mutations.append(("content changed without new ID", changed_content))
+        non_array = deepcopy(record)
+        non_array["team_weeks"] = tuple(non_array["team_weeks"])
+        mutations.append(("non-array team weeks", non_array))
+        unknown_row_field = deepcopy(record)
+        unknown_row_field["team_weeks"][0]["extra"] = True
+        mutations.append(("unknown row field", unknown_row_field))
+        noncanonical_time = deepcopy(record)
+        noncanonical_time["captured_at"] = "2026-09-01T00:00:00Z"
+        mutations.append(("noncanonical capture time", noncanonical_time))
+        naive_kickoff = deepcopy(record)
+        scheduled = next(
+            row for row in naive_kickoff["team_weeks"] if row["kickoff_at"] is not None
+        )
+        scheduled["kickoff_at"] = scheduled["kickoff_at"][:-6]
+        mutations.append(("naive kickoff time", naive_kickoff))
+
+        for case, mutation in mutations:
+            with self.subTest(case=case):
+                with self.assertRaises(ValueError):
+                    NflSchedule.from_record(mutation)
 
 
 if __name__ == "__main__":

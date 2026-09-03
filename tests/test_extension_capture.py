@@ -117,9 +117,11 @@ class ExtensionCaptureTests(unittest.TestCase):
     def test_league_ecr_espn_and_yahoo_results_keep_existing_strict_parsers(self):
         yahoo = projection_task("yahoo")
         settings = "https://football.fantasysports.yahoo.com/2026/f1/12345/settings"
+        ecr = ecr_raw(expert_count=19)
+        ecr["source"]["last_updated_ts"] = 1_787_000_000
         bridge, session = self.open({
             "league.capture": league_capture_value(),
-            "ecr.capture": ecr_raw(expert_count=19),
+            "ecr.capture": ecr,
             "espn.authenticated_json": {
                 "league": {"league": True},
                 "pro_teams": {"schedule": True},
@@ -138,10 +140,11 @@ class ExtensionCaptureTests(unittest.TestCase):
             session.capture_league_sources(league_task(), 5000, lambda: False).team_count,
             2,
         )
-        self.assertEqual(
-            session.capture_ecr_rankings(ecr_task(expected=False), 5000, lambda: False).expert_count,
-            19,
+        captured_ecr = session.capture_ecr_rankings(
+            ecr_task(expected=False), 5000, lambda: False
         )
+        self.assertEqual(captured_ecr.expert_count, 19)
+        self.assertEqual(captured_ecr.last_updated_at, "2026-08-17T20:53:20Z")
         self.assertEqual(
             session.read_authenticated_espn_json(2026, "123", 5000, 1024, lambda: False),
             ({"league": True}, {"schedule": True}),

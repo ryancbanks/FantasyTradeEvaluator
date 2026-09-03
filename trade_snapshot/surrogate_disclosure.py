@@ -11,6 +11,7 @@ from .methodology_reuse import (
     FormulaAction,
     FormulaReuseDecision,
     MethodologyFingerprint,
+    formula_static_incompatibility_reasons,
 )
 from .strength import CalibrationStatus, StrengthModel
 from .strength_calibration import CalibrationMetadata
@@ -137,6 +138,17 @@ class SurrogateDisclosure:
             raise ValueError("strength model does not match the selected formula")
         if formula.role_definitions != methodology_fingerprint.role_definitions:
             raise ValueError("formula roles do not match the methodology fingerprint")
+        incompatibilities = formula_static_incompatibility_reasons(
+            formula,
+            methodology_fingerprint,
+            season=strength_model.season,
+            scoring_profile_id=strength_model.scoring_profile_id,
+        )
+        if incompatibilities:
+            raise ValueError(
+                "strength formula is incompatible with methodology fingerprint: "
+                + "; ".join(incompatibilities)
+            )
         return cls(
             weekly_snapshot_id=strength_model.snapshot_id,
             strength_model_id=strength_model.model_id,

@@ -22,9 +22,12 @@ from .browser_capture import (
     BrowserCaptureDependencyError,
     BrowserCaptureError,
     BrowserCaptureOptions,
+    BrowserCaptureTimeout,
     BrowserCollector,
+    ProjectionNotPublished,
     SignInGate,
     YahooScoringError,
+    YahooScoringMismatch,
 )
 from .capture_schema import (
     CaptureKind,
@@ -37,6 +40,7 @@ from .capture_schema import (
     validate_artifact_for_task,
 )
 from .engine_bundle import EngineBundle
+from .ensemble import EnsembleConfig
 from .espn_free_read import (
     EspnFreeReadClient,
     EspnFreeReadError,
@@ -44,7 +48,18 @@ from .espn_free_read import (
 )
 from .espn_league import espn_host_league_snapshot
 from .identity_io import load_identity_registry, save_identity_registry
-from .nfl_schedule import parse_espn_pro_team_schedule
+from .league_binding import get_or_create_league_binding
+from .nfl_schedule import NFL_REGULAR_SEASON_WEEKS, parse_espn_pro_team_schedule
+from .methodology import default_projection_ensemble
+from .projection_source import (
+    ProjectionAttemptReason,
+    ProjectionAttemptStatus,
+    ProjectionSourceAttempt,
+)
+from .raw_capture_archive import (
+    archive_private_league_capture,
+    archive_public_captures,
+)
 from .production_calibration import (
     BrowserCalibrationFactory,
     CalibrationCallbacks,
@@ -53,6 +68,7 @@ from .production_calibration import (
 )
 from .calibration_workflow import CalibrationNotExact
 from .source_plan import build_weekly_source_plan
+from .waiver_pool import required_waiver_positions
 from .weekly_assembly import AssembledWeeklyEvidence, assemble_weekly_refresh_evidence
 from .weekly_collection import (
     WeeklyCollectionError,
@@ -71,6 +87,7 @@ from .weekly_refresh import (
 
 _TRADE_ANALYZER_URL = "https://www.fantasypros.com/nfl/myplaybook/trade-analyzer.php"
 _IDENTITY_FILE = "identity-registry.json"
+_LEAGUE_BINDINGS_FILE = "league-bindings.json"
 
 
 class ProductionWeeklyCollectionWorkflow:
@@ -179,19 +196,20 @@ class ProductionWeeklyCollectionWorkflow:
             ) from None
         except CalibrationRequired:
             raise WeeklyCollectionError(
-                "The exact FantasyPros formula could not be calibrated for this week."
+                "A FantasyPros-style formula could not be fitted and blind-holdout "
+                "validated for this week."
             ) from None
         except CalibrationNotExact as error:
             if error.surrogate_eligible and not request.allow_surrogate_power:
                 message = (
-                    "The healthy fitted formula missed exact blind replication, so no "
-                    "bundle was published. Select the explicit SURROGATE option to "
-                    "publish the measured approximation."
+                    "The fitted formula did not pass the blind-holdout validation gate, "
+                    "so no bundle was published. Select the explicit SURROGATE option "
+                    "to publish the measured approximation."
                 )
             else:
                 message = (
-                    "Calibration did not meet the exact or healthy SURROGATE "
-                    "publication gate. No weekly bundle was published."
+                    "Calibration met neither the blind-holdout validation gate nor the "
+                    "healthy SURROGATE publication gate. No weekly bundle was published."
                 )
             raise WeeklyCollectionError(message) from None
         except ValueError:
@@ -248,6 +266,16 @@ class ProductionWeeklyCollectionWorkflow:
         )
         _validate_host(host, request, host_id, team_count)
         validate_host_scoring(host, request.scoring)
+        league_binding_id = get_or_create_league_binding(
+            root / _LEAGUE_BINDINGS_FILE,
+            host.source_provider,
+            host.source_league_id,
+        )
+        archive_private_league_capture(
+            root,
+            league_binding_id,
+            (league_task, league),
+        )
         nfl_schedule = self._schedule_adapter(
             pro_team_payload, season=request.season, captured_at=captured_at
         )
@@ -259,29 +287,62 @@ class ProductionWeeklyCollectionWorkflow:
             raise BrowserCaptureError(
                 "Yahoo scoring verification requires the persistent browser collector"
             )
-        _emit(progress, WeeklyCollectionStage.COLLECTING_FANTASYPROS, .36,
-              "Preparing current ECR and visible FantasyPros, ESPN, and Yahoo projections")
+        _emit(
+            progress,
+            WeeklyCollectionStage.COLLECTING_FANTASYPROS,
+            .36,
+            "Preparing current ECR, every remaining FantasyPros week, and "
+            "available ESPN and Yahoo projections",
+        )
         _emit(
             progress,
             WeeklyCollectionStage.COLLECTING_YAHOO,
             .38,
             "Checking the selected Yahoo league's reception scoring",
         )
-        if verifier(yahoo_task, request.yahoo_projection_league_url) != request.scoring:
-            raise ValueError("Yahoo scoring verification returned the wrong profile")
+        unavailable_providers = {}
+        try:
+            yahoo_scoring = verifier(
+                yahoo_task, request.yahoo_projection_league_url
+            )
+        except YahooScoringMismatch:
+            raise
+        except (BrowserCaptureCancelled, BrowserCaptureDependencyError):
+            raise
+        except BrowserCaptureError:
+            unavailable_providers["yahoo"] = (
+                ProjectionAttemptReason.PROVIDER_PAGE_UNAVAILABLE,
+                self._now(),
+            )
+        else:
+            if yahoo_scoring != request.scoring:
+                raise YahooScoringMismatch(
+                    "Yahoo scoring verification returned the wrong profile."
+                )
         bindings = runtime_bindings(
             plan, host_id, request.yahoo_projection_league_url
         )
-        rows = collector.collect(
+        rows, projection_attempts = _collect_remaining_sources(
+            collector,
             plan,
             options,
-            cancellation=token,
-            sign_in_gate=self._gate,
-            navigation_bindings=bindings,
+            token,
+            self._gate,
+            bindings,
+            first_remaining_week=request.week,
+            attempt_clock=self._now,
+            unavailable_providers=unavailable_providers,
         )
-        projections, ecr = _source_artifacts(rows, plan, request.scoring)
+        projections, ecr = _source_artifacts(
+            rows, plan, request.scoring, projection_attempts
+        )
+        archive_public_captures(
+            root,
+            _capture_pairs(plan, (*projections, *ecr)),
+        )
+        ensemble_config = _available_projection_ensemble(projections)
         _emit(progress, WeeklyCollectionStage.COLLECTING_YAHOO, .65,
-              "All entitled projection pages were captured through the temporary scan tab")
+              "Projection page attempts completed; unavailable pages were recorded explicitly")
 
         previous = _previous_identities(root / _IDENTITY_FILE)
         _emit(progress, WeeklyCollectionStage.NORMALIZING, .7,
@@ -297,6 +358,9 @@ class ProductionWeeklyCollectionWorkflow:
             scoring=request.scoring,
             expected_team_count=team_count,
             previous_identities=previous,
+            league_binding_id=league_binding_id,
+            ensemble_config=ensemble_config,
+            projection_source_attempts=projection_attempts,
         )
         primary_team = _primary_team(assembled, metadata)
         capture_context = CalibrationCaptureContext(
@@ -351,12 +415,20 @@ class ProductionWeeklyCollectionWorkflow:
         regular_end = host.playoff_rules.regular_season_end_week
         if request.week > regular_end:
             raise ValueError("weekly collection requires remaining regular-season games")
+        rostered_positions = tuple(player.position for player in host.players)
+        lineup_positions = required_waiver_positions(
+            host.roster_rules.starting_lineup_slots,
+        )
         complete = self._plan_builder(
             season=request.season,
             as_of_week=request.week,
-            remaining_weeks=range(request.week, regular_end + 1),
+            remaining_weeks=(
+                week
+                for week in NFL_REGULAR_SEASON_WEEKS
+                if week >= request.week
+            ),
             scoring=request.scoring,
-            player_positions=(player.position for player in host.players),
+            player_positions=(*rostered_positions, *lineup_positions),
             include_future_weekly=request.include_future_weekly,
         )
         if not isinstance(complete, CapturePlan):
@@ -409,16 +481,137 @@ def _validate_host(host, request, host_id, team_count):
         raise ValueError("ESPN host snapshot does not match the capture request")
 
 
-def _source_artifacts(rows, plan, scoring):
+def _collect_remaining_sources(
+    collector,
+    plan,
+    options,
+    token,
+    sign_in_gate,
+    bindings,
+    *,
+    first_remaining_week,
+    attempt_clock,
+    unavailable_providers=None,
+):
+    artifacts = []
+    attempts = []
+    provider_failures = dict(unavailable_providers or {})
+    if not set(provider_failures) <= {"espn", "yahoo"}:
+        raise ValueError("only optional projection providers may be unavailable")
+    for task in plan.tasks:
+        provider_failure = provider_failures.get(task.provider.value)
+        if provider_failure is not None:
+            if not _optional_projection_task(task):
+                raise ValueError("only optional projection providers may be unavailable")
+            reason, attempted_at = provider_failure
+            attempts.append(_projection_attempt(
+                task,
+                ProjectionAttemptStatus.UNAVAILABLE,
+                reason,
+                attempted_at=attempted_at,
+            ))
+            continue
+        task_plan = CapturePlan((task,))
+        task_bindings = (
+            {task.task_id: bindings[task.task_id]}
+            if task.task_id in bindings
+            else None
+        )
+        try:
+            captured = collector.collect(
+                task_plan,
+                options,
+                cancellation=token,
+                sign_in_gate=sign_in_gate,
+                navigation_bindings=task_bindings,
+            )
+        except ProjectionNotPublished:
+            if not _skippable_unpublished_task(task, first_remaining_week):
+                raise
+            attempts.append(_projection_attempt(
+                task,
+                ProjectionAttemptStatus.NOT_PUBLISHED,
+                ProjectionAttemptReason.SOURCE_NOT_PUBLISHED,
+                attempted_at=attempt_clock(),
+            ))
+            continue
+        except (BrowserCaptureCancelled, BrowserCaptureDependencyError):
+            raise
+        except BrowserCaptureTimeout:
+            if not _optional_projection_task(task):
+                raise
+            attempts.append(_projection_attempt(
+                task,
+                ProjectionAttemptStatus.UNAVAILABLE,
+                ProjectionAttemptReason.PROVIDER_PAGE_UNAVAILABLE,
+                attempted_at=attempt_clock(),
+            ))
+            continue
+        except BrowserCaptureError:
+            if not _optional_projection_task(task):
+                raise
+            attempts.append(_projection_attempt(
+                task,
+                ProjectionAttemptStatus.UNAVAILABLE,
+                ProjectionAttemptReason.PROVIDER_LAYOUT_UNSUPPORTED,
+                attempted_at=attempt_clock(),
+            ))
+            continue
+        if not isinstance(captured, tuple) or len(captured) != 1:
+            raise ValueError("one source task must return exactly one artifact")
+        artifact = captured[0]
+        artifacts.append(artifact)
+        if _projection_task(task):
+            attempts.append(_projection_attempt(
+                task,
+                ProjectionAttemptStatus.CAPTURED,
+                ProjectionAttemptReason.CAPTURED,
+                attempted_at=datetime.fromisoformat(
+                    artifact.captured_at.replace("Z", "+00:00")
+                ),
+                artifact=artifact,
+            ))
+    return tuple(artifacts), tuple(attempts)
+
+
+def _source_artifacts(rows, plan, scoring, projection_attempts):
     try:
         artifacts = tuple(rows)
     except TypeError:
         raise ValueError("browser collector returned invalid artifacts") from None
+    try:
+        attempts = tuple(projection_attempts)
+    except TypeError:
+        raise ValueError("projection attempts were invalid") from None
+    if any(not isinstance(row, ProjectionSourceAttempt) for row in attempts):
+        raise ValueError("projection attempts were invalid")
+    projection_tasks = {
+        task.task_id: task for task in plan.tasks if _projection_task(task)
+    }
+    if {row.task_id for row in attempts} != set(projection_tasks) or len(attempts) != len(
+        projection_tasks
+    ):
+        raise ValueError("projection attempts did not cover the exact projection plan")
+    if any(
+        not _attempt_matches_task(row, projection_tasks[row.task_id])
+        for row in attempts
+    ):
+        raise ValueError("projection attempts did not match their requested dimensions")
+    captured_projection_ids = {
+        row.task_id
+        for row in attempts
+        if row.status is ProjectionAttemptStatus.CAPTURED
+    }
+    expected_artifact_ids = captured_projection_ids | {
+        task.task_id for task in plan.tasks if not _projection_task(task)
+    }
     by_id = {getattr(row, "task_id", None): row for row in artifacts}
-    if len(by_id) != len(artifacts) or set(by_id) != {task.task_id for task in plan.tasks}:
+    if len(by_id) != len(artifacts) or set(by_id) != expected_artifact_ids:
         raise ValueError("browser collector did not return exact plan coverage")
     projections, ecr = [], []
     for task in plan.tasks:
+        if task.task_id not in by_id:
+            continue
         artifact = by_id[task.task_id]
         validate_artifact_for_task(artifact, task)
         if getattr(artifact, "scoring", None) != scoring:
@@ -432,6 +625,90 @@ def _source_artifacts(rows, plan, scoring):
     if not projections or not ecr:
         raise ValueError("remaining source capture is incomplete")
     return tuple(projections), tuple(ecr)
+
+
+def _capture_pairs(plan, artifacts):
+    """Reattach validated artifacts to their capture tasks for local archival."""
+
+    artifacts = tuple(artifacts)
+    by_task = {row.task_id: row for row in artifacts}
+    if len(by_task) != len(artifacts):
+        raise ValueError("raw capture archive input repeats a capture task")
+    tasks = {task.task_id: task for task in plan.tasks}
+    if not set(by_task).issubset(tasks):
+        raise ValueError("raw capture archive input is outside the capture plan")
+    return tuple(
+        (tasks[task_id], artifact)
+        for task_id, artifact in sorted(by_task.items())
+    )
+
+
+def _projection_task(task):
+    return (
+        isinstance(task, PageCaptureTask)
+        and task.kind is CaptureKind.VISIBLE_TABLE
+        and task.projection is not None
+    )
+
+
+def _optional_projection_task(task):
+    return _projection_task(task) and task.provider.value in {"espn", "yahoo"}
+
+
+def _skippable_unpublished_task(task, first_remaining_week):
+    return (
+        _projection_task(task)
+        and task.provider.value == "fantasypros"
+        and task.projection.horizon.value == "weekly"
+        and task.week > first_remaining_week
+    )
+
+
+def _projection_attempt(task, status, reason, *, attempted_at, artifact=None):
+    if not _projection_task(task):
+        raise ValueError("projection attempt requires a projection task")
+    return ProjectionSourceAttempt(
+        task_id=task.task_id,
+        provider=task.provider,
+        season=task.season,
+        week=task.week,
+        horizon=task.projection.horizon,
+        scoring=task.projection.scoring,
+        position_scope=task.projection.position_scope,
+        attempted_at=attempted_at,
+        status=status,
+        reason_code=reason,
+        artifact_id=None if artifact is None else artifact.artifact_id,
+    )
+
+
+def _attempt_matches_task(attempt, task):
+    return (
+        attempt.provider is task.provider
+        and attempt.season == task.season
+        and attempt.week == task.week
+        and attempt.horizon is task.projection.horizon
+        and attempt.scoring == task.projection.scoring
+        and attempt.position_scope == task.projection.position_scope
+    )
+
+
+def _available_projection_ensemble(projections):
+    providers = {row.provider.value for row in projections}
+    baseline = default_projection_ensemble()
+    retained = tuple(
+        row for row in baseline.provider_weights if row.provider in providers
+    )
+    if len(retained) < baseline.minimum_observed_sources:
+        raise WeeklyCollectionError(
+            "At least two projection providers must publish usable data before this "
+            "week can be calculated. No weekly bundle was published."
+        )
+    return EnsembleConfig(
+        provider_weights=retained,
+        minimum_observed_sources=baseline.minimum_observed_sources,
+        position_stddev_floors=baseline.position_stddev_floors,
+    )
 
 
 def _yahoo_projection_task(plan, request):

@@ -97,11 +97,13 @@ window.DashboardUi = (() => {
   }
 
   function renderKpis(team) {
+    const fp = team.fantasypros_comparison?.source;
+    const drift = team.fantasypros_comparison?.local_minus_source;
     const values = [
       ["Power ranking", `#${team.power_rank} · ${number(team.power_score)}`, "Local roster power"],
-      ["Projected finish", `#${rank(team.projected_rank)}`, movementText(team.standings_change)],
-      ["Make playoffs", percent(team.playoff_probability), `${dashboard.playoff_team_count} playoff spots`],
-      ["Win championship", percent(team.championship_probability), "Modeled postseason share"]
+      ["Projected finish", `#${rank(team.projected_rank)}`, `${movementText(team.standings_change)} · FantasyPros mean #${rank(fp?.projected_rank)}`],
+      ["Make playoffs", percent(team.playoff_probability), `${dashboard.playoff_team_count} playoff spots · FantasyPros ${percent(fp?.playoff_probability)} · local drift ${signedPercent(drift?.playoff_probability)}`],
+      ["Win championship", percent(team.championship_probability), `Local proxy · FantasyPros ${percent(fp?.championship_probability)} · local drift ${signedPercent(drift?.championship_probability)}`]
     ];
     const container = $("dashboardKpis");
     container.replaceChildren();
@@ -114,6 +116,11 @@ window.DashboardUi = (() => {
       );
       container.append(card);
     }
+  }
+
+  function signedPercent(value) {
+    if (!Number.isFinite(value)) return "—";
+    return `${value >= 0 ? "+" : ""}${percent(value)}`;
   }
 
   function movementText(value) {
@@ -145,7 +152,7 @@ window.DashboardUi = (() => {
       const row = document.createElement("tr");
       row.setAttribute("aria-selected", String(team.team_id === selectedTeamId));
       const projected = document.createElement("td");
-      projected.append(textElement("span", "dashboard-rank", `#${rank(team.projected_rank)}`), textElement("span", "dashboard-muted", `Mean finish ${number(team.mean_projected_rank)} · current #${team.current_rank}`));
+      projected.append(textElement("span", "dashboard-rank", `#${rank(team.projected_rank)}`), textElement("span", "dashboard-muted", `Mean finish ${number(team.mean_projected_rank)} · current #${team.current_rank} · FantasyPros #${rank(team.fantasypros_comparison?.source?.projected_rank)}`));
       const name = document.createElement("td");
       const choose = textElement("button", "dashboard-team-button", team.team_name);
       choose.type = "button";
@@ -167,8 +174,10 @@ window.DashboardUi = (() => {
       movement.append(movementNode(team.standings_change));
       const playoffs = document.createElement("td");
       playoffs.append(oddsCell(team.playoff_probability));
+      playoffs.title = `FantasyPros comparison: ${percent(team.fantasypros_comparison?.source?.playoff_probability)}; local-minus-source ${signedPercent(team.fantasypros_comparison?.local_minus_source?.playoff_probability)}.`;
       const title = document.createElement("td");
       title.append(oddsCell(team.championship_probability, true));
+      title.title = `FantasyPros comparison: ${percent(team.fantasypros_comparison?.source?.championship_probability)}; local-minus-source ${signedPercent(team.fantasypros_comparison?.local_minus_source?.championship_probability)}.`;
       row.append(projected, name, power, current, projectedRecord, movement, playoffs, title);
       body.append(row);
     }
@@ -366,7 +375,13 @@ window.DashboardUi = (() => {
     const limitations = Array.isArray(model.limitations) ? model.limitations.join(" ") : model.limitations;
     const sampling = dashboard.scenario_sampling;
     const samplingNote = sampling?.capped ? ` ${sampling.methodology}` : "";
-    $("dashboardMethodNote").textContent = `${model.label}: ${model.methodology} ${limitations}${samplingNote}`.trim();
+    const comparison = dashboard.fantasypros_comparison;
+    const settlement = dashboard.host_settlement_policy;
+    const comparisonNote = comparison
+      ? ` FantasyPros diagnostic: current ranks matched for ${comparison.current_rank_match_count} of ${comparison.team_count} teams; source values are never calculation inputs.`
+      : "";
+    const settlementNote = settlement?.limitations ? ` ${settlement.limitations}` : "";
+    $("dashboardMethodNote").textContent = `${model.label}: ${model.methodology} ${limitations}${samplingNote}${comparisonNote}${settlementNote}`.trim();
   }
 
   function selectTeam(teamId) {
@@ -393,7 +408,7 @@ window.DashboardUi = (() => {
     const scenarioLabel = sampling?.capped
       ? `${dashboard.scenario_count.toLocaleString()} local scenarios (bounded from ${sampling.bundle_scenario_count.toLocaleString()})`
       : `${dashboard.scenario_count.toLocaleString()} local scenarios`;
-    $("dashboardSubtitle").textContent = `${dashboard.teams.length} teams · ${scenarioLabel} · ${dashboard.power_engine_mode === "exact" ? "exact-method power" : "surrogate power"}`;
+    $("dashboardSubtitle").textContent = `${dashboard.teams.length} teams · ${scenarioLabel} · ${dashboard.power_engine_mode === "holdout_validated" ? "blind-holdout-validated power" : "surrogate power"}`;
     populateTeamPicker();
     renderKpis(team);
     renderStandings();

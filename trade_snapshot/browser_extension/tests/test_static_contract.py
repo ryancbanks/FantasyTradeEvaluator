@@ -140,12 +140,14 @@ class ExtensionStaticContractTests(unittest.TestCase):
     def test_packaged_collectors_retain_existing_safety_checks(self) -> None:
         analyzer = self.javascript["collectors/analyzer_main.js"]
         projection = self.javascript["collectors/projection.js"]
+        ecr = self.javascript["collectors/ecr_main.js"]
         league = self.javascript["collectors/league_main.js"]
         espn = self.javascript["collectors/espn_main.js"]
         self.assertIn("/v2/ajax/myplaybook.php", analyzer)
         self.assertIn("response_too_large", analyzer)
         self.assertIn("privateColumn", projection)
         self.assertIn("Yahoo All Players", projection)
+        self.assertIn("last_updated_ts: scalar(value.last_updated_ts)", ecr)
         self.assertIn("projected_standings", league)
         self.assertIn("proTeamSchedules_wl", espn)
         self.assertIn('credentials: "include"', espn)

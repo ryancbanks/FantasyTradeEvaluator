@@ -47,8 +47,24 @@ from .capture_normalize import (
     projection_evidence_from_artifact,
     projection_provider_records,
 )
-from .ecr import EcrPeriod, EcrPlayerRanking, EcrSnapshot
+from .ecr import (
+    EcrExpertPanel,
+    EcrPeriod,
+    EcrPlayerRanking,
+    EcrSnapshot,
+    EcrSourceProvenance,
+)
+from .ecr_source import (
+    EcrHorizonEvidence,
+    EcrSourceDetails,
+    FANTASYPROS_LATEST_ECR_POLICY,
+)
 from .engine_bundle import EngineBundle, load_engine_bundle, save_engine_bundle
+from .data_readiness import (
+    DataReadinessSnapshot,
+    build_bundle_data_readiness,
+    build_data_readiness_snapshot,
+)
 from .ensemble import (
     EnsembleConfig,
     EnsembleProjection,
@@ -57,6 +73,19 @@ from .ensemble import (
     ensemble_from_record,
     ensemble_to_record,
     fuse_weekly_projections,
+)
+from .fantasypros_benchmark import (
+    FantasyProsLeagueBenchmark,
+    FantasyProsTeamBenchmark,
+)
+from .feature_engineering import (
+    DEFAULT_PROVIDERS,
+    ECR_METRICS,
+    ENSEMBLE_METRICS,
+    PROJECTION_METRICS,
+    StrengthFeatureSet,
+    build_strength_features,
+    feature_names,
 )
 from .identity import (
     IdentityRegistry,
@@ -67,15 +96,6 @@ from .identity import (
 )
 from .identity_io import load_identity_registry, save_identity_registry
 from .identity_match import ProviderPlayerRecord, reconcile_player_identities
-from .feature_engineering import (
-    DEFAULT_PROVIDERS,
-    ECR_METRICS,
-    ENSEMBLE_METRICS,
-    PROJECTION_METRICS,
-    StrengthFeatureSet,
-    build_strength_features,
-    feature_names,
-)
 from .league_state import (
     CompletedFantasyMatchup,
     FantasyMatchup,
@@ -97,6 +117,7 @@ from .league_search import (
     ResumableLeagueTradeSearch,
     TeamPairSearchOutcome,
 )
+from .league_binding import get_or_create_league_binding
 from .model import DatasetPayload, SnapshotRequest, SnapshotResult
 from .nfl_schedule import (
     NflSchedule,
@@ -105,6 +126,7 @@ from .nfl_schedule import (
     canonical_nfl_game_id,
     parse_espn_pro_team_schedule,
 )
+from .source_manifest import LeagueBindingScope, WeeklySourceManifest
 from .methodology import (
     DEFAULT_POWER_METHODOLOGY,
     PowerMethodology,
@@ -127,6 +149,18 @@ from .formula_verification import (
     REQUIRED_BALANCED_PACKAGE_SIZES,
 )
 from .projection_io import projection_from_record, projection_to_record
+from .projection_source import (
+    HostScoringCompatibility,
+    ProjectionAttemptReason,
+    ProjectionAttemptStatus,
+    ProjectionInputBinding,
+    ProjectionInputPresence,
+    ProjectionPointBasis,
+    ProjectionSource,
+    ProjectionSourceAttempt,
+    ProjectionSourceManifest,
+    projection_input_id,
+)
 from .projection_schedule import materialize_weekly_grid
 from .roster_adjustment import (
     ROSTER_ADJUSTMENT_ALGORITHM,
@@ -137,6 +171,8 @@ from .roster_adjustment import (
 from .role_design import build_calibration_roles
 from .projections import (
     ProjectionStatus,
+    ProviderStatusObservation,
+    ProviderStatusScope,
     RemainingSeasonOrigin,
     RemainingSeasonProjection,
     WeeklyProjectionOrigin,
@@ -259,9 +295,13 @@ __all__ = (
     "CorrelatedScenarioConfig",
     "EngineContext",
     "EngineBundle",
+    "EcrExpertPanel",
+    "EcrHorizonEvidence",
     "EcrPeriod",
     "EcrPlayerRanking",
     "EcrSnapshot",
+    "EcrSourceDetails",
+    "EcrSourceProvenance",
     "ECR_METRICS",
     "EnsembleConfig",
     "EnsembleProjection",
@@ -272,11 +312,16 @@ __all__ = (
     "FormulaReuseDecision",
     "FormulaVerificationReport",
     "FactorLoadings",
+    "FANTASYPROS_LATEST_ECR_POLICY",
+    "FantasyProsLeagueBenchmark",
+    "FantasyProsTeamBenchmark",
     "HeadToHeadPolicy",
+    "HostScoringCompatibility",
     "IdentityRegistry",
     "LeagueState",
     "LeagueTeam",
     "LeagueQualifiedTrade",
+    "LeagueBindingScope",
     "LeagueSearchOutcome",
     "LeagueSearchProgress",
     "league_state_from_record",
@@ -304,6 +349,8 @@ __all__ = (
     "PlayoffOddsObservation",
     "PlayoffRules",
     "ProjectionStatus",
+    "ProviderStatusObservation",
+    "ProviderStatusScope",
     "ProviderReference",
     "ProviderPlayerRecord",
     "PowerRankingChange",
@@ -312,6 +359,14 @@ __all__ = (
     "PreparedCalibrationEvidence",
     "PreparedTradePair",
     "ProjectionArtifactRow",
+    "ProjectionAttemptReason",
+    "ProjectionAttemptStatus",
+    "ProjectionInputBinding",
+    "ProjectionInputPresence",
+    "ProjectionPointBasis",
+    "ProjectionSource",
+    "ProjectionSourceAttempt",
+    "ProjectionSourceManifest",
     "PreparedScoreScenarios",
     "PreparedSeasonBaseline",
     "ProjectionProviderPolicy",
@@ -386,6 +441,7 @@ __all__ = (
     "WaiverPoolSource",
     "WeeklyProjection",
     "WeeklyProjectionOrigin",
+    "WeeklySourceManifest",
     "WorkbookSource",
     "WorkbookTeamOutlook",
     "WorkbookTradeRow",
@@ -394,6 +450,9 @@ __all__ = (
     "build_strength_features",
     "analyzer_request_for_experiment",
     "build_calibration_roles",
+    "build_bundle_data_readiness",
+    "build_data_readiness_snapshot",
+    "DataReadinessSnapshot",
     "build_weekly_engine",
     "derive_remaining_season",
     "default_projection_ensemble",
@@ -406,6 +465,7 @@ __all__ = (
     "export_trade_workbook",
     "fit_strength_surrogate",
     "fuse_weekly_projections",
+    "get_or_create_league_binding",
     "feature_names",
     "optimize_lineup",
     "observation_from_record",
@@ -415,6 +475,7 @@ __all__ = (
     "parse_playoff_response",
     "parse_power_response",
     "projection_from_record",
+    "projection_input_id",
     "projection_artifact_rows",
     "projection_evidence_from_artifact",
     "projection_provider_records",

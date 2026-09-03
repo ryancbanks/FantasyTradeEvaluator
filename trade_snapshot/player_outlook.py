@@ -2,20 +2,22 @@
 
 from collections import defaultdict
 from datetime import datetime, timezone
-from math import fsum, isclose
+from math import fsum
 import json
 
 from .ecr import EcrPeriod
 from .engine_bundle import EngineBundle
+from .nfl_schedule import NflTeamWeekStatus
+from .projection_lineage import ProjectionLineageIndex
+from .remaining_projection import summarize_remaining_projection
 from .projections import (
     ProjectionStatus,
-    RemainingSeasonProjection,
-    WeeklyProjection,
+    RemainingSeasonOrigin,
     WeeklyProjectionOrigin,
 )
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 5
 _PROVIDER_LABELS = {
     "fantasypros": "FantasyPros",
     "espn": "ESPN",
@@ -27,182 +29,13 @@ _WAIVER_SCOPE_NOTICE = (
     "Available players are limited to this bundle's bounded waiver pool, not the "
     "host platform's complete free-agent list."
 )
-
-
-class _EvidenceIndex:
-    """Index captured projection rows and recover materialized-week provenance."""
-
-    def __init__(self, rows) -> None:
-        self.weekly = {}
-        self.remaining = {}
-        self.weekly_by_pair = defaultdict(list)
-        self.rows_by_provider = defaultdict(list)
-        self.provider_ids = {}
-        for row in rows:
-            self.rows_by_provider[row.provider].append(row)
-            player_id = row.canonical_player_id
-            if player_id is None:
-                continue
-            pair = (player_id, row.provider)
-            known_id = self.provider_ids.setdefault(pair, row.provider_player_id)
-            if known_id != row.provider_player_id:
-                raise ValueError("one player/provider has conflicting provider IDs")
-            if isinstance(row, WeeklyProjection):
-                key = (*pair, row.week)
-                if key in self.weekly:
-                    raise ValueError("projection evidence contains duplicate weekly evidence")
-                self.weekly[key] = row
-                self.weekly_by_pair[pair].append(row)
-            elif isinstance(row, RemainingSeasonProjection):
-                if pair in self.remaining:
-                    raise ValueError(
-                        "projection evidence contains duplicate remaining-season evidence"
-                    )
-                self.remaining[pair] = row
-            else:
-                raise ValueError("projection evidence contains an unsupported row")
-
-    def provider_metadata(self, provider):
-        rows = self.rows_by_provider.get(provider, ())
-        captures = tuple(row.captured_at for row in rows)
-        published = tuple(
-            row.source_published_at
-            for row in rows
-            if row.source_published_at is not None
-        )
-        return {
-            "provider": provider,
-            "label": _PROVIDER_LABELS.get(provider, provider.replace("_", " ").title()),
-            "captured_at": _iso_utc(max(captures)) if captures else None,
-            "source_published_at": _iso_utc(max(published)) if published else None,
-        }
-
-    def remaining_records(self, player_id, providers):
-        return [
-            _remaining_record(row)
-            if (row := self.remaining.get((player_id, provider))) is not None
-            else _not_retained_remaining_record(provider)
-            for provider in providers
-        ]
-
-    def provider_value(self, player_id, projection, observation, player_weeks):
-        pair = (player_id, observation.provider)
-        known_id = self.provider_ids.get(pair)
-        if known_id is not None and known_id != observation.provider_player_id:
-            raise ValueError("ensemble provider ID conflicts with captured evidence")
-        origin, captured_at, source_published_at = self._provenance(
-            pair, projection, observation, player_weeks
-        )
-        return {
-            "provider": observation.provider,
-            "provider_player_id": observation.provider_player_id,
-            "status": observation.status.value,
-            "projected_points": observation.projected_fantasy_points,
-            "weight": observation.weight,
-            "origin": origin,
-            "captured_at": captured_at,
-            "source_published_at": source_published_at,
-        }
-
-    def _provenance(self, pair, projection, observation, player_weeks):
-        raw = self.weekly.get((*pair, projection.week))
-        remaining = self.remaining.get(pair)
-        if raw is not None and raw.status is not ProjectionStatus.NOT_PUBLISHED:
-            _require_observation_match(raw, observation)
-            return _weekly_provenance(raw)
-        if projection.status is ProjectionStatus.BYE:
-            return self._inferred_bye_provenance(pair, raw, remaining)
-        if raw is not None and _observation_matches(raw, observation):
-            return _weekly_provenance(raw)
-        if observation.status is ProjectionStatus.OBSERVED and remaining is not None:
-            self._validate_derived_value(pair, projection, observation, player_weeks)
-            return (
-                WeeklyProjectionOrigin.DERIVED_REST_OF_SEASON.value,
-                _iso_utc(remaining.captured_at),
-                _optional_time(remaining.source_published_at),
-            )
-        if raw is None and remaining is None:
-            return None, None, None
-        if observation.status is ProjectionStatus.NOT_PUBLISHED:
-            captures = self._pair_capture_times(pair, remaining)
-            return (
-                WeeklyProjectionOrigin.PROVIDER_PUBLISHED.value,
-                _iso_utc(max(captures)) if captures else None,
-                None,
-            )
-        raise ValueError("ensemble provider value conflicts with captured evidence")
-
-    def _inferred_bye_provenance(self, pair, raw, remaining):
-        if raw is not None and raw.status not in {
-            ProjectionStatus.BYE,
-            ProjectionStatus.NOT_PUBLISHED,
-        }:
-            raise ValueError("provider evidence conflicts with an ensemble bye")
-        captures = self._pair_capture_times(pair, remaining)
-        if not captures:
-            return None, None, None
-        return (
-            WeeklyProjectionOrigin.DERIVED_REST_OF_SEASON.value,
-            _iso_utc(max(captures)),
-            _optional_time(
-                remaining.source_published_at
-                if remaining is not None
-                else raw.source_published_at if raw is not None else None
-            ),
-        )
-
-    def _validate_derived_value(self, pair, projection, observation, player_weeks):
-        remaining = self.remaining[pair]
-        if remaining.status is not ProjectionStatus.OBSERVED:
-            raise ValueError("observed ensemble value lacks observed source evidence")
-        active_weeks = {
-            row.week for row in player_weeks if row.status is not ProjectionStatus.BYE
-        }
-        if set(remaining.applicable_weeks) not in (
-            {row.week for row in player_weeks},
-            active_weeks,
-        ):
-            raise ValueError("remaining-season evidence conflicts with player weeks")
-        published = {
-            row.week: row
-            for row in self.weekly_by_pair.get(pair, ())
-            if row.week in active_weeks
-        }
-        if any(
-            row.status not in {
-                ProjectionStatus.OBSERVED,
-                ProjectionStatus.NOT_PUBLISHED,
-            }
-            for row in published.values()
-        ):
-            raise ValueError("unsafe weekly evidence cannot be derived from ROS")
-        missing = tuple(
-            week
-            for week in active_weeks
-            if week not in published
-            or published[week].status is ProjectionStatus.NOT_PUBLISHED
-        )
-        if projection.week not in missing or not missing:
-            raise ValueError("ensemble derivation does not match captured evidence")
-        observed = fsum(
-            row.projected_fantasy_points
-            for row in published.values()
-            if row.status is ProjectionStatus.OBSERVED
-        )
-        expected = (remaining.projected_fantasy_points - observed) / len(missing)
-        if not isclose(
-            observation.projected_fantasy_points,
-            expected,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        ):
-            raise ValueError("derived ensemble value does not reconcile to ROS evidence")
-
-    def _pair_capture_times(self, pair, remaining):
-        captures = [row.captured_at for row in self.weekly_by_pair.get(pair, ())]
-        if remaining is not None:
-            captures.append(remaining.captured_at)
-        return captures
+_PROVIDER_STATUS_POLICY = (
+    "Provider injury/status designations are timestamped source observations only. "
+    "They are not converted into certain availability or appearance probabilities. "
+    "Disagreement compares only providers that reported a designation; explicit "
+    "coverage fields identify missing labels, so incomplete coverage is not an "
+    "agreement claim."
+)
 
 
 def build_player_outlook(bundle: EngineBundle) -> dict[str, object]:
@@ -213,7 +46,10 @@ def build_player_outlook(bundle: EngineBundle) -> dict[str, object]:
     weeks = bundle.state.remaining_regular_season_weeks
     projections = _projection_groups(bundle, weeks)
     providers = _provider_names(projections)
-    evidence = _EvidenceIndex(bundle.projection_evidence)
+    evidence = ProjectionLineageIndex(
+        bundle.projections,
+        bundle.projection_evidence,
+    )
     owners = _owners(bundle)
     eligibilities = {
         row.canonical_player_id: row.eligible_slots for row in bundle.eligibilities
@@ -246,7 +82,9 @@ def build_player_outlook(bundle: EngineBundle) -> dict[str, object]:
         "season": bundle.state.season,
         "first_remaining_week": bundle.state.first_remaining_week,
         "weeks": list(weeks),
-        "providers": [evidence.provider_metadata(provider) for provider in providers],
+        "providers": [_provider_metadata(evidence, provider) for provider in providers],
+        "raw_stat_key_fields": ["provider", "stat_name"],
+        "provider_status_observation_policy": _PROVIDER_STATUS_POLICY,
         "ecr_snapshots": _ecr_snapshot_records(bundle),
         "waiver_scope_notice": _WAIVER_SCOPE_NOTICE,
         "players": players,
@@ -335,14 +173,27 @@ def _player_record(
         raise ValueError("calculation player must be rostered or in the waiver pool")
     if waiver is not None and waiver.position != position:
         raise ValueError(f"player {player_id!r} has inconsistent positions")
-    weekly_records = [
-        _week_record(player_id, row, providers, evidence, rows) for row in rows
-    ]
+    weekly_records = [_week_record(row, providers, evidence) for row in rows]
     projected = [
         row.projected_fantasy_points
         for row in rows
         if row.projected_fantasy_points is not None
     ]
+    remaining = summarize_remaining_projection(
+        rows,
+        evidence,
+        applicable_weeks=tuple(
+            row.week
+            for row in bundle.nfl_schedule.team_weeks
+            if row.nfl_team_id == nfl_team_id
+            and row.week >= bundle.state.first_remaining_week
+            and row.status is NflTeamWeekStatus.SCHEDULED
+        ),
+    )
+    remaining_points = (
+        None if remaining is None else remaining.projected_fantasy_points
+    )
+    regular_season_points = fsum(projected)
     disagreements = [
         row.between_provider_stddev
         for row in rows
@@ -365,8 +216,21 @@ def _player_record(
         "rest_of_season_ecr": _ecr_detail(
             ecr_by_period, EcrPeriod.REST_OF_SEASON, player_id
         ),
-        "remaining_projected_points": fsum(projected),
-        "average_weekly_points": _average(projected),
+        "remaining_projected_points": remaining_points,
+        "remaining_projected_week_count": (
+            None if remaining is None else len(remaining.applicable_weeks)
+        ),
+        "remaining_projection_status": _remaining_status(remaining),
+        "remaining_fantasy_regular_season_points": regular_season_points,
+        "unmaterialized_remaining_points": (
+            None
+            if remaining_points is None
+            else remaining_points - regular_season_points
+        ),
+        "average_weekly_points": (
+            None if remaining is None else remaining.average_active_week
+        ),
+        "average_fantasy_regular_season_points": _average(projected),
         "average_provider_disagreement": _average(disagreements),
         "average_predictive_uncertainty": _average(uncertainties),
         "provider_complete_week_count": sum(
@@ -377,10 +241,19 @@ def _player_record(
             bool(providers) and row["direct_source_count"] == len(providers)
             for row in weekly_records
         ),
+        "provider_status_disagreement_week_count": sum(
+            row["provider_status_disagreement"] for row in weekly_records
+        ),
+        "provider_status_coverage_complete_week_count": sum(
+            row["provider_status_coverage_complete"] for row in weekly_records
+        ),
+        "provider_status_unknown_provider_week_count": sum(
+            row["provider_status_unknown_provider_count"] for row in weekly_records
+        ),
         "total_week_count": len(rows),
         "weeks": weekly_records,
-        "provider_remaining_season": evidence.remaining_records(
-            player_id, providers
+        "provider_remaining_season": _remaining_records(
+            evidence, player_id, providers, remaining
         ),
     }
 
@@ -400,14 +273,12 @@ def _player_nfl_team(player_id, rows, evidence, waiver_players):
     return values[0] if values else None
 
 
-def _week_record(player_id, projection, providers, evidence, player_weeks):
+def _week_record(projection, providers, evidence):
     by_provider = {
         row.provider: row for row in projection.provider_observations
     }
     values = [
-        evidence.provider_value(
-            player_id, projection, by_provider[provider], player_weeks
-        )
+        _provider_value(evidence, projection, by_provider[provider])
         for provider in providers
         if provider in by_provider
     ]
@@ -428,7 +299,37 @@ def _week_record(player_id, projection, providers, evidence, player_weeks):
         "observed_source_count": projection.observed_source_count,
         "minimum_observed_sources": projection.minimum_observed_sources,
         **source_counts,
+        **_provider_status_coverage(values, len(providers)),
         "provider_values": values,
+    }
+
+
+def _provider_status_coverage(values, expected_provider_count):
+    status_sets = {
+        row["provider"]: tuple(
+            sorted(
+                {
+                    observation["designation"].casefold()
+                    for observation in row["provider_status_observations"]
+                }
+            )
+        )
+        for row in values
+        if row["provider_status_observations"]
+    }
+    reporting_provider_count = len(status_sets)
+    unknown_provider_count = expected_provider_count - reporting_provider_count
+    if unknown_provider_count < 0:
+        raise AssertionError("provider status coverage exceeds the provider universe")
+    return {
+        "provider_status_observation_count": sum(
+            len(row["provider_status_observations"]) for row in values
+        ),
+        "provider_status_expected_provider_count": expected_provider_count,
+        "provider_status_reporting_provider_count": reporting_provider_count,
+        "provider_status_unknown_provider_count": unknown_provider_count,
+        "provider_status_coverage_complete": unknown_provider_count == 0,
+        "provider_status_disagreement": len(set(status_sets.values())) > 1,
     }
 
 
@@ -440,6 +341,24 @@ def _ecr_snapshot_records(bundle):
             "source_updated_at": _optional_time(snapshot.source_updated_at),
             "expert_count": snapshot.total_experts,
             "selected_expert_count": len(snapshot.expert_ids),
+            "expert_population_mode": "position_specific",
+            "expert_panels": [
+                {
+                    "position": panel.position,
+                    "expert_count": panel.total_experts,
+                    "expert_ids": list(panel.expert_ids),
+                    "expert_selection_policy": (
+                        panel.provenance.source_details.expert_selection_policy
+                    ),
+                    "expert_group_title": (
+                        panel.provenance.source_details.expert_group_title
+                    ),
+                    "expert_group_description": (
+                        panel.provenance.source_details.expert_group_description
+                    ),
+                }
+                for panel in snapshot.expert_panels
+            ],
             "ranking_count": len(snapshot.rankings),
         }
         for snapshot in sorted(
@@ -463,6 +382,96 @@ def _ecr_detail(ecr_by_period, period, player_id):
     }
 
 
+def _provider_metadata(evidence, provider):
+    rows = evidence.provider_rows(provider)
+    captures = tuple(row.captured_at for row in rows)
+    published = tuple(
+        row.source_published_at
+        for row in rows
+        if row.source_published_at is not None
+    )
+    return {
+        "provider": provider,
+        "label": _PROVIDER_LABELS.get(provider, provider.replace("_", " ").title()),
+        "captured_at": _iso_utc(max(captures)) if captures else None,
+        "source_published_at": _iso_utc(max(published)) if published else None,
+    }
+
+
+def _provider_value(evidence, projection, observation):
+    lineage = evidence.lineage_for(projection, observation)
+    raw = evidence.weekly.get(
+        (
+            projection.canonical_player_id,
+            observation.provider,
+            projection.week,
+        )
+    )
+    status_sources = (
+        raw,
+        (
+            evidence.remaining_season_for(
+                projection.canonical_player_id,
+                observation.provider,
+            )
+            if lineage.origin is WeeklyProjectionOrigin.DERIVED_REST_OF_SEASON
+            else None
+        ),
+    )
+    return {
+        "provider": observation.provider,
+        "provider_player_id": observation.provider_player_id,
+        "status": observation.status.value,
+        "projected_points": observation.projected_fantasy_points,
+        "weight": observation.weight,
+        "origin": None if lineage.origin is None else lineage.origin.value,
+        "captured_at": _iso_utc(lineage.captured_at),
+        "source_published_at": _optional_time(lineage.source_published_at),
+        "raw_projected_stats": _weekly_raw_stats(raw, observation, lineage),
+        "provider_status_observations": _provider_status_records(*status_sources),
+    }
+
+
+def _remaining_records(evidence, player_id, providers, summary):
+    observations = (
+        {}
+        if summary is None
+        else {row.provider: row for row in summary.provider_observations}
+    )
+    return [
+        _remaining_source_record(
+            evidence,
+            player_id,
+            provider,
+            observations.get(provider),
+            summary,
+        )
+        for provider in providers
+    ]
+
+
+def _remaining_source_record(evidence, player_id, provider, observation, summary):
+    retained = evidence.remaining_season_for(player_id, provider)
+    if retained is not None and retained.status is ProjectionStatus.OBSERVED:
+        return _remaining_record(retained)
+    if observation is not None and observation.status is ProjectionStatus.OBSERVED:
+        rows = tuple(
+            evidence.weekly.get((player_id, provider, week))
+            for week in summary.applicable_weeks
+        )
+        if not all(
+            row is not None
+            and row.status is ProjectionStatus.OBSERVED
+            and row.origin is WeeklyProjectionOrigin.PROVIDER_PUBLISHED
+            for row in rows
+        ):
+            raise AssertionError("full-horizon provider observation lacks source rows")
+        return _weekly_sum_remaining_record(rows, observation, summary.applicable_weeks)
+    if retained is not None:
+        return _remaining_record(retained)
+    return _not_retained_remaining_record(provider)
+
+
 def _remaining_record(row):
     return {
         "provider": row.provider,
@@ -473,6 +482,32 @@ def _remaining_record(row):
         "applicable_weeks": list(row.applicable_weeks),
         "captured_at": _iso_utc(row.captured_at),
         "source_published_at": _optional_time(row.source_published_at),
+        "raw_projected_stats": dict(row.raw_projected_stats),
+        "provider_status_observations": _provider_status_records(row),
+    }
+
+
+def _weekly_sum_remaining_record(rows, observation, applicable_weeks):
+    common_stats = set(rows[0].raw_projected_stats)
+    for row in rows[1:]:
+        common_stats.intersection_update(row.raw_projected_stats)
+    published = tuple(row.source_published_at for row in rows)
+    return {
+        "provider": observation.provider,
+        "provider_player_id": observation.provider_player_id,
+        "status": observation.status.value,
+        "projected_points": observation.projected_fantasy_points,
+        "origin": RemainingSeasonOrigin.DERIVED_WEEKLY.value,
+        "applicable_weeks": list(applicable_weeks),
+        "captured_at": _iso_utc(max(row.captured_at for row in rows)),
+        "source_published_at": (
+            _iso_utc(max(published)) if all(published) else None
+        ),
+        "raw_projected_stats": {
+            name: fsum(row.raw_projected_stats[name] for row in rows)
+            for name in sorted(common_stats)
+        },
+        "provider_status_observations": _provider_status_records(*rows),
     }
 
 
@@ -486,6 +521,8 @@ def _not_retained_weekly_record(provider):
         "origin": None,
         "captured_at": None,
         "source_published_at": None,
+        "raw_projected_stats": {},
+        "provider_status_observations": [],
     }
 
 
@@ -499,7 +536,47 @@ def _not_retained_remaining_record(provider):
         "applicable_weeks": [],
         "captured_at": None,
         "source_published_at": None,
+        "raw_projected_stats": {},
+        "provider_status_observations": [],
     }
+
+
+def _provider_status_records(*rows):
+    observations = {
+        observation
+        for row in rows
+        if row is not None
+        for observation in row.provider_status_observations
+    }
+    return [
+        {
+            "designation": observation.designation,
+            "captured_at": _iso_utc(observation.captured_at),
+            "source_scope": observation.source_scope.value,
+            "source_week": observation.source_week,
+        }
+        for observation in sorted(
+            observations,
+            key=lambda value: (
+                value.captured_at,
+                value.source_scope.value,
+                value.source_week or 0,
+                value.designation.casefold(),
+                value.designation,
+            ),
+        )
+    ]
+
+
+def _weekly_raw_stats(row, observation, lineage):
+    if (
+        row is None
+        or observation.status is not ProjectionStatus.OBSERVED
+        or row.status is not ProjectionStatus.OBSERVED
+        or row.origin is not lineage.origin
+    ):
+        return {}
+    return dict(row.raw_projected_stats)
 
 
 def _source_counts(values):
@@ -525,34 +602,16 @@ def _source_counts(values):
     }
 
 
-def _weekly_provenance(row):
-    return (
-        row.origin.value,
-        _iso_utc(row.captured_at),
-        _optional_time(row.source_published_at),
-    )
-
-
-def _require_observation_match(row, observation):
-    if not _observation_matches(row, observation):
-        raise ValueError("ensemble provider value conflicts with captured weekly evidence")
-
-
-def _observation_matches(row, observation):
-    if row.status is not observation.status:
-        return False
-    if row.projected_fantasy_points is None:
-        return observation.projected_fantasy_points is None
-    return isclose(
-        row.projected_fantasy_points,
-        observation.projected_fantasy_points,
-        rel_tol=0.0,
-        abs_tol=1e-12,
-    )
-
-
 def _average(values):
     return fsum(values) / len(values) if values else None
+
+
+def _remaining_status(summary):
+    if summary is None:
+        return "not_retained"
+    if summary.projected_fantasy_points is None:
+        return "insufficient_sources"
+    return "complete" if summary.is_complete else "partial"
 
 
 def _provider_sort_key(provider):

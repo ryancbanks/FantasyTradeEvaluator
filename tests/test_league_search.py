@@ -129,6 +129,12 @@ def build_search(*, counterparties=None):
 class LeagueTradeSearchTests(unittest.TestCase):
     def test_searches_every_other_team_and_resumes_completed_pairs(self):
         search = build_search()
+        self.assertTrue(
+            all(
+                runner.prepared_strength.adjuster.forbid_drops
+                for _, runner in search.runners
+            )
+        )
         updates = []
         with TemporaryDirectory() as directory:
             first = search.run(directory, on_progress=updates.append)

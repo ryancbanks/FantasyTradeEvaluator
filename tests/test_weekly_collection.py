@@ -105,7 +105,7 @@ class InteractiveWorkflow(SuccessfulWorkflow):
 
 
 class WeeklyCollectionRequestTests(unittest.TestCase):
-    def test_direct_request_defaults_to_current_week_plus_ros(self):
+    def test_direct_request_does_not_require_optional_espn_yahoo_future_pages(self):
         request = WeeklyCollectionRequest(2026, 1, "PPR")
         self.assertFalse(request.include_future_weekly)
 

@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from trade_snapshot.ensemble import EnsembleProjection, ProviderObservation
 from trade_snapshot.league_state import (
@@ -15,6 +16,10 @@ from trade_snapshot.league_state import (
     Tiebreaker,
 )
 from trade_snapshot.projections import ProjectionStatus
+from trade_snapshot.roster_adjustment import (
+    InfeasibleRosterAdjustment,
+    PreparedRosterAdjuster,
+)
 from trade_snapshot.scenario_config import (
     CorrelatedScenarioConfig,
     FactorLoadings,
@@ -127,7 +132,17 @@ def components(
     other = TeamRoster("other", ("q1", "q2"), 2, 2)
     rosters = (primary, other)
     model = strength_model(scoring_profile_id)
-    pair = PreparedTradePair(model, primary, other)
+    constraints = trade_constraints or TradeConstraints(require_no_drops=True)
+    pair = PreparedTradePair(
+        model,
+        primary,
+        other,
+        PreparedRosterAdjuster(
+            model,
+            rosters,
+            forbid_drops=constraints.require_no_drops,
+        ),
+    )
     space_primary = TeamRoster(
         "primary",
         tuple(reversed(primary.player_ids)) if reverse_space else primary.player_ids,
@@ -141,7 +156,7 @@ def components(
     space = TradeSpace(
         space_primary,
         space_other,
-        trade_constraints or TradeConstraints(require_no_drops=True),
+        constraints,
     )
     projections = tuple(
         projection(player_id, scoring_profile_id) for player_id in PLAYER_POINTS
@@ -166,6 +181,26 @@ def components(
 
 
 class ResumableTradeSearchTests(unittest.TestCase):
+    def test_infeasible_roster_adjustment_skips_only_that_candidate(self):
+        runner = components()
+        original = PreparedTradePair.evaluate
+
+        def fail_first(prepared, candidate, *, candidate_index):
+            if candidate_index == 0:
+                raise InfeasibleRosterAdjustment("bounded waiver pool exhausted")
+            return original(prepared, candidate, candidate_index=candidate_index)
+
+        with TemporaryDirectory() as directory, patch.object(
+            PreparedTradePair, "evaluate", new=fail_first
+        ):
+            outcome = runner.run(Path(directory) / "search.sqlite3")
+
+        self.assertEqual(outcome.progress.next_candidate_index, 4)
+        self.assertEqual(
+            tuple(row.candidate_index for row in outcome.results),
+            (1, 2, 3),
+        )
+
     def test_active_package_filter_is_bound_into_checkpoint_identity(self):
         unfiltered = components()
         filtered = components(
@@ -278,6 +313,14 @@ class ResumableTradeSearchTests(unittest.TestCase):
             changed,
             runner.prepared_strength.primary,
             runner.prepared_strength.counterparty,
+            PreparedRosterAdjuster(
+                changed,
+                (
+                    runner.prepared_strength.primary,
+                    runner.prepared_strength.counterparty,
+                ),
+                forbid_drops=True,
+            ),
         )
 
         with self.assertRaisesRegex(ValueError, "engine identity"):

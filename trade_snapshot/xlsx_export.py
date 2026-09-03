@@ -116,7 +116,12 @@ def _write_workbook(path, context, trades, outlook):
             formats,
             "QualifiedTradesTable",
         )
-        _outlook_sheet(workbook, outlook, formats)
+        write_team_outlook_sheet(
+            workbook,
+            outlook,
+            formats,
+            table_name="TeamOutlookTable",
+        )
         _details_sheet(workbook, context, len(trades), len(mutual), formats)
     finally:
         workbook.close()
@@ -254,25 +259,243 @@ def _trade_widths(sheet):
     sheet.set_default_row(18)
 
 
-def _outlook_sheet(workbook, rows, formats):
+def write_team_outlook_sheet(workbook, rows, formats, *, table_name):
+    """Write the shared 14-field team-outlook contract."""
+
     sheet = workbook.add_worksheet("Team Outlook")
     sheet.hide_gridlines(2)
     sheet.set_row(0, 30)
-    headers = ("Team", "Current W", "Current L", "Current T", "Expected W", "Expected L", "Expected T", "Mean Rank", "Playoff Chance")
+    headers = (
+        "Team", "Current Rank", "Current W", "Current L", "Current T",
+        "Expected W", "Expected L", "Expected T", "Expected PF", "Expected PA",
+        "Mean Rank", "Playoff Chance", "Rank Probabilities", "Seed Probabilities",
+    )
     sheet.merge_range(0, 0, 0, len(headers) - 1, "Projected Standings and Playoff Outlook", formats["title"])
     for column, header in enumerate(headers):
         sheet.write(2, column, header, formats["header"])
     for index, row in enumerate(rows, start=3):
-        values = (row.team_name, row.current_wins, row.current_losses, row.current_ties, row.expected_final_wins, row.expected_final_losses, row.expected_final_ties, row.mean_rank, row.playoff_probability)
+        values = (
+            row.team_name,
+            row.current_rank,
+            row.current_wins,
+            row.current_losses,
+            row.current_ties,
+            row.expected_final_wins,
+            row.expected_final_losses,
+            row.expected_final_ties,
+            row.expected_final_points_for,
+            row.expected_final_points_against,
+            row.mean_rank,
+            row.playoff_probability,
+            _distribution_text(row.rank_distribution),
+            _distribution_text(row.seed_distribution),
+        )
         for column, value in enumerate(values):
-            fmt = formats["text"] if column == 0 else formats["percent"] if column == 8 else formats["decimal"] if column >= 4 else formats["integer"]
-            sheet.write(index, column, value, fmt)
+            fmt = (
+                formats["text"]
+                if column in {0, 12, 13}
+                else formats["percent"]
+                if column == 11
+                else formats["decimal"]
+                if 5 <= column <= 10
+                else formats["integer"]
+            )
+            if value is None:
+                sheet.write_blank(index, column, None, fmt)
+            else:
+                sheet.write(index, column, value, fmt)
     if rows:
-        sheet.add_table(2, 0, 2 + len(rows), len(headers) - 1, {"name": "TeamOutlookTable", "style": "Table Style Medium 2", "columns": [{"header": value} for value in headers]})
-        sheet.conditional_format(3, 8, 2 + len(rows), 8, {"type": "data_bar", "bar_color": "#2A9D8F"})
+        sheet.add_table(
+            2,
+            0,
+            2 + len(rows),
+            len(headers) - 1,
+            {
+                "name": table_name,
+                "style": "Table Style Medium 2",
+                "columns": [{"header": value} for value in headers],
+            },
+        )
+        sheet.conditional_format(
+            3,
+            11,
+            2 + len(rows),
+            11,
+            {"type": "data_bar", "bar_color": "#2A9D8F"},
+        )
     sheet.freeze_panes(3, 1)
     sheet.set_column(0, 0, 24)
-    sheet.set_column(1, 8, 14)
+    sheet.set_column(1, 11, 14)
+    sheet.set_column(12, 13, 34)
+
+
+def _distribution_text(values):
+    return "; ".join(
+        f"{index}: {value:.1%}" for index, value in enumerate(values, 1)
+    )
+
+
+def data_readiness_detail_rows(context):
+    """Return the immutable data coverage and limitation rows for an export."""
+
+    readiness = context.data_readiness
+    rows = (
+        ("Power-Score Readiness", readiness.power_score_status),
+        ("Trade-Search Readiness", readiness.trade_search_status),
+        ("Expected-Standings Readiness", readiness.expected_standings_status),
+        ("Playoff Model Readiness", readiness.playoff_model_status),
+        ("Projection Provider Cells", readiness.provider_cell_count),
+        ("Direct Provider Projection Cells", readiness.direct_provider_cells),
+        (
+            "ROS-Derived Provider Projection Cells",
+            readiness.ros_derived_provider_cells,
+        ),
+        (
+            "Schedule-Derived Availability Cells",
+            readiness.schedule_derived_availability_cells,
+        ),
+        (
+            "Unavailable Provider Projection Cells",
+            readiness.unavailable_provider_cells,
+        ),
+        (
+            "Unattributed Provider Projection Cells",
+            readiness.unattributed_provider_cells,
+        ),
+        ("First-Week Scheduled NFL Games", readiness.first_week_scheduled_games),
+        (
+            "First-Week Games Missing Kickoff Time",
+            readiness.first_week_games_missing_kickoff,
+        ),
+        (
+            "Source Capture Timestamps",
+            readiness.source_capture_timestamp_count,
+        ),
+        (
+            "Earliest Source Capture (UTC)",
+            _utc_timestamp(readiness.earliest_source_capture_at),
+        ),
+        (
+            "Latest Source Capture (UTC)",
+            _utc_timestamp(readiness.latest_source_capture_at),
+        ),
+        (
+            "Source Capture Window (Seconds)",
+            int(
+                (
+                    readiness.latest_source_capture_at
+                    - readiness.earliest_source_capture_at
+                ).total_seconds()
+            ),
+        ),
+        (
+            "FantasyPros Comparison Team Coverage",
+            readiness.fantasypros_comparison_team_count,
+        ),
+        (
+            "Scenario Player-Score Floor",
+            (
+                readiness.scenario_player_score_floor
+                if readiness.scenario_player_score_floor is not None
+                else "UNBOUNDED"
+            ),
+        ),
+        (
+            "FantasyPros Comparison Policy",
+            readiness.fantasypros_comparison_policy,
+        ),
+        ("Projection Source Artifacts", readiness.projection_source_count),
+        (
+            "Projection Source Attempts Captured",
+            readiness.captured_projection_source_attempts,
+        ),
+        (
+            "Projection Source Attempts Not Published",
+            readiness.not_published_projection_source_attempts,
+        ),
+        (
+            "Projection Source Attempts Unavailable",
+            readiness.unavailable_projection_source_attempts,
+        ),
+        (
+            "Provider-Total Projection Sources",
+            readiness.provider_total_projection_sources,
+        ),
+        (
+            "Locally Recomputed Projection Sources",
+            readiness.locally_recomputed_projection_sources,
+        ),
+        (
+            "Base-Format-Only Projection Sources",
+            readiness.base_format_only_projection_sources,
+        ),
+        (
+            "Exact-Host-Rules Projection Sources",
+            readiness.exact_host_rules_projection_sources,
+        ),
+        (
+            "Projection Source Scoring Formats",
+            ", ".join(readiness.projection_source_scoring_formats),
+        ),
+        (
+            "Provider Status Observations",
+            readiness.provider_status_observation_count,
+        ),
+        (
+            "Provider Status Disagreement Scopes",
+            readiness.provider_status_disagreement_scope_count,
+        ),
+        (
+            "Latest Provider Status Observation (UTC)",
+            (
+                "NONE RETAINED"
+                if readiness.latest_provider_status_observed_at is None
+                else _utc_timestamp(readiness.latest_provider_status_observed_at)
+            ),
+        ),
+        ("Player-Availability Limitation", readiness.availability_limitation),
+        ("Outcome-Correlation Limitation", readiness.correlation_limitation),
+        (
+            "Marginal-Uncertainty Limitation",
+            readiness.marginal_uncertainty_limitation,
+        ),
+        (
+            "Championship-Proxy Limitation",
+            readiness.championship_proxy_limitation,
+        ),
+        (
+            "Host-Settlement-Policy Limitation",
+            readiness.host_settlement_policy_limitation,
+        ),
+    )
+    if readiness.custom_scoring_limitation:
+        rows = (
+            *rows,
+            ("Custom-Scoring Limitation", readiness.custom_scoring_limitation),
+        )
+    if readiness.as_of_time_limitation:
+        rows = (*rows, ("As-of-Time Limitation", readiness.as_of_time_limitation))
+    if readiness.ros_allocation_limitation:
+        rows = (
+            *rows,
+            ("ROS Weekly-Allocation Limitation", readiness.ros_allocation_limitation),
+        )
+    rows = (
+        *rows,
+        *(
+            (
+                f"Projection Attempts ({provider})",
+                (
+                    f"captured={captured}; not_published={not_published}; "
+                    f"unavailable={unavailable}"
+                ),
+            )
+            for provider, captured, not_published, unavailable in (
+                readiness.projection_source_provider_attempts
+            )
+        ),
+    )
+    return rows
 
 
 def _details_sheet(workbook, context, trade_count, mutual_count, formats):
@@ -280,9 +503,12 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
     sheet.hide_gridlines(2)
     sheet.set_row(0, 30)
     sheet.merge_range("A1:C1", "Calculation Provenance", formats["title"])
-    exact = context.power_engine_mode == "exact"
+    attested = context.power_engine_mode == "holdout_validated"
     details = (
         ("Snapshot ID", context.snapshot_id),
+        ("Scoring Profile ID", context.scoring_profile_id),
+        ("NFL Schedule ID", context.nfl_schedule_id),
+        ("Ensemble Configuration ID", context.ensemble_config_id),
         ("Strength Model ID", context.strength_model_id),
         ("Scenario Run ID", context.scenario_run_id),
         ("Primary Team", context.primary_team_name),
@@ -291,7 +517,11 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
         ("Simulation Scenarios", context.scenario_count),
         (
             "Power Engine Mode",
-            "EXACT / ATTESTED" if exact else "SURROGATE / APPROXIMATE",
+            (
+                "BLIND-HOLDOUT VALIDATED"
+                if attested
+                else "SURROGATE / APPROXIMATE"
+            ),
         ),
         ("Calibration Status", context.calibration_status),
         ("Methodology Evidence Type", context.methodology_evidence_kind),
@@ -312,25 +542,30 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
             context.methodology_current_evidence_id,
         ),
         (
-            "Exact FantasyPros-Power Scope",
+            "Blind-Validated FantasyPros-Power Scope",
             (
-                "balanced, no adds/drops, package sizes "
+                "Representative balanced, no-add/drop holdouts for package sizes "
                 + ", ".join(
-                    str(value) for value in context.exact_balanced_package_sizes
+                    str(value)
+                    for value in (
+                        context.holdout_validated_balanced_package_sizes
+                    )
                 )
-                if exact
+                if attested
                 else "NONE — this engine is a SURROGATE approximation"
             ),
         ),
         (
             "Power Accuracy Notice",
             (
-                "Outside the attested scope, FantasyPros-style power is labeled "
-                "extrapolated; playoff projections remain local."
-                if exact
+                "The listed shapes passed representative blind holdouts; this is "
+                "not exhaustive proof for every player combination. Other shapes "
+                "are labeled extrapolated; playoff projections remain local."
+                if attested
                 else SURROGATE_NOTICE
             ),
         ),
+        *data_readiness_detail_rows(context),
         ("Qualified Trades", trade_count),
         ("Mutual Playoff Gains", mutual_count),
     )
@@ -342,9 +577,17 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
         if label == "Blind Display Match Rate":
             value_format = formats["percent"]
         elif label == "Power Accuracy Notice":
-            value_format = formats["wrapped_text"] if exact else formats["warning"]
+            value_format = (
+                formats["wrapped_text"] if attested else formats["warning"]
+            )
             sheet.set_row(row, 60)
-        elif label == "Power Engine Mode" and not exact:
+        elif label.endswith(" Limitation"):
+            value_format = formats["warning"]
+            sheet.set_row(row, 60)
+        elif label.endswith(" Policy"):
+            value_format = formats["wrapped_text"]
+            sheet.set_row(row, 45)
+        elif label == "Power Engine Mode" and not attested:
             value_format = formats["warning"]
         sheet.write(row, 1, value, value_format)
     source_row = 4 + len(details)
@@ -358,3 +601,9 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
     sheet.set_column(0, 0, 40)
     sheet.set_column(1, 1, 82)
     sheet.set_column(2, 2, 21)
+
+
+def _utc_timestamp(value):
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )

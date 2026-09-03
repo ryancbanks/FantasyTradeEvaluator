@@ -30,13 +30,30 @@ class WaiverPoolTests(unittest.TestCase):
         self.assertEqual(
             required_waiver_positions(
                 starting,
-                ("QB", "RB", "WR", "TE", "K", "DST"),
             ),
             ("DST", "K", "QB", "RB", "TE", "WR"),
         )
         self.assertEqual(
             waiver_eligible_slots("RB", starting),
             ("FLEX", "OP", "RB"),
+        )
+
+    def test_empty_starting_position_is_still_required_for_collection(self):
+        self.assertEqual(
+            required_waiver_positions(("RB", "K")),
+            ("K", "RB"),
+        )
+
+    def test_bench_only_position_does_not_expand_waiver_requirements(self):
+        self.assertEqual(
+            required_waiver_positions(("QB",)),
+            ("QB",),
+        )
+
+    def test_generic_idp_slot_requires_concrete_defensive_positions(self):
+        self.assertEqual(
+            required_waiver_positions(("IDP",)),
+            ("DB", "DL", "LB"),
         )
 
     def test_preserves_exact_best_ids_and_labels_deterministic_ecr_fill(self):

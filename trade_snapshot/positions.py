@@ -44,9 +44,26 @@ def normalize_lineup_slot(value: object) -> str:
     return normalize_player_position(raw)
 
 
+def projection_position_in_scope(position: object, scope) -> bool:
+    """Return whether a canonical player position belongs to a page scope."""
+
+    normalized = normalize_player_position(position, require_supported=True)
+    try:
+        values = frozenset(scope)
+    except TypeError:
+        raise ValueError("projection position scope must be an iterable") from None
+    return (
+        "ALL" in values
+        or normalized in values
+        or ("FLX" in values and normalized in {"RB", "WR", "TE"})
+        or ("IDP" in values and normalized in {"DL", "LB", "DB"})
+    )
+
+
 __all__ = (
     "CANONICAL_PLAYER_POSITIONS",
     "FLEX_SLOTS",
     "normalize_lineup_slot",
     "normalize_player_position",
+    "projection_position_in_scope",
 )

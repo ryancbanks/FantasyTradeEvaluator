@@ -11,7 +11,31 @@ from types import MappingProxyType
 from ._scenario_random import SAFE_INTEGER, content_id
 
 
-_REGULAR_SEASON_WEEKS = tuple(range(1, 19))
+NFL_REGULAR_SEASON_WEEKS = tuple(range(1, 19))
+_SCHEDULE_SCHEMA_VERSION = 1
+_SCHEDULE_RECORD_FIELDS = frozenset(
+    {
+        "captured_at",
+        "kind",
+        "schedule_id",
+        "schema_version",
+        "season",
+        "source_provider",
+        "team_weeks",
+    }
+)
+_TEAM_WEEK_RECORD_FIELDS = frozenset(
+    {
+        "is_home",
+        "kickoff_at",
+        "nfl_game_id",
+        "nfl_team_id",
+        "opponent_team_id",
+        "source_game_id",
+        "status",
+        "week",
+    }
+)
 _TOP_LEVEL_FIELDS = frozenset({"display", "settings"})
 _SETTINGS_FIELDS = frozenset(
     {
@@ -162,15 +186,56 @@ class NflSchedule:
                 if previous != game_key:
                     raise ValueError("one source game ID describes conflicting games")
         ordered = tuple(sorted(rows, key=lambda row: (row.nfl_team_id, row.week)))
-        record = {
-            "season": self.season,
-            "captured_at": self.captured_at.isoformat(timespec="microseconds"),
-            "source_provider": self.source_provider,
-            "team_weeks": [_team_week_record(row) for row in ordered],
-        }
         object.__setattr__(self, "team_weeks", ordered)
         object.__setattr__(self, "_by_team_week", MappingProxyType(index))
-        object.__setattr__(self, "schedule_id", content_id("nfl-schedule", record))
+        object.__setattr__(
+            self,
+            "schedule_id",
+            content_id("nfl-schedule", self._content_record()),
+        )
+
+    def _content_record(self) -> dict[str, object]:
+        return {
+            "captured_at": _iso_time(self.captured_at),
+            "season": self.season,
+            "source_provider": self.source_provider,
+            "team_weeks": [_team_week_record(row) for row in self.team_weeks],
+        }
+
+    def to_record(self) -> dict[str, object]:
+        """Return the complete schedule as a lossless JSON-safe record."""
+
+        return {
+            "kind": "nfl_schedule",
+            "schema_version": _SCHEDULE_SCHEMA_VERSION,
+            **self._content_record(),
+            "schedule_id": self.schedule_id,
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, object]) -> "NflSchedule":
+        """Rebuild a schedule, rejecting schema drift and content tampering."""
+
+        if not isinstance(record, Mapping) or set(record) != _SCHEDULE_RECORD_FIELDS:
+            raise ValueError("NFL schedule record fields are invalid")
+        if (
+            record["kind"] != "nfl_schedule"
+            or type(record["schema_version"]) is not int
+            or record["schema_version"] != _SCHEDULE_SCHEMA_VERSION
+        ):
+            raise ValueError("NFL schedule record kind or schema version is invalid")
+        raw_team_weeks = record["team_weeks"]
+        if not isinstance(raw_team_weeks, list):
+            raise ValueError("NFL schedule team_weeks must be a JSON array")
+        schedule = cls(
+            season=record["season"],
+            captured_at=_parse_time("captured_at", record["captured_at"]),
+            source_provider=record["source_provider"],
+            team_weeks=tuple(_team_week_from_record(row) for row in raw_team_weeks),
+        )
+        if record["schedule_id"] != schedule.schedule_id:
+            raise ValueError("NFL schedule content does not match schedule_id")
+        return schedule
 
     def team_week(self, nfl_team_id: str, week: int) -> NflTeamWeek:
         """Return verified context or fail if the schedule does not cover the cell."""
@@ -183,6 +248,18 @@ class NflSchedule:
             raise ValueError(
                 f"NFL schedule lacks team/week {(nfl_team_id, week)!r}"
             ) from None
+
+
+def validate_complete_regular_season(schedule: NflSchedule) -> None:
+    """Require the complete NFL horizon consumed by full-ROS features."""
+
+    if not isinstance(schedule, NflSchedule):
+        raise ValueError("schedule must be an NflSchedule")
+    weeks = {row.week for row in schedule.team_weeks}
+    if weeks != set(NFL_REGULAR_SEASON_WEEKS):
+        raise ValueError(
+            "NFL schedule must cover every regular-season week through week 18"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,7 +330,7 @@ def parse_espn_pro_team_schedule(
     for provider_id, raw_schedule in raw_schedules.items():
         bye_week = bye_weeks[provider_id]
         expected_keys = {
-            str(week) for week in _REGULAR_SEASON_WEEKS if week != bye_week
+            str(week) for week in NFL_REGULAR_SEASON_WEEKS if week != bye_week
         }
         if set(raw_schedule) != expected_keys:
             raise ValueError("ESPN pro-team schedule does not match its explicit bye")
@@ -291,11 +368,11 @@ def parse_espn_pro_team_schedule(
             for game in normalized_games.values()
             if provider_id in (game.away_team_id, game.home_team_id)
         }
-        if len(by_week) != 17 or set(by_week) != set(_REGULAR_SEASON_WEEKS).difference(
+        if len(by_week) != 17 or set(by_week) != set(NFL_REGULAR_SEASON_WEEKS).difference(
             {bye_weeks[provider_id]}
         ):
             raise ValueError("ESPN game set does not prove one game or bye per team/week")
-        for week in _REGULAR_SEASON_WEEKS:
+        for week in NFL_REGULAR_SEASON_WEEKS:
             game = by_week.get(week)
             if game is None:
                 team_weeks.append(
@@ -357,7 +434,7 @@ def _espn_game(value: object, *, expected_week: int) -> _EspnGame:
         _boolean("ESPN game statsOfficial", row["statsOfficial"]),
         _boolean("ESPN game validForLocking", row["validForLocking"]),
     )
-    if game.week != expected_week or game.week not in _REGULAR_SEASON_WEEKS:
+    if game.week != expected_week or game.week not in NFL_REGULAR_SEASON_WEEKS:
         raise ValueError("ESPN game scoring period conflicts with its schedule week")
     return game
 
@@ -381,12 +458,48 @@ def _team_week_record(row: NflTeamWeek) -> dict[str, object]:
         "opponent_team_id": row.opponent_team_id,
         "is_home": row.is_home,
         "source_game_id": row.source_game_id,
-        "kickoff_at": (
-            row.kickoff_at.isoformat(timespec="microseconds")
-            if row.kickoff_at is not None
-            else None
-        ),
+        "kickoff_at": None if row.kickoff_at is None else _iso_time(row.kickoff_at),
     }
+
+
+def _team_week_from_record(record: object) -> NflTeamWeek:
+    if not isinstance(record, Mapping) or set(record) != _TEAM_WEEK_RECORD_FIELDS:
+        raise ValueError("NFL team/week record fields are invalid")
+    try:
+        status = NflTeamWeekStatus(record["status"])
+    except (TypeError, ValueError):
+        raise ValueError("NFL team/week status is invalid") from None
+    return NflTeamWeek(
+        nfl_team_id=record["nfl_team_id"],
+        week=record["week"],
+        status=status,
+        nfl_game_id=record["nfl_game_id"],
+        opponent_team_id=record["opponent_team_id"],
+        is_home=record["is_home"],
+        source_game_id=record["source_game_id"],
+        kickoff_at=(
+            None
+            if record["kickoff_at"] is None
+            else _parse_time("kickoff_at", record["kickoff_at"])
+        ),
+    )
+
+
+def _iso_time(value: datetime) -> str:
+    return value.isoformat(timespec="microseconds")
+
+
+def _parse_time(name: str, value: object) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be an ISO-8601 timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"{name} must be an ISO-8601 timestamp") from None
+    _aware_time(name, parsed)
+    if _iso_time(parsed) != value:
+        raise ValueError(f"{name} must use the canonical ISO-8601 representation")
+    return parsed
 
 
 def _canonical_team_id(value: object) -> str:
@@ -459,9 +572,11 @@ def _typed_rows(name: str, values: Iterable[object], expected_type: type) -> tup
 
 
 __all__ = (
+    "NFL_REGULAR_SEASON_WEEKS",
     "NflSchedule",
     "NflTeamWeek",
     "NflTeamWeekStatus",
     "canonical_nfl_game_id",
     "parse_espn_pro_team_schedule",
+    "validate_complete_regular_season",
 )

@@ -30,8 +30,8 @@ __all__ = (
 class PreparedScoreScenarios:
     """Validated inputs plus lazy deterministic scenario generation.
 
-    Factor loadings preserve each projection's variance before the fixed
-    zero-point floor; that floor can reduce variance for projections near zero.
+    Factor loadings preserve each projection's variance. A score floor is used
+    only when the persisted scenario policy explicitly requests one.
     """
 
     state: LeagueState
@@ -135,6 +135,7 @@ class PreparedScoreScenarios:
         return _realize(
             projection,
             self.config.loadings,
+            self.config.player_score_floor,
             self.draw_space_id,
             scenario_index,
             {},
@@ -166,6 +167,7 @@ class PreparedScoreScenarios:
                     _realize(
                         self._projection_by_key[(player_id, week)],
                         self.config.loadings,
+                        self.config.player_score_floor,
                         self.draw_space_id,
                         index,
                         draw_cache,
@@ -303,6 +305,11 @@ def _select_lineups(state, rosters, eligibilities, projections):
         for week in state.remaining_regular_season_weeks:
             players = []
             for player_id in roster.player_ids:
+                if (
+                    week == state.first_remaining_week
+                    and player_id in roster.capacity_exempt_player_ids
+                ):
+                    continue
                 projection = projections[(player_id, week)]
                 if projection.status is ProjectionStatus.BYE:
                     continue
@@ -320,9 +327,9 @@ def _select_lineups(state, rosters, eligibilities, projections):
     return selected
 
 
-def _realize(projection, loadings, draw_space_id, scenario_index, cache):
+def _realize(projection, loadings, score_floor, draw_space_id, scenario_index, cache):
     if projection.predictive_stddev == 0:
-        return max(0.0, projection.projected_fantasy_points)
+        return _apply_score_floor(projection.projected_fantasy_points, score_floor)
     week = projection.week
     factors = (
         (loadings.league, "league", (week,)),
@@ -335,13 +342,17 @@ def _realize(projection, loadings, draw_space_id, scenario_index, cache):
         for loading, component, parts in factors
         if loading
     )
-    result = max(
-        0.0,
+    result = _apply_score_floor(
         projection.projected_fantasy_points + projection.predictive_stddev * shock,
+        score_floor,
     )
     if not isfinite(result):
         raise ValueError("realized player score is not finite")
     return result
+
+
+def _apply_score_floor(value, score_floor):
+    return value if score_floor is None else max(score_floor, value)
 
 
 def _cached_normal(cache, draw_space_id, scenario_index, component, parts):

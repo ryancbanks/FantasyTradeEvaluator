@@ -5,7 +5,9 @@ import unittest
 from tests.test_engine_bundle import engine_bundle
 from trade_snapshot._app_support import bundle_summary
 from trade_snapshot.engine_bundle import EngineBundle
+from trade_snapshot.methodology import PowerMethodology
 from trade_snapshot.methodology_reuse import FormulaAction, FormulaReuseDecision
+from trade_snapshot.methodology_reuse import MethodologyFingerprint
 from trade_snapshot.strength import CalibrationStatus
 from trade_snapshot.strength import StrengthModel
 from trade_snapshot.surrogate_disclosure import (
@@ -23,8 +25,13 @@ def surrogate_bundle():
         max_absolute_score_error=0.25,
         display_match_rate=0.91,
     )
+    formula = replace(
+        exact.strength_formula,
+        source_fit_id="surrogate-fit-1",
+        calibration=calibration,
+    )
     model = StrengthModel(
-        exact.strength_model.role_definitions,
+        formula.role_definitions,
         exact.strength_model.players.values(),
         exact.strength_model.normalization_denominator,
         snapshot_id=exact.strength_model.snapshot_id,
@@ -37,20 +44,15 @@ def surrogate_bundle():
         ("blind exactness checks failed",),
         attestation.methodology_fingerprint.fingerprint_id,
     )
-    disclosure = SurrogateDisclosure(
-        weekly_snapshot_id=exact.state.snapshot_id,
-        strength_model_id=model.model_id,
-        formula_id=attestation.formula_id,
-        formula_source_fit_id="surrogate-fit-1",
-        formula_trained_snapshot_id=exact.state.snapshot_id,
+    disclosure = SurrogateDisclosure.from_refresh(
+        formula=formula,
+        strength_model=model,
         methodology_fingerprint=attestation.methodology_fingerprint,
         formula_decision=decision,
-        calibration_diagnostics=calibration,
-        held_out_trade_ids=attestation.calibration_holdout_ids,
-        observed_balanced_package_sizes=(1, 2, 3, 4),
     )
     return replace(
         exact,
+        strength_formula=formula,
         strength_model=model,
         methodology_attestation=None,
         surrogate_disclosure=disclosure,
@@ -95,7 +97,7 @@ class SurrogateDisclosureTests(unittest.TestCase):
         bundle = surrogate_bundle()
         record = bundle.to_record()
 
-        self.assertEqual(record["schema_version"], 6)
+        self.assertEqual(record["schema_version"], 8)
         self.assertIsNone(record["methodology_attestation"])
         self.assertEqual(EngineBundle.from_record(record), bundle)
 
@@ -111,6 +113,29 @@ class SurrogateDisclosureTests(unittest.TestCase):
             replace(exact, methodology_attestation=None)
         with self.assertRaisesRegex(ValueError, "exactly one"):
             replace(exact, surrogate_disclosure=surrogate.surrogate_disclosure)
+
+    def test_refresh_rejects_formula_feature_policy_mismatch(self):
+        bundle = surrogate_bundle()
+        current = bundle.surrogate_disclosure.methodology_fingerprint
+        fingerprint = MethodologyFingerprint(
+            current.analyzer_bundle,
+            current.response_schema_sha256,
+            PowerMethodology(("ecr_ros_inverse_rank",), ("presence",)),
+            current.role_definitions,
+        )
+        decision = FormulaReuseDecision(
+            FormulaAction.RECALIBRATE,
+            ("test feature-policy mismatch",),
+            fingerprint.fingerprint_id,
+        )
+
+        with self.assertRaisesRegex(ValueError, "feature policy changed"):
+            SurrogateDisclosure.from_refresh(
+                formula=bundle.strength_formula,
+                strength_model=bundle.strength_model,
+                methodology_fingerprint=fingerprint,
+                formula_decision=decision,
+            )
 
 
 if __name__ == "__main__":

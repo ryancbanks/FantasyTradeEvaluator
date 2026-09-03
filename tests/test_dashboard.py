@@ -8,6 +8,7 @@ from trade_snapshot.dashboard import (
     _field_conditioned_title_shares,
     build_league_dashboard,
 )
+from trade_snapshot.scenario_config import CorrelatedScenarioConfig, FactorLoadings
 from trade_snapshot.trade_impact import prepare_season_baseline
 
 
@@ -40,7 +41,7 @@ class LeagueDashboardTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         json.dumps(first, allow_nan=False)
-        self.assertEqual(first["schema_version"], 1)
+        self.assertEqual(first["schema_version"], 2)
         self.assertEqual(first["bundle_id"], bundle.bundle_id)
         self.assertEqual(
             first["scenario_sampling"],
@@ -56,7 +57,13 @@ class LeagueDashboardTests(unittest.TestCase):
         )
         self.assertEqual(first["weeks"], [1])
         self.assertEqual(first["positions"], ["FLEX"])
-        self.assertEqual(first["power_engine_mode"], "exact")
+        self.assertEqual(first["power_engine_mode"], "holdout_validated")
+        self.assertEqual(first["fantasypros_comparison"]["status"], "comparison_only")
+        self.assertEqual(first["fantasypros_comparison"]["team_count"], 2)
+        self.assertEqual(
+            first["host_settlement_policy"]["status"],
+            "partially_inferred",
+        )
         self.assertEqual(
             first["championship_model"]["kind"],
             "field_conditioned_power_share_v1",
@@ -65,11 +72,19 @@ class LeagueDashboardTests(unittest.TestCase):
             first["championship_model"]["status"], "modeled_estimate"
         )
         self.assertIn("not an exact", first["championship_model"]["limitations"])
+        self.assertEqual(
+            first["weekly_model"]["kind"],
+            "mean_optimized_independent_scenarios_v1",
+        )
+        self.assertIn(
+            "independent player-outcome",
+            first["weekly_model"]["methodology"],
+        )
 
         primary, other = first["teams"]
         self.assertEqual((primary["team_id"], other["team_id"]), ("primary", "other"))
         self.assertEqual((primary["power_rank"], other["power_rank"]), (1, 2))
-        self.assertEqual((primary["power_score"], other["power_score"]), (50.0, 40.0))
+        self.assertEqual((primary["power_score"], other["power_score"]), (100.0, 80.0))
         self.assertEqual(primary["weekly_outlook"][0]["projected_points"], 12.0)
         self.assertEqual(primary["weekly_outlook"][0]["uncertainty"], 0.0)
         self.assertEqual(primary["weekly_outlook"][0]["opponent_id"], "other")
@@ -80,6 +95,80 @@ class LeagueDashboardTests(unittest.TestCase):
         self.assertEqual(primary["position_outlook"][0]["projected_points"], 20.0)
         self.assertEqual(primary["position_outlook"][0]["league_percentile"], 1.0)
         self.assertEqual(other["position_outlook"][0]["league_percentile"], 0.0)
+        self.assertEqual(
+            primary["fantasypros_comparison"]["source"]["current_rank"],
+            next(
+                row.current_rank
+                for row in bundle.fantasypros_benchmark.teams
+                if row.team_id == primary["team_id"]
+            ),
+        )
+        self.assertAlmostEqual(
+            primary["fantasypros_comparison"]["local_minus_source"][
+                "playoff_probability"
+            ],
+            primary["playoff_probability"]
+            - primary["fantasypros_comparison"]["source"][
+                "playoff_probability"
+            ],
+        )
+
+    def test_surfaces_current_rank_drift_without_using_benchmark_as_input(self):
+        bundle, baseline = dashboard_inputs()
+        benchmark = bundle.fantasypros_benchmark
+        swapped = replace(
+            benchmark,
+            teams=tuple(
+                replace(
+                    row,
+                    current_rank=(2.0 if row.current_rank == 1 else 1.0),
+                )
+                for row in benchmark.teams
+            ),
+        )
+        changed_bundle = replace(bundle, fantasypros_benchmark=swapped)
+
+        original = build_dashboard(bundle, baseline)
+        changed = build_dashboard(changed_bundle, baseline)
+
+        self.assertEqual(
+            [row["current_rank"] for row in changed["teams"]],
+            [row["current_rank"] for row in original["teams"]],
+        )
+        self.assertFalse(changed["fantasypros_comparison"]["current_rank_all_match"])
+        self.assertFalse(
+            changed["host_settlement_policy"][
+                "current_rank_matches_fantasypros"
+            ]
+        )
+    def test_weekly_model_discloses_nonzero_shared_factors(self):
+        bundle, _ = dashboard_inputs()
+        correlated = replace(
+            bundle,
+            scenario_config=CorrelatedScenarioConfig(
+                bundle.scenario_config.scenario_count,
+                bundle.scenario_config.seed,
+                FactorLoadings(0, 1, 0, 0),
+            ),
+        )
+        baseline = prepare_season_baseline(
+            correlated.state,
+            correlated.rosters,
+            correlated.projections,
+            correlated.eligibilities,
+            correlated.scenario_config,
+        )
+
+        result = build_dashboard(correlated, baseline)
+
+        self.assertEqual(
+            result["weekly_model"]["kind"],
+            "mean_optimized_correlated_scenarios_v1",
+        )
+        self.assertIn(
+            "shared league/game/team-factor",
+            result["weekly_model"]["methodology"],
+        )
 
     def test_probability_and_distribution_invariants_hold(self):
         bundle, baseline = dashboard_inputs()

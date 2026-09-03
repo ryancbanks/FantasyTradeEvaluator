@@ -10,6 +10,7 @@ from ._capture_errors import (
     BrowserCaptureDependencyError,
     BrowserCaptureError,
     BrowserCaptureTimeout,
+    ProjectionNotPublished,
     YahooScoringError,
 )
 from ._capture_task_policy import (
@@ -229,6 +230,10 @@ class _ExtensionSession:
             cancelled,
             "projection capture failed in the browser extension",
         )
+        if result == {"status": "not_published"}:
+            raise ProjectionNotPublished(
+                "FantasyPros has not published projections for the requested week."
+            )
         if not isinstance(result, Mapping) or set(result) != {"segments"}:
             raise BrowserCaptureError("projection extraction returned an invalid result")
         segments = result["segments"]

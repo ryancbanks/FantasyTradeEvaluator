@@ -69,7 +69,11 @@ def public_player_link(
     elif provider is CaptureProvider.FANTASYPROS:
         allowed = (
             host in {"fantasypros.com", "www.fantasypros.com"}
-            and re.fullmatch(r"/nfl/players/[a-z0-9-]+\.php", path, re.IGNORECASE)
+            and re.fullmatch(
+                r"/nfl/(?:players|projections)/[a-z0-9-]+\.php",
+                path,
+                re.IGNORECASE,
+            )
         )
     else:
         allowed = False

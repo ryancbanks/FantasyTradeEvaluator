@@ -19,7 +19,10 @@ from trade_snapshot.league_state import (
     Tiebreaker,
 )
 from trade_snapshot.projections import ProjectionStatus
-from trade_snapshot.roster_adjustment import PreparedRosterAdjuster
+from trade_snapshot.roster_adjustment import (
+    InfeasibleRosterAdjustment,
+    PreparedRosterAdjuster,
+)
 from trade_snapshot.scenario_config import (
     CorrelatedScenarioConfig,
     FactorLoadings,
@@ -175,7 +178,11 @@ def components(*, threshold=-100.0, checkpoint_interval=3):
         require_no_drops=True,
     )
     space = ThreeWayTradeSpace((rosters[0], rosters[2], rosters[1]), constraints)
-    prepared = PreparedThreeWayTrade(strength, space.rosters)
+    prepared = PreparedThreeWayTrade(
+        strength,
+        space.rosters,
+        PreparedRosterAdjuster(strength, rosters, forbid_drops=True),
+    )
     runner = ResumableThreeWayTradeSearch(
         space,
         prepared,
@@ -296,15 +303,21 @@ class ThreeWayEvaluationTests(unittest.TestCase):
         }
         self.assertEqual(actual, expected)
 
-    def test_no_drop_runner_rejects_an_adjuster(self):
+    def test_no_drop_runner_requires_an_add_only_adjuster(self):
         space, prepared, baseline, _ = components()
-        adjusted = PreparedThreeWayTrade(
+        without_adjuster = PreparedThreeWayTrade(
+            prepared.model,
+            space.rosters,
+        )
+        with self.assertRaisesRegex(ValueError, "prepared roster adjuster"):
+            ResumableThreeWayTradeSearch(space, without_adjuster, baseline)
+        drop_enabled = PreparedThreeWayTrade(
             prepared.model,
             space.rosters,
             PreparedRosterAdjuster(prepared.model, league_rosters()),
         )
-        with self.assertRaisesRegex(ValueError, "pure simultaneous"):
-            ResumableThreeWayTradeSearch(space, adjusted, baseline)
+        with self.assertRaisesRegex(ValueError, "drop policy"):
+            ResumableThreeWayTradeSearch(space, drop_enabled, baseline)
         for invalid in (0, "", []):
             with self.subTest(settings=invalid), self.assertRaisesRegex(
                 ValueError, "settings"
@@ -313,6 +326,28 @@ class ThreeWayEvaluationTests(unittest.TestCase):
 
 
 class ThreeWayRunnerTests(unittest.TestCase):
+    def test_infeasible_roster_adjustment_skips_only_that_candidate(self):
+        space, _, _, runner = components()
+        original = PreparedThreeWayTrade.evaluate
+
+        def fail_first(prepared, candidate, *, candidate_index):
+            if candidate_index == 0:
+                raise InfeasibleRosterAdjustment("bounded waiver pool exhausted")
+            return original(prepared, candidate, candidate_index=candidate_index)
+
+        with TemporaryDirectory() as directory, patch.object(
+            PreparedThreeWayTrade, "evaluate", new=fail_first
+        ):
+            outcome = runner.run(Path(directory) / "three.sqlite3")
+            self.assertEqual(
+                outcome.progress.next_candidate_index,
+                space.candidate_count,
+            )
+            self.assertNotIn(
+                0,
+                (row.candidate_index for row in outcome.results()),
+            )
+
     def test_run_identity_binds_position_evidence_that_changes_candidate_order(self):
         _, prepared, baseline, _ = components()
         constraints = TradeConstraints(

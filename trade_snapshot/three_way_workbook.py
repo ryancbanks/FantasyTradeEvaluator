@@ -226,11 +226,13 @@ def three_way_workbook_rows(
 
     if not isinstance(team_names, Mapping) or not isinstance(player_names, Mapping):
         raise ValueError("team_names and player_names must be mappings")
-    if power_engine_mode not in {"exact", "surrogate"}:
-        raise ValueError("power_engine_mode must be exact or surrogate")
+    if power_engine_mode not in {"holdout_validated", "surrogate"}:
+        raise ValueError(
+            "power_engine_mode must be holdout_validated or surrogate"
+        )
     status = (
         "extrapolated"
-        if power_engine_mode == "exact"
+        if power_engine_mode == "holdout_validated"
         else "surrogate_extrapolated"
     )
     try:

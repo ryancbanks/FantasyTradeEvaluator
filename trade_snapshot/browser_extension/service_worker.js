@@ -546,7 +546,7 @@ async function captureProjection(payload, sessionActionDelayMs) {
     if (configured.action === "ready") break;
     if (configured.action === "error") throw new BridgeError("projection_configuration_failed");
     changes += 1;
-    if (changes > 6) throw new BridgeError("projection_configuration_unstable");
+    if (changes > 12) throw new BridgeError("projection_configuration_unstable");
     await boundedDelay(actionDelayMs, deadline);
   }
 
@@ -556,6 +556,9 @@ async function captureProjection(payload, sessionActionDelayMs) {
   let actions = 0;
   while (true) {
     const stable = await stableProjection(payload.request, deadline, requireChange);
+    if (stable.availability === "not_published") {
+      return {status: "not_published"};
+    }
     const serialized = JSON.stringify(stable);
     if (serialized !== previous) {
       segments.push(stable);
@@ -648,7 +651,10 @@ async function stableProjection(request, deadline, rejectSerialized) {
   while (Date.now() < deadline) {
     const value = await retryScanAction("projection.read", request, deadline);
     const ready = protocol.isRecord(value) && protocol.isRecord(value.source) &&
-      Array.isArray(value.tables) && value.tables.length > 0;
+      Array.isArray(value.tables) && (
+        (value.availability === "available" && value.tables.length > 0) ||
+        (value.availability === "not_published" && value.tables.length === 0)
+      );
     const serialized = ready ? JSON.stringify(value) : null;
     if (ready && serialized !== rejectSerialized) {
       samples = serialized === previous ? samples + 1 : 1;

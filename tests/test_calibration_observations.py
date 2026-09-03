@@ -37,7 +37,7 @@ def plan():
         features(), ROLES, ROSTERS,
         primary_team_id="a",
         residual_feature_names=("ecr_ros_inverse_rank",),
-        role_feature_names=("projection_fantasypros_remaining_points",),
+        role_feature_names=("projection_fantasypros_full_ros_points",),
         training_experiment_count=3,
         held_out_experiment_count=2,
     )

@@ -36,7 +36,7 @@ class PowerMethodology:
                 {
                     "residual_feature_names": list(residual),
                     "role_feature_names": list(roles),
-                    "source_boundary": "fantasypros_only_v1",
+                    "source_boundary": "fantasypros_ros_ecr_only_v3",
                 },
             ),
         )
@@ -102,11 +102,9 @@ DEFAULT_POWER_METHODOLOGY = PowerMethodology(
     residual_feature_names=(
         "presence",
         "ecr_ros_log_strength",
-        "projection_fantasypros_remaining_points",
     ),
     role_feature_names=(
         "ecr_ros_inverse_rank",
         "ecr_ros_log_strength",
-        "projection_fantasypros_remaining_points",
     ),
 )

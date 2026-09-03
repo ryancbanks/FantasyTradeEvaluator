@@ -62,8 +62,8 @@
           <label class="wide-field"><span>Yahoo league or player-list link</span><input id="yahooProjectionUrl" type="url" placeholder="League home, numeric team, Players, or Player List page" required></label>
         </div>
         <div class="collection-actions">
-          <label class="check"><input id="includeFutureWeekly" type="checkbox"><span>Try every future week too (advanced; all three sites must publish it)</span></label>
-          <label class="check surrogate-consent"><input id="allowSurrogatePower" type="checkbox"><span>If exact replication fails, publish a <strong>SURROGATE</strong> weekly engine. Its power scores are approximations and will never be labeled exact.</span></label>
+          <label class="check"><input id="includeFutureWeekly" type="checkbox"><span>Also try future ESPN and Yahoo weekly pages when available. Every remaining FantasyPros week is attempted; unpublished future pages are recorded explicitly.</span></label>
+          <label class="check surrogate-consent"><input id="allowSurrogatePower" type="checkbox"><span>If the formula does not pass the blind-holdout validation gate, publish a <strong>SURROGATE</strong> weekly engine. Its results remain approximations and are labeled surrogate or surrogate extrapolated.</span></label>
           <div class="action-row compact-actions">
             <button id="collectButton" type="submit" class="primary">Scan league &amp; collect</button>
             <button id="cancelCollectionButton" type="button" class="danger hidden">Stop collection</button>
@@ -96,6 +96,10 @@
           <div id="bundleSummary" class="bundle-summary">Import or collect a weekly bundle to begin.</div>
         </div>
       </div>
+      <details id="bundleDataReadiness" class="bundle-data-readiness hidden">
+        <summary>Data coverage and model limits</summary>
+        <div id="bundleDataReadinessContent" class="bundle-data-readiness-content"></div>
+      </details>
     </section>
 
     <section id="dashboardPanel" class="panel dashboard-panel" aria-labelledby="dashboardHeading">
@@ -213,8 +217,8 @@
         <div class="player-lab-layout">
           <div class="table-wrap player-lab-master-wrap" role="region" aria-label="Scrollable Player Lab results" tabindex="0">
             <table class="player-lab-master">
-              <caption class="player-lab-sr-only">Players with ownership, remaining projections, ECR, and source coverage</caption>
-              <thead><tr><th>Player</th><th>Team / status</th><th>Pos</th><th>ROS pts</th><th>Avg active</th><th>Weekly ECR</th><th>ROS ECR</th><th>Sources</th></tr></thead>
+              <caption class="player-lab-sr-only">Players with ownership, full NFL rest-of-season projections, ECR, and source coverage</caption>
+              <thead><tr><th>Player</th><th>Team / status</th><th>Pos</th><th>Full ROS pts</th><th>ROS avg</th><th>Weekly ECR</th><th>ROS ECR</th><th>Sources</th></tr></thead>
               <tbody id="playerLabTableBody"></tbody>
             </table>
           </div>
@@ -222,8 +226,8 @@
           <article class="player-lab-detail-card" aria-labelledby="playerLabDetailHeading">
             <h3 id="playerLabDetailHeading" class="player-lab-sr-only">Selected player details</h3>
             <div id="playerLabDetail" class="player-lab-detail" aria-live="polite"></div>
-            <div class="player-lab-grid-heading"><h4>Weekly breakdown</h4><p>Ensemble alongside every retained provider value</p></div>
-            <p class="player-lab-coverage-note">Usable sources include direct weekly values and disclosed rest-of-season allocations. “All-direct” excludes every locally allocated value.</p>
+            <div class="player-lab-grid-heading"><h4>Fantasy regular-season weekly breakdown</h4><p>Ensemble alongside every retained provider value</p></div>
+            <p class="player-lab-coverage-note">Usable sources include direct weekly values and disclosed rest-of-season allocations. Residual points and stat components are divided evenly across missing active weeks; that shape is local, not a provider-published matchup projection. “All-direct” excludes every locally allocated value.</p>
             <div class="table-wrap player-lab-weekly-wrap" role="region" aria-label="Scrollable weekly projection breakdown" tabindex="0">
               <table class="player-lab-weekly">
                 <caption class="player-lab-sr-only">Weekly ensemble and provider projections for the selected player</caption>
@@ -232,6 +236,7 @@
               </table>
             </div>
             <div id="playerLabRosSources" class="player-lab-ros-sources"></div>
+            <div id="playerLabRawStats" class="player-lab-raw-stats" aria-label="Retained raw projected statistics"></div>
           </article>
         </div>
       </div>
@@ -332,7 +337,7 @@
             <label class="check"><input id="balancedOnly" type="checkbox"><span>Only equal-size swaps</span></label>
             <label id="skipSmallRow" class="check"><input id="skipSmall" type="checkbox" checked><span>Skip trades FantasyPros already covers (3 or fewer per side)</span></label>
             <label class="check"><input id="noDrops" type="checkbox" checked><span id="noDropsLabel">Do not force either team to drop a player</span></label>
-            <label id="surrogateSearchConsentRow" class="check surrogate-consent hidden"><input id="acceptSurrogateSearch" type="checkbox"><span>I understand this selected week uses <strong>SURROGATE</strong> power, which affects trade filtering and is not an exact FantasyPros result.</span></label>
+            <label id="surrogateSearchConsentRow" class="check surrogate-consent hidden"><input id="acceptSurrogateSearch" type="checkbox"><span>I understand this selected week uses <strong>SURROGATE</strong> power, which affects trade filtering and is not holdout validated. Results are labeled surrogate or surrogate extrapolated.</span></label>
             <label><span>Minimum power change for each team</span><input id="powerFloor" type="number" step="0.1" value="-5"></label>
             <label><span>Season simulations per candidate</span><input id="scenarioCount" type="number" min="100" max="1000000" step="100" value="10000"></label>
           </fieldset>

@@ -1,4 +1,4 @@
-"""Content-addressed proof for the FantasyPros power method in one engine."""
+"""Content-addressed blind-validation evidence for one FantasyPros power model."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -14,6 +14,7 @@ from .methodology_reuse import (
     FormulaAction,
     FormulaReuseDecision,
     MethodologyFingerprint,
+    formula_static_incompatibility_reasons,
 )
 from .strength import CalibrationStatus, StrengthModel
 from .strength_calibration import CalibrationMetadata
@@ -150,6 +151,17 @@ class MethodologyAttestation:
             raise ValueError("strength model does not match the selected formula")
         if formula.role_definitions != methodology_fingerprint.role_definitions:
             raise ValueError("formula roles do not match the methodology fingerprint")
+        incompatibilities = formula_static_incompatibility_reasons(
+            formula,
+            methodology_fingerprint,
+            season=strength_model.season,
+            scoring_profile_id=strength_model.scoring_profile_id,
+        )
+        if incompatibilities:
+            raise ValueError(
+                "strength formula is incompatible with methodology fingerprint: "
+                + "; ".join(incompatibilities)
+            )
         return cls(
             weekly_snapshot_id=strength_model.snapshot_id,
             strength_model_id=strength_model.model_id,
@@ -202,7 +214,12 @@ class MethodologyAttestation:
         incoming_count: int,
         has_roster_adjustment: bool,
     ) -> str:
-        """Label one trade exact only inside its blind-held-out shape scope."""
+        """Label one trade by how directly its shape was blind validated.
+
+        A representative blind holdout can validate a package *shape*, but it is
+        not an exhaustive proof for every player combination of that shape.
+        Keep that distinction visible to every downstream consumer.
+        """
 
         if (
             type(outgoing_count) is not int
@@ -212,12 +229,12 @@ class MethodologyAttestation:
             or not isinstance(has_roster_adjustment, bool)
         ):
             raise ValueError("trade shape counts and adjustment flag are invalid")
-        exact = (
+        holdout_validated = (
             not has_roster_adjustment
             and outgoing_count == incoming_count
             and outgoing_count in self.validated_balanced_package_sizes
         )
-        return "exact" if exact else "extrapolated"
+        return "holdout_validated" if holdout_validated else "extrapolated"
 
     def validate_bundle(self, *, snapshot_id: str, strength_model: StrengthModel) -> None:
         """Fail closed when the persisted proof is detached from its engine."""

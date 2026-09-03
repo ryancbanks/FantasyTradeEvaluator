@@ -13,7 +13,7 @@ from .calibration_observations import (
     prepare_calibration_evidence,
 )
 from .calibration_plan import CalibrationExperimentPlan, design_calibration_experiments
-from .feature_engineering import StrengthFeatureSet
+from .feature_engineering import StrengthFeatureSet, require_available_features
 from .formula_verification import REQUIRED_BALANCED_PACKAGE_SIZES
 from .methodology import PowerMethodology
 from .methodology_reuse import MethodologyFingerprint
@@ -113,6 +113,10 @@ def prepare_calibration_session(
 
     if not isinstance(methodology, PowerMethodology):
         raise ValueError("methodology must be a PowerMethodology")
+    require_available_features(
+        features,
+        (*methodology.residual_feature_names, *methodology.role_feature_names),
+    )
     plan = design_calibration_experiments(
         features,
         roles,

@@ -20,7 +20,13 @@ from ._app_support import (
     workbook_sources,
 )
 from .dashboard import build_league_dashboard
-from .engine_bundle import EngineBundle, load_engine_bundle, save_engine_bundle
+from .data_readiness import build_data_readiness_snapshot
+from .engine_bundle import (
+    EngineBundle,
+    UnsupportedEngineBundleSchema,
+    load_engine_bundle,
+    save_engine_bundle,
+)
 from .league_search import LeagueSearchOutcome, LeagueSearchProgress, ResumableLeagueTradeSearch
 from .player_outlook import build_player_outlook
 from .roster_adjustment import (
@@ -266,6 +272,19 @@ class LocalAppService:
         for path in sorted(self.bundle_directory.glob("*.json")):
             try:
                 summaries.append(bundle_summary(load_engine_bundle(path)))
+            except UnsupportedEngineBundleSchema as error:
+                summaries.append(
+                    {
+                        "file": path.name,
+                        "status": (
+                            "legacy_requires_rescan"
+                            if error.schema_version < 8
+                            else "requires_app_update"
+                        ),
+                        "schema_version": error.schema_version,
+                        "error": str(error),
+                    }
+                )
             except ValueError as error:
                 summaries.append({"file": path.name, "status": "invalid", "error": str(error)})
         return tuple(summaries)
@@ -303,6 +322,7 @@ class LocalAppService:
                     _MAX_DASHBOARD_SCENARIOS,
                     source_config.seed,
                     source_config.loadings,
+                    source_config.player_score_floor,
                 )
             )
             baseline = prepare_season_baseline(
@@ -369,8 +389,9 @@ class LocalAppService:
 
     def _bundle_readiness(self, bundles) -> dict[str, object]:
         ready_count = sum(row.get("status") == "ready" for row in bundles)
-        exact_count = sum(
-            row.get("status") == "ready" and row.get("power_engine_mode") == "exact"
+        validated_count = sum(
+            row.get("status") == "ready"
+            and row.get("power_engine_mode") == "holdout_validated"
             for row in bundles
         )
         surrogate_count = sum(
@@ -378,32 +399,55 @@ class LocalAppService:
             and row.get("power_engine_mode") == "surrogate"
             for row in bundles
         )
-        invalid_count = len(bundles) - ready_count
+        legacy_count = sum(
+            row.get("status") == "legacy_requires_rescan" for row in bundles
+        )
+        update_count = sum(
+            row.get("status") == "requires_app_update" for row in bundles
+        )
+        invalid_count = sum(row.get("status") == "invalid" for row in bundles)
         if ready_count:
-            message = (
-                f"{exact_count} exact-method and {surrogate_count} SURROGATE weekly "
+            message_parts = [
+                f"{validated_count} holdout-validated and {surrogate_count} "
+                "SURROGATE weekly "
                 "engine(s) are ready. Surrogate use requires explicit acceptance."
-            )
-        elif invalid_count:
-            message = (
-                "Saved weekly data failed validation. Collect this week again or import "
-                "a complete bundle."
-            )
+            ]
+        elif legacy_count or update_count or invalid_count:
+            message_parts = ["No compatible weekly engine is ready."]
         elif self._collections.available:
-            message = "Not ready yet. Collect this week or import a complete bundle."
+            message_parts = [
+                "Not ready yet. Collect this week or import a complete bundle."
+            ]
         else:
-            message = (
+            message_parts = [
                 "Not ready yet. Weekly collection is unavailable in this build; "
                 "import a complete bundle."
+            ]
+        if legacy_count:
+            message_parts.append(
+                f"Older-format saved weekly bundles: {legacy_count}. Scan the league "
+                "again to rebuild them with complete schedule and model evidence."
+            )
+        if update_count:
+            message_parts.append(
+                f"Saved weekly bundles requiring a newer application: {update_count}. "
+                "Update the app before using them."
+            )
+        if invalid_count:
+            message_parts.append(
+                f"Saved weekly bundles that failed validation: {invalid_count}. "
+                "Collect those weeks again or import complete bundles."
             )
         return {
             "ready": ready_count > 0,
             "ready_bundle_count": ready_count,
-            "exact_bundle_count": exact_count,
+            "holdout_validated_bundle_count": validated_count,
             "surrogate_bundle_count": surrogate_count,
+            "legacy_bundle_count": legacy_count,
+            "requires_app_update_bundle_count": update_count,
             "invalid_bundle_count": invalid_count,
             "collection_available": self._collections.available,
-            "message": message,
+            "message": " ".join(message_parts),
         }
 
     def start_weekly_collection(
@@ -468,11 +512,7 @@ class LocalAppService:
                     request.primary_team_id,
                     *request.counterparty_team_ids,
                 ],
-                "free_agent_allocation_policy": (
-                    None
-                    if request.constraints.require_no_drops
-                    else MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
-                ),
+                "free_agent_allocation_policy": MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY,
             }
         pairs = tuple(
             {
@@ -525,11 +565,7 @@ class LocalAppService:
                 bundle,
                 baseline.season_projection,
                 limit,
-                free_agent_allocation_policy=(
-                    None
-                    if request.constraints.require_no_drops
-                    else MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
-                ),
+                free_agent_allocation_policy=MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY,
             )
         return search_result_record(outcome, bundle, baseline.season_projection, limit)
 
@@ -573,11 +609,7 @@ class LocalAppService:
                     seed=request.seed,
                     trade_constraint_record=request.constraints.to_record(),
                     power_settings_record=request.settings.to_record(),
-                    free_agent_allocation_policy=(
-                        None
-                        if request.constraints.require_no_drops
-                        else MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
-                    ),
+                    free_agent_allocation_policy=MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY,
                 ),
                 rows,
                 team_outlook_rows(bundle.state, baseline.season_projection),
@@ -615,6 +647,7 @@ class LocalAppService:
                 job.request.scenario_count,
                 job.request.seed,
                 bundle.scenario_config.loadings,
+                bundle.scenario_config.player_score_floor,
             )
             baseline = prepare_season_baseline(
                 bundle.state,
@@ -633,10 +666,10 @@ class LocalAppService:
                         for player_id, player in bundle.strength_model.players.items()
                     },
                 )
-                adjuster = (
-                    None
-                    if job.request.constraints.require_no_drops
-                    else PreparedRosterAdjuster(bundle.strength_model, bundle.rosters)
+                adjuster = PreparedRosterAdjuster(
+                    bundle.strength_model,
+                    bundle.rosters,
+                    forbid_drops=job.request.constraints.require_no_drops,
                 )
                 prepared = PreparedThreeWayTrade(
                     bundle.strength_model,
@@ -777,6 +810,9 @@ def _workbook_context(
     team_names = {row.team_id: row.name for row in bundle.state.teams}
     return TradeWorkbookContext(
         snapshot_id=bundle.state.snapshot_id,
+        scoring_profile_id=bundle.scoring_profile.scoring_profile_id,
+        nfl_schedule_id=bundle.nfl_schedule.schedule_id,
+        ensemble_config_id=bundle.ensemble_config.config_id,
         strength_model_id=bundle.strength_model.model_id,
         scenario_run_id=baseline.scenarios.run_id,
         primary_team_id=request.primary_team_id,
@@ -787,13 +823,13 @@ def _workbook_context(
         power_engine_mode=bundle.methodology_mode,
         calibration_status=bundle.strength_model.calibration.status.value,
         methodology_evidence_kind=(
-            "exact_attestation"
-            if bundle.methodology_mode == "exact"
+            "blind_holdout_attestation"
+            if bundle.methodology_mode == "holdout_validated"
             else "surrogate_disclosure"
         ),
         methodology_record_id=(
             bundle.methodology_attestation.attestation_id
-            if bundle.methodology_mode == "exact"
+            if bundle.methodology_mode == "holdout_validated"
             else bundle.surrogate_disclosure.disclosure_id
         ),
         formula_id=methodology.formula_id,
@@ -804,8 +840,8 @@ def _workbook_context(
         formula_action=methodology.formula_decision.action.value,
         methodology_current_evidence_id=methodology.current_evidence_id,
         methodology_quality_gate=(
-            "exact_attestation_v1"
-            if bundle.methodology_mode == "exact"
+            "blind_holdout_validation_v1"
+            if bundle.methodology_mode == "holdout_validated"
             else SURROGATE_QUALITY_GATE
         ),
         methodology_holdout_count=methodology.current_holdout_count,
@@ -815,7 +851,10 @@ def _workbook_context(
         holdout_display_match_rate=(
             methodology.calibration_diagnostics.display_match_rate
         ),
-        exact_balanced_package_sizes=methodology.validated_balanced_package_sizes,
+        holdout_validated_balanced_package_sizes=(
+            methodology.validated_balanced_package_sizes
+        ),
+        data_readiness=build_data_readiness_snapshot(bundle),
         sources=workbook_sources(bundle),
     )
 

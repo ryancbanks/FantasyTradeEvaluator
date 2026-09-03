@@ -7,10 +7,27 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from tests.test_search_runner import PLAYER_POINTS, components
+from tests.ecr_fixtures import ecr_source_provenance
+from tests.source_fixtures import (
+    fantasypros_league_benchmark,
+    projection_source_manifest,
+    weekly_source_manifest,
+)
 from trade_snapshot.analyzer_contract import BundleFingerprint
-from trade_snapshot.ecr import EcrPeriod, EcrPlayerRanking, EcrSnapshot
-from trade_snapshot.engine_bundle import EngineBundle, load_engine_bundle, save_engine_bundle
-from trade_snapshot.ensemble import EnsembleProjection, ProviderObservation
+from trade_snapshot.ecr import EcrExpertPanel, EcrPeriod, EcrPlayerRanking, EcrSnapshot
+from trade_snapshot.engine_bundle import (
+    EngineBundle,
+    UnsupportedEngineBundleSchema,
+    load_engine_bundle,
+    save_engine_bundle,
+)
+from trade_snapshot.ensemble import (
+    EnsembleConfig,
+    EnsembleProjection,
+    ProviderObservation,
+    ProviderWeight,
+)
+from trade_snapshot.feature_engineering import build_strength_features
 from trade_snapshot.methodology import PowerMethodology
 from trade_snapshot.methodology_attestation import MethodologyAttestation
 from trade_snapshot.methodology_reuse import (
@@ -19,7 +36,17 @@ from trade_snapshot.methodology_reuse import (
     MethodologyFingerprint,
 )
 from trade_snapshot.league_state import RosterRules
-from trade_snapshot.projections import ProjectionStatus, WeeklyProjection
+from trade_snapshot.nfl_schedule import (
+    NflSchedule,
+    NflTeamWeek,
+    NflTeamWeekStatus,
+)
+from trade_snapshot.projections import (
+    ProjectionStatus,
+    RemainingSeasonOrigin,
+    RemainingSeasonProjection,
+    WeeklyProjection,
+)
 from trade_snapshot.scenario_config import PlayerEligibility
 from trade_snapshot.scoring import ScoringProfile
 from trade_snapshot.strength import CalibrationStatus, PlayerStrength, StrengthModel
@@ -63,10 +90,30 @@ def ecr_snapshot(period):
             )
             for index, player_id in enumerate(ALL_POINTS, start=1)
         ),
+        expert_panels=(EcrExpertPanel(
+            "FLEX",
+            ("9", "22"),
+            2,
+            ecr_source_provenance(
+                captured_at=NOW,
+                source_updated_at=NOW,
+                horizon=("weekly" if period is EcrPeriod.WEEKLY else "ros"),
+                position="FLEX",
+                source_player_count=len(ALL_POINTS),
+            ),
+        ),),
     )
 
 
-def exact_model_and_attestation(model):
+def exact_formula_model_and_attestation(
+    role_definitions,
+    projections,
+    eligibilities,
+    ecr_snapshots,
+    evidence,
+    rosters,
+    ensemble_config,
+):
     calibration = CalibrationMetadata(
         URL,
         SHA,
@@ -77,52 +124,48 @@ def exact_model_and_attestation(model):
         0,
         1,
     )
-    waiver_strengths = tuple(
-        PlayerStrength(
-            player_id,
-            ALL_POINTS[player_id],
-            frozenset({"RB", "FLEX"}),
-            {model.role_definitions[0].role_id: 0},
-        )
-        for player_id in WAIVER_PLAYER_IDS
+    methodology = PowerMethodology(
+        ("projection_fantasypros_full_ros_points",),
+        ("presence",),
     )
-    exact_model = StrengthModel(
-        model.role_definitions,
-        (*model.players.values(), *waiver_strengths),
-        model.normalization_denominator,
-        snapshot_id=model.snapshot_id,
-        season=model.season,
-        scoring_profile_id=model.scoring_profile_id,
-        calibration=calibration,
+    formula = StrengthFormula(
+        "strength-fit-test",
+        "snapshot-1",
+        2026,
+        SCORING_PROFILE.scoring_profile_id,
+        role_definitions,
+        {"projection_fantasypros_full_ros_points": 1},
+        {
+            role.role_id: {"presence": 0}
+            for role in role_definitions
+        },
+        calibration,
+        tuple(f"calibration-holdout-{index}" for index in range(100)),
+        (1, 2, 3, 4),
     )
-    methodology = PowerMethodology(("presence",), ("ecr_ros_inverse_rank",))
+    features = build_strength_features(
+        ecr_snapshots,
+        projections,
+        eligibilities,
+        provider_names=("fantasypros",),
+        projection_evidence=evidence,
+        remaining_week_scopes={
+            player_id: tuple(range(1, 19)) for player_id in ALL_POINTS
+        },
+    )
+    exact_model = formula.build_model(features, rosters)
     fingerprint = MethodologyFingerprint(
         BundleFingerprint(URL, SHA),
         SCHEMA,
         methodology,
         exact_model.role_definitions,
     )
-    formula = StrengthFormula(
-        "strength-fit-test",
-        exact_model.snapshot_id,
-        exact_model.season,
-        exact_model.scoring_profile_id,
-        exact_model.role_definitions,
-        {"presence": 1},
-        {
-            role.role_id: {"ecr_ros_inverse_rank": 1}
-            for role in exact_model.role_definitions
-        },
-        calibration,
-        tuple(f"calibration-holdout-{index}" for index in range(100)),
-        (1, 2, 3, 4),
-    )
     decision = FormulaReuseDecision(
         FormulaAction.RECALIBRATE,
         ("test calibration",),
         fingerprint.fingerprint_id,
     )
-    return exact_model, MethodologyAttestation.from_refresh(
+    return formula, exact_model, MethodologyAttestation.from_refresh(
         formula=formula,
         strength_model=exact_model,
         methodology_fingerprint=fingerprint,
@@ -142,8 +185,8 @@ def waiver_projection(template, player_id):
         ProjectionStatus.OBSERVED,
         (
             ProviderObservation(
-                "source",
-                f"source-{player_id}",
+                "fantasypros",
+                f"fantasypros-{player_id}",
                 ProjectionStatus.OBSERVED,
                 ALL_POINTS[player_id],
                 1,
@@ -155,7 +198,7 @@ def waiver_projection(template, player_id):
         0,
         0,
         f"NFL-{player_id}".upper(),
-        "G1",
+        f"G1-{player_id}",
         f"OPP-{player_id}",
         True,
     )
@@ -186,15 +229,43 @@ def waiver_pool():
     )
 
 
+def nfl_schedule_for(projections, weeks=tuple(range(1, 19))):
+    rows = []
+    by_player = {}
+    for projection in projections:
+        by_player.setdefault(projection.canonical_player_id, projection)
+    for projection in by_player.values():
+        for week in weeks:
+            game_id = f"G{week}-{projection.canonical_player_id}"
+            rows.extend(
+                (
+                    NflTeamWeek(
+                        projection.nfl_team_id,
+                        week,
+                        NflTeamWeekStatus.SCHEDULED,
+                        game_id,
+                        projection.opponent_team_id,
+                        projection.is_home,
+                    ),
+                    NflTeamWeek(
+                        projection.opponent_team_id,
+                        week,
+                        NflTeamWeekStatus.SCHEDULED,
+                        game_id,
+                        projection.nfl_team_id,
+                        not projection.is_home,
+                    ),
+                )
+            )
+    return NflSchedule(2026, NOW, "espn", tuple(rows))
+
+
 def engine_bundle():
     runner = components(scoring_profile_id=SCORING_PROFILE.scoring_profile_id)
     baseline = runner.season_baseline
     bundle_state = replace(
         baseline.state,
         roster_rules=RosterRules(2, ("FLEX", "RB")),
-    )
-    strength_model, attestation = exact_model_and_attestation(
-        runner.prepared_strength.model
     )
     projections = (
         *baseline.scenarios.projections,
@@ -206,25 +277,76 @@ def engine_bundle():
         *(PlayerEligibility(player_id, ("RB", "FLEX"))
           for player_id in WAIVER_PLAYER_IDS),
     )
+    projections = tuple(
+        replace(
+            row,
+            provider_observations=(
+                replace(
+                    row.provider_observations[0],
+                    provider="fantasypros",
+                    provider_player_id=f"fantasypros-{row.canonical_player_id}",
+                ),
+            ),
+            nfl_game_id=f"G1-{row.canonical_player_id}",
+        )
+        for row in projections
+    )
+    projection_by_player = {
+        row.canonical_player_id: row for row in projections
+    }
     evidence = tuple(
         WeeklyProjection(
             canonical_player_id=player_id,
             snapshot_id="snapshot-1",
             scoring_profile_id=SCORING_PROFILE.scoring_profile_id,
             provider="fantasypros",
-            provider_player_id=f"fp-{player_id}",
+            provider_player_id=f"fantasypros-{player_id}",
             season=2026,
             week=1,
             status=ProjectionStatus.OBSERVED,
             captured_at=NOW,
             projected_fantasy_points=points,
             raw_projected_stats={"points": points, "rush_yards": points * 5},
-            nfl_team_id=f"NFL-{player_id}",
-            nfl_game_id="G1",
-            opponent_team_id=f"OPP-{player_id}",
-            is_home=True,
+            nfl_team_id=projection_by_player[player_id].nfl_team_id,
+            nfl_game_id=projection_by_player[player_id].nfl_game_id,
+            opponent_team_id=projection_by_player[player_id].opponent_team_id,
+            is_home=projection_by_player[player_id].is_home,
         )
         for player_id, points in ALL_POINTS.items()
+    ) + tuple(
+        RemainingSeasonProjection(
+            canonical_player_id=player_id,
+            snapshot_id="snapshot-1",
+            scoring_profile_id=SCORING_PROFILE.scoring_profile_id,
+            provider="fantasypros",
+            provider_player_id=f"fantasypros-{player_id}",
+            season=2026,
+            applicable_weeks=tuple(range(1, 19)),
+            status=ProjectionStatus.OBSERVED,
+            origin=RemainingSeasonOrigin.PROVIDER_PUBLISHED,
+            captured_at=NOW,
+            projected_fantasy_points=points,
+        )
+        for player_id, points in ALL_POINTS.items()
+    )
+    ecr_snapshots = (
+        ecr_snapshot(EcrPeriod.WEEKLY),
+        ecr_snapshot(EcrPeriod.REST_OF_SEASON),
+    )
+    ensemble_config = EnsembleConfig(
+        (ProviderWeight("fantasypros", 1),),
+        1,
+        {"FLEX": 0, "RB": 0},
+    )
+    nfl_schedule = nfl_schedule_for(projections)
+    formula, strength_model, attestation = exact_formula_model_and_attestation(
+        runner.prepared_strength.model.role_definitions,
+        projections,
+        eligibilities,
+        ecr_snapshots,
+        evidence,
+        baseline.scenarios.rosters,
+        ensemble_config,
     )
     return EngineBundle(
         state=bundle_state,
@@ -232,12 +354,18 @@ def engine_bundle():
         rosters=baseline.scenarios.rosters,
         projections=projections,
         eligibilities=eligibilities,
-        scenario_config=baseline.scenarios.config,
-        strength_model=strength_model,
-        ecr_snapshots=(
-            ecr_snapshot(EcrPeriod.WEEKLY),
-            ecr_snapshot(EcrPeriod.REST_OF_SEASON),
+        nfl_schedule=nfl_schedule,
+        source_manifest=weekly_source_manifest(),
+        projection_source_manifest=projection_source_manifest(evidence),
+        fantasypros_benchmark=fantasypros_league_benchmark(
+            captured_at=NOW,
+            team_ids=("primary", "other"),
         ),
+        ensemble_config=ensemble_config,
+        scenario_config=baseline.scenarios.config,
+        strength_formula=formula,
+        strength_model=strength_model,
+        ecr_snapshots=ecr_snapshots,
         projection_evidence=evidence,
         player_names={player_id: player_id.upper() for player_id in ALL_POINTS},
         waiver_pool=waiver_pool(),
@@ -245,8 +373,141 @@ def engine_bundle():
     )
 
 
+def rebuild_bundle_inputs(
+    bundle,
+    *,
+    state=None,
+    projections=None,
+    projection_evidence=None,
+    nfl_schedule=None,
+    ensemble_config=None,
+    ecr_snapshots=None,
+):
+    state = state or bundle.state
+    projections = tuple(projections or bundle.projections)
+    evidence = tuple(projection_evidence or bundle.projection_evidence)
+    schedule = nfl_schedule or bundle.nfl_schedule
+    config = ensemble_config or bundle.ensemble_config
+    ecr = tuple(ecr_snapshots or bundle.ecr_snapshots)
+    player_teams = {}
+    for row in projections:
+        player_teams.setdefault(row.canonical_player_id, row.nfl_team_id)
+    features = build_strength_features(
+        ecr,
+        projections,
+        bundle.eligibilities,
+        provider_names=tuple(row.provider for row in config.provider_weights),
+        projection_evidence=evidence,
+        remaining_week_scopes={
+            player_id: tuple(
+                row.week
+                for row in schedule.team_weeks
+                if row.nfl_team_id == nfl_team_id
+                and row.status is NflTeamWeekStatus.SCHEDULED
+                and row.week >= state.first_remaining_week
+            )
+            for player_id, nfl_team_id in player_teams.items()
+        },
+    )
+    model = bundle.strength_formula.build_model(features, bundle.rosters)
+    attestation = replace(
+        bundle.methodology_attestation,
+        strength_model_id=model.model_id,
+    )
+    return replace(
+        bundle,
+        state=state,
+        projections=projections,
+        projection_evidence=evidence,
+        projection_source_manifest=projection_source_manifest(evidence),
+        nfl_schedule=schedule,
+        ensemble_config=config,
+        ecr_snapshots=ecr,
+        strength_model=model,
+        methodology_attestation=attestation,
+    )
+
+
+def ros_derived_bundle(*, explicit_not_published=False):
+    """Build a bundle whose current value depends on a future direct source row."""
+
+    bundle = engine_bundle()
+    target = next(
+        row for row in bundle.projections if row.canonical_player_id == "p1"
+    )
+    observation = target.provider_observations[0]
+    derived_points = 5.0
+    derived_projection = replace(
+        target,
+        provider_observations=(
+            replace(
+                observation,
+                projected_fantasy_points=derived_points,
+            ),
+        ),
+        projected_fantasy_points=derived_points,
+    )
+    source = next(
+        row
+        for row in bundle.projection_evidence
+        if isinstance(row, WeeklyProjection) and row.canonical_player_id == "p1"
+    )
+    future_direct = replace(
+        source,
+        week=2,
+        projected_fantasy_points=4.0,
+        raw_projected_stats={"points": 4.0},
+        nfl_game_id="G2-p1",
+    )
+    remaining = RemainingSeasonProjection(
+        canonical_player_id=source.canonical_player_id,
+        snapshot_id=source.snapshot_id,
+        scoring_profile_id=source.scoring_profile_id,
+        provider=source.provider,
+        provider_player_id=source.provider_player_id,
+        season=source.season,
+        applicable_weeks=tuple(range(1, 19)),
+        status=ProjectionStatus.OBSERVED,
+        origin=RemainingSeasonOrigin.PROVIDER_PUBLISHED,
+        captured_at=NOW,
+        projected_fantasy_points=89.0,
+        raw_projected_stats={"points": 89.0},
+    )
+    projections = tuple(
+        derived_projection if row is target else row for row in bundle.projections
+    )
+    source_rows = ()
+    if explicit_not_published:
+        source_rows = (
+            replace(
+                source,
+                status=ProjectionStatus.NOT_PUBLISHED,
+                projected_fantasy_points=None,
+                raw_projected_stats={},
+            ),
+        )
+    evidence = tuple(
+        replace(row, applicable_weeks=tuple(range(1, 19)))
+        if isinstance(row, RemainingSeasonProjection)
+        and row.canonical_player_id != "p1"
+        else row
+        for row in bundle.projection_evidence
+        if row is not source
+        and not (
+            isinstance(row, RemainingSeasonProjection)
+            and row.canonical_player_id == "p1"
+        )
+    ) + source_rows + (future_direct, remaining)
+    return rebuild_bundle_inputs(
+        bundle,
+        projections=projections,
+        projection_evidence=evidence,
+        nfl_schedule=nfl_schedule_for(projections),
+    )
+
+
 class EngineBundleTests(unittest.TestCase):
-    def test_methodology_status_is_exact_only_inside_attested_trade_scope(self):
+    def test_methodology_status_is_holdout_validated_only_inside_attested_shape(self):
         attestation = engine_bundle().methodology_attestation
         self.assertEqual(
             attestation.power_result_status(
@@ -254,7 +515,7 @@ class EngineBundleTests(unittest.TestCase):
                 incoming_count=1,
                 has_roster_adjustment=False,
             ),
-            "exact",
+            "holdout_validated",
         )
         for outgoing, incoming, adjusted in (
             (1, 2, False),
@@ -277,7 +538,11 @@ class EngineBundleTests(unittest.TestCase):
     def test_strict_json_round_trip_and_atomic_file_persistence(self):
         bundle = engine_bundle()
         record = bundle.to_record()
-        self.assertEqual(record["schema_version"], 6)
+        self.assertEqual(record["schema_version"], 8)
+        self.assertEqual(
+            record["projection_source_manifest"],
+            bundle.projection_source_manifest.to_record(),
+        )
         self.assertIsNone(record["surrogate_disclosure"])
         self.assertEqual(
             record["methodology_attestation"]["attestation_id"],
@@ -321,7 +586,13 @@ class EngineBundleTests(unittest.TestCase):
             rosters=rosters,
             projections=baseline.projections,
             eligibilities=baseline.eligibilities,
+            nfl_schedule=baseline.nfl_schedule,
+            source_manifest=baseline.source_manifest,
+            projection_source_manifest=baseline.projection_source_manifest,
+            fantasypros_benchmark=baseline.fantasypros_benchmark,
+            ensemble_config=baseline.ensemble_config,
             scenario_config=baseline.scenario_config,
+            strength_formula=baseline.strength_formula,
             strength_model=baseline.strength_model,
             ecr_snapshots=baseline.ecr_snapshots,
             projection_evidence=baseline.projection_evidence,
@@ -346,7 +617,13 @@ class EngineBundleTests(unittest.TestCase):
             rosters=tuple(reversed(bundle.rosters)),
             projections=tuple(reversed(bundle.projections)),
             eligibilities=tuple(reversed(bundle.eligibilities)),
+            nfl_schedule=bundle.nfl_schedule,
+            source_manifest=bundle.source_manifest,
+            projection_source_manifest=bundle.projection_source_manifest,
+            fantasypros_benchmark=bundle.fantasypros_benchmark,
+            ensemble_config=bundle.ensemble_config,
             scenario_config=bundle.scenario_config,
+            strength_formula=bundle.strength_formula,
             strength_model=bundle.strength_model,
             ecr_snapshots=tuple(reversed(bundle.ecr_snapshots)),
             projection_evidence=tuple(reversed(bundle.projection_evidence)),
@@ -369,11 +646,13 @@ class EngineBundleTests(unittest.TestCase):
         bundle = engine_bundle()
         legacy = copy.deepcopy(bundle.to_record())
         legacy.pop("scoring_profile")
-        for old_schema in (1, 2, 3, 4):
+        for old_schema in (1, 2, 3, 4, 5, 6, 7):
             with self.subTest(old_schema=old_schema):
                 legacy["schema_version"] = old_schema
-                with self.assertRaisesRegex(ValueError, "fields are invalid"):
+                with self.assertRaises(UnsupportedEngineBundleSchema) as raised:
                     EngineBundle.from_record(legacy)
+                self.assertEqual(raised.exception.schema_version, old_schema)
+                self.assertIn("collect the league again", str(raised.exception))
 
         tampered = copy.deepcopy(bundle.to_record())
         tampered["scoring_profile"]["settings"]["reception"] = 0
@@ -395,7 +674,13 @@ class EngineBundleTests(unittest.TestCase):
                 rosters=bundle.rosters,
                 projections=bundle.projections[:-1],
                 eligibilities=bundle.eligibilities,
+                nfl_schedule=bundle.nfl_schedule,
+                source_manifest=bundle.source_manifest,
+                projection_source_manifest=bundle.projection_source_manifest,
+                fantasypros_benchmark=bundle.fantasypros_benchmark,
+                ensemble_config=bundle.ensemble_config,
                 scenario_config=bundle.scenario_config,
+                strength_formula=bundle.strength_formula,
                 strength_model=bundle.strength_model,
                 ecr_snapshots=bundle.ecr_snapshots,
                 projection_evidence=bundle.projection_evidence,
@@ -403,6 +688,27 @@ class EngineBundleTests(unittest.TestCase):
                 waiver_pool=bundle.waiver_pool,
                 methodology_attestation=bundle.methodology_attestation,
             )
+
+    def test_rejects_split_simulation_and_strength_eligibility(self):
+        bundle = engine_bundle()
+        first, *rest = bundle.eligibilities
+        changed = PlayerEligibility(first.canonical_player_id, ("K",))
+
+        with self.assertRaisesRegex(ValueError, "simulation eligibility"):
+            replace(bundle, eligibilities=(changed, *rest))
+
+    def test_rejects_ensemble_provider_identity_without_raw_evidence(self):
+        bundle = engine_bundle()
+        evidence = tuple(
+            replace(row, provider_player_id="detached-provider-player")
+            if row.canonical_player_id == "p1"
+            and row.provider == "fantasypros"
+            else row
+            for row in bundle.projection_evidence
+        )
+
+        with self.assertRaisesRegex(ValueError, "matching projection evidence"):
+            replace(bundle, projection_evidence=evidence)
         with self.assertRaisesRegex(ValueError, "normalized source projections"):
             EngineBundle(
                 state=bundle.state,
@@ -410,7 +716,13 @@ class EngineBundleTests(unittest.TestCase):
                 rosters=bundle.rosters,
                 projections=bundle.projections,
                 eligibilities=bundle.eligibilities,
+                nfl_schedule=bundle.nfl_schedule,
+                source_manifest=bundle.source_manifest,
+                projection_source_manifest=bundle.projection_source_manifest,
+                fantasypros_benchmark=bundle.fantasypros_benchmark,
+                ensemble_config=bundle.ensemble_config,
                 scenario_config=bundle.scenario_config,
+                strength_formula=bundle.strength_formula,
                 strength_model=bundle.strength_model,
                 ecr_snapshots=bundle.ecr_snapshots,
                 projection_evidence=(),
@@ -418,6 +730,234 @@ class EngineBundleTests(unittest.TestCase):
                 waiver_pool=bundle.waiver_pool,
                 methodology_attestation=bundle.methodology_attestation,
             )
+
+    def test_rejects_projection_evidence_outside_the_calculation_universe(self):
+        bundle = engine_bundle()
+        source = next(
+            row
+            for row in bundle.projection_evidence
+            if isinstance(row, RemainingSeasonProjection)
+        )
+        ghost = replace(
+            source,
+            canonical_player_id="ghost",
+            provider_player_id="ghost-provider-id",
+        )
+
+        with self.assertRaisesRegex(ValueError, "outside the calculation universe"):
+            replace(bundle, projection_evidence=(*bundle.projection_evidence, ghost))
+
+        unconfigured = replace(
+            source,
+            provider="unconfigured",
+            provider_player_id="unconfigured-provider-id",
+        )
+        with self.assertRaisesRegex(ValueError, "outside the ensemble configuration"):
+            replace(
+                bundle,
+                projection_evidence=(*bundle.projection_evidence, unconfigured),
+            )
+
+        identity_collision = replace(source, canonical_player_id="p2")
+        with self.assertRaisesRegex(ValueError, "maps to multiple calculation players"):
+            replace(
+                bundle,
+                projection_evidence=(*bundle.projection_evidence, identity_collision),
+            )
+
+    def test_accepts_exact_ros_residual_after_future_direct_rows(self):
+        bundle = ros_derived_bundle()
+
+        restored = EngineBundle.from_record(bundle.to_record())
+        target = next(
+            row for row in restored.projections if row.canonical_player_id == "p1"
+        )
+
+        self.assertEqual(
+            target.provider_observations[0].projected_fantasy_points,
+            5.0,
+        )
+
+    def test_ros_residual_replaces_an_explicit_not_published_row(self):
+        bundle = ros_derived_bundle(explicit_not_published=True)
+
+        target = next(
+            row for row in bundle.projections if row.canonical_player_id == "p1"
+        )
+
+        self.assertEqual(
+            target.provider_observations[0].projected_fantasy_points,
+            5.0,
+        )
+
+    def test_rejects_tampered_ros_derived_provider_value(self):
+        bundle = ros_derived_bundle()
+        target = next(
+            row for row in bundle.projections if row.canonical_player_id == "p1"
+        )
+        observation = target.provider_observations[0]
+        tampered = replace(
+            target,
+            provider_observations=(
+                replace(observation, projected_fantasy_points=5.1),
+            ),
+            projected_fantasy_points=5.1,
+        )
+        projections = tuple(
+            tampered if row is target else row for row in bundle.projections
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not reconcile to ROS"):
+            replace(bundle, projections=projections)
+
+    def test_rejects_full_horizon_evidence_detached_from_the_strength_model(self):
+        bundle = engine_bundle()
+        target = next(
+            row
+            for row in bundle.projection_evidence
+            if isinstance(row, RemainingSeasonProjection)
+            and row.canonical_player_id == "p1"
+        )
+        evidence = tuple(
+            replace(
+                row,
+                projected_fantasy_points=row.projected_fantasy_points + 1,
+            )
+            if row is target
+            else row
+            for row in bundle.projection_evidence
+        )
+
+        with self.assertRaisesRegex(ValueError, "strength model does not match"):
+            replace(bundle, projection_evidence=evidence)
+
+    def test_rejects_detached_ensemble_configuration_and_nfl_schedule(self):
+        bundle = engine_bundle()
+        changed_config = EnsembleConfig(
+            (ProviderWeight("fantasypros", 2),),
+            bundle.ensemble_config.minimum_observed_sources,
+            bundle.ensemble_config.position_stddev_floors,
+        )
+        with self.assertRaisesRegex(ValueError, "provider weight"):
+            replace(bundle, ensemble_config=changed_config)
+
+        target_game = bundle.projections[0].nfl_game_id
+        changed_schedule = NflSchedule(
+            bundle.nfl_schedule.season,
+            bundle.nfl_schedule.captured_at,
+            bundle.nfl_schedule.source_provider,
+            tuple(
+                replace(row, nfl_game_id="different-game")
+                if row.nfl_game_id == target_game
+                else row
+                for row in bundle.nfl_schedule.team_weeks
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "NFL schedule"):
+            replace(bundle, nfl_schedule=changed_schedule)
+
+        truncated_schedule = nfl_schedule_for(bundle.projections, weeks=(1,))
+        with self.assertRaisesRegex(ValueError, "through week 18"):
+            replace(bundle, nfl_schedule=truncated_schedule)
+
+    def test_rejects_projection_position_outside_player_eligibility(self):
+        bundle = engine_bundle()
+        projections = tuple(
+            replace(row, position="WR")
+            if row.canonical_player_id == "p1"
+            else row
+            for row in bundle.projections
+        )
+
+        with self.assertRaisesRegex(ValueError, "primary position"):
+            replace(bundle, projections=projections)
+
+    def test_rejects_raw_weekly_team_or_game_context_contradictions(self):
+        bundle = engine_bundle()
+        target = next(
+            row
+            for row in bundle.projection_evidence
+            if isinstance(row, WeeklyProjection)
+            and row.canonical_player_id == "p1"
+        )
+        wrong_team = tuple(
+            replace(row, nfl_team_id="WRONG") if row is target else row
+            for row in bundle.projection_evidence
+        )
+        with self.assertRaisesRegex(ValueError, "NFL team"):
+            replace(bundle, projection_evidence=wrong_team)
+
+        tampered = copy.deepcopy(bundle.to_record())
+        raw = next(
+            row
+            for row in tampered["projection_evidence"]
+            if row["kind"] == "weekly" and row["canonical_player_id"] == "p1"
+        )
+        raw["nfl_game_id"] = "WRONG-GAME"
+        with self.assertRaisesRegex(ValueError, "game context"):
+            EngineBundle.from_record(tampered)
+
+    def test_rejects_a_strength_formula_detached_from_methodology_evidence(self):
+        bundle = engine_bundle()
+        formula = replace(bundle.strength_formula, source_fit_id="different-fit")
+
+        with self.assertRaisesRegex(ValueError, "strength formula"):
+            replace(bundle, strength_formula=formula)
+
+    def test_rejects_a_formula_with_a_different_declared_feature_policy(self):
+        bundle = engine_bundle()
+        current = bundle.methodology_attestation.methodology_fingerprint
+        fingerprint = MethodologyFingerprint(
+            current.analyzer_bundle,
+            current.response_schema_sha256,
+            PowerMethodology(("ecr_ros_inverse_rank",), ("presence",)),
+            current.role_definitions,
+        )
+        decision = FormulaReuseDecision(
+            FormulaAction.RECALIBRATE,
+            ("test feature-policy mismatch",),
+            fingerprint.fingerprint_id,
+        )
+        with self.assertRaisesRegex(ValueError, "feature policy changed"):
+            MethodologyAttestation.from_refresh(
+                formula=bundle.strength_formula,
+                strength_model=bundle.strength_model,
+                methodology_fingerprint=fingerprint,
+                formula_decision=decision,
+                reuse_verification=None,
+            )
+
+        # The bundle boundary independently rejects a detached record loaded from
+        # storage, even if it bypassed the normal refresh constructor.
+        attestation = replace(
+            bundle.methodology_attestation,
+            methodology_fingerprint=fingerprint,
+            formula_decision=decision,
+        )
+
+        with self.assertRaisesRegex(ValueError, "feature policy changed"):
+            replace(bundle, methodology_attestation=attestation)
+
+    def test_rejects_observed_value_without_weekly_or_ros_support(self):
+        bundle = engine_bundle()
+        target = next(
+            row
+            for row in bundle.projection_evidence
+            if isinstance(row, WeeklyProjection)
+            and row.canonical_player_id == "p1"
+        )
+        future_only = replace(target, week=2, nfl_game_id="G2")
+        evidence = tuple(
+            future_only if row is target else row
+            for row in bundle.projection_evidence
+            if not (
+                isinstance(row, RemainingSeasonProjection)
+                and row.canonical_player_id == "p1"
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "lacks matching projection evidence"):
+            replace(bundle, projection_evidence=evidence)
 
     def test_rejects_detached_or_tampered_methodology_attestation(self):
         bundle = engine_bundle()

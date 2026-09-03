@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .analyzer_contract import PowerRankingChange
-from .roster_adjustment import PreparedRosterAdjuster, TeamRosterAdjustment
+from .roster_adjustment import (
+    InfeasibleRosterAdjustment,
+    PreparedRosterAdjuster,
+    TeamRosterAdjustment,
+)
 from .search_runner import TradeSearchSettings
 from .strength import RosterStrength, StrengthModel
 from .three_way_search_records import (
@@ -165,10 +169,10 @@ class ResumableThreeWayTradeSearch:
             for left, right in zip(space.rosters, prepared.rosters)
         ):
             raise ValueError("trade space and prepared rosters do not match")
-        if space.constraints.require_no_drops and prepared.adjuster is not None:
-            raise ValueError("no-drop trades require pure simultaneous roster changes")
-        if not space.constraints.require_no_drops and prepared.adjuster is None:
-            raise ValueError("trades allowing roster drops require a prepared adjuster")
+        if prepared.adjuster is None:
+            raise ValueError("trade searches require a prepared roster adjuster")
+        if prepared.adjuster.forbid_drops is not space.constraints.require_no_drops:
+            raise ValueError("roster adjuster drop policy does not match trade constraints")
         baseline_by_team = {row.team_id: row for row in baseline.scenarios.rosters}
         if any(
             roster.team_id not in baseline_by_team
@@ -209,10 +213,14 @@ class ResumableThreeWayTradeSearch:
                     store.checkpoint(index)
                     next_index, cancelled = index, True
                     break
-                power = self.prepared.evaluate(candidate, candidate_index=index)
+                try:
+                    power = self.prepared.evaluate(candidate, candidate_index=index)
+                except InfeasibleRosterAdjustment:
+                    power = None
                 next_index = index + 1
-                qualified = self._power_qualifies(power)
+                qualified = power is not None and self._power_qualifies(power)
                 if qualified:
+                    assert power is not None
                     result = self._simulate_candidate(power)
                     store.upsert_qualified_result(
                         result, next_candidate_index=next_index

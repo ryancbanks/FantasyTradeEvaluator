@@ -7,6 +7,7 @@ from math import isfinite
 from numbers import Real
 from pathlib import Path
 
+from .roster_adjustment import InfeasibleRosterAdjustment
 from .search import PreparedTradePair, TradePowerEvaluation
 from .search_store import (
     QualifiedSearchResult,
@@ -112,8 +113,11 @@ class ResumableTradeSearch:
             trade_space.counterparty, prepared_strength.counterparty
         ):
             raise ValueError("trade space and prepared strength teams do not match")
-        if not trade_space.constraints.require_no_drops and prepared_strength.adjuster is None:
-            raise ValueError("trades allowing roster drops require a prepared roster adjuster")
+        adjuster = prepared_strength.adjuster
+        if adjuster is None:
+            raise ValueError("trade searches require a prepared roster adjuster")
+        if adjuster.forbid_drops is not trade_space.constraints.require_no_drops:
+            raise ValueError("roster adjuster drop policy does not match trade constraints")
         baseline_by_team = {
             roster.team_id: roster for roster in season_baseline.scenarios.rosters
         }
@@ -194,10 +198,16 @@ class ResumableTradeSearch:
                     next_index = index
                     cancelled = True
                     break
-                power = self.prepared_strength.evaluate(candidate, candidate_index=index)
+                try:
+                    power = self.prepared_strength.evaluate(
+                        candidate, candidate_index=index
+                    )
+                except InfeasibleRosterAdjustment:
+                    power = None
                 next_index = index + 1
-                qualified = self._power_qualifies(power)
+                qualified = power is not None and self._power_qualifies(power)
                 if qualified:
+                    assert power is not None
                     saved = self._simulate_candidate(power)
                     store.upsert_qualified_result(saved, next_candidate_index=next_index)
                     saved_results.append(saved)

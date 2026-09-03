@@ -42,7 +42,7 @@ CAPTURED_AT = "2026-09-01T14:15:16Z"
 
 
 class CapturePlanTests(unittest.TestCase):
-    def test_round_trip_is_strict_content_addressed_and_queryless(self):
+    def test_round_trip_is_strict_content_addressed_and_uses_only_public_dimensions(self):
         tasks = (
             projection_task("fantasypros"), projection_task("espn"),
             projection_task("yahoo"), analyzer_task(), ecr_task("weekly"), ecr_task("ros"),
@@ -54,7 +54,11 @@ class CapturePlanTests(unittest.TestCase):
         json.dumps(record, allow_nan=False)
         self.assertEqual(capture_plan_from_record(record), plan)
         self.assertEqual(len({task.task_id for task in tasks}), len(tasks))
-        self.assertNotIn("?", json.dumps(record))
+        self.assertEqual(
+            record["tasks"][0]["url"],
+            "https://www.fantasypros.com/nfl/projections/rb.php?week=1&scoring=PPR",
+        )
+        self.assertNotIn("secret", json.dumps(record).casefold())
 
         changed = copy.deepcopy(record)
         changed["tasks"][0]["week"] = 2
@@ -131,12 +135,12 @@ class CapturePlanTests(unittest.TestCase):
                 "league": LEAGUE_SOURCE_SCHEMA_FINGERPRINT,
             },
             {
-                "task": "capschema_14dd3e69ae0237cd2f3a451ed1a412e4cc0c34415499a3dbfe224a4608ce5841",
-                "plan": "capschema_7637127ff6ae3e425ae723916a45daa62d579d58ded2ab687ea3d1bc702e6704",
+                "task": "capschema_a9f3ffe2d793437e248ec9d71d67c6660525344b2c930c0217d0bfeddc95c08c",
+                "plan": "capschema_cd80db37533fe7d8d11fd8227e6523b1714c870d69e6b74b66444f6f8cd0f7ad",
                 "table": "capschema_abde1ebf0213e2cde16382bd6448a1a254e4efa9745745334c7977a6e90e068b",
                 "analyzer": "capschema_bcf693343ec0769715115324a1c4e1bd210d418eb52abca72cca5d820f73092e",
-                "ecr_task": "capschema_75f616f4218befaa96bd8caaa5179825b5e22f4e088174d0e989f869602ef9a6",
-                "ecr": "capschema_7efe13de770357c2bc8031b32b1da11697c198e630c3664b6642b1a4dfb94faf",
+                "ecr_task": "capschema_62035209fe09acc94aece7e364f3af99fa5c9ba622decd4213dfd5af7ecb7175",
+                "ecr": "capschema_4c36763ac799eb4a267a836e532eecbd2e7582ab0f379272e753a31828569092",
                 "league": "capschema_d21e24b0e4ed0e7e97b1826bb8f8f8e40da8a52432be37b696dad6d52558291b",
             },
         )
@@ -325,6 +329,19 @@ class LeagueArtifactTests(unittest.TestCase):
                 changed_sources,
             )
 
+    def test_bootstrap_player_crosswalk_ids_are_unique_and_typed(self):
+        source = league_sources()[0].to_record()
+        players = source["body"]["payload"]["players"]
+        players[0]["espn_id"] = "2001"
+        players[1]["espn_id"] = "2001"
+        with self.assertRaisesRegex(ValueError, "unique espn_id"):
+            LeagueSource.from_record(source)
+
+        source = league_sources()[0].to_record()
+        source["body"]["payload"]["players"][0]["yahoo_id"] = 3001
+        with self.assertRaisesRegex(ValueError, "positive decimal"):
+            LeagueSource.from_record(source)
+
     def test_semantically_empty_error_and_unrelated_league_payloads_fail_closed(self):
         for payload in ({"ok": True}, {"error": "signed out"}, {"leagues": []}):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
@@ -390,6 +407,22 @@ class ECRArtifactTests(unittest.TestCase):
     def test_weekly_and_ros_are_distinct_and_export_is_not_falsely_exposed(self):
         weekly, ros = ecr_task("weekly"), ecr_task("ros")
         self.assertNotEqual(weekly.task_id, ros.task_id)
+        self.assertEqual(
+            weekly.to_record()["expert_selection_policy"],
+            "fantasypros_latest_ecr_v1",
+        )
+        with self.assertRaisesRegex(ValueError, "expert_selection_policy"):
+            FantasyProsECRTask(
+                2026,
+                1,
+                "weekly",
+                "PPR",
+                ("RB",),
+                (),
+                None,
+                "https://www.fantasypros.com/nfl/rankings/ppr-rb.php",
+                expert_selection_policy="signed_in_preference",
+            )
         with self.assertRaises(ValueError):
             FantasyProsECRTask(
                 2026, 1, "weekly", "PPR", ("RB",), (), None,
@@ -404,19 +437,23 @@ class ECRArtifactTests(unittest.TestCase):
     def test_ecr_preserves_exact_rank_fields_experts_and_update_evidence(self):
         task = ecr_task("weekly", expected=True)
         artifact = FantasyProsECRArtifact.from_task(
-            task, last_updated_text="9/01", last_updated_at=None,
-            captured_at=CAPTURED_AT, rankings=(ranking_row(),),
+            task, source_scoring="PPR", last_updated_text="9/01", last_updated_at=None,
+            captured_at=CAPTURED_AT,
+            source_details=ecr_source_details(),
+            rankings=(ranking_row(),),
         )
         record = artifact_to_record(artifact, task)
         self.assertEqual(record["expert_ids"], ["1204", "7639"])
         self.assertEqual(record["rankings"][0]["rank_std"], 0.8)
         self.assertEqual(record["last_updated_text"], "9/01")
+        self.assertEqual(record["source_scoring"], "PPR")
+        self.assertEqual(record["schema_version"], 4)
         self.assertEqual(artifact_from_record(record, task), artifact)
 
 
 def projection_task(provider="espn"):
     urls = {
-        "fantasypros": "https://www.fantasypros.com/nfl/projections/rb.php",
+        "fantasypros": "https://www.fantasypros.com/nfl/projections/rb.php?week=1&scoring=PPR",
         "espn": "https://fantasy.espn.com/football/players/projections",
         "yahoo": "https://football.fantasysports.yahoo.com/f1/players",
     }
@@ -446,7 +483,8 @@ def ecr_task(horizon, expected=False):
         2026, 1, horizon, "PPR", ("RB",),
         ("1204", "7639") if expected else (), 2 if expected else None,
         "https://www.fantasypros.com/nfl/rankings/ppr-rb.php"
-        if horizon == "weekly" else "https://www.fantasypros.com/nfl/rankings/ros-rb.php",
+        if horizon == "weekly"
+        else "https://www.fantasypros.com/nfl/rankings/ros-ppr-rb.php",
     )
 
 
@@ -471,3 +509,4 @@ def power_body():
 
 if __name__ == "__main__":
     unittest.main()
+from tests.ecr_fixtures import ecr_source_details

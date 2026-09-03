@@ -27,7 +27,7 @@ from .score_scenarios import PreparedScoreScenarios
 from .season import SeasonProjection
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _TITLE_POWER_POINTS_PER_DOUBLING = 10.0
 _POSITION_ORDER = ("QB", "RB", "WR", "TE", "FLEX", "K", "DST")
 
@@ -65,6 +65,9 @@ def build_league_dashboard(
     state = bundle.state
     weeks = state.remaining_regular_season_weeks
     team_names = {team.team_id: team.name for team in state.teams}
+    benchmark_by_team = {
+        team.team_id: team for team in bundle.fantasypros_benchmark.teams
+    }
     roster_by_team = {roster.team_id: roster for roster in bundle.rosters}
     projection_by_team = {
         team.team_id: team for team in baseline_projection.teams
@@ -83,6 +86,14 @@ def build_league_dashboard(
             projection_by_team[team_id].mean_rank,
             -projection_by_team[team_id].expected_final_wins,
         ),
+    )
+    shared_outcome_factors = any(
+        value > 0
+        for value in (
+            bundle.scenario_config.loadings.league,
+            bundle.scenario_config.loadings.game,
+            bundle.scenario_config.loadings.nfl_team,
+        )
     )
 
     weekly, win_points, title_totals = _scenario_summaries(
@@ -126,8 +137,7 @@ def build_league_dashboard(
         projection = projection_by_team[team_id]
         current = projection.current_standing
         games_played = current.wins + current.losses + current.ties
-        rows.append(
-            {
+        team_record = {
                 "team_id": team_id,
                 "team_name": team_names[team_id],
                 "power_rank": power_ranks[team_id],
@@ -193,8 +203,14 @@ def build_league_dashboard(
                     }
                     for position in positions
                 ],
-            }
+        }
+        team_record["fantasypros_comparison"] = _team_benchmark_comparison(
+            team_record,
+            benchmark_by_team[team_id],
         )
+        rows.append(team_record)
+
+    comparison = _benchmark_summary(bundle, rows)
 
     result = {
         "schema_version": _SCHEMA_VERSION,
@@ -210,6 +226,23 @@ def build_league_dashboard(
         "playoff_team_count": state.playoff_rules.qualifier_count,
         "power_engine_mode": bundle.methodology_mode,
         "power_engine_notice": _power_notice(bundle.methodology_mode),
+        "host_settlement_policy": {
+            "status": "partially_inferred",
+            "methodology": (
+                "The captured host rule fields and completed matchup history drive "
+                "the local ranking implementation. FantasyPros current ranks are "
+                "compared below as a diagnostic cross-check."
+            ),
+            "limitations": (
+                "The bundle does not contain an authoritative host contract for "
+                "every future multi-team tie group, so current-rank agreement does "
+                "not certify all future settlement cases."
+            ),
+            "current_rank_matches_fantasypros": comparison[
+                "current_rank_all_match"
+            ],
+        },
+        "fantasypros_comparison": comparison,
         "championship_model": {
             "kind": "field_conditioned_power_share_v1",
             "status": "modeled_estimate",
@@ -227,11 +260,20 @@ def build_league_dashboard(
             "power_points_per_doubling": _TITLE_POWER_POINTS_PER_DOUBLING,
         },
         "weekly_model": {
-            "kind": "mean_optimized_correlated_scenarios_v1",
+            "kind": (
+                "mean_optimized_correlated_scenarios_v1"
+                if shared_outcome_factors
+                else "mean_optimized_independent_scenarios_v1"
+            ),
             "score_decimal_places": baseline_projection.score_decimal_places,
             "methodology": (
                 "Each week's legal lineup is optimized from ensemble means, then "
-                "evaluated across the bundle's correlated score scenarios."
+                "evaluated across the bundle's "
+                + (
+                    "shared league/game/team-factor score scenarios."
+                    if shared_outcome_factors
+                    else "independent player-outcome score scenarios."
+                )
             ),
         },
         "schedule_difficulty_model": {
@@ -248,6 +290,82 @@ def build_league_dashboard(
     }
     validate_dashboard_result(result)
     return result
+
+
+def _team_benchmark_comparison(local, source):
+    """Keep source values and signed local-minus-source drift side by side."""
+
+    current_record = local["current_record"]
+    projected_record = local["projected_record"]
+    return {
+        "status": "comparison_only",
+        "source_team_name": source.team_name,
+        "source": {
+            "current_rank": source.current_rank,
+            "projected_rank": source.projected_rank,
+            "current_record": _record(
+                source.current_wins,
+                source.current_losses,
+                0.0,
+            ),
+            "projected_record": _record(
+                source.projected_wins,
+                source.projected_losses,
+                0.0,
+            ),
+            "playoff_probability": source.playoff_probability,
+            "championship_probability": source.championship_probability,
+        },
+        "current_rank_match": local["current_rank"] == source.current_rank,
+        "current_record_match": (
+            current_record["wins"] == source.current_wins
+            and current_record["losses"] == source.current_losses
+        ),
+        "local_minus_source": {
+            "current_rank": local["current_rank"] - source.current_rank,
+            "projected_rank": local["mean_projected_rank"] - source.projected_rank,
+            "projected_wins": (
+                projected_record["wins"] - source.projected_wins
+            ),
+            "projected_losses": (
+                projected_record["losses"] - source.projected_losses
+            ),
+            "playoff_probability": (
+                local["playoff_probability"] - source.playoff_probability
+            ),
+            "championship_probability": (
+                local["championship_probability"]
+                - source.championship_probability
+            ),
+        },
+    }
+
+
+def _benchmark_summary(bundle, rows):
+    rank_matches = sum(
+        row["fantasypros_comparison"]["current_rank_match"] for row in rows
+    )
+    record_matches = sum(
+        row["fantasypros_comparison"]["current_record_match"] for row in rows
+    )
+    return {
+        "status": "comparison_only",
+        "benchmark_id": bundle.fantasypros_benchmark.benchmark_id,
+        "source_artifact_id": bundle.fantasypros_benchmark.source_artifact_id,
+        "captured_at": bundle.fantasypros_benchmark.captured_at.isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z"),
+        "team_count": len(rows),
+        "current_rank_match_count": rank_matches,
+        "current_rank_all_match": rank_matches == len(rows),
+        "current_record_match_count": record_matches,
+        "current_record_all_match": record_matches == len(rows),
+        "delta_direction": "local_minus_fantasypros",
+        "policy": (
+            "FantasyPros values are retained only for drift review and are never "
+            "inputs to local standings, playoff, or championship calculations."
+        ),
+    }
 
 
 def _scenario_summaries(bundle, baseline, scenarios, power_scores):
@@ -425,10 +543,11 @@ def _scenario_sampling(bundle_count, dashboard_count):
 
 
 def _power_notice(mode):
-    if mode == "exact":
+    if mode == "holdout_validated":
         return (
             "Power scores use this bundle's calibrated FantasyPros-method model; "
-            "exact-method claims remain limited to its attested trade scope."
+            "representative blind holdouts validate only the listed trade shapes, "
+            "not every possible player combination."
         )
     return (
         "Power scores use this bundle's disclosed surrogate model and are "

@@ -6,10 +6,14 @@ from datetime import datetime
 from enum import Enum
 import math
 from numbers import Real
+import re
+import unicodedata
 
 
 __all__ = (
     "ProjectionStatus",
+    "ProviderStatusObservation",
+    "ProviderStatusScope",
     "WeeklyProjectionOrigin",
     "RemainingSeasonOrigin",
     "RemainingSeasonProjection",
@@ -41,6 +45,40 @@ class WeeklyProjectionOrigin(str, Enum):
 
     PROVIDER_PUBLISHED = "provider_published"
     DERIVED_REST_OF_SEASON = "derived_rest_of_season"
+
+
+class ProviderStatusScope(str, Enum):
+    """The provider page on which a non-authoritative designation appeared."""
+
+    WEEKLY = "weekly"
+    REST_OF_SEASON = "ros"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderStatusObservation:
+    """A provider's captured label, not a determination that a player will play."""
+
+    designation: str
+    captured_at: datetime
+    source_scope: ProviderStatusScope
+    source_week: int | None = None
+
+    def __post_init__(self) -> None:
+        _validate_designation(self.designation)
+        _require_aware_datetime("provider status captured_at", self.captured_at)
+        if not isinstance(self.source_scope, ProviderStatusScope):
+            raise ValueError(
+                "provider status source_scope must be a ProviderStatusScope"
+            )
+        if self.source_scope is ProviderStatusScope.WEEKLY:
+            _require_int(
+                "provider status source_week",
+                self.source_week,
+                minimum=1,
+                maximum=25,
+            )
+        elif self.source_week is not None:
+            raise ValueError("ROS provider status observation cannot have source_week")
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -95,6 +133,7 @@ class WeeklyProjection:
     is_home: bool | None = None
     source_published_at: datetime | None = None
     origin: WeeklyProjectionOrigin = WeeklyProjectionOrigin.PROVIDER_PUBLISHED
+    provider_status_observations: tuple[ProviderStatusObservation, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_identity(self)
@@ -103,6 +142,11 @@ class WeeklyProjection:
         _require_int("season", self.season, minimum=2012, maximum=None)
         _require_int("week", self.week, minimum=1, maximum=25)
         _validate_times(self.source_published_at, self.captured_at)
+        object.__setattr__(
+            self,
+            "provider_status_observations",
+            _status_observations(self.provider_status_observations, self.captured_at),
+        )
         _validate_week_context(self)
         points, stats = _validated_values(
             self.status,
@@ -130,6 +174,7 @@ class RemainingSeasonProjection:
     projected_fantasy_points: float | None = None
     raw_projected_stats: Mapping[str, float] = field(default_factory=dict)
     source_published_at: datetime | None = None
+    provider_status_observations: tuple[ProviderStatusObservation, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_identity(self)
@@ -146,6 +191,11 @@ class RemainingSeasonProjection:
             raise ValueError(f"{self.status.value} is not valid for a remaining-season projection")
         _require_int("season", self.season, minimum=2012, maximum=None)
         _validate_times(self.source_published_at, self.captured_at)
+        object.__setattr__(
+            self,
+            "provider_status_observations",
+            _status_observations(self.provider_status_observations, self.captured_at),
+        )
         weeks = _normalized_weeks(
             self.applicable_weeks,
             allow_empty=self.status is ProjectionStatus.NOT_APPLICABLE,
@@ -229,6 +279,7 @@ def derive_remaining_season(
         ),
         raw_projected_stats=aggregated_stats,
         source_published_at=published_at,
+        provider_status_observations=_merged_status_observations(selected),
     )
 
 
@@ -323,6 +374,58 @@ def _validate_times(published_at: datetime | None, captured_at: datetime) -> Non
         _require_aware_datetime("source_published_at", published_at)
         if published_at > captured_at:
             raise ValueError("source_published_at cannot be after captured_at")
+
+
+def _status_observations(values, captured_at):
+    if isinstance(values, (str, bytes)):
+        raise ValueError("provider_status_observations must be an iterable")
+    try:
+        observations = tuple(values)
+    except TypeError:
+        raise ValueError("provider_status_observations must be an iterable") from None
+    if any(not isinstance(row, ProviderStatusObservation) for row in observations):
+        raise ValueError(
+            "provider_status_observations must contain ProviderStatusObservation values"
+        )
+    if len(set(observations)) != len(observations):
+        raise ValueError("provider_status_observations cannot contain duplicates")
+    if any(row.captured_at > captured_at for row in observations):
+        raise ValueError("provider status observation cannot be newer than its projection")
+    return tuple(
+        sorted(
+            observations,
+            key=lambda row: (
+                row.captured_at,
+                row.source_scope.value,
+                row.source_week or 0,
+                row.designation.casefold(),
+                row.designation,
+            ),
+        )
+    )
+
+
+def _merged_status_observations(rows):
+    return tuple(
+        dict.fromkeys(
+            observation
+            for row in rows
+            for observation in row.provider_status_observations
+        )
+    )
+
+
+def _validate_designation(value: object) -> None:
+    if not isinstance(value, str) or not value:
+        raise ValueError("provider status designation must be a non-empty string")
+    if value != " ".join(value.split()) or len(value) > 80:
+        raise ValueError(
+            "provider status designation must be normalized and at most 80 characters"
+        )
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        raise ValueError("provider status designation cannot contain control characters")
+    if re.search(r"(?:https?://|www\.)", value, flags=re.IGNORECASE):
+        raise ValueError("provider status designation cannot contain a URL")
 
 
 def _normalized_weeks(

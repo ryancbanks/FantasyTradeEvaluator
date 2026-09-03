@@ -5,6 +5,8 @@ import unittest
 
 from trade_snapshot.projections import (
     ProjectionStatus,
+    ProviderStatusObservation,
+    ProviderStatusScope,
     RemainingSeasonOrigin,
     RemainingSeasonProjection,
     WeeklyProjection,
@@ -138,6 +140,37 @@ class WeeklyProjectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires nfl_team_id"):
             make_weekly(nfl_team_id=None)
 
+    def test_provider_status_is_bounded_observation_not_projection_availability(self):
+        observation = ProviderStatusObservation(
+            "Questionable",
+            CAPTURED_AT,
+            ProviderStatusScope.WEEKLY,
+            1,
+        )
+        projection = make_weekly(provider_status_observations=(observation,))
+
+        self.assertIs(projection.status, ProjectionStatus.OBSERVED)
+        self.assertEqual(projection.provider_status_observations, (observation,))
+        for designation in (" Q ", "https://example.test/status", "x" * 81):
+            with self.subTest(designation=designation), self.assertRaises(ValueError):
+                ProviderStatusObservation(
+                    designation,
+                    CAPTURED_AT,
+                    ProviderStatusScope.WEEKLY,
+                    1,
+                )
+        with self.assertRaisesRegex(ValueError, "newer"):
+            make_weekly(
+                provider_status_observations=(
+                    ProviderStatusObservation(
+                        "Out",
+                        CAPTURED_AT + timedelta(seconds=1),
+                        ProviderStatusScope.WEEKLY,
+                        1,
+                    ),
+                )
+            )
+
 
 class RemainingSeasonProjectionTests(unittest.TestCase):
     def test_ros_is_a_separate_type_with_the_same_missing_value_contract(self):
@@ -189,6 +222,14 @@ class RemainingSeasonProjectionTests(unittest.TestCase):
             week=1,
             projected_fantasy_points=10.25,
             raw_projected_stats={"targets": 6, "receiving_yards": 55},
+            provider_status_observations=(
+                ProviderStatusObservation(
+                    "Q",
+                    CAPTURED_AT,
+                    ProviderStatusScope.WEEKLY,
+                    1,
+                ),
+            ),
         )
         week2 = make_weekly(
             week=2,
@@ -217,6 +258,10 @@ class RemainingSeasonProjectionTests(unittest.TestCase):
         )
         self.assertEqual(ros.captured_at, week2.captured_at)
         self.assertIsNone(ros.source_published_at)
+        self.assertEqual(
+            ros.provider_status_observations,
+            week1.provider_status_observations,
+        )
 
     def test_derivation_rejects_missing_non_observed_and_duplicate_weeks(self):
         week1 = make_weekly(week=1)

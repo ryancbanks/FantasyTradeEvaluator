@@ -88,6 +88,17 @@ function compactNumber(value) {
   }
   return new Intl.NumberFormat(undefined, {maximumFractionDigits: 0}).format(value);
 }
+
+const powerEvidenceLabels = Object.freeze({
+  holdout_validated: "Holdout-validated shape",
+  extrapolated: "Extrapolated",
+  surrogate: "Surrogate",
+  surrogate_extrapolated: "Surrogate extrapolation"
+});
+
+function powerEvidenceLabel(value) {
+  return powerEvidenceLabels[value] || String(value).replaceAll("_", " ");
+}
 function percent(value) { return new Intl.NumberFormat(undefined, {style: "percent", minimumFractionDigits: 1, maximumFractionDigits: 1}).format(value); }
 function signed(value, asPercent = false) {
   const text = asPercent ? percent(Math.abs(value)) : Math.abs(value).toFixed(1);
@@ -220,8 +231,13 @@ async function refreshBundles(selectId = null) {
   const select = $("bundleSelect");
   select.replaceChildren(new Option(bundles.length ? "Choose a ready week" : "No weekly bundle yet", ""));
   for (const bundle of bundles) {
-    const mode = bundle.power_engine_mode === "surrogate" ? " · SURROGATE" : " · exact method";
-    const option = new Option(`${bundle.season} · Week ${bundle.week} · ${bundle.team_count} teams${mode}`, bundle.bundle_id);
+    const mode = bundle.power_engine_mode === "surrogate"
+      ? " · SURROGATE"
+      : " · blind-holdout validated";
+    const option = new Option(
+      `${bundle.league_label} · ${bundle.season} · Week ${bundle.week} · ${bundle.team_count} teams${mode}`,
+      bundle.bundle_id
+    );
     select.add(option);
   }
   select.disabled = bundles.length === 0;
@@ -240,8 +256,110 @@ function renderReadiness(readiness) {
   row.className = `readiness ${readiness.ready ? "ready" : "not-ready"}`;
 }
 
+const capabilityLabels = {
+  fantasypros_style_power: "Trade power",
+  trade_search: "Trade search",
+  expected_standings: "Expected standings",
+  playoff_model_estimates: "Playoff model estimates",
+  player_lab: "Player lab",
+  team_outlook_and_exports: "Team outlook and exports",
+  fantasypros_comparison_benchmark: "FantasyPros comparison benchmark",
+  exact_championship_simulation: "Exact championship simulation"
+};
+
+const capabilityStatusLabels = {
+  ready_with_holdout_validated_scope: "Ready in holdout-validated scope",
+  ready_with_limitations: "Ready with limitations",
+  model_estimate_with_limitations: "Model estimate with limitations",
+  surrogate: "Approximate",
+  comparison_only: "Comparison only",
+  not_ready: "Not available"
+};
+
+function appendTextElement(parent, tag, className, value) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  element.textContent = value;
+  parent.append(element);
+  return element;
+}
+
+function renderBundleDataReadiness(bundle) {
+  const panel = $("bundleDataReadiness");
+  const content = $("bundleDataReadinessContent");
+  content.replaceChildren();
+  const report = bundle && bundle.data_readiness;
+  if (!report || typeof report !== "object") {
+    panel.classList.add("hidden");
+    panel.open = false;
+    return;
+  }
+
+  const coverage = report.coverage || {};
+  const available = Number(coverage.available_full_horizon_provider_cells || 0);
+  const total = Number(coverage.full_horizon_provider_cells || 0);
+  const direct = Number(coverage.direct_provider_cells || 0);
+  const derived = Number(coverage.ros_derived_provider_cells || 0);
+  const unavailable = Number(coverage.unavailable_provider_cells || 0);
+  const captureRange = coverage.earliest_capture_at === coverage.latest_capture_at
+    ? coverage.earliest_capture_at
+    : `${coverage.earliest_capture_at} to ${coverage.latest_capture_at}`;
+  appendTextElement(
+    content,
+    "p",
+    "bundle-readiness-overview",
+    `${bundle.league_label} · ${available} of ${total} provider/player remaining-season projections are complete. ` +
+      `Weekly values include ${direct} source-published, ${derived} derived from captured ` +
+      `rest-of-season totals, and ${unavailable} unavailable cells. Captures span ${captureRange}.`
+  );
+  const projectionSources = coverage.projection_sources || {};
+  const sourceFormats = Array.isArray(projectionSources.source_scoring_formats)
+    ? projectionSources.source_scoring_formats.join(", ")
+    : "unknown";
+  appendTextElement(
+    content,
+    "p",
+    "bundle-readiness-overview",
+    `${Number(projectionSources.source_count || 0)} retained projection source artifacts ` +
+      `(${Number(projectionSources.captured_attempts || 0)} captured attempts, ` +
+      `${Number(projectionSources.not_published_attempts || 0)} not published, ` +
+      `${Number(projectionSources.unavailable_attempts || 0)} unavailable). ` +
+      `Source scoring: ${sourceFormats}; ${Number(projectionSources.provider_total_sources || 0)} ` +
+      `provider-total/base-format sources and ` +
+      `${Number(projectionSources.locally_recomputed_sources || 0)} locally recomputed sources.`
+  );
+
+  const grid = appendTextElement(content, "div", "bundle-capability-grid", "");
+  for (const [key, capability] of Object.entries(report.capabilities || {})) {
+    const item = appendTextElement(grid, "article", "bundle-capability", "");
+    const heading = appendTextElement(item, "div", "bundle-capability-heading", "");
+    appendTextElement(heading, "h3", "", capabilityLabels[key] || key.replaceAll("_", " "));
+    appendTextElement(
+      heading,
+      "span",
+      `bundle-capability-status status-${String(capability.status || "unknown").replaceAll("_", "-")}`,
+      capabilityStatusLabels[capability.status] || String(capability.status || "Unknown")
+    );
+    const notes = [...(capability.limitations || []), ...(capability.missing || [])];
+    if (notes.length) {
+      const list = appendTextElement(item, "ul", "", "");
+      for (const note of notes) appendTextElement(list, "li", "", note);
+    }
+    if (capability.available_fallback) {
+      appendTextElement(
+        item,
+        "p",
+        "bundle-capability-fallback",
+        `Available fallback: ${String(capability.available_fallback).replaceAll("_", " ")}.`
+      );
+    }
+  }
+  panel.classList.remove("hidden");
+}
+
 function renderBundle() {
   const bundle = currentBundle();
+  renderBundleDataReadiness(bundle);
   const primary = $("primaryTeam");
   const others = $("counterparties");
   primary.replaceChildren();
@@ -272,7 +390,7 @@ function renderBundle() {
     summary.classList.add("surrogate-warning");
   } else {
     const sizes = bundle.methodology.validated_balanced_package_sizes.join(", ");
-    summary.textContent = `${bundle.season} week ${bundle.week} · ${bundle.team_count} teams · exact FantasyPros-power evidence: balanced ${sizes}-player packages without adds/drops; other shapes are labeled extrapolated`;
+    summary.textContent = `${bundle.season} week ${bundle.week} · ${bundle.team_count} teams · FantasyPros-power method passed representative blind holdouts for balanced ${sizes}-player package shapes without adds/drops; this is not exhaustive proof, and other shapes are labeled extrapolated`;
     summary.classList.remove("surrogate-warning");
   }
   $("surrogateSearchConsentRow").classList.toggle("hidden", !surrogate);
@@ -613,7 +731,7 @@ function renderTwoTeamTradeRows(rows) {
       signed(row.their_power_delta),
       signed(row.your_playoff_delta, true),
       signed(row.their_playoff_delta, true),
-      row.power_methodology_status
+      powerEvidenceLabel(row.power_methodology_status)
     ];
     cells.forEach((value, index) => {
       const cell = document.createElement("td");
@@ -656,7 +774,7 @@ async function loadResults() {
       value.rows,
       activeSearchTeamIds,
       currentBundle(),
-      {signed, percent}
+      {signed, percent, powerEvidenceLabel}
     );
   }
   else renderTwoTeamTradeRows(value.rows);

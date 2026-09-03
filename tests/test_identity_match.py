@@ -5,7 +5,12 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from trade_snapshot.identity_io import load_identity_registry, save_identity_registry
-from trade_snapshot.identity_match import ProviderPlayerRecord, reconcile_player_identities
+from trade_snapshot.identity import ProviderReference
+from trade_snapshot.identity_match import (
+    ProviderIdentityLink,
+    ProviderPlayerRecord,
+    reconcile_player_identities,
+)
 
 
 def row(provider, player_id, name="A.J. Brown", position="WR", team="PHI"):
@@ -138,6 +143,42 @@ class IdentityMatchTests(unittest.TestCase):
         self.assertEqual(len(registry.players), 2)
         self.assertEqual(len(registry.unresolved), 1)
         self.assertIn("ambiguous", registry.unresolved[0].reason)
+
+    def test_source_published_crosswalk_resolves_provider_name_variants(self):
+        registry = reconcile_player_identities(
+            (
+                row("fantasypros", "101", name="Marvin Harrison Jr."),
+                row("espn", "202", name="Marvin Harrison Jr"),
+            ),
+            verified_links=(
+                ProviderIdentityLink(
+                    (ProviderReference("fantasypros", "101"),
+                     ProviderReference("espn", "202")),
+                    "FantasyPros league bootstrap player 101",
+                ),
+            ),
+        )
+        self.assertEqual(len(registry.players), 1)
+        self.assertEqual(len(registry.players[0].provider_references), 2)
+        self.assertEqual(registry.unresolved, ())
+
+    def test_source_published_crosswalk_rejects_position_or_team_conflicts(self):
+        for changed in (
+            row("espn", "202", position="RB"),
+            row("espn", "202", team="DAL"),
+        ):
+            with self.subTest(changed=changed):
+                with self.assertRaisesRegex(ValueError, "metadata conflicts"):
+                    reconcile_player_identities(
+                        (row("fantasypros", "101"), changed),
+                        verified_links=(
+                            ProviderIdentityLink(
+                                (ProviderReference("fantasypros", "101"),
+                                 ProviderReference("espn", "202")),
+                                "FantasyPros league bootstrap player 101",
+                            ),
+                        ),
+                    )
 
 
 if __name__ == "__main__":

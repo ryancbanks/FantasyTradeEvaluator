@@ -49,7 +49,7 @@ No league key, cookie, request header, or private response body is retained in t
 
 ## Validation-gated FantasyPros methodology mode
 
-The local evaluator recomputes an ordinary trade by changing two rosters and solving a small maximum-weight roster-role assignment. It can also apply one simultaneous three-team agreement by moving each selected player from the original owner to either other participant, then rescoring all three resulting rosters. It never calls FantasyPros for a candidate after the role formula is calibrated. A weekly refresh captures current ECR/projections and reapplies the frozen formula to every player locally.
+The local evaluator recomputes an ordinary trade by changing two rosters and solving a small maximum-weight roster-role assignment. It can also apply one simultaneous three-team agreement by moving each selected player from the original owner to either other participant, then rescoring all three resulting rosters. It never calls FantasyPros for a candidate after the role formula is calibrated. A weekly refresh captures current ECR and published projection evidence, then reapplies only the inputs named by the persisted formula. The reliable default formula uses FantasyPros rest-of-season ECR and does not require a nonexistent FantasyPros in-season rest-of-season projection table.
 
 Three-team agreements are outside the current FantasyPros attestation because its held-out analyzer evidence covers two-team packages only. An exact weekly formula therefore labels three-team power as `extrapolated`; a surrogate weekly formula labels it `surrogate_extrapolated`. This limitation is disclosed before a three-team run, not only in its results. Playoff probabilities remain fully local in either case and reuse the same scenario draws for the before and after league states. If roster adjustments are allowed and multiple teams need scarce free agents, teams reserve their locally optimal replacements in ascending team-ID order from the players still available. The app, result payload, and workbook disclose that deterministic allocation policy.
 
@@ -81,7 +81,9 @@ For every player and remaining NFL week, retain:
 
 - source-projected fantasy points and raw projected stats when available;
 - opponent, game, kickoff, and bye status;
-- injury/availability semantics and position eligibility;
+- timestamped provider injury/status wording and position eligibility; the
+  wording is retained as an observation, not treated as a certain appearance
+  probability;
 - source publication time when disclosed and retrieval time separately;
 - raw source row and a reviewed cross-source player identity.
 
@@ -94,7 +96,9 @@ The snapshot also needs current standings, every remaining fantasy matchup, poin
 For each simulated season:
 
 1. Optimize every team's legal lineup using projected means.
-2. Simulate player outcomes with predictive uncertainty and shared NFL game/offense effects.
+2. Simulate player outcomes with predictive uncertainty. Apply shared NFL
+   game/offense effects only when the bundle contains nonzero, calibrated
+   factor loadings; the current default uses independent player shocks.
 3. Settle the remaining fantasy schedule using platform score rounding.
 4. Update records and tiebreak state.
 5. Apply the captured qualification and seeding rules.

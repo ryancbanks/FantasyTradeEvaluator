@@ -80,7 +80,7 @@ class ThreeWayWorkbookTests(unittest.TestCase):
             (losing, winning),
             {"A": "Alpha", "B": "Beta", "C": "Gamma"},
             {"a": "A Player", "b": "B Player", "c": "C Player"},
-            "exact",
+            "holdout_validated",
         )
 
         self.assertEqual(tuple(row.candidate_index for row in rows), (2, 1))
@@ -106,7 +106,7 @@ class ThreeWayWorkbookTests(unittest.TestCase):
                 (result(),),
                 {"A": "Alpha", "B": "Beta", "C": "Gamma"},
                 {"a": "A Player", "b": "B Player"},
-                "exact",
+                "holdout_validated",
             )
 
 

@@ -7,6 +7,7 @@ import re
 import sys
 
 from ._scenario_random import content_id
+from .data_readiness import build_bundle_data_readiness
 from .engine_bundle import EngineBundle
 from .league_search import LeagueSearchOutcome
 from .positions import CANONICAL_PLAYER_POSITIONS
@@ -34,7 +35,14 @@ def default_data_directory() -> Path:
 
 def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
     evidence = bundle.methodology_evidence
-    exact = bundle.methodology_attestation is not None
+    attested = bundle.methodology_attestation is not None
+    data_readiness = build_bundle_data_readiness(bundle)
+    binding = bundle.source_manifest
+    league_key = binding.league_binding_id.removeprefix("league_")[:12]
+    league_label = (
+        f"{binding.host_provider.upper()} "
+        f"{binding.league_binding_scope.value} {league_key}"
+    )
     roster_by_team = {row.team_id: row for row in bundle.rosters}
     player_positions = {
         player_id: tuple(sorted(
@@ -56,7 +64,11 @@ def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
         teams.append({"team_id": team.team_id, "name": team.name, "players": players})
     return {
         "bundle_id": bundle.bundle_id,
-        "status": "ready",
+        "league_key": league_key,
+        "league_label": league_label,
+        "status": (
+            "not_ready" if data_readiness["status"] == "not_ready" else "ready"
+        ),
         "season": bundle.state.season,
         "week": bundle.state.first_remaining_week,
         "team_count": len(bundle.state.teams),
@@ -67,20 +79,23 @@ def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
         "calibration_status": bundle.strength_model.calibration.status.value,
         "power_engine_mode": bundle.methodology_mode,
         "power_engine_notice": (
-            "Exact within the attested balanced-package scope; other shapes are extrapolated."
-            if exact
+            "Representative blind holdouts validate the listed balanced-package "
+            "shapes; this is not an exhaustive proof of every combination. Other "
+            "shapes are extrapolated."
+            if attested
             else SURROGATE_NOTICE
         ),
         "three_team_free_agent_allocation_policy": (
             MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
         ),
+        "data_readiness": data_readiness,
         "methodology": {
             "mode": bundle.methodology_mode,
             "attestation_id": (
-                None if not exact else bundle.methodology_attestation.attestation_id
+                None if not attested else bundle.methodology_attestation.attestation_id
             ),
             "surrogate_disclosure_id": (
-                None if exact else bundle.surrogate_disclosure.disclosure_id
+                None if attested else bundle.surrogate_disclosure.disclosure_id
             ),
             "formula_id": evidence.formula_id,
             "fingerprint_id": evidence.methodology_fingerprint.fingerprint_id,
@@ -88,19 +103,23 @@ def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
             "current_evidence_id": evidence.current_evidence_id,
             "source_fit_id": evidence.formula_source_fit_id,
             "quality_gate": (
-                "exact_attestation_v1" if exact else SURROGATE_QUALITY_GATE
+                "blind_holdout_validation_v1"
+                if attested
+                else SURROGATE_QUALITY_GATE
             ),
             "source_fit_id_binds_full_solver_diagnostics": True,
             "current_holdout_count": evidence.current_holdout_count,
-            "exact_trade_scope": (
-                "balanced packages with no adds or drops" if exact else None
+            "holdout_validated_trade_scope": (
+                "balanced package shapes with no adds or drops"
+                if attested
+                else None
             ),
             "validated_balanced_package_sizes": list(
                 evidence.validated_balanced_package_sizes
             ),
             "observed_balanced_package_sizes": (
                 list(evidence.validated_balanced_package_sizes)
-                if exact
+                if attested
                 else list(evidence.observed_balanced_package_sizes)
             ),
             "holdout_max_absolute_score_error": (
@@ -115,12 +134,59 @@ def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
 
 def workbook_sources(bundle: EngineBundle) -> tuple[WorkbookSource, ...]:
     evidence = bundle.methodology_evidence
+    manifest = bundle.source_manifest
     sources = [
+        WorkbookSource(
+            f"Host league snapshot ({manifest.host_provider})",
+            manifest.host_snapshot_id,
+            manifest.host_captured_at,
+        ),
+        WorkbookSource(
+            f"Opaque league binding ({manifest.league_binding_scope.value})",
+            manifest.league_binding_id,
+            manifest.host_captured_at,
+        ),
+        WorkbookSource(
+            "FantasyPros league artifact",
+            manifest.fantasypros_league_artifact_id,
+            manifest.fantasypros_captured_at,
+        ),
+        WorkbookSource(
+            "FantasyPros comparison benchmark record (comparison only)",
+            bundle.fantasypros_benchmark.benchmark_id,
+            bundle.fantasypros_benchmark.captured_at,
+        ),
+        WorkbookSource(
+            "FantasyPros comparison source artifact (comparison only)",
+            bundle.fantasypros_benchmark.source_artifact_id,
+            bundle.fantasypros_benchmark.captured_at,
+        ),
+    ]
+    sources.extend(
         WorkbookSource(
             f"FantasyPros ECR ({row.period.value})", row.ecr_id, row.captured_at
         )
         for row in bundle.ecr_snapshots
-    ]
+    )
+    sources.append(
+        WorkbookSource(
+            f"NFL schedule ({bundle.nfl_schedule.source_provider})",
+            bundle.nfl_schedule.schedule_id,
+            bundle.nfl_schedule.captured_at,
+        )
+    )
+    projection_sources = bundle.projection_source_manifest.sources
+    projection_attempts = bundle.projection_source_manifest.attempts
+    projection_source_times = tuple(
+        row.captured_at for row in projection_sources
+    ) + tuple(row.attempted_at for row in projection_attempts)
+    sources.append(
+        WorkbookSource(
+            "Projection source manifest",
+            bundle.projection_source_manifest.manifest_id,
+            max(projection_source_times),
+        )
+    )
     by_provider = {}
     for row in bundle.projection_evidence:
         by_provider.setdefault(row.provider, []).append(row)
@@ -136,12 +202,12 @@ def workbook_sources(bundle: EngineBundle) -> tuple[WorkbookSource, ...]:
             WorkbookSource(
                 (
                     "FantasyPros methodology attestation"
-                    if bundle.methodology_mode == "exact"
+                    if bundle.methodology_mode == "holdout_validated"
                     else "FantasyPros SURROGATE methodology disclosure"
                 ),
                 (
                     bundle.methodology_attestation.attestation_id
-                    if bundle.methodology_mode == "exact"
+                    if bundle.methodology_mode == "holdout_validated"
                     else bundle.surrogate_disclosure.disclosure_id
                 ),
                 evidence.current_evidence_at,
@@ -177,7 +243,10 @@ def search_result_record(
         "power_engine_notice": (
             SURROGATE_NOTICE
             if bundle.methodology_mode == "surrogate"
-            else "Exact only inside the attested trade scope."
+            else (
+                "Power is blind-holdout validated for representative trades in "
+                "the listed package shapes, not exhaustively proven for every combination."
+            )
         ),
         "team_outlook": _team_outlook_records(outlook),
         "rows": [
@@ -267,7 +336,7 @@ def three_way_search_result_record(
                 "combined_playoff_delta": result.combined_playoff_delta / 100,
                 "power_methodology_status": (
                     "extrapolated"
-                    if bundle.methodology_mode == "exact"
+                    if bundle.methodology_mode == "holdout_validated"
                     else "surrogate_extrapolated"
                 ),
             }
@@ -288,7 +357,7 @@ def three_way_search_result_record(
         "power_engine_notice": (
             SURROGATE_NOTICE
             if bundle.methodology_mode == "surrogate"
-            else "Three-team power is extrapolated beyond the attested two-team scope."
+            else "Three-team power is extrapolated beyond the blind-validated two-team scope."
         ),
         "free_agent_allocation_policy": free_agent_allocation_policy,
         "team_outlook": _team_outlook_records(
@@ -309,7 +378,12 @@ def _team_outlook_records(outlook) -> list[dict[str, object]]:
             "expected_final_wins": row.expected_final_wins,
             "expected_final_losses": row.expected_final_losses,
             "expected_final_ties": row.expected_final_ties,
+            "current_rank": row.current_rank,
+            "expected_final_points_for": row.expected_final_points_for,
+            "expected_final_points_against": row.expected_final_points_against,
             "projected_finish": row.mean_rank,
+            "rank_distribution": list(row.rank_distribution),
+            "seed_distribution": list(row.seed_distribution),
             "playoff_probability": row.playoff_probability,
         }
         for row in outlook

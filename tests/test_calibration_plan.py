@@ -18,10 +18,12 @@ def features():
             frozenset({position}),
             {
                 name: (
-                    value
+                    1.0
+                    if name.endswith("_available")
+                    else value
                     if name == "ecr_ros_inverse_rank"
                     else value * value + team_offset
-                    if name == "projection_fantasypros_remaining_points"
+                    if name == "projection_fantasypros_full_ros_points"
                     else 0.0
                 )
                 for name in names
@@ -59,10 +61,12 @@ def production_size_inputs():
                     frozenset({position}),
                     {
                         name: (
-                            value
+                            1.0
+                            if name.endswith("_available")
+                            else value
                             if name == "ecr_ros_inverse_rank"
                             else value * value + index * index * index / 1000
-                            if name == "projection_fantasypros_remaining_points"
+                            if name == "projection_fantasypros_full_ros_points"
                             else 0.0
                         )
                         for name in names
@@ -100,7 +104,7 @@ class CalibrationPlanTests(unittest.TestCase):
             features(), roles, rosters,
             primary_team_id="a",
             residual_feature_names=("ecr_ros_inverse_rank",),
-            role_feature_names=("projection_fantasypros_remaining_points",),
+            role_feature_names=("projection_fantasypros_full_ros_points",),
             training_experiment_count=3,
             held_out_experiment_count=2,
         )
@@ -131,7 +135,7 @@ class CalibrationPlanTests(unittest.TestCase):
             rosters,
             primary_team_id="a",
             residual_feature_names=("ecr_ros_inverse_rank",),
-            role_feature_names=("projection_fantasypros_remaining_points",),
+            role_feature_names=("projection_fantasypros_full_ros_points",),
         )
         second = design_calibration_experiments(
             feature_rows,
@@ -139,7 +143,7 @@ class CalibrationPlanTests(unittest.TestCase):
             tuple(reversed(rosters)),
             primary_team_id="a",
             residual_feature_names=("ecr_ros_inverse_rank",),
-            role_feature_names=("projection_fantasypros_remaining_points",),
+            role_feature_names=("projection_fantasypros_full_ros_points",),
         )
         self.assertEqual(first.plan_id, second.plan_id)
         self.assertEqual(len(first.training), 250)
@@ -165,7 +169,7 @@ class CalibrationPlanTests(unittest.TestCase):
                 features(), roles, rosters,
                 primary_team_id="a",
                 residual_feature_names=("ecr_ros_inverse_rank",),
-                role_feature_names=("projection_fantasypros_remaining_points",),
+                role_feature_names=("projection_fantasypros_full_ros_points",),
                 training_experiment_count=100,
                 held_out_experiment_count=100,
             )

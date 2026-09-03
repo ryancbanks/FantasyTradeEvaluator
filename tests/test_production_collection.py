@@ -8,6 +8,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 from tests.capture_fixtures import league_sources
+from tests.ecr_fixtures import ecr_source_details
 from tests.test_engine_bundle import engine_bundle
 from trade_snapshot.analyzer_contract import CURRENT_BUNDLE_FINGERPRINT
 from trade_snapshot.capture_schema import (
@@ -33,8 +34,11 @@ from trade_snapshot.espn_free_read import (
 from trade_snapshot._espn_browser_read import read_authenticated_espn_json
 from trade_snapshot.browser_capture import (
     BrowserCaptureCancelled,
+    BrowserCaptureError,
     BrowserCaptureOptions,
+    ProjectionNotPublished,
     YahooScoringError,
+    YahooScoringMismatch,
 )
 from trade_snapshot.identity import IdentityRegistry
 from trade_snapshot.identity_io import load_identity_registry
@@ -43,17 +47,25 @@ from trade_snapshot.production_calibration import (
     CalibrationCaptureContext,
     InteractiveSignInGate,
 )
+from trade_snapshot.calibration_workflow import CalibrationNotExact
+from trade_snapshot.methodology_reuse import FormulaAction, FormulaReuseDecision
 from trade_snapshot.production_collection import (
     CalibrationCallbacks,
     ProductionWeeklyCollectionWorkflow,
+    _available_projection_ensemble,
+    _collect_remaining_sources,
+    _source_artifacts,
     _yahoo_projection_task,
     create_production_weekly_collection_workflow,
 )
+from trade_snapshot.source_plan import build_weekly_source_plan
+from trade_snapshot.projection_source import ProjectionAttemptStatus
 from trade_snapshot.weekly_assembly import AssembledWeeklyEvidence
 from trade_snapshot.weekly_collection import (
     WeeklyCollectionError,
     WeeklyCollectionRequest,
 )
+from trade_snapshot.weekly_refresh import CalibrationRequired
 
 
 NOW = datetime(2026, 9, 1, tzinfo=timezone.utc)
@@ -108,6 +120,184 @@ class _Collector:
 
 
 class ProductionWeeklyCollectionTests(unittest.TestCase):
+    def test_plan_records_unpublished_and_optional_failures_without_losing_quorum(self):
+        complete = build_weekly_source_plan(
+            season=2026,
+            as_of_week=1,
+            remaining_weeks=(1, 2),
+            scoring="PPR",
+            player_positions=("RB",),
+        )
+        plan = CapturePlan(
+            task for task in complete.tasks if task.kind is not CaptureKind.LEAGUE_SOURCE
+        )
+
+        class OutcomeCollector(_Collector):
+            def collect(self, task_plan, options, **kwargs):
+                self.calls.append((task_plan, options, kwargs))
+                task = task_plan.tasks[0]
+                if (
+                    isinstance(task, PageCaptureTask)
+                    and task.provider.value == "fantasypros"
+                    and task.week == 2
+                ):
+                    raise ProjectionNotPublished("sanitized unpublished page")
+                if isinstance(task, PageCaptureTask) and task.provider.value == "espn":
+                    raise BrowserCaptureError("sanitized unsupported layout")
+                return (_artifact(task),)
+
+        collector = OutcomeCollector()
+        rows, attempts = _collect_remaining_sources(
+            collector,
+            plan,
+            BrowserCaptureOptions(Path("profile")),
+            object(),
+            _Gate(),
+            {},
+            first_remaining_week=1,
+            attempt_clock=lambda: NOW,
+        )
+        projections, ecr = _source_artifacts(rows, plan, "PPR", attempts)
+        ensemble = _available_projection_ensemble(projections)
+
+        self.assertEqual(len(ecr), 2)
+        self.assertEqual(
+            {row.provider.value for row in projections},
+            {"fantasypros", "yahoo"},
+        )
+        self.assertEqual(
+            tuple(row.provider for row in ensemble.provider_weights),
+            ("fantasypros", "yahoo"),
+        )
+        self.assertEqual(
+            {status: sum(row.status is status for row in attempts) for status in ProjectionAttemptStatus},
+            {
+                ProjectionAttemptStatus.CAPTURED: 3,
+                ProjectionAttemptStatus.NOT_PUBLISHED: 1,
+                ProjectionAttemptStatus.UNAVAILABLE: 2,
+            },
+        )
+        unsuccessful = tuple(
+            row for row in attempts if row.status is not ProjectionAttemptStatus.CAPTURED
+        )
+        self.assertTrue(all(row.attempted_at == NOW for row in unsuccessful))
+
+    def test_yahoo_preflight_failure_becomes_attempts_when_two_sources_remain(self):
+        collector = _Collector()
+        collector.yahoo_scoring_error = YahooScoringError(
+            "sanitized Yahoo settings page failure"
+        )
+        assembled = _assembled()
+        recorded = {}
+
+        def assembler(**kwargs):
+            recorded.update(kwargs)
+            return assembled
+
+        def plan_builder(**dimensions):
+            season = dimensions["season"]
+            week = dimensions["as_of_week"]
+            scoring = dimensions["scoring"]
+            projection = ProjectionTableSpec("weekly", scoring, ("RB",))
+            return CapturePlan((
+                PageCaptureTask(
+                    "fantasypros", season, week, "league_source",
+                    "https://www.fantasypros.com/nfl/myplaybook/trade-analyzer.php",
+                ),
+                PageCaptureTask(
+                    "fantasypros", season, week, "visible_table",
+                    "https://www.fantasypros.com/nfl/projections/rb.php"
+                    "?week=1&scoring=PPR",
+                    projection=projection,
+                ),
+                PageCaptureTask(
+                    "espn", season, week, "visible_table",
+                    "https://fantasy.espn.com/football/players/projections",
+                    projection=projection,
+                ),
+                PageCaptureTask(
+                    "yahoo", season, week, "visible_table",
+                    "https://football.fantasysports.yahoo.com/f1/players",
+                    projection=projection,
+                ),
+                FantasyProsECRTask(
+                    season, week, "weekly", scoring, ("RB",), (), None,
+                    "https://www.fantasypros.com/nfl/rankings/ppr-rb.php",
+                ),
+            ))
+
+        workflow = _workflow(collector=collector, assembler=assembler)
+        workflow._plan_builder = plan_builder
+        with TemporaryDirectory() as directory:
+            workflow(
+                _request(),
+                data_directory=Path(directory),
+                progress=lambda _: None,
+                cancelled=lambda: False,
+            )
+
+        attempts = recorded["projection_source_attempts"]
+        yahoo = tuple(row for row in attempts if row.provider.value == "yahoo")
+        self.assertEqual(len(yahoo), 1)
+        self.assertIs(yahoo[0].status, ProjectionAttemptStatus.UNAVAILABLE)
+        self.assertEqual(yahoo[0].attempted_at, NOW)
+        self.assertEqual(
+            {row.provider.value for row in recorded["projection_artifacts"]},
+            {"fantasypros", "espn"},
+        )
+        captured_providers = {
+            call[0].tasks[0].provider.value
+            for call in collector.calls[1:]
+        }
+        self.assertNotIn("yahoo", captured_providers)
+
+    def test_projection_plan_covers_rostered_and_empty_starting_positions(self):
+        captured = {}
+
+        def plan_builder(**dimensions):
+            captured.update(dimensions)
+            return _small_plan(**dimensions)
+
+        workflow = _workflow(collector=_Collector())
+        workflow._plan_builder = plan_builder
+        host = _host_snapshot(
+            players=(SimpleNamespace(position="QB"), SimpleNamespace(position="DL")),
+            roster_rules=SimpleNamespace(starting_lineup_slots=("QB", "K")),
+        )
+
+        workflow._remaining_plan(_request(), host)
+
+        self.assertEqual(tuple(captured["remaining_weeks"]), tuple(range(1, 19)))
+        self.assertEqual(set(captured["player_positions"]), {"QB", "DL", "K"})
+
+    def test_default_collection_plan_attempts_every_remaining_fantasypros_week(self):
+        workflow = _workflow(collector=_Collector())
+        workflow._plan_builder = build_weekly_source_plan
+
+        plan = workflow._remaining_plan(_request(), _host_snapshot())
+
+        fantasypros = tuple(
+            task
+            for task in plan.tasks
+            if isinstance(task, PageCaptureTask)
+            and task.provider.value == "fantasypros"
+        )
+        self.assertEqual(
+            {(task.week, task.projection.position_scope) for task in fantasypros},
+            {(week, ("RB",)) for week in range(1, 19)},
+        )
+        optional_weekly = tuple(
+            task
+            for task in plan.tasks
+            if isinstance(task, PageCaptureTask)
+            and task.provider.value in {"espn", "yahoo"}
+            and task.projection.horizon.value == "weekly"
+        )
+        self.assertEqual(
+            {(task.provider.value, task.week) for task in optional_weekly},
+            {("espn", 1), ("yahoo", 1)},
+        )
+
     def test_collects_two_single_page_phases_and_forwards_strict_calibration(self):
         collector = _Collector()
         host = _host_snapshot()
@@ -156,12 +346,40 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
         )
         progress = []
         with TemporaryDirectory() as directory:
-            identity_path = Path(directory) / "identity-registry.json"
+            data_root = Path(directory)
+            identity_path = data_root / "identity-registry.json"
             result = workflow(
-                _request(allow_surrogate_power=True), data_directory=Path(directory),
+                _request(allow_surrogate_power=True), data_directory=data_root,
                 progress=progress.append, cancelled=lambda: False,
             )
             self.assertEqual(load_identity_registry(identity_path), assembled.identities)
+            public_captures = tuple(
+                (data_root / "raw-captures" / "public").glob("*.json")
+            )
+            private_captures = tuple(
+                (data_root / "raw-captures" / "private-leagues").glob("*/*.json")
+            )
+            self.assertEqual(len(public_captures), 3)
+            self.assertEqual(len(private_captures), 1)
+            self.assertEqual(
+                {path.stem for path in public_captures},
+                {
+                    artifact.artifact_id
+                    for artifact in (
+                        *records["assembly"]["projection_artifacts"],
+                        *records["assembly"]["ecr_artifacts"],
+                    )
+                },
+            )
+            self.assertEqual(
+                private_captures[0].stem,
+                records["assembly"]["fantasypros_league"].artifact_id,
+            )
+            self.assertTrue(
+                all(path.stem.startswith(("captable_", "capecr_")) for path in public_captures)
+            )
+            self.assertTrue(private_captures[0].stem.startswith("capleague_"))
+            self.assertRegex(private_captures[0].parent.name, r"^league_[0-9a-f]{32}$")
 
         self.assertIs(result, bundle)
         self.assertEqual(records["read"][:2], (2026, "123"))
@@ -176,7 +394,7 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
         self.assertIs(records["refresh"][1]["calibrate"], callbacks.calibrate)
         self.assertIs(records["refresh"][1]["verify_reuse"], callbacks.verify_reuse)
         self.assertTrue(records["refresh"][1]["allow_surrogate_power"])
-        self.assertEqual(len(collector.calls), 2)
+        self.assertEqual(len(collector.calls), 4)
         self.assertEqual(len(collector.open_calls), 1)
         self.assertEqual(collector.close_count, 1)
         self.assertEqual(collector.authenticated_calls, [])
@@ -188,14 +406,25 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
             yahoo_url,
             "https://football.fantasysports.yahoo.com/f1/456/players?status=ALL",
         )
-        first, second = collector.calls
-        self.assertIs(first[1], second[1])
+        first, *source_calls = collector.calls
+        self.assertTrue(all(first[1] is row[1] for row in source_calls))
         self.assertTrue(first[1].headed)
         self.assertEqual(first[1].action_delay_ms, 200)
         self.assertLessEqual(first[1].overall_timeout_ms, 3_600_000)
-        self.assertIs(first[2]["sign_in_gate"], second[2]["sign_in_gate"])
-        bindings = second[2]["navigation_bindings"]
-        by_provider = {task.provider.value: task.task_id for task in second[0].tasks}
+        self.assertTrue(all(
+            first[2]["sign_in_gate"] is row[2]["sign_in_gate"]
+            for row in source_calls
+        ))
+        bindings = {
+            task_id: url
+            for row in source_calls
+            for task_id, url in (row[2]["navigation_bindings"] or {}).items()
+        }
+        by_provider = {
+            row[0].tasks[0].provider.value: row[0].tasks[0].task_id
+            for row in source_calls
+            if isinstance(row[0].tasks[0], PageCaptureTask)
+        }
         self.assertEqual(
             bindings[by_provider["espn"]],
             "https://fantasy.espn.com/football/players/projections?leagueId=123",
@@ -298,7 +527,7 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
                 )
             self.assertFalse((Path(directory) / "identity-registry.json").exists())
         self.assertNotIn("private player", str(raised.exception))
-        self.assertEqual(len(collector.calls), 2)
+        self.assertEqual(len(collector.calls), 4)
 
     def test_refresh_failure_does_not_persist_identity_registry(self):
         def failed_refresh(*_args, **_kwargs):
@@ -316,6 +545,57 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
             self.assertFalse((Path(directory) / "identity-registry.json").exists())
         self.assertNotIn("private refresh", str(raised.exception))
 
+    def test_calibration_failures_describe_validation_scope_without_exact_claims(self):
+        failures = (
+            (
+                CalibrationRequired(FormulaReuseDecision(
+                    FormulaAction.RECALIBRATE,
+                    ("weekly calibration required",),
+                    "methodology-fingerprint",
+                )),
+                False,
+                "blind-holdout validated",
+            ),
+            (
+                CalibrationNotExact(
+                    None,
+                    None,
+                    surrogate_eligible=True,
+                ),
+                False,
+                "did not pass the blind-holdout validation gate",
+            ),
+            (
+                CalibrationNotExact(
+                    None,
+                    None,
+                    surrogate_eligible=False,
+                ),
+                True,
+                "neither the blind-holdout validation gate",
+            ),
+        )
+        for failure, allow_surrogate, expected in failures:
+            with self.subTest(expected=expected), TemporaryDirectory() as directory:
+                def failed_refresh(*_args, failure=failure, **_kwargs):
+                    raise failure
+
+                workflow = _workflow(
+                    collector=_Collector(),
+                    refresher=failed_refresh,
+                )
+                with self.assertRaises(WeeklyCollectionError) as raised:
+                    workflow(
+                        _request(allow_surrogate_power=allow_surrogate),
+                        data_directory=Path(directory),
+                        progress=lambda _: None,
+                        cancelled=lambda: False,
+                    )
+                message = str(raised.exception)
+                self.assertIn(expected, message)
+                self.assertNotIn("exact FantasyPros", message)
+                self.assertNotIn("exact blind replication", message)
+
     def test_espn_scoring_mismatch_fails_before_projection_capture(self):
         collector = _Collector()
         host = _host_snapshot(scoring_profile=SimpleNamespace(
@@ -332,9 +612,9 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
             )
         self.assertEqual(len(collector.calls), 1)
 
-    def test_yahoo_scoring_failure_is_actionable_and_stops_before_projections(self):
+    def test_yahoo_scoring_mismatch_is_actionable_and_stops_before_projections(self):
         collector = _Collector()
-        collector.yahoo_scoring_error = YahooScoringError(
+        collector.yahoo_scoring_error = YahooScoringMismatch(
             "Yahoo league scoring is Half PPR, but this refresh is set to PPR."
         )
         workflow = _workflow(collector=collector)
@@ -737,15 +1017,24 @@ def _artifact(task):
         return FantasyProsECRArtifact.from_task(
             task,
             expert_ids=("1",),
+            source_scoring=task.source_scoring,
             last_updated_text="today",
             last_updated_at="2026-09-01T00:00:00Z",
             captured_at="2026-09-01T01:00:00Z",
+            source_details=ecr_source_details(
+                season=task.season,
+                week=task.week,
+                horizon=task.horizon.value,
+                position=task.position_scope[0],
+                source_scoring=task.source_scoring,
+            ),
             rankings=(ECRRankingRow(
                 "1001", "Player 1001", "ARI", "RB", 1, 1, 1, 1, 0, "RB1",
                 {"ECR": "1"},
             ),),
         )
     links = {
+        "fantasypros": "https://www.fantasypros.com/nfl/projections/player-one.php",
         "espn": "https://www.espn.com/nfl/player/_/id/201/player-one",
         "yahoo": "https://sports.yahoo.com/nfl/players/301/",
     }
@@ -771,6 +1060,7 @@ def _host_snapshot(**changes):
         "expected_team_count": 2,
         "players": (SimpleNamespace(position="RB"),),
         "playoff_rules": SimpleNamespace(regular_season_end_week=2),
+        "roster_rules": SimpleNamespace(starting_lineup_slots=("RB",)),
         "scoring_profile": SimpleNamespace(
             platform="espn",
             settings={"scoring_settings": {"playerRankType": "PPR"}},

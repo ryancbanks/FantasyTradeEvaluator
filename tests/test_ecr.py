@@ -3,17 +3,23 @@ import copy
 import json
 import unittest
 
-from trade_snapshot.ecr import EcrPeriod, EcrPlayerRanking, EcrSnapshot
+from tests.ecr_fixtures import ecr_source_provenance
+from trade_snapshot.ecr import (
+    EcrExpertPanel,
+    EcrPeriod,
+    EcrPlayerRanking,
+    EcrSnapshot,
+)
 
 
 NOW = datetime(2026, 9, 1, 18, tzinfo=timezone.utc)
 
 
-def ranking(player_id="p1", fantasypros_id="101", rank=1):
+def ranking(player_id="p1", fantasypros_id="101", rank=1, *, position="rb"):
     return EcrPlayerRanking(
         canonical_player_id=player_id,
         fantasypros_player_id=fantasypros_id,
-        position="rb",
+        position=position,
         rank_ecr=rank,
         position_rank=rank,
         rank_min=rank,
@@ -33,8 +39,18 @@ def snapshot(rankings=None):
         captured_at=NOW,
         source_updated_at=NOW - timedelta(hours=2),
         expert_ids=("22", "9"),
-        total_experts=3,
+        total_experts=2,
         rankings=tuple(rankings or (ranking(), ranking("p2", "102", 2))),
+        expert_panels=(EcrExpertPanel(
+            "RB",
+            ("22", "9"),
+            2,
+            ecr_source_provenance(
+                captured_at=NOW,
+                source_updated_at=NOW - timedelta(hours=2),
+                source_player_count=2,
+            ),
+        ),),
     )
 
 
@@ -48,6 +64,8 @@ class EcrSnapshotTests(unittest.TestCase):
         self.assertEqual(first.rankings[0].canonical_player_id, "p1")
         self.assertEqual(first.rankings[0].position, "RB")
         record = first.to_record()
+        self.assertEqual(record["schema_version"], 4)
+        self.assertEqual(record["expert_panels"][0]["position"], "RB")
         json.dumps(record, allow_nan=False)
         self.assertEqual(EcrSnapshot.from_record(record), first)
         self.assertTrue(first.ecr_id.startswith("ecr_"))
@@ -76,6 +94,65 @@ class EcrSnapshotTests(unittest.TestCase):
                 (),
                 0,
                 (ranking(),),
+                (EcrExpertPanel(
+                    "RB",
+                    ("9",),
+                    1,
+                    ecr_source_provenance(captured_at=NOW),
+                ),),
+            )
+
+    def test_position_panels_preserve_exact_provenance_and_aggregate_union(self):
+        result = EcrSnapshot(
+            snapshot_id="snapshot-1",
+            scoring_profile_id="profile-1",
+            season=2026,
+            as_of_week=1,
+            period=EcrPeriod.WEEKLY,
+            captured_at=NOW,
+            source_updated_at=None,
+            expert_ids=("wr-expert", "shared", "rb-expert"),
+            total_experts=3,
+            rankings=(
+                ranking(),
+                ranking("p2", "102", 2, position="WR"),
+            ),
+            expert_panels=(
+                EcrExpertPanel(
+                    "WR",
+                    ("wr-expert", "shared"),
+                    2,
+                    ecr_source_provenance(captured_at=NOW, position="WR"),
+                ),
+                EcrExpertPanel(
+                    "RB",
+                    ("rb-expert", "shared"),
+                    2,
+                    ecr_source_provenance(captured_at=NOW),
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            tuple(panel.position for panel in result.expert_panels),
+            ("RB", "WR"),
+        )
+        self.assertEqual(result.expert_ids, ("rb-expert", "shared", "wr-expert"))
+        self.assertEqual(EcrSnapshot.from_record(result.to_record()), result)
+
+        with self.assertRaisesRegex(ValueError, "position-panel union"):
+            EcrSnapshot(
+                snapshot_id="snapshot-1",
+                scoring_profile_id="profile-1",
+                season=2026,
+                as_of_week=1,
+                period=EcrPeriod.WEEKLY,
+                captured_at=NOW,
+                source_updated_at=None,
+                expert_ids=("shared",),
+                total_experts=1,
+                rankings=result.rankings,
+                expert_panels=result.expert_panels,
             )
 
     def test_rejects_duplicate_identities_and_invalid_rank_statistics(self):
@@ -95,6 +172,12 @@ class EcrSnapshotTests(unittest.TestCase):
                 (),
                 0,
                 (ranking(),),
+                (EcrExpertPanel(
+                    "RB",
+                    ("9",),
+                    1,
+                    ecr_source_provenance(captured_at=NOW),
+                ),),
             )
 
 

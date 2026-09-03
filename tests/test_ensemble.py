@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 from fractions import Fraction
@@ -57,6 +58,47 @@ class EnsembleConfigTests(unittest.TestCase):
             with self.subTest(minimum=minimum):
                 with self.assertRaises(ValueError):
                     make_config(minimum_observed_sources=minimum)
+
+    def test_strict_json_record_round_trip_is_lossless_and_content_addressed(self):
+        config = make_config(position_stddev_floors={"WR": 4, "RB": 3})
+
+        record = config.to_record()
+
+        json.dumps(record, allow_nan=False)
+        self.assertEqual(EnsembleConfig.from_record(record), config)
+        self.assertEqual(record["schema_version"], 1)
+        self.assertEqual(record["config_id"], config.config_id)
+
+        mutations = []
+        extra = deepcopy(record)
+        extra["extra"] = True
+        mutations.append(("unknown top-level field", extra))
+        boolean_version = deepcopy(record)
+        boolean_version["schema_version"] = True
+        mutations.append(("boolean schema version", boolean_version))
+        changed_id = deepcopy(record)
+        changed_id["config_id"] = "ensemble-config_tampered"
+        mutations.append(("changed content ID", changed_id))
+        non_array = deepcopy(record)
+        non_array["provider_weights"] = tuple(non_array["provider_weights"])
+        mutations.append(("non-array provider weights", non_array))
+        unknown_weight_field = deepcopy(record)
+        unknown_weight_field["provider_weights"][0]["extra"] = True
+        mutations.append(("unknown weight field", unknown_weight_field))
+        changed_weight = deepcopy(record)
+        changed_weight["provider_weights"][0]["weight"] += 0.5
+        mutations.append(("content changed without new ID", changed_weight))
+        non_object_floors = deepcopy(record)
+        non_object_floors["position_stddev_floors"] = [
+            ["RB", 3.0],
+            ["WR", 4.0],
+        ]
+        mutations.append(("non-object floors", non_object_floors))
+
+        for case, mutation in mutations:
+            with self.subTest(case=case):
+                with self.assertRaises(ValueError):
+                    EnsembleConfig.from_record(mutation)
 
 
 class WeeklyEnsembleTests(unittest.TestCase):

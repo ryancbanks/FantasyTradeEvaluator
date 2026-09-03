@@ -136,7 +136,12 @@ window.ThreeWayUi = (() => {
     return cell;
   }
 
-  function renderTradeRows(rows, participantTeamIds, bundle, {signed, percent}) {
+  function renderTradeRows(
+    rows,
+    participantTeamIds,
+    bundle,
+    {signed, percent, powerEvidenceLabel}
+  ) {
     const names = new Map((bundle?.teams || []).map(team => [team.team_id, team.name]));
     const firstImpacts = rows.length ? orderedTeamImpacts(rows[0], participantTeamIds) : [];
     const participantNames = firstImpacts.length === 3
@@ -167,7 +172,7 @@ window.ThreeWayUi = (() => {
       combined.textContent = signed(row.combined_playoff_delta, true);
       combined.className = row.combined_playoff_delta >= 0 ? "gain" : "loss";
       const evidence = document.createElement("td");
-      evidence.textContent = row.power_methodology_status;
+      evidence.textContent = powerEvidenceLabel(row.power_methodology_status);
       result.append(combined, evidence);
       body.append(result);
     }

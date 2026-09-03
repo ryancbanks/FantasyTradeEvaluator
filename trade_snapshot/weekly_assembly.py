@@ -9,6 +9,7 @@ offline engine.
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from types import MappingProxyType
 
 from ._analyzer_types import BundleFingerprint
@@ -26,17 +27,45 @@ from .capture_schema import (
     RankingHorizon,
 )
 from .ecr import EcrPeriod, EcrSnapshot
+from .ecr_source import EcrHorizonEvidence
 from .ensemble import EnsembleConfig
-from .identity import IdentityRegistry
-from .identity_match import ProviderPlayerRecord, reconcile_player_identities
+from .identity import IdentityRegistry, ProviderReference
+from .identity_match import (
+    ProviderIdentityLink,
+    ProviderPlayerRecord,
+    reconcile_player_identities,
+)
 from .league_ingest import NormalizedLeagueInputs, host_player_records, normalize_host_league_snapshot
 from .league_source import VerifiedHostLeagueSnapshot
 from .methodology import DEFAULT_POWER_METHODOLOGY, PowerMethodology, default_projection_ensemble
-from .nfl_schedule import NflSchedule
+from .feature_engineering import (
+    ProjectionAvailabilityRequirements,
+    projection_availability_requirements,
+)
+from .fantasypros_benchmark import FantasyProsLeagueBenchmark
+from .nfl_schedule import (
+    NFL_REGULAR_SEASON_WEEKS,
+    NflSchedule,
+    NflTeamWeekStatus,
+    validate_complete_regular_season,
+)
 from .positions import normalize_player_position
+from .projection_schedule import (
+    materialize_weekly_grid,
+    normalize_ros_active_weeks,
+    validate_weekly_projection_schedule,
+)
+from .projection_source import ProjectionSourceAttempt, ProjectionSourceManifest
+from .projections import (
+    ProjectionStatus,
+    RemainingSeasonProjection,
+    WeeklyProjection,
+    WeeklyProjectionOrigin,
+)
 from .role_design import build_calibration_roles
 from .scenario_config import CorrelatedScenarioConfig, FactorLoadings
 from .scenario_config import PlayerEligibility
+from .source_manifest import WeeklySourceManifest
 from .waiver_pool import (
     WaiverCandidate,
     required_waiver_positions,
@@ -90,6 +119,8 @@ def assemble_weekly_refresh_evidence(
     ensemble_config: EnsembleConfig | None = None,
     scenario_config: CorrelatedScenarioConfig | None = None,
     power_methodology: PowerMethodology = DEFAULT_POWER_METHODOLOGY,
+    league_binding_id: str | None = None,
+    projection_source_attempts: Iterable[ProjectionSourceAttempt] | None = None,
 ) -> AssembledWeeklyEvidence:
     """Build one complete local-engine input or fail before publishing anything."""
 
@@ -133,15 +164,27 @@ def assemble_weekly_refresh_evidence(
         "projection_artifacts", projection_artifacts, GenericTableArtifact
     )
     ecr = _typed_tuple("ecr_artifacts", ecr_artifacts, FantasyProsECRArtifact)
+    ensemble = ensemble_config or default_projection_ensemble()
+    if not isinstance(ensemble, EnsembleConfig):
+        raise ValueError("ensemble_config must be EnsembleConfig or None")
     _validate_artifact_dimensions(
         host_snapshot.season,
         host_snapshot.first_remaining_week,
         scoring,
         projections,
         ecr,
+        ensemble,
     )
+    _validate_capture_before_first_remaining_kickoff(
+        host_snapshot,
+        fantasypros_league,
+        projections,
+        ecr,
+        nfl_schedule,
+    )
+    _validate_preseason_ros_capture_times(ecr, nfl_schedule)
 
-    identity_records = _dedupe_player_records(
+    collected_identity_records = _dedupe_player_records(
         (
             *host_player_records(host_snapshot),
             *(row for artifact in ecr for row in ecr_provider_records(artifact)),
@@ -154,10 +197,18 @@ def assemble_weekly_refresh_evidence(
             ),
         )
     )
+    bootstrap_records, bootstrap_links = _fantasypros_bootstrap_identity_evidence(
+        fantasypros_league,
+        collected_identity_records,
+    )
+    identity_records = _dedupe_player_records(
+        (*collected_identity_records, *bootstrap_records)
+    )
     identities = reconcile_player_identities(
         identity_records,
         previous_identities,
         anchor_provider="fantasypros",
+        verified_links=bootstrap_links,
     )
     league_inputs = normalize_host_league_snapshot(host_snapshot, identities)
     rostered = frozenset(
@@ -168,6 +219,11 @@ def assemble_weekly_refresh_evidence(
         league_inputs,
         identities,
     )
+    fantasypros_benchmark = FantasyProsLeagueBenchmark.from_capture(
+        fantasypros_league,
+        host_snapshot.snapshot_id,
+        team_ids,
+    )
 
     ecr_snapshots = _merge_ecr_artifacts(
         ecr,
@@ -175,12 +231,16 @@ def assemble_weekly_refresh_evidence(
         snapshot_id=host_snapshot.snapshot_id,
         scoring_profile_id=host_snapshot.scoring_profile.scoring_profile_id,
     )
+    remaining_nfl_weeks = _remaining_nfl_weeks(
+        nfl_schedule,
+        host_snapshot.first_remaining_week,
+    )
     all_projection_evidence = _projection_evidence(
         projections,
         identities,
         snapshot_id=host_snapshot.snapshot_id,
         scoring_profile_id=host_snapshot.scoring_profile.scoring_profile_id,
-        applicable_weeks=league_inputs.league_state.remaining_regular_season_weeks,
+        applicable_weeks=remaining_nfl_weeks,
     )
     players = {row.canonical_player_id: row for row in identities.players}
     waiver_pool = _waiver_pool(
@@ -190,14 +250,11 @@ def assemble_weekly_refresh_evidence(
         ecr_snapshots,
         all_projection_evidence,
         nfl_schedule,
+        ensemble,
+        power_methodology,
     )
     computation_players = rostered | frozenset(waiver_pool.player_ids)
     player_ids = _fantasypros_player_ids(computation_players, identities)
-    projection_evidence = tuple(
-        row
-        for row in all_projection_evidence
-        if row.canonical_player_id in computation_players
-    )
     positions = {
         player_id: normalize_player_position(players[player_id].position)
         for player_id in sorted(computation_players)
@@ -210,6 +267,18 @@ def assemble_weekly_refresh_evidence(
         player_id: players[player_id].nfl_team_id
         for player_id in sorted(computation_players)
     }
+    projection_evidence = _calculation_projection_evidence(
+        all_projection_evidence,
+        computation_players,
+        nfl_teams,
+        nfl_schedule,
+    )
+    projection_source_manifest = ProjectionSourceManifest.from_artifacts(
+        projections,
+        projection_evidence,
+        attempts=projection_source_attempts,
+        identities=identities,
+    )
     eligibility_by_player = {
         row.canonical_player_id: row for row in league_inputs.eligibilities
     }
@@ -230,7 +299,6 @@ def assemble_weekly_refresh_evidence(
         positions,
         eligibilities,
     )
-    ensemble = ensemble_config or default_projection_ensemble()
     scenarios = scenario_config or CorrelatedScenarioConfig(
         10_000,
         20_260_901,
@@ -242,6 +310,13 @@ def assemble_weekly_refresh_evidence(
         rosters=league_inputs.rosters,
         projection_evidence=projection_evidence,
         nfl_schedule=nfl_schedule,
+        source_manifest=WeeklySourceManifest.from_captures(
+            host_snapshot,
+            fantasypros_league,
+            league_binding_id=league_binding_id,
+        ),
+        projection_source_manifest=projection_source_manifest,
+        fantasypros_benchmark=fantasypros_benchmark,
         ecr_snapshots=ecr_snapshots,
         eligibilities=eligibilities,
         player_positions=positions,
@@ -264,7 +339,9 @@ def assemble_weekly_refresh_evidence(
     )
 
 
-def _validate_artifact_dimensions(season, week, scoring, projections, ecr) -> None:
+def _validate_artifact_dimensions(
+    season, week, scoring, projections, ecr, ensemble_config
+) -> None:
     for row in (*projections, *ecr):
         if row.season != season or row.scoring != scoring:
             raise ValueError("weekly artifacts do not share season and scoring")
@@ -276,11 +353,83 @@ def _validate_artifact_dimensions(season, week, scoring, projections, ecr) -> No
     if any(row.week != week for row in ecr):
         raise ValueError("ECR artifacts must use the first remaining week")
     projection_horizons = {row.horizon for row in projections}
-    if projection_horizons != {RankingHorizon.WEEKLY, RankingHorizon.ROS}:
-        raise ValueError("projection artifacts must include weekly and rest-of-season rows")
+    if RankingHorizon.WEEKLY not in projection_horizons:
+        raise ValueError("projection artifacts must include weekly rows")
     providers = {row.provider.value for row in projections}
-    if providers != {"fantasypros", "espn", "yahoo"}:
-        raise ValueError("projection artifacts must include FantasyPros, ESPN, and Yahoo")
+    configured = {row.provider for row in ensemble_config.provider_weights}
+    if not configured.issubset(providers):
+        raise ValueError("projection artifacts must cover every configured provider")
+    if "fantasypros" not in configured:
+        raise ValueError("ensemble_config must include FantasyPros")
+
+
+def _validate_preseason_ros_capture_times(ecr, nfl_schedule) -> None:
+    fallback = tuple(
+        row
+        for row in ecr
+        if row.source_details.horizon_evidence
+        is EcrHorizonEvidence.PRESEASON_REST_OF_SEASON_PAGE
+    )
+    if not fallback:
+        return
+    week_one = tuple(
+        row
+        for row in nfl_schedule.team_weeks
+        if row.week == 1 and row.status is NflTeamWeekStatus.SCHEDULED
+    )
+    if not week_one or any(row.kickoff_at is None for row in week_one):
+        raise ValueError(
+            "preseason ROS fallback requires complete NFL Week 1 kickoff times"
+        )
+    earliest_kickoff = min(row.kickoff_at for row in week_one)
+    if any(_artifact_time(row.captured_at) >= earliest_kickoff for row in fallback):
+        raise ValueError(
+            "preseason ROS fallback cannot be used at or after the first NFL kickoff"
+        )
+
+
+def _validate_capture_before_first_remaining_kickoff(
+    host_snapshot,
+    fantasypros_league,
+    projections,
+    ecr,
+    nfl_schedule,
+) -> None:
+    """Reject a mixed/partial current week until played-game inputs are modeled."""
+
+    current_week = host_snapshot.first_remaining_week
+    scheduled = tuple(
+        row
+        for row in nfl_schedule.team_weeks
+        if row.week == current_week and row.status is NflTeamWeekStatus.SCHEDULED
+    )
+    known_kickoffs = tuple(
+        row.kickoff_at for row in scheduled if row.kickoff_at is not None
+    )
+    if not known_kickoffs:
+        return
+    earliest_kickoff = min(known_kickoffs)
+    capture_times = (
+        host_snapshot.captured_at.astimezone(timezone.utc),
+        _artifact_time(fantasypros_league.captured_at),
+        *(_artifact_time(row.captured_at) for row in projections),
+        *(_artifact_time(row.captured_at) for row in ecr),
+    )
+    if max(capture_times) >= earliest_kickoff:
+        raise ValueError(
+            "weekly collection began at or after the first kickoff in the first "
+            "remaining week; completed-game scores and player usage are not yet "
+            "modeled, so advance the remaining week or collect before kickoff"
+        )
+
+
+def _artifact_time(value):
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
+            timezone.utc
+        )
+    except (AttributeError, ValueError):
+        raise ValueError("ECR captured_at must be an ISO-8601 timestamp") from None
 
 
 def _dedupe_player_records(values) -> tuple[ProviderPlayerRecord, ...]:
@@ -296,6 +445,150 @@ def _dedupe_player_records(values) -> tuple[ProviderPlayerRecord, ...]:
     if not result:
         raise ValueError("identity evidence cannot be empty")
     return tuple(result[key] for key in sorted(result))
+
+
+_FANTASYPROS_POSITION_IDS = {
+    "1": "QB",
+    "2": "RB",
+    "3": "WR",
+    "4": "TE",
+    "5": "K",
+    "6": "DST",
+}
+_NFL_TEAM_IDS = frozenset(
+    {
+        "ARI", "ATL", "BAL", "BUF", "CAR", "CHI", "CIN", "CLE",
+        "DAL", "DEN", "DET", "GB", "HOU", "IND", "JAX", "KC",
+        "LAC", "LAR", "LV", "MIA", "MIN", "NE", "NO", "NYG",
+        "NYJ", "PHI", "PIT", "SEA", "SF", "TB", "TEN", "WSH",
+    }
+)
+
+
+def _fantasypros_bootstrap_identity_evidence(artifact, existing_records):
+    """Turn captured provider crosswalks into explicit, verified identity links."""
+
+    bootstrap = _league_payload(artifact, LeagueSourceKind.BOOTSTRAP)
+    players = {row["player_id"]: row for row in bootstrap["players"]}
+    rostered_ids = {
+        player_id
+        for roster in bootstrap["rosters"]
+        for player_id in roster["player_ids"]
+    }
+    best_free_agent_ids = set(
+        _league_payload(
+            artifact, LeagueSourceKind.ANALYZER_INIT
+        )["best_free_agent_ids"]
+    )
+    by_reference = {
+        (row.provider, row.provider_player_id): row for row in existing_records
+    }
+    records = []
+    links = []
+    crosswalk_owner = {}
+    for fantasypros_id in sorted(rostered_ids | best_free_agent_ids):
+        raw = players[fantasypros_id]
+        references = [ProviderReference("fantasypros", fantasypros_id)]
+        for provider, field in (("espn", "espn_id"), ("yahoo", "yahoo_id")):
+            provider_id = raw.get(field)
+            if provider_id is None:
+                continue
+            key = provider, provider_id
+            previous_owner = crosswalk_owner.get(key)
+            if previous_owner is not None and previous_owner != fantasypros_id:
+                raise ValueError(
+                    f"FantasyPros bootstrap maps {key!r} to multiple players"
+                )
+            crosswalk_owner[key] = fantasypros_id
+            references.append(ProviderReference(provider, provider_id))
+
+        known = tuple(
+            by_reference[reference.key]
+            for reference in references
+            if reference.key in by_reference
+        )
+        anchor = next(
+            (row for row in known if row.provider == "fantasypros"),
+            known[0] if known else None,
+        )
+        captured_position = _bootstrap_player_position(raw)
+        captured_team = _bootstrap_player_team(raw)
+        if anchor is None:
+            if captured_position is None or captured_team is None:
+                raise ValueError(
+                    "FantasyPros roster contains a player without an exact identity: "
+                    f"player {fantasypros_id!r} lacks usable position/team metadata "
+                    "and a captured ESPN/Yahoo crosswalk"
+                )
+            anchor = ProviderPlayerRecord(
+                "fantasypros",
+                fantasypros_id,
+                raw["name"],
+                captured_position,
+                captured_team,
+            )
+        if captured_position is not None and captured_position != anchor.position:
+            raise ValueError(
+                f"FantasyPros bootstrap position conflicts for player {fantasypros_id!r}"
+            )
+        if captured_team is not None and captured_team != anchor.nfl_team_id:
+            raise ValueError(
+                f"FantasyPros bootstrap NFL team conflicts for player {fantasypros_id!r}"
+            )
+
+        for reference in references:
+            if reference.key in by_reference:
+                continue
+            record = ProviderPlayerRecord(
+                reference.provider,
+                reference.provider_player_id,
+                anchor.display_name,
+                anchor.position,
+                anchor.nfl_team_id,
+            )
+            by_reference[reference.key] = record
+            records.append(record)
+        if len(references) > 1:
+            links.append(
+                ProviderIdentityLink(
+                    tuple(references),
+                    f"FantasyPros league bootstrap player {fantasypros_id}",
+                )
+            )
+    return tuple(records), tuple(links)
+
+
+def _bootstrap_player_position(row) -> str | None:
+    values = []
+    for name in ("position", "position_id"):
+        value = row.get(name)
+        if isinstance(value, (int, str)) and not isinstance(value, bool):
+            text = str(value).strip().upper()
+            text = _FANTASYPROS_POSITION_IDS.get(text, text)
+            try:
+                values.append(normalize_player_position(text, require_supported=True))
+            except ValueError:
+                pass
+    raw_positions = row.get("positions")
+    if isinstance(raw_positions, (list, tuple)):
+        for value in raw_positions:
+            try:
+                values.append(normalize_player_position(value, require_supported=True))
+            except ValueError:
+                pass
+    unique = tuple(dict.fromkeys(values))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _bootstrap_player_team(row) -> str | None:
+    value = row.get("team_id")
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().upper()
+    normalized = {"JAC": "JAX", "WAS": "WSH", "LA": "LAR"}.get(
+        normalized, normalized
+    )
+    return normalized if normalized in _NFL_TEAM_IDS else None
 
 
 def _fantasypros_player_ids(calculation_player_ids, identities) -> Mapping[str, str]:
@@ -370,6 +663,16 @@ def _merge_ecr_artifacts(
         (RankingHorizon.ROS, EcrPeriod.REST_OF_SEASON),
     ):
         rows = by_horizon[horizon]
+        panels_by_position = {}
+        for snapshot in rows:
+            for panel in snapshot.expert_panels:
+                previous = panels_by_position.get(panel.position)
+                if previous is not None and previous != panel:
+                    raise ValueError(
+                        f"{horizon.value} ECR has conflicting expert panels "
+                        f"for {panel.position}"
+                    )
+                panels_by_position[panel.position] = panel
         rankings = tuple(
             ranking
             for snapshot in rows
@@ -386,21 +689,28 @@ def _merge_ecr_artifacts(
         source_updated_at = (
             None if any(value is None for value in source_times) else min(source_times)
         )
-        expert_ids = tuple(
-            sorted({expert for row in rows for expert in row.expert_ids})
+        panels = tuple(
+            panels_by_position[position]
+            for position in sorted(panels_by_position)
         )
+        expert_ids = tuple(sorted({
+            expert_id
+            for panel in panels
+            for expert_id in panel.expert_ids
+        }))
         result.append(
             EcrSnapshot(
-                snapshot_id,
-                scoring_profile_id,
-                rows[0].season,
-                rows[0].as_of_week,
-                period,
-                captured_at,
-                source_updated_at,
-                expert_ids,
-                len(expert_ids),
-                rankings,
+                snapshot_id=snapshot_id,
+                scoring_profile_id=scoring_profile_id,
+                season=rows[0].season,
+                as_of_week=rows[0].as_of_week,
+                period=period,
+                captured_at=captured_at,
+                source_updated_at=source_updated_at,
+                expert_ids=expert_ids,
+                total_experts=len(expert_ids),
+                rankings=rankings,
+                expert_panels=panels,
             )
         )
     return tuple(result)
@@ -435,6 +745,50 @@ def _projection_evidence(
     return tuple(result)
 
 
+def _remaining_nfl_weeks(nfl_schedule, first_remaining_week) -> tuple[int, ...]:
+    validate_complete_regular_season(nfl_schedule)
+    weeks = tuple(
+        sorted(
+            {
+                row.week
+                for row in nfl_schedule.team_weeks
+                if row.week >= first_remaining_week
+            }
+        )
+    )
+    expected = tuple(
+        week for week in NFL_REGULAR_SEASON_WEEKS if week >= first_remaining_week
+    )
+    if weeks != expected:
+        raise ValueError(
+            "NFL schedule must cover every remaining regular-season week"
+        )
+    return weeks
+
+
+def _calculation_projection_evidence(
+    rows,
+    calculation_player_ids,
+    player_nfl_team_ids,
+    nfl_schedule,
+):
+    """Retain calculation rows and make each ROS horizon player-specific."""
+
+    result = []
+    for row in rows:
+        player_id = row.canonical_player_id
+        if player_id not in calculation_player_ids:
+            continue
+        if isinstance(row, RemainingSeasonProjection):
+            row = normalize_ros_active_weeks(
+                row,
+                nfl_team_id=player_nfl_team_ids[player_id],
+                nfl_schedule=nfl_schedule,
+            )
+        result.append(row)
+    return tuple(result)
+
+
 def _waiver_pool(
     artifact,
     league_inputs,
@@ -442,6 +796,8 @@ def _waiver_pool(
     ecr_snapshots,
     projection_evidence,
     nfl_schedule,
+    ensemble_config,
+    power_methodology,
 ):
     state = league_inputs.league_state
     rostered = frozenset(
@@ -449,11 +805,32 @@ def _waiver_pool(
     )
     required_positions = required_waiver_positions(
         state.roster_rules.starting_lineup_slots,
-        (players[player_id].position for player_id in rostered),
     )
     materializable = _materializable_projection_player_ids(
         projection_evidence,
-        state.remaining_regular_season_weeks,
+        {
+            player_id: tuple(
+                row.week
+                for row in nfl_schedule.team_weeks
+                if row.nfl_team_id == player.nfl_team_id
+                and row.week >= state.first_remaining_week
+                and row.status is NflTeamWeekStatus.SCHEDULED
+            )
+            for player_id, player in players.items()
+        },
+        calculation_weeks=state.remaining_regular_season_weeks,
+        current_week=state.first_remaining_week,
+        provider_names=tuple(
+            row.provider for row in ensemble_config.provider_weights
+        ),
+        minimum_observed_sources=ensemble_config.minimum_observed_sources,
+        requirements=projection_availability_requirements(
+            (
+                *power_methodology.residual_feature_names,
+                *power_methodology.role_feature_names,
+            ),
+            (row.provider for row in ensemble_config.provider_weights),
+        ),
     )
     by_period = {row.period: row for row in ecr_snapshots}
     weekly = {
@@ -467,6 +844,18 @@ def _waiver_pool(
     candidate_ids = (
         set(weekly) & set(ros) & materializable & set(players)
     ).difference(rostered)
+    candidate_ids = {
+        player_id
+        for player_id in candidate_ids
+        if _can_materialize_waiver_player(
+            state,
+            projection_evidence,
+            player_id,
+            players[player_id].nfl_team_id,
+            tuple(row.provider for row in ensemble_config.provider_weights),
+            nfl_schedule,
+        )
+    }
     candidates = []
     for player_id in sorted(candidate_ids):
         identity = players[player_id]
@@ -504,22 +893,257 @@ def _waiver_pool(
     )
 
 
-def _materializable_projection_player_ids(rows, weeks) -> set[str]:
-    providers = ("fantasypros", "espn", "yahoo")
-    required_weeks = frozenset(weeks)
-    coverage = defaultdict(lambda: defaultdict(set))
-    for row in rows:
-        period = row.week if hasattr(row, "week") else "ros"
-        coverage[row.canonical_player_id][row.provider].add(period)
-    return {
-        player_id
-        for player_id, provider_periods in coverage.items()
-        if all(
-            "ros" in provider_periods.get(provider, ())
-            or required_weeks.issubset(provider_periods.get(provider, ()))
-            for provider in providers
+def _materializable_projection_player_ids(
+    rows,
+    active_weeks_by_player,
+    *,
+    calculation_weeks,
+    current_week,
+    provider_names,
+    minimum_observed_sources,
+    requirements,
+) -> set[str]:
+    providers = tuple(provider_names)
+    if (
+        not providers
+        or len(set(providers)) != len(providers)
+        or any(not isinstance(provider, str) or not provider for provider in providers)
+    ):
+        raise ValueError("provider_names must contain unique provider names")
+    if (
+        type(minimum_observed_sources) is not int
+        or not 1 <= minimum_observed_sources <= len(providers)
+    ):
+        raise ValueError("minimum_observed_sources is invalid")
+    if not isinstance(requirements, ProjectionAvailabilityRequirements):
+        raise ValueError(
+            "requirements must be ProjectionAvailabilityRequirements"
         )
-    }
+    try:
+        calculation = frozenset(calculation_weeks)
+    except TypeError:
+        raise ValueError("calculation_weeks must be an iterable") from None
+    if (
+        not calculation
+        or any(type(week) is not int or not 1 <= week <= 25 for week in calculation)
+        or type(current_week) is not int
+        or current_week not in calculation
+    ):
+        raise ValueError("calculation_weeks and current_week are invalid")
+    required_providers = (
+        requirements.current_providers | requirements.full_ros_providers
+    )
+    if not required_providers.issubset(providers):
+        raise ValueError("formula-required providers must be configured providers")
+    ros_observed = {}
+    ros_by_pair = {}
+    weekly_by_pair = defaultdict(dict)
+    provider_identity = set()
+    player_ids = set()
+    for row in rows:
+        if row.canonical_player_id is None:
+            continue
+        pair = row.canonical_player_id, row.provider
+        player_ids.add(row.canonical_player_id)
+        provider_identity.add(pair)
+        if isinstance(row, RemainingSeasonProjection):
+            if pair in ros_by_pair:
+                raise ValueError("projection evidence contains duplicate ROS rows")
+            ros_by_pair[pair] = row
+            if row.status is ProjectionStatus.OBSERVED:
+                ros_observed[pair] = row
+        elif isinstance(row, WeeklyProjection):
+            if row.week in weekly_by_pair[pair]:
+                raise ValueError(
+                    "projection evidence contains duplicate weekly rows"
+                )
+            weekly_by_pair[pair][row.week] = row
+    result = set()
+    for player_id in player_ids:
+        active_weeks = frozenset(active_weeks_by_player.get(player_id, ()))
+        if not active_weeks or any(
+            (player_id, provider) not in provider_identity
+            for provider in providers
+        ):
+            continue
+        if any(
+            not _provider_has_materializer_capture(
+                (player_id, provider),
+                calculation,
+                ros_by_pair,
+                weekly_by_pair,
+            )
+            or not _provider_schedule_statuses_are_valid(
+                (player_id, provider),
+                calculation,
+                active_weeks,
+                ros_observed,
+                weekly_by_pair,
+            )
+            for provider in providers
+        ):
+            continue
+        regular_weeks = active_weeks.intersection(calculation)
+        week_sources = {
+            week: {
+                provider
+                for provider in providers
+                if _provider_week_available(
+                    (player_id, provider),
+                    week,
+                    active_weeks,
+                    weekly_by_pair,
+                    ros_observed,
+                )
+            }
+            for week in regular_weeks
+        }
+        if any(
+            len(week_sources[week]) < minimum_observed_sources
+            for week in regular_weeks
+        ):
+            continue
+        full_horizon_sources = {
+            provider
+            for provider in providers
+            if _provider_full_horizon_available(
+                (player_id, provider),
+                active_weeks,
+                weekly_by_pair,
+                ros_observed,
+            )
+        }
+        if not requirements.full_ros_providers.issubset(full_horizon_sources):
+            continue
+        current_sources = week_sources.get(current_week, set())
+        if not requirements.current_providers.issubset(current_sources):
+            continue
+        if requirements.ensemble_current and len(current_sources) < minimum_observed_sources:
+            continue
+        if (
+            requirements.ensemble_full_ros
+            and len(full_horizon_sources) < minimum_observed_sources
+        ):
+            continue
+        result.add(player_id)
+    return result
+
+
+def _provider_has_materializer_capture(
+    pair,
+    calculation_weeks,
+    ros_by_pair,
+    weekly_by_pair,
+):
+    return pair in ros_by_pair or any(
+        week in calculation_weeks for week in weekly_by_pair[pair]
+    )
+
+
+def _provider_schedule_statuses_are_valid(
+    pair,
+    calculation_weeks,
+    active_weeks,
+    ros_observed,
+    weekly_by_pair,
+):
+    ros = ros_observed.get(pair)
+    final_week = max(
+        (*calculation_weeks, *(ros.applicable_weeks if ros is not None else ()))
+    )
+    first_week = min(calculation_weeks)
+    for week, row in weekly_by_pair[pair].items():
+        if not first_week <= week <= final_week:
+            continue
+        if week in active_weeks:
+            if row.status is ProjectionStatus.BYE:
+                return False
+        elif row.status not in {
+            ProjectionStatus.BYE,
+            ProjectionStatus.NOT_PUBLISHED,
+        }:
+            return False
+    return True
+
+
+def _can_materialize_waiver_player(
+    state,
+    projection_evidence,
+    player_id,
+    nfl_team_id,
+    providers,
+    nfl_schedule,
+):
+    try:
+        player_evidence = tuple(
+            row
+            for row in projection_evidence
+            if row.canonical_player_id == player_id
+        )
+        validate_weekly_projection_schedule(
+            nfl_schedule,
+            {player_id: nfl_team_id},
+            player_evidence,
+        )
+        evidence = _calculation_projection_evidence(
+            player_evidence,
+            {player_id},
+            {player_id: nfl_team_id},
+            nfl_schedule,
+        )
+        materialize_weekly_grid(
+            state,
+            evidence,
+            player_ids=(player_id,),
+            provider_names=providers,
+            nfl_schedule=nfl_schedule,
+            player_nfl_team_ids={player_id: nfl_team_id},
+        )
+    except ValueError:
+        return False
+    return True
+
+
+def _provider_week_available(
+    pair,
+    week,
+    active_weeks,
+    weekly_by_pair,
+    ros_observed,
+):
+    direct = weekly_by_pair[pair].get(week)
+    if direct is not None and direct.status is ProjectionStatus.OBSERVED:
+        return True
+    if direct is not None and direct.status is not ProjectionStatus.NOT_PUBLISHED:
+        return False
+    ros = ros_observed.get(pair)
+    if ros is None or week not in ros.applicable_weeks:
+        return False
+    return all(
+        row.status in {
+            ProjectionStatus.OBSERVED,
+            ProjectionStatus.NOT_PUBLISHED,
+        }
+        for row_week, row in weekly_by_pair[pair].items()
+        if row_week in active_weeks
+    )
+
+
+def _provider_full_horizon_available(
+    pair,
+    active_weeks,
+    weekly_by_pair,
+    ros_observed,
+):
+    ros = ros_observed.get(pair)
+    if ros is not None and active_weeks.issubset(ros.applicable_weeks):
+        return True
+    return all(
+        (row := weekly_by_pair[pair].get(week)) is not None
+        and row.status is ProjectionStatus.OBSERVED
+        and row.origin is WeeklyProjectionOrigin.PROVIDER_PUBLISHED
+        for week in active_weeks
+    )
 
 
 def _has_complete_schedule(schedule, nfl_team_id, weeks) -> bool:

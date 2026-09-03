@@ -160,4 +160,26 @@ def _scoring(value: object) -> str:
     return aliases[text]
 
 
-__all__ = ("AnalyzerTradeSpec", "ProjectionTableSpec", "RankingHorizon")
+def fantasypros_ecr_source_scoring(
+    league_scoring: object,
+    position_scope: Iterable[object],
+) -> str:
+    """Return the scoring dimension exposed by the selected ECR page.
+
+    FantasyPros publishes reception-sensitive pages for RB/WR/TE (and their
+    aggregate views). Its QB, K, DST, and IDP position pages identify their
+    source scoring as standard even when the fantasy league is PPR or half-PPR.
+    """
+
+    scoring = _scoring(league_scoring)
+    positions = set(_positions(position_scope))
+    reception_sensitive = {"RB", "WR", "TE", "FLX", "ALL"}
+    return scoring if positions & reception_sensitive else "STD"
+
+
+__all__ = (
+    "AnalyzerTradeSpec",
+    "ProjectionTableSpec",
+    "RankingHorizon",
+    "fantasypros_ecr_source_scoring",
+)

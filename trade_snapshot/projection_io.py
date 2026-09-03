@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 
 from .projections import (
     ProjectionStatus,
+    ProviderStatusObservation,
+    ProviderStatusScope,
     RemainingSeasonOrigin,
     RemainingSeasonProjection,
     WeeklyProjectionOrigin,
@@ -24,6 +26,7 @@ _COMMON_KEYS = {
     "source_published_at",
     "projected_fantasy_points",
     "raw_projected_stats",
+    "provider_status_observations",
     "kind",
 }
 _WEEKLY_KEYS = _COMMON_KEYS | {
@@ -60,6 +63,15 @@ def projection_to_record(
         ),
         "projected_fantasy_points": projection.projected_fantasy_points,
         "raw_projected_stats": dict(projection.raw_projected_stats),
+        "provider_status_observations": [
+            {
+                "designation": observation.designation,
+                "captured_at": _iso_utc(observation.captured_at),
+                "source_scope": observation.source_scope.value,
+                "source_week": observation.source_week,
+            }
+            for observation in projection.provider_status_observations
+        ],
     }
     if isinstance(projection, WeeklyProjection):
         record.update(
@@ -108,6 +120,9 @@ def projection_from_record(record: Mapping[str, object]):
         "source_published_at": _optional_time(record["source_published_at"]),
         "projected_fantasy_points": record["projected_fantasy_points"],
         "raw_projected_stats": record["raw_projected_stats"],
+        "provider_status_observations": _status_observations(
+            record["provider_status_observations"]
+        ),
     }
     if kind == "weekly":
         return WeeklyProjection(
@@ -135,6 +150,37 @@ def _enum_value(enum_type, value: object, name: str):
 
 def _optional_time(value: object) -> datetime | None:
     return None if value is None else _parse_time(value, "source_published_at")
+
+
+def _status_observations(value: object) -> tuple[ProviderStatusObservation, ...]:
+    if isinstance(value, (str, bytes)):
+        raise ValueError("projection record provider_status_observations must be a list")
+    try:
+        records = tuple(value)
+    except TypeError:
+        raise ValueError(
+            "projection record provider_status_observations must be a list"
+        ) from None
+    result = []
+    expected = {"designation", "captured_at", "source_scope", "source_week"}
+    for record in records:
+        if not isinstance(record, Mapping) or set(record) != expected:
+            raise ValueError("projection record provider status fields are invalid")
+        result.append(
+            ProviderStatusObservation(
+                designation=record["designation"],
+                captured_at=_parse_time(
+                    record["captured_at"], "provider status captured_at"
+                ),
+                source_scope=_enum_value(
+                    ProviderStatusScope,
+                    record["source_scope"],
+                    "provider status source_scope",
+                ),
+                source_week=record["source_week"],
+            )
+        )
+    return tuple(result)
 
 
 def _parse_time(value: object, name: str) -> datetime:

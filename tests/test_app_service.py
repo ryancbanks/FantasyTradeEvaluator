@@ -1,4 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
@@ -6,12 +8,14 @@ import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from zipfile import ZipFile
 
 from tests.test_engine_bundle import engine_bundle
 from tests.test_three_way_search import components as three_way_components
 from tests.test_surrogate_disclosure import surrogate_bundle
 from trade_snapshot.app_service import LocalAppService, LocalSearchRequest
 from trade_snapshot.three_way_search import ThreeWaySearchOutcome
+from trade_snapshot.trade_impact import prepare_season_baseline
 
 
 def payload(bundle_id):
@@ -60,6 +64,71 @@ def wait_for_job(service, job_id):
 
 
 class LocalAppServiceTests(unittest.TestCase):
+    def test_catalog_labels_legacy_bundles_with_a_rescan_recovery(self):
+        legacy = engine_bundle().to_record()
+        legacy["schema_version"] = 6
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            (service.bundle_directory / "legacy.json").write_text(
+                json.dumps(legacy),
+                encoding="utf-8",
+            )
+
+            catalog = service.bundle_catalog()
+
+        self.assertEqual(catalog["bundles"][0]["status"], "legacy_requires_rescan")
+        self.assertEqual(catalog["bundles"][0]["schema_version"], 6)
+        self.assertEqual(catalog["readiness"]["legacy_bundle_count"], 1)
+        self.assertEqual(catalog["readiness"]["invalid_bundle_count"], 0)
+        self.assertIn("Scan the league again", catalog["readiness"]["message"])
+
+    def test_catalog_reports_every_incompatible_saved_bundle_alongside_ready_data(self):
+        bundle = engine_bundle()
+        legacy = bundle.to_record()
+        legacy["schema_version"] = 7
+        future = bundle.to_record()
+        future["schema_version"] = 9
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            for filename, record in (
+                ("legacy.json", legacy),
+                ("future.json", future),
+                ("invalid.json", {}),
+            ):
+                (service.bundle_directory / filename).write_text(
+                    json.dumps(record),
+                    encoding="utf-8",
+                )
+
+            catalog = service.bundle_catalog()
+
+        status_by_file = {
+            row.get("file"): row["status"] for row in catalog["bundles"]
+        }
+        self.assertEqual(status_by_file["legacy.json"], "legacy_requires_rescan")
+        self.assertEqual(status_by_file["future.json"], "requires_app_update")
+        self.assertEqual(status_by_file["invalid.json"], "invalid")
+        self.assertTrue(catalog["readiness"]["ready"])
+        self.assertEqual(catalog["readiness"]["ready_bundle_count"], 1)
+        self.assertEqual(catalog["readiness"]["legacy_bundle_count"], 1)
+        self.assertEqual(
+            catalog["readiness"]["requires_app_update_bundle_count"], 1
+        )
+        self.assertEqual(catalog["readiness"]["invalid_bundle_count"], 1)
+        self.assertIn(
+            "Older-format saved weekly bundles: 1",
+            catalog["readiness"]["message"],
+        )
+        self.assertIn(
+            "Saved weekly bundles requiring a newer application: 1",
+            catalog["readiness"]["message"],
+        )
+        self.assertIn(
+            "Saved weekly bundles that failed validation: 1",
+            catalog["readiness"]["message"],
+        )
+
     def test_player_outlook_is_available_without_a_search_and_cached(self):
         bundle = engine_bundle()
         with TemporaryDirectory() as directory:
@@ -203,6 +272,28 @@ class LocalAppServiceTests(unittest.TestCase):
             },
         )
 
+    def test_dashboard_cap_preserves_the_bundle_player_score_floor(self):
+        bundle = engine_bundle()
+        bundle = replace(
+            bundle,
+            scenario_config=replace(
+                bundle.scenario_config,
+                player_score_floor=-2.5,
+            ),
+        )
+        with TemporaryDirectory() as directory, patch(
+            "trade_snapshot.app_service._MAX_DASHBOARD_SCENARIOS", 2
+        ):
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            with patch(
+                "trade_snapshot.app_service.prepare_season_baseline",
+                wraps=prepare_season_baseline,
+            ) as prepared:
+                service.league_dashboard(bundle.bundle_id)
+
+        self.assertEqual(prepared.call_args.args[4].player_score_floor, -2.5)
+
     def test_concurrent_dashboard_requests_share_one_calculation(self):
         bundle = engine_bundle()
         calculation_started = Event()
@@ -243,7 +334,7 @@ class LocalAppServiceTests(unittest.TestCase):
     def test_three_team_service_counts_runs_and_presents_every_participant(self):
         space, prepared, baseline, _ = three_way_components()
         bundle = SimpleNamespace(
-            methodology_mode="exact",
+            methodology_mode="holdout_validated",
             state=baseline.state,
             rosters=baseline.scenarios.rosters,
             projections=baseline.scenarios.projections,
@@ -371,6 +462,8 @@ class LocalAppServiceTests(unittest.TestCase):
             preview = service.job_results(started["job_id"])
             exported = service.export_job(started["job_id"])
             export_path = service.export_path(exported["filename"])
+            with ZipFile(export_path) as archive:
+                export_strings = archive.read("xl/sharedStrings.xml").decode()
 
             resumed = service.start_search(request)
             resumed_finished = wait_for_job(service, resumed["job_id"])
@@ -391,8 +484,8 @@ class LocalAppServiceTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            summary["methodology"]["exact_trade_scope"],
-            "balanced packages with no adds or drops",
+            summary["methodology"]["holdout_validated_trade_scope"],
+            "balanced package shapes with no adds or drops",
         )
         self.assertEqual(estimate["candidate_count"], 4)
         self.assertEqual(finished["status"], "complete")
@@ -403,11 +496,11 @@ class LocalAppServiceTests(unittest.TestCase):
         self.assertEqual(len(preview["rows"]), 4)
         self.assertEqual(
             {row["power_methodology_status"] for row in preview["rows"]},
-            {"exact"},
+            {"holdout_validated"},
         )
         self.assertEqual(
             {row["power_methodology_status"] for row in preview["rows"]},
-            {"exact"},
+            {"holdout_validated"},
         )
         self.assertEqual(len(preview["team_outlook"]), 2)
         self.assertEqual(
@@ -417,9 +510,76 @@ class LocalAppServiceTests(unittest.TestCase):
         self.assertTrue(
             all(0 <= row["playoff_probability"] <= 1 for row in preview["team_outlook"])
         )
+        for row in preview["team_outlook"]:
+            self.assertIsInstance(row["current_rank"], int)
+            self.assertIsInstance(row["expected_final_points_for"], float)
+            self.assertIsInstance(row["expected_final_points_against"], float)
+            self.assertAlmostEqual(sum(row["rank_distribution"]), 1.0)
+            self.assertAlmostEqual(
+                sum(row["seed_distribution"]),
+                row["playoff_probability"],
+            )
         self.assertTrue(export_path.name.endswith(".xlsx"))
+        self.assertIn("Direct Provider Projection Cells", export_strings)
+        self.assertIn("Custom-Scoring Limitation", export_strings)
+        self.assertIn("Outcome-Correlation Limitation", export_strings)
+        self.assertIn("Marginal-Uncertainty Limitation", export_strings)
+        self.assertIn("Championship-Proxy Limitation", export_strings)
+        self.assertIn("As-of-Time Limitation", export_strings)
+        self.assertIn("Host league snapshot (espn)", export_strings)
+        self.assertIn("Opaque league binding (workspace)", export_strings)
+        self.assertIn(bundle.source_manifest.league_binding_id, export_strings)
+        self.assertIn(bundle.source_manifest.host_snapshot_id, export_strings)
+        self.assertIn("FantasyPros league artifact", export_strings)
+        self.assertIn(
+            bundle.source_manifest.fantasypros_league_artifact_id,
+            export_strings,
+        )
+        self.assertIn(
+            "FantasyPros comparison benchmark record (comparison only)",
+            export_strings,
+        )
+        self.assertIn(bundle.fantasypros_benchmark.benchmark_id, export_strings)
+        self.assertIn(
+            "FantasyPros comparison source artifact (comparison only)",
+            export_strings,
+        )
+        self.assertIn(
+            bundle.fantasypros_benchmark.source_artifact_id,
+            export_strings,
+        )
+        self.assertIn("NFL schedule (espn)", export_strings)
+        self.assertIn(bundle.nfl_schedule.schedule_id, export_strings)
+        self.assertIn("Projection source manifest", export_strings)
+        self.assertIn(
+            bundle.projection_source_manifest.manifest_id,
+            export_strings,
+        )
         self.assertEqual(resumed_finished["status"], "complete")
         self.assertEqual(len(databases), 1)
+
+    def test_search_override_preserves_the_bundle_player_score_floor(self):
+        bundle = engine_bundle()
+        bundle = replace(
+            bundle,
+            scenario_config=replace(
+                bundle.scenario_config,
+                player_score_floor=-3.0,
+            ),
+        )
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            request = LocalSearchRequest.from_payload(payload(bundle.bundle_id))
+            with patch(
+                "trade_snapshot.app_service.prepare_season_baseline",
+                wraps=prepare_season_baseline,
+            ) as prepared:
+                started = service.start_search(request)
+                finished = wait_for_job(service, started["job_id"])
+
+        self.assertEqual(finished["status"], "complete", finished)
+        self.assertEqual(prepared.call_args.args[4].player_score_floor, -3.0)
 
     def test_request_is_content_addressed_and_supports_explicit_roster_adjustments(self):
         bundle = engine_bundle()
@@ -593,7 +753,7 @@ class LocalAppServiceTests(unittest.TestCase):
     def test_expression_player_ownership_supports_multiple_selected_partners(self):
         _space, prepared, baseline, _ = three_way_components()
         bundle = SimpleNamespace(
-            methodology_mode="exact",
+            methodology_mode="holdout_validated",
             state=baseline.state,
             rosters=baseline.scenarios.rosters,
             projections=baseline.scenarios.projections,
@@ -735,7 +895,9 @@ class LocalAppServiceTests(unittest.TestCase):
                 extrapolated_results = service.job_results(second["job_id"])
 
         self.assertEqual(summary["power_engine_mode"], "surrogate")
-        self.assertIsNone(summary["methodology"]["exact_trade_scope"])
+        self.assertIsNone(
+            summary["methodology"]["holdout_validated_trade_scope"]
+        )
         self.assertEqual(estimate["candidate_count"], 4)
         self.assertEqual(finished["status"], "complete")
         self.assertEqual(results["power_engine_mode"], "surrogate")

@@ -4,6 +4,8 @@ import unittest
 from trade_snapshot.projection_io import projection_from_record, projection_to_record
 from trade_snapshot.projections import (
     ProjectionStatus,
+    ProviderStatusObservation,
+    ProviderStatusScope,
     RemainingSeasonOrigin,
     RemainingSeasonProjection,
     WeeklyProjection,
@@ -31,11 +33,25 @@ class ProjectionRecordTests(unittest.TestCase):
             nfl_game_id="game-1",
             opponent_team_id="CHI",
             is_home=True,
+            provider_status_observations=(
+                ProviderStatusObservation(
+                    "Questionable",
+                    CAPTURED,
+                    ProviderStatusScope.WEEKLY,
+                    1,
+                ),
+            ),
         )
 
         record = projection_to_record(projection)
 
         self.assertEqual(record["captured_at"], "2026-09-01T15:00:00.123456Z")
+        self.assertEqual(record["provider_status_observations"], [{
+            "designation": "Questionable",
+            "captured_at": "2026-09-01T15:00:00.123456Z",
+            "source_scope": "weekly",
+            "source_week": 1,
+        }])
         self.assertEqual(projection_from_record(record), projection)
 
     def test_remaining_season_round_trip_preserves_origin(self):
@@ -73,6 +89,12 @@ class ProjectionRecordTests(unittest.TestCase):
             {**base, "unknown": 1},
             {**base, "kind": "daily"},
             {**base, "captured_at": "not-a-time"},
+            {**base, "provider_status_observations": [{
+                "designation": "Out",
+                "captured_at": "2026-09-01T15:00:00.123456Z",
+                "source_scope": "ros",
+                "source_week": 1,
+            }]},
         )
         for record in invalid_records:
             with self.subTest(record=record):

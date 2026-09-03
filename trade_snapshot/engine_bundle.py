@@ -10,21 +10,53 @@ from uuid import uuid4
 
 from ._scenario_random import content_id
 from .ecr import EcrPeriod, EcrSnapshot
-from .ensemble import EnsembleProjection, ensemble_from_record, ensemble_to_record
+from .ensemble import (
+    EnsembleConfig,
+    EnsembleProjection,
+    ensemble_from_record,
+    ensemble_to_record,
+)
+from .feature_engineering import build_strength_features
+from .fantasypros_benchmark import FantasyProsLeagueBenchmark
 from .league_io import league_state_from_record, league_state_to_record
 from .league_state import LeagueState
 from .methodology_attestation import MethodologyAttestation
+from .methodology_reuse import formula_static_incompatibility_reasons
+from .nfl_schedule import (
+    NflSchedule,
+    NflTeamWeekStatus,
+    validate_complete_regular_season,
+)
 from .projection_io import projection_from_record, projection_to_record
-from .projections import RemainingSeasonProjection, WeeklyProjection
+from .projection_lineage import ProjectionLineageIndex
+from .projection_source import ProjectionSourceManifest
+from .projection_schedule import validate_weekly_projection_schedule
+from .projections import ProjectionStatus, RemainingSeasonProjection, WeeklyProjection
 from .scenario_config import CorrelatedScenarioConfig, PlayerEligibility
 from .scoring import ScoringProfile
 from .strength import StrengthModel
+from .strength_formula import StrengthFormula
+from .source_manifest import WeeklySourceManifest
 from .surrogate_disclosure import SurrogateDisclosure
 from .trade_space import TeamRoster
 from .waiver_pool import WaiverPool
 
 
-_BUNDLE_SCHEMA_VERSION = 6
+_BUNDLE_SCHEMA_VERSION = 8
+
+
+class UnsupportedEngineBundleSchema(ValueError):
+    """A recognized bundle needs a newer scan or application version."""
+
+    def __init__(self, schema_version: int) -> None:
+        self.schema_version = schema_version
+        if schema_version < _BUNDLE_SCHEMA_VERSION:
+            recovery = "collect the league again to create a current bundle"
+        else:
+            recovery = "update the application before opening this bundle"
+        super().__init__(
+            f"engine bundle schema {schema_version} is unsupported; {recovery}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +66,13 @@ class EngineBundle:
     rosters: tuple[TeamRoster, ...]
     projections: tuple[EnsembleProjection, ...]
     eligibilities: tuple[PlayerEligibility, ...]
+    nfl_schedule: NflSchedule
+    source_manifest: WeeklySourceManifest
+    projection_source_manifest: ProjectionSourceManifest
+    fantasypros_benchmark: FantasyProsLeagueBenchmark
+    ensemble_config: EnsembleConfig
     scenario_config: CorrelatedScenarioConfig
+    strength_formula: StrengthFormula
     strength_model: StrengthModel
     ecr_snapshots: tuple[EcrSnapshot, ...]
     projection_evidence: tuple[WeeklyProjection | RemainingSeasonProjection, ...]
@@ -61,6 +99,37 @@ class EngineBundle:
             raise ValueError("projection_evidence must contain normalized source projections")
         if not isinstance(self.scenario_config, CorrelatedScenarioConfig):
             raise ValueError("scenario_config must be a CorrelatedScenarioConfig")
+        if not isinstance(self.nfl_schedule, NflSchedule):
+            raise ValueError("nfl_schedule must be an NflSchedule")
+        if not isinstance(self.source_manifest, WeeklySourceManifest):
+            raise ValueError("source_manifest must be a WeeklySourceManifest")
+        if self.source_manifest.host_snapshot_id != self.state.snapshot_id:
+            raise ValueError("source manifest does not match the league snapshot")
+        if not isinstance(self.projection_source_manifest, ProjectionSourceManifest):
+            raise ValueError(
+                "projection_source_manifest must be a ProjectionSourceManifest"
+            )
+        if (
+            self.projection_source_manifest.evaluation_scoring_profile_id
+            != self.state.scoring_profile_id
+        ):
+            raise ValueError(
+                "projection source manifest does not match the league scoring profile"
+            )
+        if not isinstance(self.fantasypros_benchmark, FantasyProsLeagueBenchmark):
+            raise ValueError(
+                "fantasypros_benchmark must be a FantasyProsLeagueBenchmark"
+            )
+        if (
+            self.fantasypros_benchmark.snapshot_id != self.state.snapshot_id
+            or self.fantasypros_benchmark.source_artifact_id
+            != self.source_manifest.fantasypros_league_artifact_id
+        ):
+            raise ValueError("FantasyPros benchmark does not match the source manifest")
+        if not isinstance(self.ensemble_config, EnsembleConfig):
+            raise ValueError("ensemble_config must be an EnsembleConfig")
+        if not isinstance(self.strength_formula, StrengthFormula):
+            raise ValueError("strength_formula must be a StrengthFormula")
         if not isinstance(self.strength_model, StrengthModel):
             raise ValueError("strength_model must be a StrengthModel")
         if not isinstance(self.waiver_pool, WaiverPool):
@@ -77,6 +146,7 @@ class EngineBundle:
             )
         names = _names(self.player_names)
         _validate_identity(self, rosters, projections, eligibilities, ecr, evidence, names)
+        self.projection_source_manifest.validate_projection_evidence(evidence)
         rosters = tuple(sorted(rosters, key=lambda row: row.team_id))
         projections = tuple(
             sorted(projections, key=lambda row: (row.canonical_player_id, row.week))
@@ -100,11 +170,17 @@ class EngineBundle:
 
     @property
     def methodology_mode(self) -> str:
-        return "exact" if self.methodology_attestation is not None else "surrogate"
+        return (
+            "holdout_validated"
+            if self.methodology_attestation is not None
+            else "surrogate"
+        )
 
     def _content_record(self) -> dict[str, object]:
         return {
             "ecr_snapshots": [row.to_record() for row in self.ecr_snapshots],
+            "ensemble_config": self.ensemble_config.to_record(),
+            "fantasypros_benchmark": self.fantasypros_benchmark.to_record(),
             "eligibilities": [
                 {
                     "canonical_player_id": row.canonical_player_id,
@@ -118,6 +194,9 @@ class EngineBundle:
                 if self.methodology_attestation is None
                 else self.methodology_attestation.to_record()
             ),
+            "nfl_schedule": self.nfl_schedule.to_record(),
+            "source_manifest": self.source_manifest.to_record(),
+            "projection_source_manifest": self.projection_source_manifest.to_record(),
             "player_names": dict(self.player_names),
             "projection_evidence": [
                 projection_to_record(row) for row in self.projection_evidence
@@ -138,6 +217,7 @@ class EngineBundle:
             "scoring_profile": self.scoring_profile.to_record(),
             "scenario_config": self.scenario_config.to_record(),
             "strength_model": self.strength_model.to_record(),
+            "strength_formula": self.strength_formula.to_record(),
             "surrogate_disclosure": (
                 None
                 if self.surrogate_disclosure is None
@@ -158,9 +238,14 @@ class EngineBundle:
     def from_record(cls, record: Mapping[str, object]) -> "EngineBundle":
         content_keys = {
             "ecr_snapshots",
+            "ensemble_config",
+            "fantasypros_benchmark",
             "eligibilities",
             "league_state",
             "methodology_attestation",
+            "nfl_schedule",
+            "source_manifest",
+            "projection_source_manifest",
             "player_names",
             "projection_evidence",
             "projections",
@@ -168,21 +253,25 @@ class EngineBundle:
             "scoring_profile",
             "scenario_config",
             "strength_model",
+            "strength_formula",
             "surrogate_disclosure",
             "waiver_pool",
         }
-        if not isinstance(record, Mapping) or set(record) != content_keys | {
+        if not isinstance(record, Mapping):
+            raise ValueError("engine bundle record fields are invalid")
+        if record.get("kind") != "fantasy_trade_engine_bundle":
+            raise ValueError("engine bundle kind is invalid")
+        schema_version = record.get("schema_version")
+        if type(schema_version) is not int:
+            raise ValueError("engine bundle schema version is invalid")
+        if schema_version != _BUNDLE_SCHEMA_VERSION:
+            raise UnsupportedEngineBundleSchema(schema_version)
+        if set(record) != content_keys | {
             "kind",
             "schema_version",
             "bundle_id",
         }:
             raise ValueError("engine bundle record fields are invalid")
-        if (
-            record["kind"] != "fantasy_trade_engine_bundle"
-            or type(record["schema_version"]) is not int
-            or record["schema_version"] != _BUNDLE_SCHEMA_VERSION
-        ):
-            raise ValueError("engine bundle kind or schema version is invalid")
         arrays = {
             name: _json_array(name, record[name])
             for name in (
@@ -206,11 +295,32 @@ class EngineBundle:
             eligibilities=tuple(
                 _eligibility_from_record(row) for row in arrays["eligibilities"]
             ),
+            nfl_schedule=NflSchedule.from_record(
+                _mapping("nfl_schedule", record["nfl_schedule"])
+            ),
+            source_manifest=WeeklySourceManifest.from_record(
+                _mapping("source_manifest", record["source_manifest"])
+            ),
+            projection_source_manifest=ProjectionSourceManifest.from_record(
+                _mapping(
+                    "projection_source_manifest",
+                    record["projection_source_manifest"],
+                )
+            ),
+            fantasypros_benchmark=FantasyProsLeagueBenchmark.from_record(
+                _mapping("fantasypros_benchmark", record["fantasypros_benchmark"])
+            ),
+            ensemble_config=EnsembleConfig.from_record(
+                _mapping("ensemble_config", record["ensemble_config"])
+            ),
             scenario_config=CorrelatedScenarioConfig.from_record(
                 _mapping("scenario_config", record["scenario_config"])
             ),
             strength_model=StrengthModel.from_record(
                 _mapping("strength_model", record["strength_model"])
+            ),
+            strength_formula=StrengthFormula.from_record(
+                _mapping("strength_formula", record["strength_formula"])
             ),
             ecr_snapshots=tuple(
                 EcrSnapshot.from_record(_mapping("ECR snapshot", row))
@@ -300,6 +410,8 @@ def _validate_identity(bundle, rosters, projections, eligibilities, ecr, evidenc
     if bundle.waiver_pool.minimum_pool_size < state.roster_rules.roster_cap:
         raise ValueError("waiver pool cannot fill a complete active roster")
     team_ids = {team.team_id for team in state.teams}
+    if {row.team_id for row in bundle.fantasypros_benchmark.teams} != team_ids:
+        raise ValueError("FantasyPros benchmark must exactly cover league teams")
     if {row.team_id for row in rosters} != team_ids or len(rosters) != len(team_ids):
         raise ValueError("rosters must exactly cover league teams")
     if any(
@@ -349,6 +461,15 @@ def _validate_identity(bundle, rosters, projections, eligibilities, ecr, evidenc
     eligibility_by_player = {
         row.canonical_player_id: row.eligible_slots for row in eligibilities
     }
+    for player_id, slots in eligibility_by_player.items():
+        if frozenset(slots) != bundle.strength_model.players[player_id].eligible_positions:
+            raise ValueError(
+                "simulation eligibility does not match strength-model eligibility"
+            )
+    primary_positions = _validate_primary_positions(
+        projections,
+        eligibility_by_player,
+    )
     ecr_by_period = {
         snapshot.period: {
             row.canonical_player_id: row for row in snapshot.rankings
@@ -365,6 +486,8 @@ def _validate_identity(bundle, rosters, projections, eligibilities, ecr, evidenc
             raise ValueError("waiver pool display name does not match player metadata")
         if eligibility_by_player.get(waiver.canonical_player_id) != waiver.eligible_slots:
             raise ValueError("waiver pool eligibility does not match calculation metadata")
+        if primary_positions[waiver.canonical_player_id] != waiver.position:
+            raise ValueError("waiver pool position does not match the projection grid")
         if nfl_teams_by_player.get(waiver.canonical_player_id) != {waiver.nfl_team_id}:
             raise ValueError("waiver pool NFL team does not match the projection grid")
         for period in (EcrPeriod.WEEKLY, EcrPeriod.REST_OF_SEASON):
@@ -381,9 +504,141 @@ def _validate_identity(bundle, rosters, projections, eligibilities, ecr, evidenc
             != waiver.rest_of_season_ecr_rank
         ):
             raise ValueError("waiver pool ROS ECR rank does not match its provenance")
+    configured_providers = {
+        row.provider for row in bundle.ensemble_config.provider_weights
+    }
+    provider_player_owners = {}
     for row in evidence:
         if (row.snapshot_id, row.scoring_profile_id, row.season) != identity:
             raise ValueError("projection evidence identity does not match league state")
+        if row.canonical_player_id not in projection_ids:
+            raise ValueError(
+                "projection evidence player is outside the calculation universe"
+            )
+        if row.provider not in configured_providers:
+            raise ValueError(
+                "projection evidence provider is outside the ensemble configuration"
+            )
+        provider_key = row.provider, row.provider_player_id
+        previous_owner = provider_player_owners.setdefault(
+            provider_key,
+            row.canonical_player_id,
+        )
+        if previous_owner != row.canonical_player_id:
+            raise ValueError(
+                "one provider player identity maps to multiple calculation players"
+            )
+    ProjectionLineageIndex(projections, evidence)
+    _validate_ensemble_config(bundle.ensemble_config, projections)
+    player_nfl_teams = _validate_schedule(
+        bundle.nfl_schedule,
+        state,
+        projections,
+    )
+    validate_weekly_projection_schedule(
+        bundle.nfl_schedule,
+        player_nfl_teams,
+        evidence,
+    )
+    if bundle.strength_formula.formula_id != bundle.methodology_evidence.formula_id:
+        raise ValueError("strength formula does not match methodology evidence")
+    formula_reasons = formula_static_incompatibility_reasons(
+        bundle.strength_formula,
+        bundle.methodology_evidence.methodology_fingerprint,
+        season=state.season,
+        scoring_profile_id=state.scoring_profile_id,
+    )
+    if formula_reasons:
+        raise ValueError(
+            "strength formula is incompatible with methodology evidence: "
+            + "; ".join(formula_reasons)
+        )
+    features = build_strength_features(
+        ecr,
+        projections,
+        eligibilities,
+        provider_names=tuple(
+            row.provider for row in bundle.ensemble_config.provider_weights
+        ),
+        projection_evidence=evidence,
+        remaining_week_scopes={
+            player_id: tuple(
+                row.week
+                for row in bundle.nfl_schedule.team_weeks
+                if row.nfl_team_id == nfl_team_id
+                and row.week >= state.first_remaining_week
+                and row.status is NflTeamWeekStatus.SCHEDULED
+            )
+            for player_id, nfl_team_id in player_nfl_teams.items()
+        },
+    )
+    rebuilt_model = bundle.strength_formula.build_model(features, rosters)
+    if rebuilt_model != bundle.strength_model:
+        raise ValueError(
+            "strength model does not match its formula, ECR, projections, and rosters"
+        )
+
+
+def _validate_ensemble_config(config, projections):
+    weights = {row.provider: row.weight for row in config.provider_weights}
+    for projection in projections:
+        observations = {
+            row.provider: row for row in projection.provider_observations
+        }
+        if set(observations) != set(weights):
+            raise ValueError("ensemble provider set does not match ensemble_config")
+        if any(
+            observations[provider].weight != weight
+            for provider, weight in weights.items()
+        ):
+            raise ValueError("ensemble provider weight does not match ensemble_config")
+        if projection.minimum_observed_sources != config.minimum_observed_sources:
+            raise ValueError("ensemble source quorum does not match ensemble_config")
+        if config.position_stddev_floors.get(projection.position) != (
+            projection.position_stddev_floor
+        ):
+            raise ValueError("ensemble uncertainty floor does not match ensemble_config")
+
+
+def _validate_primary_positions(projections, eligibility_by_player):
+    positions = {}
+    for projection in projections:
+        player_id = projection.canonical_player_id
+        known = positions.setdefault(player_id, projection.position)
+        if known != projection.position:
+            raise ValueError("player primary position changes across projection weeks")
+    for player_id, position in positions.items():
+        if position not in eligibility_by_player[player_id]:
+            raise ValueError(
+                "player primary position is absent from calculation eligibility"
+            )
+    return positions
+
+
+def _validate_schedule(schedule, state, projections):
+    if schedule.season != state.season:
+        raise ValueError("NFL schedule season does not match league state")
+    validate_complete_regular_season(schedule)
+    player_teams = {}
+    for projection in projections:
+        nfl_team_id = projection.nfl_team_id
+        if not isinstance(nfl_team_id, str) or not nfl_team_id:
+            raise ValueError("ensemble projection lacks an NFL team identity")
+        known = player_teams.setdefault(projection.canonical_player_id, nfl_team_id)
+        if known != nfl_team_id:
+            raise ValueError("player NFL team changes across projection weeks")
+        team_week = schedule.team_week(nfl_team_id, projection.week)
+        if team_week.status is NflTeamWeekStatus.BYE:
+            if projection.status is not ProjectionStatus.BYE:
+                raise ValueError("ensemble projection conflicts with an NFL bye")
+        elif (
+            projection.status is not ProjectionStatus.OBSERVED
+            or projection.nfl_game_id != team_week.nfl_game_id
+            or projection.opponent_team_id != team_week.opponent_team_id
+            or projection.is_home is not team_week.is_home
+        ):
+            raise ValueError("ensemble projection conflicts with the NFL schedule")
+    return player_teams
 
 
 def _typed(name, values, expected_type):

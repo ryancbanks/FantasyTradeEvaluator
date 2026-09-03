@@ -139,6 +139,13 @@ def validate_artifact_for_task(
             mismatched.append("expert_ids")
         if task.expert_count is not None and artifact.expert_count != task.expert_count:
             mismatched.append("expert_count")
+        if artifact.source_scoring != task.source_scoring:
+            mismatched.append("source_scoring")
+        if (
+            artifact.source_details.expert_selection_policy
+            != task.expert_selection_policy
+        ):
+            mismatched.append("expert_selection_policy")
     elif isinstance(artifact, FantasyProsLeagueArtifact):
         if task.kind is not CaptureKind.LEAGUE_SOURCE:
             mismatched.append("kind")

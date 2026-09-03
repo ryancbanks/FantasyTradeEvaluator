@@ -24,30 +24,33 @@ An ESPN link may be copied from League Home, My Team, Standings, Scoreboard, Sch
 
 1. Pair the extension with a one-use, two-minute code approved from the extension popup. The extension opens one temporary scan tab in the user's normal browser profile; it never opens a second collector tab.
 2. Discover the team count and every roster from the signed-in FantasyPros league, then independently capture and cross-check ESPN's league settings, full rosters, standings, completed and remaining fantasy schedules, roster slots/cap, scoring rules, playoff/tiebreak rules, and the complete NFL pro-team schedule payload. No team count or player-by-player roster entry is required.
-3. Capture the actual current FantasyPros consensus expert IDs plus weekly/remaining-season ECR, the player crosswalk, and FantasyPros projections. ECR changes refresh player inputs; they do not refit formula coefficients.
+3. Capture the page's current **Latest ECR** group, its exact per-position expert IDs, weekly/remaining-season ECR, the player crosswalk, and every remaining FantasyPros weekly projection page. The collector verifies the group identity and its recency/accuracy semantics instead of guessing which experts belong in the consensus. ECR changes refresh player inputs; they do not refit formula coefficients. FantasyPros has no verified public in-season projection table for the full remaining season, so the collector does not invent one.
 4. Reuse the same scan tab for ESPN and then Yahoo; never keep more than one collector tab open. Closing the app tab, scan tab, or completed session revokes the bridge token and closes the remaining scan tab.
 5. Normalize every required provider/player/week cell. A missing or failed row is stored with an explicit status and is never converted to zero.
-6. Hash raw response bodies in memory, write sanitized normalized datasets, validate the full provider grid, then publish the immutable snapshot atomically.
+6. Convert source responses and visible tables into credential-screened, content-addressed capture artifacts, retain those artifacts in a local-only archive, normalize the calculation rows, validate the required provider grid, then publish the immutable snapshot atomically. Cookies, authorization headers, browser storage, and unfiltered transport bodies are never archived.
 7. If no validated formula exists—or the public analyzer fingerprint changed—run the bounded power-only calibration experiment: 250 atomic training observations plus 100 leakage-safe blind package observations. The blind design deterministically covers every feasible balanced package size the budget permits and must include 2-for-2, 3-for-3, and 4-for-4. If a compatible exact formula exists, revalidate it on the same scoped design from the current weekly snapshot. Reuse is allowed only when maximum raw score and delta errors are each at most `1e-6` and every displayed change matches; a missing, stale, insufficient, or failed report routes the refresh back through calibration.
 8. Exact publication remains the default. An explicit, unchecked-by-default user option may publish a freshly fitted current-week surrogate only when the solver converged, the design is identifiable, training fits within the exact tolerance, and the full diverse blind design ran. The bundle stores a separate content-addressed surrogate disclosure—not an exact attestation—with blind maximum score error, display-match rate, holdout IDs/sizes, and the source fit ID. That fit ID binds the full solver diagnostics checked by the publication gate. A surrogate is never eligible for weekly formula reuse and never replaces the canonical exact formula.
 9. Close the scan tab and disconnect the short-lived extension session. Recompute weekly player strengths from current ECR locally; ESPN/Yahoo data feed weekly scoring only, and all later filtering, scenario generation, trade search, standings, playoff analysis, and spreadsheet export remain offline.
 
-The default current-week-only mode still captures a weekly table and a
-rest-of-season table from each of FantasyPros, ESPN, and Yahoo. Missing future
-weekly rows are then allocated from each provider's captured rest-of-season
-total against the verified NFL schedule. A player is eligible for the local
-calculation domain only when every provider has either that rest-of-season row
-or an explicit row for every remaining week; the engine's provider quorum and
-status checks still fail closed after materialization. The advanced future-week
-option requests every remaining week and should be enabled only when all three
-sites visibly publish that full range; Yahoo normally exposes only a short
-rolling window.
+The default mode attempts every remaining FantasyPros weekly page and the
+current weekly plus rest-of-season ESPN and Yahoo views. A still-empty future
+FantasyPros page, or one whose visible season is stale, becomes a timestamped
+`not_published` attempt instead of a fabricated projection. An unavailable
+optional ESPN or Yahoo page likewise remains a typed provider outcome. The
+current FantasyPros page is mandatory. The refresh may continue only when at
+least two providers remain configured, and each player/week still has to meet
+that source quorum after schedule-aware materialization. Missing ESPN/Yahoo
+weekly rows may be allocated from a captured provider rest-of-season total;
+FantasyPros rows are never allocated from a nonexistent FantasyPros ROS page.
+The future-week option requests additional direct ESPN and Yahoo weeks when
+those sites publish them; Yahoo normally exposes only a short rolling window.
 
 ## Privacy and freshness
 
 - Browser profiles, cookies, and OAuth tokens remain under the normal browser's control. The extension has no cookie permission and never returns browser storage or credentials to the app. None is exported to Excel or copied into calibration artifacts.
 - A capture timestamp records when the app observed a row. A provider publication time is stored separately only when the provider supplies one.
-- Snapshot readiness requires the exact content-addressed scoring profile and an explicit row from every configured provider for every computation-domain player and remaining week. The full verified profile is persisted in the portable engine bundle; ID-only legacy bundles fail closed instead of reconstructing settings from a scoring label.
+- Provider injury/status labels are retained as sanitized, timestamped observations with their weekly or rest-of-season source scope. They are never treated as proof that a player will or will not play, and derived projection rows preserve that source scope.
+- Snapshot readiness requires the exact content-addressed scoring profile and an explicit row from every provider retained in the ensemble configuration for every computation-domain player and remaining week. Providers omitted after a typed page-level failure remain visible in the attempt manifest, while the configured ensemble must still satisfy its quorum. The full verified profile is persisted in the portable engine bundle; ID-only legacy bundles fail closed instead of reconstructing settings from a scoring label.
 - Weekly materialization uses the separately verified NFL schedule for game context and byes. Source points and raw projected stats are left unchanged; schedule enrichment never invents a player projection.
 - Failed providers are visible in the GUI. A degraded ensemble may run only when its configured minimum observed-provider count is still met; the app never silently drops a provider.
 - Matching FantasyPros client-bundle and response-schema fingerprints are necessary but not sufficient for reuse. Every weekly refresh binds its revalidation report to the saved formula, current methodology fingerprint, and current snapshot; a changed fingerprint or failed weekly holdout gate invalidates reuse until calibration passes again.

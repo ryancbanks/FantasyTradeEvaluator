@@ -37,6 +37,8 @@ class WeeklyCollectionRequest:
     expected_team_count: int | None = None
     host_league_url: str | None = None
     yahoo_projection_league_url: str | None = None
+    # FantasyPros always captures every remaining week. This option requests
+    # extra direct weekly pages from ESPN and Yahoo when they publish them.
     include_future_weekly: bool = False
     allow_surrogate_power: bool = False
 

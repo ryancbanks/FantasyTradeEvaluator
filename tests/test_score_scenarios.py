@@ -27,12 +27,16 @@ from trade_snapshot.season import project_remaining_season
 
 class ScenarioConfigTests(unittest.TestCase):
     def test_config_has_strict_lossless_json_record_and_content_id(self):
-        config = config_for(3, seed=-9)
+        config = CorrelatedScenarioConfig(
+            3, -9, FactorLoadings(0, 0, 0, 1), player_score_floor=-5
+        )
         record = config.to_record()
 
         json.dumps(record, allow_nan=False)
         self.assertEqual(CorrelatedScenarioConfig.from_record(record), config)
         self.assertTrue(config.config_id.startswith("scfg_"))
+        self.assertEqual(record["schema_version"], 2)
+        self.assertEqual(record["player_score_floor"], -5.0)
 
         invalid = (
             {**record, "extra": True},
@@ -65,6 +69,11 @@ class ScenarioConfigTests(unittest.TestCase):
                     CorrelatedScenarioConfig(count, 0, FactorLoadings(0, 0, 0, 1))
         with self.assertRaises(ValueError):
             CorrelatedScenarioConfig(1, 1 << 53, FactorLoadings(0, 0, 0, 1))
+        for floor in (True, math.inf, math.nan, "0"):
+            with self.subTest(floor=floor), self.assertRaises(ValueError):
+                CorrelatedScenarioConfig(
+                    1, 0, FactorLoadings(0, 0, 0, 1), floor
+                )
 
 
 class PreparedScoreScenarioTests(unittest.TestCase):
@@ -123,6 +132,11 @@ class PreparedScoreScenarioTests(unittest.TestCase):
             ],
             ["p1"],
         )
+        scores = {
+            row.team_id: row.score
+            for row in next(iter(with_ir)).scores
+        }
+        self.assertEqual(scores["a"], 0.0)
 
     def test_matchup_score_adjustment_changes_content_identity_not_player_draws(self):
         ordinary = basic_prepared(scenario_count=2)
@@ -248,7 +262,7 @@ class PreparedScoreScenarioTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             tuple(prepared.iter_scenarios(0, 6))
 
-    def test_context_required_only_for_enabled_factors_and_scores_are_nonnegative(self):
+    def test_context_required_only_for_enabled_factors_and_score_floor_is_explicit(self):
         state = make_state(("FLEX",), roster_cap=1)
         rosters = (TeamRoster("a", ("p1",), 1, 1), TeamRoster("b", ("p2",), 1, 1))
         projections = (
@@ -257,8 +271,24 @@ class PreparedScoreScenarioTests(unittest.TestCase):
         )
         eligibility = (PlayerEligibility("p1", ("FLEX",)), PlayerEligibility("p2", ("FLEX",)))
 
-        player_only = prepare_score_scenarios(state, rosters, projections, eligibility, config_for(20))
-        self.assertTrue(all(score.score >= 0 for scenario in player_only for score in scenario.scores))
+        player_only = prepare_score_scenarios(
+            state, rosters, projections, eligibility, config_for(100)
+        )
+        self.assertTrue(
+            any(score.score < 0 for scenario in player_only for score in scenario.scores)
+        )
+        floored = prepare_score_scenarios(
+            state,
+            rosters,
+            projections,
+            eligibility,
+            CorrelatedScenarioConfig(
+                100, 0, FactorLoadings(0, 0, 0, 1), player_score_floor=0
+            ),
+        )
+        self.assertTrue(
+            all(score.score >= 0 for scenario in floored for score in scenario.scores)
+        )
 
         with self.assertRaisesRegex(ValueError, "game IDs"):
             prepare_score_scenarios(

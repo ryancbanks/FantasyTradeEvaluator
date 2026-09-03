@@ -160,8 +160,10 @@ class ResumableLeagueTradeSearch:
             counterparty_team_ids, ordered_league_ids, primary_team_id
         )
         primary = by_team[primary_team_id]
-        adjuster = None if constraints.require_no_drops else PreparedRosterAdjuster(
-            model, roster_rows
+        adjuster = PreparedRosterAdjuster(
+            model,
+            roster_rows,
+            forbid_drops=constraints.require_no_drops,
         )
         eligible_positions = {
             player_id: player.eligible_positions

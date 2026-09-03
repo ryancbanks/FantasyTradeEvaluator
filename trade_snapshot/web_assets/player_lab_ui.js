@@ -22,7 +22,7 @@ window.PlayerLabUi = (() => {
     waiver_pool: "Available"
   });
   const SORTS = Object.freeze([
-    ["ros_points", "Rest-of-season points"],
+    ["ros_points", "Full NFL rest-of-season points"],
     ["weekly_ecr", "Weekly ECR"],
     ["ros_ecr", "Rest-of-season ECR"],
     ["disagreement", "Provider disagreement"],
@@ -73,6 +73,10 @@ window.PlayerLabUi = (() => {
 
   function number(value) {
     return Number.isFinite(value) ? numberFormatter.format(value) : "—";
+  }
+
+  function countLabel(count, singular) {
+    return `${count} ${singular}${count === 1 ? "" : "s"}`;
   }
 
   function evidenceNumber(value) {
@@ -150,6 +154,29 @@ window.PlayerLabUi = (() => {
     const updated = timeNode(source.source_published_at, "Source updated");
     container.append(captured || node("span", "player-lab-muted", "Capture time unavailable"));
     container.append(updated || node("span", "player-lab-muted", "Source update time unavailable"));
+    appendProviderStatusObservations(container, source);
+  }
+
+  function appendProviderStatusObservations(container, source) {
+    const observations = Array.isArray(source.provider_status_observations)
+      ? source.provider_status_observations
+      : [];
+    for (const observation of observations) {
+      if (!observation || typeof observation.designation !== "string") continue;
+      const scope = observation.source_scope === "weekly"
+        ? `weekly source${Number.isInteger(observation.source_week) ? `, Week ${observation.source_week}` : ""}`
+        : observation.source_scope === "ros"
+          ? "rest-of-season source"
+          : "provider source";
+      const status = node(
+        "span",
+        "player-lab-provider-status",
+        `Provider status observed: ${observation.designation} (${scope})`
+      );
+      const captured = timeNode(observation.captured_at, "Captured");
+      if (captured) status.append(" · ", captured);
+      container.append(status);
+    }
   }
 
   function setState(kind, message = "") {
@@ -162,7 +189,8 @@ window.PlayerLabUi = (() => {
   function clearRenderedContent() {
     for (const id of [
       "playerLabTableBody", "playerLabDetail", "playerLabProviderHead",
-      "playerLabWeeklyBody", "playerLabRosSources", "playerLabFreshness"
+      "playerLabWeeklyBody", "playerLabRosSources", "playerLabRawStats",
+      "playerLabFreshness"
     ]) $(id).replaceChildren();
     $("playerLabCount").textContent = "";
   }
@@ -199,7 +227,15 @@ window.PlayerLabUi = (() => {
         {signal: controller.signal}
       );
       if (controller.signal.aborted || revision !== requestRevision) return;
-      if (!value || !Array.isArray(value.players) || !Array.isArray(value.providers)) {
+      if (
+        !value
+        || value.schema_version !== 5
+        || !Array.isArray(value.players)
+        || !Array.isArray(value.providers)
+        || !Array.isArray(value.raw_stat_key_fields)
+        || value.raw_stat_key_fields.join("|") !== "provider|stat_name"
+        || typeof value.provider_status_observation_policy !== "string"
+      ) {
         throw new Error("Player outlook response is invalid.");
       }
       outlook = value;
@@ -331,11 +367,27 @@ window.PlayerLabUi = (() => {
       const position = node("td", "", player.position);
       secondaryText(position, (player.eligible_slots || []).join(" · ") || "No listed flex eligibility");
       const points = node("td", "player-lab-number", number(player.remaining_projected_points));
+      secondaryText(
+        points,
+        Number.isFinite(player.remaining_projected_week_count)
+          ? `${player.remaining_projected_week_count} active NFL weeks`
+          : "Full horizon unavailable"
+      );
       const average = node("td", "player-lab-number", number(player.average_weekly_points));
+      secondaryText(average, "Full NFL horizon");
       const weeklyEcr = node("td", "player-lab-number", ecrRank(player.weekly_ecr));
       const rosEcr = node("td", "player-lab-number", ecrRank(player.rest_of_season_ecr));
       const sources = node("td", "", `${player.provider_complete_week_count}/${player.total_week_count} complete`);
-      secondaryText(sources, `${player.all_direct_week_count} all-direct · Provider σ ${number(player.average_provider_disagreement)}`);
+      secondaryText(
+        sources,
+        `${player.all_direct_week_count} all-direct · Provider σ ${number(player.average_provider_disagreement)}` +
+          (player.provider_status_disagreement_week_count
+            ? ` · ${player.provider_status_disagreement_week_count} status-label disagreement weeks`
+            : "") +
+          (player.provider_status_unknown_provider_week_count
+            ? ` · ${countLabel(player.provider_status_unknown_provider_week_count, "provider-week status label")} unreported`
+            : "")
+      );
       row.append(identity, owner, position, points, average, weeklyEcr, rosEcr, sources);
       body.append(row);
     }
@@ -373,6 +425,7 @@ window.PlayerLabUi = (() => {
       renderProviderHeader();
       $("playerLabWeeklyBody").replaceChildren();
       $("playerLabRosSources").replaceChildren();
+      $("playerLabRawStats").replaceChildren();
       return;
     }
 
@@ -388,14 +441,16 @@ window.PlayerLabUi = (() => {
     const metrics = node("div", "player-lab-metrics");
     metrics.append(
       metric(
-        "Rest-of-season points",
+        "Full NFL rest-of-season points",
         number(player.remaining_projected_points),
-        `${player.provider_complete_week_count}/${player.total_week_count} provider-complete · ${player.all_direct_week_count} all-direct`
+        Number.isFinite(player.remaining_projected_points)
+          ? `${player.remaining_projected_week_count} active NFL weeks · ${number(player.remaining_fantasy_regular_season_points)} in the fantasy regular-season slice`
+          : `Full horizon ${humanize(player.remaining_projection_status)} · fantasy regular-season slice ${number(player.remaining_fantasy_regular_season_points)}`
       ),
       metric(
-        "Average active week",
+        "Full ROS average active week",
         number(player.average_weekly_points),
-        `${(player.weeks || []).filter(week => Number.isFinite(week.projected_points)).length} projected games`
+        `Fantasy regular-season average ${number(player.average_fantasy_regular_season_points)}`
       ),
       metric("Weekly ECR", ecrRank(player.weekly_ecr), ecrDetail(player.weekly_ecr)),
       metric("Rest-of-season ECR", ecrRank(player.rest_of_season_ecr), ecrDetail(player.rest_of_season_ecr)),
@@ -404,11 +459,17 @@ window.PlayerLabUi = (() => {
     );
     const eligibility = node("p", "player-lab-eligibility", `Eligible lineup slots: ${(player.eligible_slots || []).join(", ") || "none listed"}.`);
     const notice = node("p", "player-lab-notice", outlook.waiver_scope_notice || "Waiver-wire scope is not available for this bundle.");
-    detail.append(heading, metrics, eligibility, notice);
+    const statusNotice = node(
+      "p",
+      "player-lab-notice player-lab-status-notice",
+      outlook.provider_status_observation_policy
+    );
+    detail.append(heading, metrics, eligibility, notice, statusNotice);
 
     renderProviderHeader();
     renderWeeklyEvidence(player);
     renderRemainingSeasonSources(player);
+    renderRawStats(player);
   }
 
   function renderProviderHeader() {
@@ -481,6 +542,14 @@ window.PlayerLabUi = (() => {
       ];
       if (week.unattributed_source_count) provenance.push(`${week.unattributed_source_count} provenance unknown`);
       if (week.not_retained_source_count) provenance.push(`${week.not_retained_source_count} not retained`);
+      if (week.provider_status_disagreement) provenance.push("provider status labels disagree");
+      else if (week.provider_status_observation_count) {
+        provenance.push(`${week.provider_status_observation_count} provider status observations`);
+      }
+      if (week.provider_status_unknown_provider_count) {
+        const unknown = week.provider_status_unknown_provider_count;
+        provenance.push(`${countLabel(unknown, "provider")} without a status label`);
+      }
       if (week.status !== "bye") provenance.push(`minimum ${week.minimum_observed_sources}`);
       secondaryText(
         coverage,
@@ -520,6 +589,76 @@ window.PlayerLabUi = (() => {
     return content;
   }
 
+  function rawStatEntries(source) {
+    if (!source?.raw_projected_stats || typeof source.raw_projected_stats !== "object") return [];
+    return Object.entries(source.raw_projected_stats)
+      .filter(([name, value]) => name && Number.isFinite(value))
+      .sort(([left], [right]) => collator.compare(left, right));
+  }
+
+  function appendRawStatPeriod(container, label, source) {
+    const entries = rawStatEntries(source);
+    if (!entries.length) return false;
+    const group = node("section", "player-lab-raw-period");
+    group.append(node("h5", "", label));
+    const values = node("dl", "player-lab-raw-values");
+    for (const [name, value] of entries) {
+      const row = node("div", "player-lab-raw-value");
+      row.dataset.statProvider = providerKey(source);
+      row.dataset.statName = name;
+      const result = node("dd", "", evidenceNumber(value));
+      result.title = `Exact stored value: ${String(value)}`;
+      row.append(node("dt", "", humanize(name)), result);
+      values.append(row);
+    }
+    group.append(values);
+    container.append(group);
+    return true;
+  }
+
+  function renderRawStats(player) {
+    const container = $("playerLabRawStats");
+    container.replaceChildren();
+    const heading = node("div", "player-lab-grid-heading");
+    heading.append(
+      node("h4", "", "Retained raw projected stats"),
+      node("p", "", "Keys are scoped by provider; same-named fields are never merged")
+    );
+    container.append(heading);
+    for (const provider of outlook.providers) {
+      const key = providerKey(provider);
+      const card = node("details", "player-lab-raw-card");
+      card.append(node("summary", "", `${providerLabel(provider)} stat components`));
+      const content = node("div", "player-lab-raw-card-content");
+      let hasStats = false;
+      for (const week of player.weeks || []) {
+        const source = (week.provider_values || [])
+          .find(value => providerKey(value) === key);
+        hasStats = appendRawStatPeriod(
+          content,
+          `Week ${week.week}`,
+          source
+        ) || hasStats;
+      }
+      const remaining = (player.provider_remaining_season || [])
+        .find(value => providerKey(value) === key);
+      hasStats = appendRawStatPeriod(
+        content,
+        "Full rest of season",
+        remaining
+      ) || hasStats;
+      if (!hasStats) {
+        content.append(node(
+          "p",
+          "player-lab-muted",
+          "No raw stat components were retained for this provider."
+        ));
+      }
+      card.append(content);
+      container.append(card);
+    }
+  }
+
   function freshnessCard(title, capturedAt, sourceUpdatedAt, detail = "") {
     const card = node("article", "player-lab-freshness-card");
     card.append(node("strong", "", title));
@@ -539,13 +678,35 @@ window.PlayerLabUi = (() => {
     heading.append(node("h3", "", "Evidence freshness"), node("p", "", "Weekly collection and source-update times"));
     container.append(heading);
     for (const snapshot of outlook.ecr_snapshots || []) {
+      const panels = Array.isArray(snapshot.expert_panels) ? snapshot.expert_panels : [];
+      const panelDetail = panels
+        .map(panel => `${panel.position} ${panel.expert_count} · ${panel.expert_group_title || "Expert group unavailable"}`)
+        .join(" · ");
+      const selectionPolicies = [...new Set(
+        panels.map(panel => panel.expert_selection_policy).filter(Boolean)
+      )];
+      const groupDescriptions = [...new Set(
+        panels.map(panel => panel.expert_group_description).filter(Boolean)
+      )];
+      const expertDetail = panelDetail
+        ? [
+            `Position panels · ${panelDetail}`,
+            panels.length > 1 && Number.isFinite(snapshot.expert_count)
+              ? `${snapshot.expert_count} unique experts`
+              : "",
+            groupDescriptions.join(" / "),
+            selectionPolicies.length
+              ? `Selection policy ${selectionPolicies.join(", ")}`
+              : "",
+          ].filter(Boolean).join(" · ")
+        : Number.isFinite(snapshot.expert_count)
+          ? `${snapshot.expert_count} experts`
+          : "";
       container.append(freshnessCard(
         `FantasyPros ECR · ${humanize(snapshot.period)}`,
         snapshot.captured_at,
         snapshot.source_updated_at || snapshot.source_published_at,
-        Number.isFinite(snapshot.expert_count)
-          ? `${snapshot.expert_count} experts${Number.isFinite(snapshot.selected_expert_count) ? ` · ${snapshot.selected_expert_count} selected` : ""}`
-          : ""
+        expertDetail
       ));
     }
     for (const provider of outlook.providers) {

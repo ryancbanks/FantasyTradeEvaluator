@@ -14,7 +14,8 @@ _PLAYER_HEADERS = {"PLAYER", "PLAYERS", "PLAYER NAME", "ATHLETE", "NAME"}
 _POSITION_HEADERS = {"POS", "POSITION"}
 _TEAM_HEADERS = {"TEAM", "TM"}
 _OPPONENT_HEADERS = {"OPP", "OPPONENT"}
-_STATUS_HEADERS = {"STATUS", "BYE"}
+_DESIGNATION_HEADERS = {"STATUS"}
+_BYE_HEADERS = {"BYE"}
 _POINT_HEADER_TIERS = (
     {"FPTS", "FAN PTS", "FANTASY POINTS"},
     {"PROJ", "PROJECTED"},
@@ -36,6 +37,7 @@ class ProjectionArtifactRow:
     is_bye: bool
     opponent_team_id: str | None
     is_home: bool | None
+    provider_status_designation: str | None
 
 
 def projection_artifact_rows(
@@ -56,8 +58,12 @@ def projection_artifact_rows(
         position_index = _optional_index(headers, _POSITION_HEADERS, "position")
         team_index = _optional_index(headers, _TEAM_HEADERS, "team")
         opponent_index = _optional_index(headers, _OPPONENT_HEADERS, "opponent")
+        designation_index = _optional_index(
+            headers, _DESIGNATION_HEADERS, "status designation"
+        )
+        bye_index = _optional_index(headers, _BYE_HEADERS, "bye status")
         status_indices = tuple(
-            index for index, header in enumerate(headers) if header in _STATUS_HEADERS
+            index for index in (designation_index, bye_index) if index is not None
         )
         excluded = {
             player_index,
@@ -119,6 +125,11 @@ def projection_artifact_rows(
                     is_bye=bool(re.search(r"\bBYE\b", statuses)),
                     opponent_team_id=opponent,
                     is_home=is_home,
+                    provider_status_designation=(
+                        None
+                        if designation_index is None
+                        else _provider_status(cells[designation_index].text)
+                    ),
                 )
             )
     if not rows:
@@ -176,6 +187,18 @@ def _parse_player_cell(value, expected_position, expected_team):
                 normalize_position(match.group("pos")),
                 _team(match.group("team")),
             )
+    if expected_position and not expected_team:
+        match = re.fullmatch(
+            r"(?P<name>.+?)\s+(?P<team>[A-Z]{2,3}|FA)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return (
+                match.group("name").strip(),
+                expected_position,
+                _team(match.group("team")),
+            )
     if expected_position and expected_team:
         for suffix in (expected_team, expected_position):
             match = re.fullmatch(
@@ -190,13 +213,14 @@ def _parse_player_cell(value, expected_position, expected_team):
 def _provider_link(provider, link):
     path = urlsplit(link).path
     patterns = {
-        CaptureProvider.ESPN: ("espn", r"^/nfl/player/_/id/([0-9]+)(?:/[^/]*)?/?$"),
-        CaptureProvider.YAHOO: ("yahoo", r"^/nfl/players/([0-9]+)/?$"),
+        CaptureProvider.ESPN: r"^/nfl/player/_/id/([0-9]+)(?:/[^/]*)?/?$",
+        CaptureProvider.YAHOO: r"^/nfl/players/([0-9]+)/?$",
         CaptureProvider.FANTASYPROS: (
-            "fantasypros_projection", r"^/nfl/players/([a-z0-9-]+)\.php$"
+            r"^/nfl/(?:players|projections)/([a-z0-9-]+)\.php$"
         ),
     }
-    identity_provider, pattern = patterns[provider]
+    identity_provider = projection_identity_provider(provider)
+    pattern = patterns[provider]
     match = re.fullmatch(pattern, path, flags=re.IGNORECASE)
     if match is not None:
         return identity_provider, match.group(1), False
@@ -209,6 +233,20 @@ def _provider_link(provider, link):
         if team is not None:
             return "yahoo", team.group(1).casefold(), True
     raise ValueError("projection link does not contain a supported public identity")
+
+
+def projection_identity_provider(provider):
+    """Return the stable identity namespace used by a projection page's links."""
+
+    try:
+        provider = CaptureProvider(provider)
+    except (TypeError, ValueError):
+        raise ValueError("projection provider is invalid") from None
+    return {
+        CaptureProvider.FANTASYPROS: "fantasypros_projection",
+        CaptureProvider.ESPN: "espn",
+        CaptureProvider.YAHOO: "yahoo",
+    }[provider]
 
 
 def _points_index(headers):
@@ -269,6 +307,17 @@ def _optional_number(value):
     return number if isfinite(number) else None
 
 
+def _provider_status(value):
+    text = " ".join(value.split())
+    if text.upper() in _MISSING or text.upper() == "BYE":
+        return None
+    if len(text) > 80 or re.search(r"(?:https?://|www\.)", text, flags=re.IGNORECASE):
+        raise ValueError("projection status designation is not a bounded label")
+    if any(ord(character) < 32 or ord(character) == 127 for character in text):
+        raise ValueError("projection status designation contains a control character")
+    return text
+
+
 def normalize_position(value):
     return normalize_player_position(value, require_supported=True)
 
@@ -289,4 +338,5 @@ __all__ = (
     "ProjectionArtifactRow",
     "normalize_position",
     "projection_artifact_rows",
+    "projection_identity_provider",
 )
