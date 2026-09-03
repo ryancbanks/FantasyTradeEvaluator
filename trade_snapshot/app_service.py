@@ -40,6 +40,7 @@ from .trade_filters import (
     parse_trade_filter,
 )
 from .trade_impact import PreparedSeasonBaseline, prepare_season_baseline
+from .trade_timing import build_trade_timing
 from .trade_space import TeamRoster, TradeConstraints, TradeSpace
 from .three_way_trade import ThreeWayTradeSpace
 from .three_way_search import (
@@ -70,6 +71,7 @@ from .xlsx_export import export_trade_workbook
 _MAX_DASHBOARD_SCENARIOS = 10_000
 _MAX_PLAYER_OUTLOOK_CACHE_SIZE = 4
 _MAX_GM_INSIGHTS_CACHE_SIZE = 4
+_MAX_TRADE_TIMING_CACHE_SIZE = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,6 +261,12 @@ class LocalAppService:
         self._gm_insights_futures: dict[
             tuple[str, str | None], Future[dict[str, object]]
         ] = {}
+        self._trade_timing_cache: OrderedDict[
+            tuple[str, str | None, str], dict[str, object]
+        ] = OrderedDict()
+        self._trade_timing_futures: dict[
+            tuple[str, str | None, str], Future[dict[str, object]]
+        ] = {}
         self._history_store = LeagueHistoryStore(
             self.data_directory / LEAGUE_HISTORY_FILENAME
         )
@@ -424,6 +432,47 @@ class LocalAppService:
             with self._lock:
                 if self._gm_insights_futures.get(cache_key) is future:
                     del self._gm_insights_futures[cache_key]
+
+    def trade_timing(
+        self, bundle_id: str, primary_team_id: str
+    ) -> dict[str, object]:
+        """Return one coalesced, history-aware trade-timing preview."""
+
+        bundle = load_engine_bundle(self._bundle_path(bundle_id))
+        history = self._history_store.snapshot_for_bundle(bundle_id)
+        revision = None if history is None else history.history_revision
+        cache_key = bundle_id, revision, primary_team_id
+        with self._lock:
+            cached = self._trade_timing_cache.get(cache_key)
+            if cached is not None:
+                self._trade_timing_cache.move_to_end(cache_key)
+                return cached
+            future = self._trade_timing_futures.get(cache_key)
+            owns_calculation = future is None
+            if owns_calculation:
+                future = Future()
+                self._trade_timing_futures[cache_key] = future
+        assert future is not None
+        if not owns_calculation:
+            return future.result()
+
+        try:
+            timing = build_trade_timing(bundle, history, primary_team_id)
+        except BaseException as error:
+            future.set_exception(error)
+            raise
+        else:
+            with self._lock:
+                self._trade_timing_cache[cache_key] = timing
+                self._trade_timing_cache.move_to_end(cache_key)
+                while len(self._trade_timing_cache) > _MAX_TRADE_TIMING_CACHE_SIZE:
+                    self._trade_timing_cache.popitem(last=False)
+            future.set_result(timing)
+            return timing
+        finally:
+            with self._lock:
+                if self._trade_timing_futures.get(cache_key) is future:
+                    del self._trade_timing_futures[cache_key]
 
     def _bundle_readiness(self, bundles) -> dict[str, object]:
         ready_count = sum(row.get("status") == "ready" for row in bundles)

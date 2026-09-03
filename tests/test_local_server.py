@@ -115,6 +115,24 @@ class LocalServerTests(unittest.TestCase):
         status, _, _ = self.request("GET", gm_insights_path, token=False)
         self.assertEqual(status, 403)
 
+        trade_timing_path = (
+            f"/api/bundles/{bundle.bundle_id}/trade-timing?primaryTeamId=primary"
+        )
+        status, _, raw = self.request("GET", trade_timing_path)
+        trade_timing = json.loads(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(trade_timing["primary_team_id"], "primary")
+        self.assertFalse(
+            trade_timing["methodology"]["manager_acceptance_modeled"]
+        )
+        self.assertEqual(len(trade_timing["partner_plans"]), 1)
+        status, _, _ = self.request("GET", trade_timing_path, token=False)
+        self.assertEqual(status, 403)
+        status, _, _ = self.request(
+            "GET", f"/api/bundles/{bundle.bundle_id}/trade-timing"
+        )
+        self.assertEqual(status, 400)
+
         status, _, raw = self.request(
             "POST", "/api/searches/estimate", value=payload(bundle.bundle_id)
         )
@@ -186,6 +204,8 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b"GmInsightsUi.setBundle", body)
         self.assertIn(b"onUseTradePartner: chooseTradePartnerFromInsights", body)
         self.assertIn(b"GmInsightsUi.setPrimaryTeam", body)
+        self.assertIn(b"TradeTimingUi.setBundle", body)
+        self.assertIn(b"TradeTimingUi.setPrimaryTeam", body)
         self.assertIn(b"Count this specific three-team search", body)
         self.assertNotIn(b"Count this exact three-team search", body)
         self.assertNotIn(b"expected_team_count", body)
@@ -262,12 +282,14 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b'src="/gm_insights_format.js"', page)
         self.assertIn(b'src="/gm_insights_evidence_ui.js"', page)
         self.assertIn(b'src="/gm_insights_ui.js"', page)
+        self.assertIn(b'src="/trade_timing_ui.js"', page)
         self.assertIn(b'src="/player_lab_ui.js"', page)
         self.assertLess(page.index(b'/dashboard_charts.js'), page.index(b'/dashboard_ui.js'))
         self.assertLess(page.index(b'/dashboard_ui.js'), page.index(b'/app.js'))
         self.assertLess(page.index(b'/gm_insights_format.js'), page.index(b'/gm_insights_evidence_ui.js'))
         self.assertLess(page.index(b'/gm_insights_evidence_ui.js'), page.index(b'/gm_insights_ui.js'))
         self.assertLess(page.index(b'/gm_insights_ui.js'), page.index(b'/app.js'))
+        self.assertLess(page.index(b'/trade_timing_ui.js'), page.index(b'/app.js'))
         self.assertLess(page.index(b'/player_lab_ui.js'), page.index(b'/app.js'))
         self.assertLess(page.index(b'/three_way_ui.js'), page.index(b'/app.js'))
         self.assertNotIn(b'id="expectedTeamCount"', page)
@@ -366,6 +388,23 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b"tr.is-selected", gm_insights_styles)
         self.assertIn(b"prefers-reduced-motion", gm_insights_styles)
         self.assertIn(b"@media", gm_insights_styles)
+
+        status, headers, timing_ui = self.request(
+            "GET", "/trade_timing_ui.js", token=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/javascript", headers["Content-Type"])
+        self.assertIn(b"window.TradeTimingUi", timing_ui)
+        self.assertIn(b"Historical completed-deal participation", timing_ui)
+        self.assertNotIn(b"innerHTML", timing_ui)
+
+        status, headers, timing_styles = self.request(
+            "GET", "/trade_timing.css", token=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/css", headers["Content-Type"])
+        self.assertIn(b".trade-timing-lab", timing_styles)
+        self.assertIn(b"prefers-reduced-motion", timing_styles)
 
         status, headers, player_lab_ui = self.request(
             "GET", "/player_lab_ui.js", token=False

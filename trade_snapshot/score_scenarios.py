@@ -140,6 +140,32 @@ class PreparedScoreScenarios:
             {},
         )
 
+    def team_scores(
+        self, team_ids: Iterable[str], scenario_index: int
+    ) -> tuple[TeamWeekScore, ...]:
+        """Realize a bounded set of teams with the run's shared scenario draws."""
+
+        if isinstance(team_ids, (str, bytes)):
+            raise ValueError("team_ids must be an iterable of team IDs")
+        try:
+            requested = tuple(team_ids)
+        except TypeError:
+            raise ValueError("team_ids must be an iterable of team IDs") from None
+        if not requested or any(
+            not isinstance(team_id, str) or not team_id for team_id in requested
+        ):
+            raise ValueError("team_ids must contain non-empty strings")
+        if len(set(requested)) != len(requested):
+            raise ValueError("team_ids contains a duplicate")
+        known = {team.team_id for team in self.state.teams}
+        unknown = set(requested).difference(known)
+        if unknown:
+            raise ValueError(f"team_id {min(unknown)!r} is outside this scenario run")
+        require_json_int("scenario_index", scenario_index, minimum=0)
+        if scenario_index >= self.config.scenario_count:
+            raise ValueError("scenario_index must be less than scenario_count")
+        return self._team_scores(tuple(sorted(requested)), scenario_index)
+
     def identity_record(self) -> dict[str, object]:
         record = _run_record(
             self.state,
@@ -157,10 +183,22 @@ class PreparedScoreScenarios:
         }
 
     def _scenario(self, index: int) -> ScoreScenario:
+        team_ids = tuple(sorted(team.team_id for team in self.state.teams))
+        scores = self._team_scores(team_ids, index)
+        return ScoreScenario(
+            scenario_id=f"{self.draw_space_id}:{index}",
+            snapshot_id=self.state.snapshot_id,
+            scoring_profile_id=self.state.scoring_profile_id,
+            scores=scores,
+        )
+
+    def _team_scores(
+        self, team_ids: tuple[str, ...], index: int
+    ) -> tuple[TeamWeekScore, ...]:
         scores = []
         draw_cache: dict[tuple[str, tuple[object, ...]], float] = {}
         for week in self.state.remaining_regular_season_weeks:
-            for team_id in sorted(team.team_id for team in self.state.teams):
+            for team_id in team_ids:
                 player_ids = self._lineups[(team_id, week)]
                 total = fsum(
                     _realize(
@@ -173,12 +211,7 @@ class PreparedScoreScenarios:
                     for player_id in player_ids
                 )
                 scores.append(TeamWeekScore(team_id, week, total))
-        return ScoreScenario(
-            scenario_id=f"{self.draw_space_id}:{index}",
-            snapshot_id=self.state.snapshot_id,
-            scoring_profile_id=self.state.scoring_profile_id,
-            scores=tuple(scores),
-        )
+        return tuple(scores)
 
 
 def prepare_score_scenarios(

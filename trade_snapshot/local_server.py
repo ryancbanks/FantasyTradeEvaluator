@@ -13,7 +13,7 @@ from secrets import token_urlsafe
 import shutil
 from threading import Event, Lock, Thread, Timer
 from time import monotonic
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 import webbrowser
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
@@ -42,6 +42,9 @@ _PLAYER_OUTLOOK_PATH = re.compile(
 _GM_INSIGHTS_PATH = re.compile(
     r"^/api/bundles/(engine_[0-9a-f]{64})/gm-insights$"
 )
+_TRADE_TIMING_PATH = re.compile(
+    r"^/api/bundles/(engine_[0-9a-f]{64})/trade-timing$"
+)
 _COLLECTION_PATH = re.compile(r"^/api/weekly-collections/([0-9a-f]{32})$")
 _COLLECTION_CANCEL_PATH = re.compile(
     r"^/api/weekly-collections/([0-9a-f]{32})/cancel$"
@@ -59,6 +62,8 @@ _STATIC = {
     "/gm_insights_evidence_ui.js": ("gm_insights_evidence_ui.js", "text/javascript; charset=utf-8"),
     "/gm_insights_format.js": ("gm_insights_format.js", "text/javascript; charset=utf-8"),
     "/gm_insights_ui.js": ("gm_insights_ui.js", "text/javascript; charset=utf-8"),
+    "/trade_timing.css": ("trade_timing.css", "text/css; charset=utf-8"),
+    "/trade_timing_ui.js": ("trade_timing_ui.js", "text/javascript; charset=utf-8"),
     "/player_lab.css": ("player_lab.css", "text/css; charset=utf-8"),
     "/player_lab_ui.js": ("player_lab_ui.js", "text/javascript; charset=utf-8"),
     "/trade_filter_ui.js": ("trade_filter_ui.js", "text/javascript; charset=utf-8"),
@@ -193,7 +198,8 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Unexpected local application error."})
 
     def _get(self) -> None:
-        path = urlsplit(self.path).path
+        split = urlsplit(self.path)
+        path = split.path
         if path == "/":
             template = _asset("index.html").decode("utf-8")
             body = template.replace("__APP_TOKEN__", self.server.app_token).encode("utf-8")
@@ -237,6 +243,21 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
             self._json(
                 HTTPStatus.OK,
                 self.server.app_service.gm_insights(matched.group(1)),
+            )
+            return
+        matched = _TRADE_TIMING_PATH.fullmatch(path)
+        if matched:
+            query = parse_qs(split.query, keep_blank_values=True)
+            if set(query) != {"primaryTeamId"} or len(query["primaryTeamId"]) != 1:
+                raise ValueError("trade timing requires exactly one primaryTeamId")
+            primary_team_id = query["primaryTeamId"][0]
+            if not primary_team_id:
+                raise ValueError("primaryTeamId must be a non-empty string")
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.trade_timing(
+                    matched.group(1), primary_team_id
+                ),
             )
             return
         if path == "/api/browser-extension/status":

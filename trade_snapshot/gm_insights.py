@@ -7,6 +7,7 @@ import json
 from statistics import median
 
 from ._league_history_evidence import captured_transaction_evidence
+from ._league_history_health import capture_is_fresh, latest_physical_injury_ids
 from ._gm_decision_signals import (
     counterparty_value_opportunity,
     deal_accessibility,
@@ -31,12 +32,8 @@ from ._gm_team_profiles import (
     _valuations_by_team,
 )
 from .engine_bundle import EngineBundle
-from .gm_trade_valuation import (
-    PHYSICAL_INJURY_STATUSES,
-    value_historical_trades,
-)
+from .gm_trade_valuation import value_historical_trades
 from .league_history import (
-    HISTORY_CAPTURE_BINDING_TOLERANCE,
     HistoryTransactionKind,
     LeagueHistorySnapshot,
 )
@@ -70,7 +67,7 @@ def build_gm_insights(
     transactions, first_observed_at = captured_transaction_evidence(captures)
     transactions = tuple(row for row in transactions if row.recorded_at <= as_of)
     latest_capture = max(captures, key=lambda row: (row.captured_at, row.capture_id), default=None)
-    capture_fresh = _capture_is_fresh(latest_capture, as_of)
+    capture_fresh = capture_is_fresh(latest_capture, as_of)
     transaction_complete = bool(
         capture_fresh and latest_capture.transaction_history_complete
     )
@@ -121,7 +118,7 @@ def build_gm_insights(
         bundle, current_roster_captures, as_of, positions
     )
     position_needs = _position_needs(bundle)
-    current_injuries = _latest_physical_injury_ids(
+    current_injuries = latest_physical_injury_ids(
         current_roster_captures, as_of
     )
     compatibility_report = build_roster_compatibility(
@@ -468,38 +465,6 @@ def _compatibility_teams(report):
         }
         for row in report["teams"]
     }
-
-
-def _latest_physical_injury_ids(captures, as_of):
-    latest = max(
-        (
-            row
-            for row in captures
-            if row.captured_at <= as_of and row.roster_complete
-        ),
-        key=lambda row: (row.captured_at, row.capture_id),
-        default=None,
-    )
-    if latest is None or not _capture_is_fresh(latest, as_of):
-        return ()
-    return tuple(
-        sorted(
-            player.canonical_player_id
-            for roster in latest.rosters
-            for player in roster.players
-            if player.injury_status in PHYSICAL_INJURY_STATUSES
-        )
-    )
-
-
-def _capture_is_fresh(capture, as_of):
-    return bool(
-        capture is not None
-        and capture.captured_at <= as_of
-        and as_of - capture.captured_at <= HISTORY_CAPTURE_BINDING_TOLERANCE
-        and capture.coverage_end <= as_of
-        and as_of - capture.coverage_end <= HISTORY_CAPTURE_BINDING_TOLERANCE
-    )
 
 
 __all__ = ("build_gm_insights",)

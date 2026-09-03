@@ -248,6 +248,21 @@ class PreparedScoreScenarioTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             tuple(prepared.iter_scenarios(0, 6))
 
+    def test_bounded_team_scores_match_the_complete_scenario(self):
+        prepared = basic_prepared(scenario_count=3)
+
+        complete = next(prepared.iter_scenarios(1, 2))
+        selected = prepared.team_scores(("a",), 1)
+
+        self.assertEqual(
+            selected,
+            tuple(row for row in complete.scores if row.team_id == "a"),
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            prepared.team_scores(("a", "a"), 0)
+        with self.assertRaisesRegex(ValueError, "outside"):
+            prepared.team_scores(("missing",), 0)
+
     def test_context_required_only_for_enabled_factors_and_scores_are_nonnegative(self):
         state = make_state(("FLEX",), roster_cap=1)
         rosters = (TeamRoster("a", ("p1",), 1, 1), TeamRoster("b", ("p2",), 1, 1))

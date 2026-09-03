@@ -300,6 +300,10 @@ function changeBundle() {
     primaryTeamId: $("primaryTeam").value || null,
     onUseTradePartner: chooseTradePartnerFromInsights
   });
+  void TradeTimingUi.setBundle(currentBundle(), {
+    apiRequest: api,
+    primaryTeamId: $("primaryTeam").value || null
+  });
   void PlayerLabUi.setBundle(currentBundle(), {request: api, onError: showError});
 }
 
@@ -741,6 +745,7 @@ $("bundleSelect").addEventListener("change", changeBundle);
 $("primaryTeam").addEventListener("change", () => {
   syncCounterparties();
   GmInsightsUi.setPrimaryTeam($("primaryTeam").value);
+  void TradeTimingUi.setPrimaryTeam($("primaryTeam").value);
 });
 $("counterparties").addEventListener("change", populatePackageFilters);
 for (const option of document.querySelectorAll('input[name="tradeFormat"]')) {
