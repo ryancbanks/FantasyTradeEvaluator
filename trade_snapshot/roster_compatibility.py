@@ -5,6 +5,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import combinations
 import json
+from math import isfinite
+from numbers import Real
 
 from ._gm_statistics import percentile
 from .engine_bundle import EngineBundle
@@ -32,11 +34,15 @@ _POSITION_ORDER = {
 
 
 @dataclass(frozen=True, slots=True)
-class _Swap:
-    left_player_id: str
-    right_player_id: str
-    left_power_delta: float
-    right_power_delta: float
+class RosterSwap:
+    """One oriented 1-for-1 swap with raw and displayed power changes."""
+
+    primary_player_id: str
+    counterparty_player_id: str
+    primary_power_delta: float
+    counterparty_power_delta: float
+    primary_display_power_delta: float
+    counterparty_display_power_delta: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +52,7 @@ class _PairResult:
     evaluated_count: int
     mutually_positive_count: int
     mutually_nondecreasing_count: int
-    best_mutually_positive: _Swap | None
+    best_mutually_positive: RosterSwap | None
     power_methodology_status: str
 
 
@@ -102,6 +108,54 @@ def build_roster_compatibility(
     }
     json.dumps(result, allow_nan=False, sort_keys=True)
     return result
+
+
+def screened_roster_swaps(
+    bundle: EngineBundle,
+    primary_team_id: str,
+    counterparty_team_id: str,
+    *,
+    minimum_displayed_power_delta: float = -5.0,
+    physically_injured_player_ids: Iterable[str] = (),
+    limit: int | None = None,
+) -> tuple[RosterSwap, ...]:
+    """Return oriented 1-for-1 swaps that pass both teams' displayed-power floor."""
+
+    threshold = _finite_threshold(minimum_displayed_power_delta)
+    if limit is not None and (type(limit) is not int or limit < 1):
+        raise ValueError("limit must be a positive integer or null")
+    if not isinstance(bundle, EngineBundle):
+        raise ValueError("bundle must be an EngineBundle")
+    rosters = {row.team_id: row for row in bundle.rosters}
+    if primary_team_id == counterparty_team_id:
+        raise ValueError("trade teams must be different")
+    unknown = {primary_team_id, counterparty_team_id}.difference(rosters)
+    if unknown:
+        raise ValueError(f"team_id {min(unknown)!r} is not in the selected bundle")
+    injured = _injured_ids(bundle, physically_injured_player_ids)
+    team_names = {row.team_id: row.name for row in bundle.state.teams}
+    candidates, _ = _candidate_players(bundle, injured, team_names)
+    prepared = PreparedTradePair(
+        bundle.strength_model,
+        rosters[primary_team_id],
+        rosters[counterparty_team_id],
+    )
+    swaps = []
+    for left_index, left_player_id in enumerate(candidates[primary_team_id]):
+        for right_index, right_player_id in enumerate(candidates[counterparty_team_id]):
+            result = prepared.evaluate(
+                TradeCandidate((left_player_id,), (right_player_id,)),
+                candidate_index=(
+                    left_index * len(candidates[counterparty_team_id]) + right_index
+                ),
+            )
+            if (
+                result.primary_display_delta >= threshold
+                and result.counterparty_display_delta >= threshold
+            ):
+                swaps.append(_roster_swap(left_player_id, right_player_id, result))
+    ordered = tuple(sorted(swaps, key=lambda row: _best_swap_key(row, bundle.player_names)))
+    return ordered if limit is None else ordered[:limit]
 
 
 def _team_records(pairs, rosters, candidates, profiles, team_names, player_names):
@@ -321,11 +375,13 @@ def _evaluate_pair(bundle, left, right, left_candidates, right_candidates, statu
                 nondecreasing_count += 1
             if left_delta > _POWER_EPSILON and right_delta > _POWER_EPSILON:
                 positive_count += 1
-                swap = _Swap(
+                swap = RosterSwap(
                     left_player_id,
                     right_player_id,
                     left_delta,
                     right_delta,
+                    result.primary_display_delta,
+                    result.counterparty_display_delta,
                 )
                 key = _best_swap_key(swap, bundle.player_names)
                 if best_key is None or key < best_key:
@@ -389,11 +445,11 @@ def _directed_partner_record(pair, team_id, partner_id, team_names, player_names
     best = pair.best_mutually_positive
     if best is not None:
         if team_id == pair.left_team_id:
-            sends_id, receives_id = best.left_player_id, best.right_player_id
-            team_delta, partner_delta = best.left_power_delta, best.right_power_delta
+            sends_id, receives_id = best.primary_player_id, best.counterparty_player_id
+            team_delta, partner_delta = best.primary_power_delta, best.counterparty_power_delta
         else:
-            sends_id, receives_id = best.right_player_id, best.left_player_id
-            team_delta, partner_delta = best.right_power_delta, best.left_power_delta
+            sends_id, receives_id = best.counterparty_player_id, best.primary_player_id
+            team_delta, partner_delta = best.counterparty_power_delta, best.primary_power_delta
         example = {
             "team_sends": {"player_id": sends_id, "player_name": player_names[sends_id]},
             "team_receives": {
@@ -451,10 +507,10 @@ def _partner_rank_key(row, team_names):
 
 def _best_swap_key(row, player_names):
     return (
-        -min(row.left_power_delta, row.right_power_delta),
-        -(row.left_power_delta + row.right_power_delta),
-        *_player_key(row.left_player_id, player_names),
-        *_player_key(row.right_player_id, player_names),
+        -min(row.primary_power_delta, row.counterparty_power_delta),
+        -(row.primary_power_delta + row.counterparty_power_delta),
+        *_player_key(row.primary_player_id, player_names),
+        *_player_key(row.counterparty_player_id, player_names),
     )
 
 
@@ -470,4 +526,28 @@ def _position_key(position):
     return _POSITION_ORDER.get(position, len(_POSITION_ORDER)), position
 
 
-__all__ = ("build_roster_compatibility",)
+def _finite_threshold(value):
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError("minimum_displayed_power_delta must be a finite number")
+    normalized = float(value)
+    if not isfinite(normalized):
+        raise ValueError("minimum_displayed_power_delta must be a finite number")
+    return normalized
+
+
+def _roster_swap(primary_player_id, counterparty_player_id, result):
+    return RosterSwap(
+        primary_player_id,
+        counterparty_player_id,
+        result.primary_raw_delta,
+        result.counterparty_raw_delta,
+        result.primary_display_delta,
+        result.counterparty_display_delta,
+    )
+
+
+__all__ = (
+    "RosterSwap",
+    "build_roster_compatibility",
+    "screened_roster_swaps",
+)

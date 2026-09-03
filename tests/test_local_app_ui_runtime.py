@@ -92,13 +92,16 @@ class LocalAppUiRuntimeTests(unittest.TestCase):
                         page = browser.new_page()
                         page_errors = []
                         gm_requests = []
+                        timing_requests = []
                         page.on("pageerror", lambda error: page_errors.append(str(error)))
-                        page.on(
-                            "request",
-                            lambda request: gm_requests.append(request.url)
-                            if request.url.endswith("/gm-insights")
-                            else None,
-                        )
+
+                        def record_insight_request(request):
+                            if request.url.endswith("/gm-insights"):
+                                gm_requests.append(request.url)
+                            if "/trade-timing?" in request.url:
+                                timing_requests.append(request.url)
+
+                        page.on("request", record_insight_request)
                         page.goto(server.app_url, wait_until="networkidle")
                         page.locator("#health", has_text="running").wait_for()
 
@@ -107,7 +110,9 @@ class LocalAppUiRuntimeTests(unittest.TestCase):
                         self.assertFalse(page.locator("#dashboardContent").is_visible())
                         self.assertFalse(page.locator("#playerLabContent").is_visible())
                         self.assertFalse(page.locator("#gmInsightsContent").is_visible())
+                        self.assertFalse(page.locator("#tradeTimingContent").is_visible())
                         self.assertEqual(gm_requests, [])
+                        self.assertEqual(timing_requests, [])
 
                         page.locator("#playerLabLoadButton").click()
                         page.locator("#playerLabContent").wait_for(state="visible")
@@ -131,6 +136,16 @@ class LocalAppUiRuntimeTests(unittest.TestCase):
                             page.locator("#gmInsightsTableBody tr").count(), 0
                         )
                         self.assertEqual(len(gm_requests), 1)
+                        self.assertEqual(timing_requests, [])
+
+                        page.locator("#tradeTimingLoadButton").click()
+                        page.locator("#tradeTimingContent").wait_for(
+                            state="visible", timeout=15_000
+                        )
+                        self.assertGreater(
+                            page.locator("#tradeTimingPartnerBoard > *").count(), 0
+                        )
+                        self.assertEqual(len(timing_requests), 1)
 
                         page.locator("#maxOutgoing").fill("1")
                         page.locator("#maxIncoming").fill("1")

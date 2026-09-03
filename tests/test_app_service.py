@@ -153,6 +153,110 @@ class LocalAppServiceTests(unittest.TestCase):
 
         self.assertFalse(pending.done())
 
+    def test_trade_timing_is_cached_per_primary_team(self):
+        bundle = engine_bundle()
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            first = service.trade_timing(bundle.bundle_id, "primary")
+            with patch(
+                "trade_snapshot.app_service.build_trade_timing",
+                side_effect=AssertionError("cached timing must not be rebuilt"),
+            ):
+                second = service.trade_timing(bundle.bundle_id, "primary")
+
+        self.assertIs(first, second)
+        self.assertEqual(first["primary_team_id"], "primary")
+        self.assertFalse(first["methodology"]["manager_acceptance_modeled"])
+
+    def test_trade_timing_opens_history_lazily_and_uses_shared_bundle_cache(self):
+        bundle = engine_bundle()
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            self.assertIsNone(service._history_store)
+            service.import_bundle(bundle.to_record())
+            self.assertIsNone(service._history_store)
+
+            with patch(
+                "trade_snapshot.app_service.load_engine_bundle",
+                side_effect=AssertionError("the cached bundle must be reused"),
+            ), patch(
+                "trade_snapshot.app_service.build_trade_timing",
+                return_value={"bundle_id": bundle.bundle_id, "status": "test"},
+            ):
+                result = service.trade_timing(bundle.bundle_id, "primary")
+
+            self.assertEqual(result["status"], "test")
+            self.assertIsNotNone(service._history_store)
+
+    def test_concurrent_trade_timing_requests_share_one_calculation(self):
+        bundle = engine_bundle()
+        calculation_started = Event()
+        release_calculation = Event()
+
+        def delayed_build(*args):
+            calculation_started.set()
+            self.assertTrue(release_calculation.wait(5))
+            return {
+                "bundle_id": args[0].bundle_id,
+                "primary_team_id": args[2],
+                "status": "test",
+            }
+
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            with patch(
+                "trade_snapshot.app_service.build_trade_timing",
+                side_effect=delayed_build,
+            ) as mocked_build, ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(
+                    service.trade_timing, bundle.bundle_id, "primary"
+                )
+                self.assertTrue(calculation_started.wait(5))
+                second = pool.submit(
+                    service.trade_timing, bundle.bundle_id, "primary"
+                )
+                time.sleep(0.02)
+                self.assertFalse(second.done())
+                self.assertTrue(service.is_busy)
+                release_calculation.set()
+                first_result = first.result(timeout=5)
+                second_result = second.result(timeout=5)
+
+        self.assertIs(first_result, second_result)
+        mocked_build.assert_called_once()
+
+    def test_trade_timing_cache_is_bounded_and_least_recently_used(self):
+        bundle = engine_bundle()
+        build_count = 0
+
+        def build(*_args):
+            nonlocal build_count
+            build_count += 1
+            return {"calculation": build_count}
+
+        with TemporaryDirectory() as directory, patch(
+            "trade_snapshot.app_service._MAX_TRADE_TIMING_CACHE_SIZE", 2
+        ):
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            with patch(
+                "trade_snapshot.app_service.build_trade_timing", side_effect=build
+            ):
+                first = service.trade_timing(bundle.bundle_id, "primary")
+                service.trade_timing(bundle.bundle_id, "other")
+                self.assertIs(
+                    service.trade_timing(bundle.bundle_id, "primary"), first
+                )
+                service.trade_timing(bundle.bundle_id, "third")
+                self.assertIs(
+                    service.trade_timing(bundle.bundle_id, "primary"), first
+                )
+                service.trade_timing(bundle.bundle_id, "other")
+
+        self.assertEqual(build_count, 4)
+
     def test_gm_insights_supports_old_bundles_and_refreshes_for_new_history(self):
         bundle = engine_bundle()
         captured_at = datetime(2026, 9, 1, tzinfo=timezone.utc)
@@ -191,15 +295,20 @@ class LocalAppServiceTests(unittest.TestCase):
             service = LocalAppService(directory)
             service.import_bundle(bundle.to_record())
             old_bundle_result = service.gm_insights(bundle.bundle_id)
+            old_timing = service.trade_timing(bundle.bundle_id, "primary")
             LeagueHistoryStore(
                 Path(directory) / LEAGUE_HISTORY_FILENAME
             ).ingest(capture, bundle=binding)
             captured_result = service.gm_insights(bundle.bundle_id)
+            captured_timing = service.trade_timing(bundle.bundle_id, "primary")
 
         self.assertEqual(old_bundle_result["status"], "not_collected")
         self.assertEqual(captured_result["status"], "insufficient_sample")
         self.assertIsNotNone(captured_result["league_history_id"])
         self.assertEqual(len(captured_result["teams"]), len(bundle.state.teams))
+        self.assertIsNone(old_timing["history_revision"])
+        self.assertIsNotNone(captured_timing["history_revision"])
+        self.assertIsNot(old_timing, captured_timing)
 
     def test_corrupt_optional_history_does_not_prevent_launch_or_other_features(self):
         bundle = engine_bundle()
@@ -332,12 +441,51 @@ class LocalAppServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "General Manager Insights"):
                 service.player_outlook(bundle.bundle_id)
             with self.assertRaisesRegex(RuntimeError, "General Manager Insights"):
+                service.trade_timing(bundle.bundle_id, "primary")
+            with self.assertRaisesRegex(RuntimeError, "General Manager Insights"):
                 service.start_weekly_collection(
                     SimpleNamespace()
                 )
             with self.assertRaisesRegex(RuntimeError, "General Manager Insights"):
                 service.start_search(request)
             with self.assertRaisesRegex(RuntimeError, "General Manager Insights"):
+                service.export_job(completed.job_id)
+
+        self.assertFalse(pending.done())
+
+    def test_trade_timing_activity_blocks_every_other_heavy_feature(self):
+        bundle = engine_bundle()
+        request = LocalSearchRequest.from_payload(payload(bundle.bundle_id))
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            pending = Future()
+            service._trade_timing_futures[(bundle.bundle_id, "primary")] = pending
+            completed = _SearchJob(
+                "a" * 32,
+                request,
+                status="complete",
+                outcome=SimpleNamespace(),
+                context=SimpleNamespace(),
+            )
+            service._jobs[completed.job_id] = completed
+
+            self.assertTrue(service.is_busy)
+            with self.assertRaisesRegex(RuntimeError, "Trade Timing"):
+                service._require_draft_capacity()
+            with self.assertRaisesRegex(RuntimeError, "Trade Timing"):
+                service.league_dashboard(bundle.bundle_id)
+            with self.assertRaisesRegex(RuntimeError, "Trade Timing"):
+                service.player_outlook(bundle.bundle_id)
+            with self.assertRaisesRegex(RuntimeError, "Trade Timing"):
+                service.gm_insights(bundle.bundle_id)
+            with self.assertRaisesRegex(RuntimeError, "Trade Timing"):
+                service.trade_timing(bundle.bundle_id, "other")
+            with self.assertRaisesRegex(RuntimeError, "Trade Timing"):
+                service.start_weekly_collection(SimpleNamespace())
+            with self.assertRaisesRegex(RuntimeError, "Trade Timing"):
+                service.start_search(request)
+            with self.assertRaisesRegex(RuntimeError, "Trade Timing"):
                 service.export_job(completed.job_id)
 
         self.assertFalse(pending.done())

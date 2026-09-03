@@ -11,6 +11,7 @@
   <link rel="stylesheet" href="/dashboard.css">
   <link rel="stylesheet" href="/draft_lab.css">
   <link rel="stylesheet" href="/gm_insights.css">
+  <link rel="stylesheet" href="/trade_timing.css">
   <link rel="stylesheet" href="/player_lab.css">
 </head>
 <body>
@@ -270,9 +271,64 @@
       </div>
     </section>
 
+    <section id="tradeTimingLab" class="panel trade-timing-lab" aria-labelledby="tradeTimingHeading">
+      <div class="section-heading trade-timing-heading">
+        <div><span class="step">4</span><h2 id="tradeTimingHeading">Trade Timing Lab</h2></div>
+        <div class="section-action">
+          <p>Find simulated proposal windows—not a prediction that a manager will accept.</p>
+          <button id="tradeTimingLoadButton" class="secondary" type="button" disabled>Calculate trade timing</button>
+        </div>
+      </div>
+      <div id="tradeTimingEmpty" class="trade-timing-state" aria-live="polite">
+        Select a ready week, then calculate trade windows when you are ready.
+      </div>
+      <div id="tradeTimingLoading" class="trade-timing-state trade-timing-loading hidden" aria-live="polite">
+        <span class="trade-timing-spinner" aria-hidden="true"></span>
+        <span>Simulating records, pressure windows, and mutually useful trades…</span>
+      </div>
+      <div id="tradeTimingError" class="trade-timing-state trade-timing-error hidden" role="alert"></div>
+      <div id="tradeTimingContent" class="trade-timing-content hidden">
+        <div class="trade-timing-toolbar">
+          <div>
+            <p id="tradeTimingSummary" class="trade-timing-summary" role="status" aria-live="polite" aria-atomic="true"></p>
+            <p class="trade-timing-boundary"><strong>Verification is required.</strong> Confirm the trade deadline and current player health. Timing priority is not acceptance probability.</p>
+          </div>
+          <label class="trade-timing-partner-picker"><span>Plan against</span><select id="tradeTimingPartnerSelect" aria-controls="tradeTimingPartnerOverview"></select></label>
+        </div>
+        <section class="trade-timing-board-section" aria-labelledby="tradeTimingBoardHeading">
+          <div class="trade-timing-card-heading"><h3 id="tradeTimingBoardHeading">League timing board</h3><p>Every opponent · select one for the full plan</p></div>
+          <div id="tradeTimingPartnerBoard" class="trade-timing-partner-board" aria-label="Trade timing plans by opponent"></div>
+        </section>
+        <div id="tradeTimingPartnerOverview" class="trade-timing-partner-overview" aria-live="polite"></div>
+        <div class="trade-timing-layout">
+          <div class="trade-timing-main">
+            <div id="tradeTimingRecommendations"></div>
+            <section class="trade-timing-card" aria-labelledby="tradeTimingWindowsHeading">
+              <div class="trade-timing-card-heading"><h3 id="tradeTimingWindowsHeading">Vulnerable windows</h3><p>Projected team pressure—not manager intent</p></div>
+              <div id="tradeTimingWindows"></div>
+            </section>
+          </div>
+          <aside class="trade-timing-side">
+            <section class="trade-timing-card" aria-labelledby="tradeTimingTrajectoryHeading">
+              <div class="trade-timing-card-heading"><h3 id="tradeTimingTrajectoryHeading">Record trajectory</h3><p id="tradeTimingTrajectoryDirection"></p></div>
+              <div id="tradeTimingTrajectory"></div>
+            </section>
+            <section class="trade-timing-card" aria-labelledby="tradeTimingHistoryHeading">
+              <div class="trade-timing-card-heading"><h3 id="tradeTimingHistoryHeading">Completed-deal timing</h3><p>Historical participation only</p></div>
+              <div id="tradeTimingDealTiming"></div>
+            </section>
+          </aside>
+        </div>
+        <details class="trade-timing-methodology">
+          <summary>How to read this timing plan</summary>
+          <div id="tradeTimingMethodology"></div>
+        </details>
+      </div>
+    </section>
+
     <section id="playerLabPanel" class="panel player-lab-panel" aria-labelledby="playerLabHeading">
       <div class="section-heading">
-        <div><span class="step">4</span><h2 id="playerLabHeading">Player Lab</h2></div>
+        <div><span class="step">5</span><h2 id="playerLabHeading">Player Lab</h2></div>
         <div class="section-action">
           <p>Inspect every rostered player and captured waiver candidate without leaving the local app.</p>
           <button id="playerLabLoadButton" class="secondary" type="button" disabled>Open Player Lab</button>
@@ -326,7 +382,7 @@
 
     <section class="panel">
       <div class="section-heading">
-        <div><span class="step">5</span><h2>Choose the search</h2></div>
+        <div><span class="step">6</span><h2>Choose the search</h2></div>
         <p>Counts are exact before the run starts. Playoff simulations happen only after the fast power filter.</p>
       </div>
       <form id="searchForm">
@@ -438,7 +494,7 @@
 
     <section id="progressPanel" class="panel hidden">
       <div class="section-heading">
-        <div><span class="step">6</span><h2>Search progress</h2></div>
+        <div><span class="step">7</span><h2>Search progress</h2></div>
         <p id="progressText">Preparing the shared season simulation…</p>
       </div>
       <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
@@ -447,7 +503,7 @@
 
     <section id="resultsPanel" class="panel hidden">
       <div class="section-heading results-heading">
-        <div><span class="step">7</span><h2>Best local results</h2></div>
+        <div><span class="step">8</span><h2>Best local results</h2></div>
         <button id="exportButton" class="primary">Download Excel workbook</button>
       </div>
       <p id="resultsNote" class="results-note"></p>
@@ -689,6 +745,7 @@
   <script src="/gm_insights_format.js" defer></script>
   <script src="/gm_insights_evidence_ui.js" defer></script>
   <script src="/gm_insights_ui.js" defer></script>
+  <script src="/trade_timing_ui.js" defer></script>
   <script src="/player_lab_ui.js" defer></script>
   <script src="/three_way_ui.js" defer></script>
   <script src="/trade_filter_ui.js" defer></script>

@@ -1,9 +1,13 @@
 import unittest
+from unittest.mock import patch
 
 from tests.draft_fixtures import small_draft_config, small_historical_corpus
+from trade_snapshot.draft_config import score_raw_stats
+from trade_snapshot.draft_history import ActualWeekStatus
 from trade_snapshot.draft_benchmark import _trial_cell, compare_to_regression_baseline
 from trade_snapshot.draft_brain import initialize_genome
 from trade_snapshot.draft_features import build_baseline_brain
+from trade_snapshot.draft_season import _prepare_scoring_context
 
 
 class DraftBenchmarkTests(unittest.TestCase):
@@ -28,6 +32,37 @@ class DraftBenchmarkTests(unittest.TestCase):
         self.assertEqual(result.verdict, "inconclusive")
         self.assertEqual(result.evaluation_seasons, (2025,))
         self.assertEqual(result.interval_basis, "season_clustered")
+
+    def test_reuses_one_scoring_context_across_benchmark_trials(self):
+        played_week_count = sum(
+            week.status is ActualWeekStatus.PLAYED
+            for player in self.corpus.seasons[0].players
+            for week in player.actual_weeks
+        )
+
+        with (
+            patch(
+                "trade_snapshot.draft_benchmark._prepare_scoring_context",
+                wraps=_prepare_scoring_context,
+            ) as prepare,
+            patch(
+                "trade_snapshot.draft_season.score_raw_stats",
+                wraps=score_raw_stats,
+            ) as score,
+        ):
+            result = compare_to_regression_baseline(
+                self.baseline,
+                self.corpus,
+                self.config,
+                trials=4,
+                evaluation_years=(2025,),
+                seed=5,
+                candidate_window=4,
+            )
+
+        self.assertEqual(result.ties, 4)
+        self.assertEqual(prepare.call_count, 1)
+        self.assertEqual(score.call_count, played_week_count)
 
     def test_evolved_comparison_is_paired_bounded_and_reports_progress(self):
         brain = initialize_genome(

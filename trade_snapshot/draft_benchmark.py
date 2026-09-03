@@ -9,7 +9,7 @@ import math
 from .draft_brain import DraftBrain
 from .draft_config import DraftLeagueConfig
 from .draft_history import HistoricalCorpus
-from .draft_season import simulate_historical_season
+from .draft_season import _prepare_scoring_context, simulate_historical_season
 from .draft_simulation import simulate_snake_draft
 
 
@@ -84,6 +84,7 @@ def compare_to_regression_baseline(
     deltas_by_season: dict[int, list[float]] = {
         season.season: [] for season in seasons
     }
+    scoring_contexts = {}
     wins = ties = losses = 0
 
     for trial in range(trials):
@@ -91,6 +92,10 @@ def compare_to_regression_baseline(
             raise InterruptedError("draft model benchmark was cancelled")
         season_index, seat = _trial_cell(trial, len(seasons), config.team_count)
         season = seasons[season_index]
+        scoring_context = scoring_contexts.get(season_index)
+        if scoring_context is None:
+            scoring_context = _prepare_scoring_context(season, config)
+            scoring_contexts[season_index] = scoring_context
         trial_seed = seed + trial * 7_919
         opponents = _paired_opponents(
             brain, baseline, config.team_count, seat, seed, trial, season.season
@@ -107,8 +112,12 @@ def compare_to_regression_baseline(
             season, config, tuple(candidate_brains),
             seed=trial_seed, candidate_window=candidate_window, should_cancel=should_cancel,
         )
-        reference = simulate_historical_season(reference_draft.rosters, season, config)
-        candidate = simulate_historical_season(candidate_draft.rosters, season, config)
+        reference = simulate_historical_season(
+            reference_draft.rosters, season, config, _prepared=scoring_context
+        )
+        candidate = simulate_historical_season(
+            candidate_draft.rosters, season, config, _prepared=scoring_context
+        )
         team_id = f"drafter-{seat + 1}"
         old = next(row for row in reference.standings if row.team_id == team_id)
         new = next(row for row in candidate.standings if row.team_id == team_id)

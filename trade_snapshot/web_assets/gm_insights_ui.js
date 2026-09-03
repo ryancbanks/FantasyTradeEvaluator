@@ -731,6 +731,7 @@ window.GmInsightsUi = (() => {
     $("gmInsightsTeamSelect").value = teamId;
     renderTable();
     renderProfile();
+    window.TradeTimingUi?.setPartnerTeam(teamId);
     if (focus) {
       const buttons = [...$("gmInsightsTableBody").querySelectorAll(".gm-insights-team-button")];
       buttons.find(button => button.dataset.teamId === teamId)?.focus();

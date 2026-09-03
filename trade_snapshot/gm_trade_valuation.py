@@ -18,6 +18,10 @@ from ._league_history_evidence import (
     captured_transaction_evidence,
     transaction_executed_by,
 )
+from ._league_history_health import (
+    NON_PHYSICAL_UNAVAILABLE_STATUSES,
+    PHYSICAL_INJURY_STATUSES,
+)
 from .engine_bundle import EngineBundle
 from .league_history import (
     HISTORY_CAPTURE_BINDING_TOLERANCE,
@@ -34,20 +38,6 @@ from .trade_space import TeamRoster
 _MAX_VALUATION_LAG = timedelta(days=8)
 _MAX_PLAYOFF_SCENARIOS = 2_000
 _MAX_HEALTH_COVERAGE_GAP = timedelta(days=8)
-PHYSICAL_INJURY_STATUSES = frozenset(
-    {
-        "DAY_TO_DAY",
-        "DOUBTFUL",
-        "DTD",
-        "INJURED_RESERVE",
-        "INJURY_RESERVE",
-        "IR",
-        "NFI",
-        "OUT",
-        "PUP",
-        "QUESTIONABLE",
-    }
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,9 +133,6 @@ class _HistoryIndexes:
             intervening_by_binding_time,
             health_by_capture,
         )
-
-
-_NON_PHYSICAL_UNAVAILABLE_STATUSES = frozenset({"SUSPENDED"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -733,7 +720,7 @@ def _health_eligibility_reasons(
                 reasons.append("traded_player_health_status_unknown")
             elif status in PHYSICAL_INJURY_STATUSES:
                 reasons.append("physical_injury_status_observed")
-            elif status in _NON_PHYSICAL_UNAVAILABLE_STATUSES:
+            elif status in NON_PHYSICAL_UNAVAILABLE_STATUSES:
                 reasons.append("non_physical_unavailability_observed")
             elif status != "ACTIVE":
                 reasons.append("unrecognized_health_status_observed")

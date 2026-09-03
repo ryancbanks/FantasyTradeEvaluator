@@ -20,6 +20,7 @@ let activeSearchTeamIds = [];
 let activeInsight = null;
 let dashboardBundleId = null;
 let gmInsightsBundleId = null;
+let tradeTimingBundleId = null;
 let playerLabBundleId = null;
 let exportBusy = false;
 let draftWorkBusy = false;
@@ -338,6 +339,7 @@ function changeBundle() {
   renderBundle();
   dashboardBundleId = null;
   gmInsightsBundleId = null;
+  tradeTimingBundleId = null;
   playerLabBundleId = null;
   DashboardUi.reset(
     currentBundle()
@@ -348,6 +350,11 @@ function changeBundle() {
     currentBundle()
       ? "Open GM Insights when you want current roster fit and verified league history."
       : "Select a ready week, then open GM Insights when you want current roster fit and verified league history."
+  );
+  TradeTimingUi.reset(
+    currentBundle()
+      ? "Calculate trade timing when you want simulated proposal windows."
+      : "Select a ready week, then calculate trade timing when you are ready."
   );
   PlayerLabUi.reset(
     currentBundle()
@@ -365,11 +372,14 @@ function updateActivityControls() {
   $("bundleSelect").disabled = bundles.length === 0 || busy;
   $("dashboardLoadButton").disabled = !bundle || busy;
   $("gmInsightsLoadButton").disabled = !bundle || busy;
+  $("tradeTimingLoadButton").disabled = !bundle || busy;
   $("playerLabLoadButton").disabled = !bundle || busy;
   $("dashboardLoadButton").textContent =
     bundle && dashboardBundleId === bundle.bundle_id ? "Refresh league outlook" : "Calculate league outlook";
   $("gmInsightsLoadButton").textContent =
     bundle && gmInsightsBundleId === bundle.bundle_id ? "Refresh GM Insights" : "Open GM Insights";
+  $("tradeTimingLoadButton").textContent =
+    bundle && tradeTimingBundleId === bundle.bundle_id ? "Refresh trade timing" : "Calculate trade timing";
   $("playerLabLoadButton").textContent =
     bundle && playerLabBundleId === bundle.bundle_id ? "Refresh Player Lab" : "Open Player Lab";
   $("collectButton").disabled =
@@ -491,6 +501,12 @@ async function loadInsight(kind) {
         onUseTradePartner: chooseTradePartnerFromInsights
       });
       if (!failed) gmInsightsBundleId = bundle.bundle_id;
+    } else if (kind === "timing") {
+      await TradeTimingUi.setBundle(bundle, {
+        apiRequest: api,
+        primaryTeamId: $("primaryTeam").value || null
+      });
+      tradeTimingBundleId = bundle.bundle_id;
     } else {
       await PlayerLabUi.setBundle(bundle, {request: api, onError});
       if (!failed) playerLabBundleId = bundle.bundle_id;
@@ -994,7 +1010,16 @@ $("bundleFile").addEventListener("change", async event => {
   } catch (error) { showError(error); }
 });
 $("bundleSelect").addEventListener("change", changeBundle);
-$("primaryTeam").addEventListener("change", syncCounterparties);
+$("primaryTeam").addEventListener("change", () => {
+  syncCounterparties();
+  GmInsightsUi.setPrimaryTeam($("primaryTeam").value);
+  if (tradeTimingBundleId !== null) {
+    tradeTimingBundleId = null;
+    TradeTimingUi.reset("Your team changed. Calculate trade timing again when you are ready.");
+  }
+  void TradeTimingUi.setPrimaryTeam($("primaryTeam").value);
+  updateActivityControls();
+});
 $("counterparties").addEventListener("change", populatePackageFilters);
 for (const option of document.querySelectorAll('input[name="tradeFormat"]')) {
   option.addEventListener("change", changeTradeFormat);
@@ -1009,6 +1034,7 @@ $("cancelCollectionButton").addEventListener("click", cancelCollection);
 $("confirmSignInButton").addEventListener("click", confirmCollectionSignIn);
 $("dashboardLoadButton").addEventListener("click", () => void loadInsight("dashboard"));
 $("gmInsightsLoadButton").addEventListener("click", () => void loadInsight("gm"));
+$("tradeTimingLoadButton").addEventListener("click", () => void loadInsight("timing"));
 $("playerLabLoadButton").addEventListener("click", () => void loadInsight("player"));
 $("estimateButton").addEventListener("click", estimate);
 $("searchForm").addEventListener("input", searchConfigurationChanged);
