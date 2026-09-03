@@ -1,0 +1,740 @@
+"""Application service for local Draft Lab jobs, files, and assistant sessions."""
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+from threading import Event, RLock, Thread
+from time import monotonic
+from uuid import uuid4
+
+from .draft_assistant import (
+    AssistantDraftBinding,
+    DraftAssistantSession,
+    assistant_board_coverage,
+    assistant_status,
+    bind_assistant_draft,
+    create_assistant_session,
+    drafter_for_pick,
+    reconcile_assistant_picks,
+    record_assistant_pick,
+    undo_assistant_pick,
+)
+from .draft_benchmark import compare_to_regression_baseline
+from .draft_config import (
+    DraftLeagueConfig,
+    DraftStrategy,
+    config_from_engine_bundle,
+)
+from .draft_espn_live import (
+    EspnDraftObservation,
+    EspnDraftSyncError,
+    EspnPublicDraftAdapter,
+)
+from .draft_persistence import DraftFileStore, DraftModelArtifact
+from .draft_training import (
+    EvolutionConfig,
+    TrainingCheckpoint,
+    run_training_batch,
+    training_estimate,
+)
+from .engine_bundle import load_engine_bundle
+
+
+_MAX_RETAINED_TERMINAL_JOBS = 24
+_TERMINAL_JOB_STATUSES = frozenset({"complete", "cancelled", "failed"})
+
+
+@dataclass(slots=True)
+class _DraftJob:
+    job_id: str
+    kind: str
+    status: str = "queued"
+    progress: dict[str, object] = field(default_factory=dict)
+    error: str | None = None
+    result: dict[str, object] | None = None
+    cancel: Event = field(default_factory=Event)
+
+
+class DraftLabService:
+    def __init__(
+        self,
+        data_directory: str | Path,
+        bundle_directory: str | Path,
+        *,
+        heavy_work_guard=lambda: None,
+        activity_lock=None,
+        espn_draft_adapter=None,
+    ) -> None:
+        self.data_directory = Path(data_directory).resolve()
+        self.bundle_directory = Path(bundle_directory).resolve()
+        self.store = DraftFileStore(self.data_directory)
+        self.session_directory = self.data_directory / "draft-assistant-sessions"
+        self.session_directory.mkdir(parents=True, exist_ok=True)
+        self._lock = RLock()
+        self._recommendation_lock = RLock()
+        self._jobs: dict[str, _DraftJob] = {}
+        self._heavy_work_guard = heavy_work_guard
+        self._activity_lock = activity_lock or RLock()
+        self._espn_draft_adapter = (
+            EspnPublicDraftAdapter()
+            if espn_draft_adapter is None
+            else espn_draft_adapter
+        )
+        if not callable(getattr(self._espn_draft_adapter, "poll", None)):
+            raise ValueError("espn_draft_adapter must provide poll()")
+
+    @property
+    def is_busy(self) -> bool:
+        with self._lock:
+            return any(row.status in {"queued", "running"} for row in self._jobs.values())
+
+    def catalog(self) -> dict[str, object]:
+        return {
+            "corpora": self.store.list_corpora(),
+            "boards": self.store.list_boards(),
+            "models": self.store.list_models(),
+            "checkpoints": self.store.list_checkpoints(),
+            "assistant_sessions": self._session_catalog(),
+            "league_presets": self._league_presets(),
+            "supported_training_seasons": [
+                2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025
+            ],
+            "year_notice": (
+                "2015 is usable only when the imported pack includes a genuine 2015 "
+                "preseason snapshot. 2020 is intentionally excluded."
+            ),
+            "live_sync": {
+                "status": "available",
+                "provider": "espn",
+                "access": "public",
+                "polling": "on_demand",
+                "message": (
+                    "ESPN snake drafts can be polled from the public read endpoint. "
+                    "The current board must map ESPN player IDs. Private leagues and "
+                    "credentialed reads are not supported."
+                ),
+            },
+        }
+
+    def import_corpus(self, record):
+        return self.store.import_corpus(record)
+
+    def import_board(self, record):
+        return self.store.import_board(record)
+
+    def import_model(self, record):
+        return self.store.import_model(record)
+
+    def estimate_training(self, payload: Mapping[str, object]) -> dict[str, object]:
+        corpus, config, evolution, _ = self._training_inputs(payload)
+        return training_estimate(corpus, config, evolution)
+
+    def start_training(self, payload: Mapping[str, object]) -> dict[str, object]:
+        with self._activity_lock:
+            self._heavy_work_guard()
+            with self._lock:
+                if self.is_busy:
+                    raise RuntimeError("another Draft Lab training or benchmark job is running")
+            corpus, config, evolution, resume = self._training_inputs(payload)
+            with self._recommendation_lock:
+                with self._lock:
+                    if self.is_busy:
+                        raise RuntimeError(
+                            "another Draft Lab training or benchmark job is running"
+                        )
+                    job = _DraftJob(uuid4().hex, "training")
+                    job.progress = {
+                        "generation": 0, "generation_count": evolution.generations
+                    }
+                    self._jobs[job.job_id] = job
+        Thread(
+            target=self._run_training,
+            args=(job, corpus, config, evolution, resume),
+            name=f"draft-training-{job.job_id[:8]}",
+            daemon=True,
+        ).start()
+        return self._job_record(job)
+
+    def resume_training(
+        self, checkpoint_job_id: str, generations: int | None = None
+    ) -> dict[str, object]:
+        with self._activity_lock:
+            self._heavy_work_guard()
+            with self._lock:
+                if self.is_busy:
+                    raise RuntimeError("another Draft Lab training or benchmark job is running")
+            checkpoint = TrainingCheckpoint.from_record(
+                self.store.load_checkpoint(checkpoint_job_id)
+            )
+            evolution = checkpoint.evolution_config
+            if generations is not None:
+                if type(generations) is not int or not 1 <= generations <= 1_000:
+                    raise ValueError("resume generations must be an integer from 1 through 1000")
+                if generations < checkpoint.generation_completed:
+                    raise ValueError("resume generations cannot precede the saved generation")
+                evolution = replace(evolution, generations=generations)
+            return self.start_training({
+                "corpus_id": checkpoint.corpus_id,
+                "league_config": checkpoint.league_config.to_record(),
+                "evolution_config": evolution.to_record(),
+                "resume_checkpoint_job_id": checkpoint_job_id,
+            })
+
+    def start_benchmark(self, payload: Mapping[str, object]) -> dict[str, object]:
+        _exact_keys(
+            "benchmark", payload,
+            {"model_id", "trials", "seed", "candidate_window", "evaluation_years"},
+        )
+        years = payload["evaluation_years"]
+        if not isinstance(years, list):
+            raise ValueError("evaluation_years must be a JSON array")
+        options = {
+            "trials": payload["trials"], "seed": payload["seed"],
+            "candidate_window": payload["candidate_window"],
+            "evaluation_years": tuple(years),
+        }
+        with self._activity_lock:
+            self._heavy_work_guard()
+            with self._lock:
+                if self.is_busy:
+                    raise RuntimeError("another Draft Lab training or benchmark job is running")
+            model = self.store.load_model(payload["model_id"])
+            corpus = self.store.load_corpus(model.corpus_id)
+            with self._recommendation_lock:
+                with self._lock:
+                    if self.is_busy:
+                        raise RuntimeError(
+                            "another Draft Lab training or benchmark job is running"
+                        )
+                    job = _DraftJob(uuid4().hex, "benchmark")
+                    job.progress = {"trial": 0, "trial_count": options["trials"]}
+                    self._jobs[job.job_id] = job
+        Thread(
+            target=self._run_benchmark, args=(job, model, corpus, options),
+            name=f"draft-benchmark-{job.job_id[:8]}", daemon=True,
+        ).start()
+        return self._job_record(job)
+
+    def job(self, job_id: str) -> dict[str, object]:
+        with self._lock:
+            return self._job_record(self._require_job(job_id))
+
+    def cancel_job(self, job_id: str) -> dict[str, object]:
+        with self._lock:
+            job = self._require_job(job_id)
+            if job.status in {"queued", "running"}:
+                job.cancel.set()
+            return self._job_record(job)
+
+    def job_result(self, job_id: str) -> dict[str, object]:
+        with self._lock:
+            job = self._require_job(job_id)
+            if job.status != "complete" or job.result is None:
+                raise RuntimeError("Draft Lab job result is not ready")
+            return job.result
+
+    def create_assistant(self, payload: Mapping[str, object]) -> dict[str, object]:
+        _exact_keys(
+            "assistant", payload,
+            {"model_id", "board_id", "user_drafter_number", "strategy"},
+        )
+        model = self.store.load_model(payload["model_id"])
+        board = self.store.load_board(payload["board_id"])
+        try:
+            strategy = DraftStrategy(payload["strategy"])
+        except (TypeError, ValueError):
+            raise ValueError("assistant strategy is invalid") from None
+        with self._activity_lock:
+            with self._recommendation_lock:
+                session = create_assistant_session(
+                    model, board, user_drafter_number=payload["user_drafter_number"],
+                    strategy=strategy,
+                )
+                with self._lock:
+                    self._ensure_recommendations_available(session, model)
+                result = assistant_status(session, model, board)
+                with self._lock:
+                    self._save_session(session)
+                return result
+
+    def assistant(self, session_id: str) -> dict[str, object]:
+        with self._activity_lock:
+            with self._recommendation_lock:
+                with self._lock:
+                    session, model, board = self._assistant_inputs(session_id)
+                    self._ensure_recommendations_available(session, model)
+                return assistant_status(session, model, board)
+
+    def assistant_players(self, session_id: str) -> dict[str, object]:
+        with self._lock:
+            session, _, board = self._assistant_inputs(session_id)
+            drafted = {row.player_id for row in session.picks}
+        return {
+            "players": [
+                {
+                    "player_id": row.player_id, "name": row.display_name,
+                    "position": row.position, "drafted": row.player_id in drafted,
+                }
+                for row in sorted(
+                    board.players,
+                    key=lambda row: (row.position, row.display_name.casefold()),
+                )
+            ]
+        }
+
+    def record_pick(self, session_id: str, payload: Mapping[str, object]):
+        _exact_keys("assistant pick", payload, {"player_id", "drafter_number"})
+        with self._activity_lock:
+            with self._recommendation_lock:
+                with self._lock:
+                    session, model, board = self._assistant_inputs(session_id)
+                session = record_assistant_pick(
+                    session, model, board, player_id=payload["player_id"],
+                    drafter_number=payload["drafter_number"],
+                )
+                with self._lock:
+                    self._ensure_recommendations_available(session, model)
+                result = assistant_status(session, model, board)
+                with self._lock:
+                    self._save_session(session)
+                return result
+
+    def undo_pick(self, session_id: str):
+        with self._activity_lock:
+            with self._recommendation_lock:
+                with self._lock:
+                    session, model, board = self._assistant_inputs(session_id)
+                session = undo_assistant_pick(session)
+                with self._lock:
+                    self._ensure_recommendations_available(session, model)
+                result = assistant_status(session, model, board)
+                with self._lock:
+                    self._save_session(session)
+                return result
+
+    def sync_espn_draft(
+        self, session_id: str, payload: Mapping[str, object]
+    ) -> dict[str, object]:
+        _exact_keys("ESPN public draft sync", payload, {"league_id", "season"})
+        with self._lock:
+            _, model, board = self._assistant_inputs(session_id)
+        observation = self._espn_draft_adapter.poll(
+            league_id=payload["league_id"],
+            season=payload["season"],
+            board=board,
+            team_count=model.league_config.team_count,
+            roster_size=model.league_config.roster_size,
+        )
+        if not isinstance(observation, EspnDraftObservation):
+            raise EspnDraftSyncError("ESPN draft adapter returned an invalid observation")
+        if (
+            observation.league_id != payload["league_id"]
+            or observation.season != payload["season"]
+        ):
+            raise EspnDraftSyncError(
+                "ESPN draft adapter returned different source coordinates"
+            )
+
+        with self._activity_lock:
+            with self._recommendation_lock:
+                with self._lock:
+                    current, model, board = self._assistant_inputs(session_id)
+                try:
+                    binding = AssistantDraftBinding(
+                        "espn", observation.league_id, observation.season,
+                        observation.team_order,
+                    )
+                    bound = bind_assistant_draft(current, binding)
+                except ValueError as error:
+                    raise EspnDraftSyncError(str(error)) from None
+                if len(observation.assistant_picks) < len(current.picks):
+                    raise EspnDraftSyncError(
+                        "ESPN currently exposes fewer picks than this assistant session; "
+                        "automatic rollback is intentionally disabled"
+                    )
+                updated = reconcile_assistant_picks(
+                    bound, model, board, observation.assistant_picks
+                )
+                appended = len(updated.picks) - len(current.picks)
+                with self._lock:
+                    self._ensure_recommendations_available(updated, model)
+                result = assistant_status(updated, model, board)
+                result["live_sync"] = observation.live_sync_record(appended)
+                if updated != current:
+                    with self._lock:
+                        self._save_session(updated)
+                return result
+
+    def model_path(self, model_id: str) -> Path:
+        return self.store.model_path(model_id)
+
+    def promote_checkpoint(self, checkpoint_job_id: str) -> dict[str, object]:
+        """Make an autosaved champion usable without running another generation."""
+
+        with self._lock:
+            checkpoint = TrainingCheckpoint.from_record(
+                self.store.load_checkpoint(checkpoint_job_id)
+            )
+            performance = checkpoint.champion_performance
+            expected_metrics = {
+                "fitness": performance.fitness,
+                "championship_rate": (
+                    performance.championships / performance.appearances
+                ),
+                "playoff_rate": performance.playoffs / performance.appearances,
+                "mean_finish": performance.mean_finish,
+            }
+            expected_seasons = list(checkpoint.evolution_config.training_years)
+            for summary in self.store.list_models():
+                if (
+                    summary.get("status") != "invalid"
+                    and summary.get("brain_id") == checkpoint.champion.brain_id
+                    and summary.get("corpus_id") == checkpoint.corpus_id
+                    and summary.get("config_id") == checkpoint.league_config.config_id
+                    and summary.get("trained_seasons") == expected_seasons
+                    and summary.get("generation") == checkpoint.generation_completed
+                    and summary.get("metrics") == expected_metrics
+                ):
+                    return summary
+            artifact = _checkpoint_model_artifact(checkpoint)
+            self.store.save_model(artifact)
+            return artifact.summary()
+
+    def _run_training(self, job, corpus, config, evolution, resume):
+        try:
+            self._set_job(job, status="running")
+            started_at = monotonic()
+            initial_generation = 0 if resume is None else resume.generation_completed
+
+            def arena_progress(generation, arena, arena_count):
+                elapsed = monotonic() - started_at
+                completed_here = (
+                    (generation - 1 - initial_generation) * arena_count + arena
+                )
+                rate = elapsed / max(1, completed_here)
+                total_remaining = (
+                    evolution.generations * arena_count
+                    - ((generation - 1) * arena_count + arena)
+                )
+                self._set_job(job, progress={
+                    "generation": generation - 1,
+                    "generation_count": evolution.generations,
+                    "current_generation": generation,
+                    "arena": arena,
+                    "arena_count": arena_count,
+                    "estimated_remaining_seconds": rate * total_remaining,
+                    "autosaved": generation - 1 > 0,
+                })
+
+            def saved(checkpoint):
+                self.store.save_checkpoint(job.job_id, checkpoint.to_record())
+                summary = checkpoint.history[-1]
+                completed_here = checkpoint.generation_completed - initial_generation
+                elapsed = monotonic() - started_at
+                per_generation = elapsed / max(1, completed_here)
+                self._set_job(job, progress={
+                    "generation": checkpoint.generation_completed,
+                    "generation_count": evolution.generations,
+                    "champion_brain_id": checkpoint.champion.brain_id,
+                    "champion_fitness": checkpoint.champion_performance.fitness,
+                    "mean_fitness": summary.mean_fitness,
+                    "autosaved": True,
+                    "elapsed_seconds": elapsed,
+                    "seconds_per_generation": per_generation,
+                    "estimated_remaining_seconds": per_generation * (
+                        evolution.generations - checkpoint.generation_completed
+                    ),
+                })
+
+            checkpoint = run_training_batch(
+                corpus, config, evolution, resume=resume, on_generation=saved,
+                on_arena=arena_progress,
+                should_cancel=job.cancel.is_set,
+            )
+            artifact = _checkpoint_model_artifact(checkpoint)
+            self.store.save_model(artifact)
+            self._set_job(job, status="complete", result={
+                "model": artifact.summary(),
+                "showcase": checkpoint.to_record()["showcase"],
+                "history": [row.to_record() for row in checkpoint.history],
+                "checkpoint_id": checkpoint.checkpoint_id,
+            })
+        except InterruptedError:
+            self._set_job(job, status="cancelled", error="Stopped safely after the last autosaved generation.")
+        except Exception as error:
+            self._set_job(job, status="failed", error=str(error))
+
+    def _run_benchmark(self, job, model, corpus, options):
+        try:
+            self._set_job(job, status="running")
+            result = compare_to_regression_baseline(
+                model.brain, corpus, model.league_config, **options,
+                should_cancel=job.cancel.is_set,
+                on_progress=lambda done, total: self._set_job(
+                    job, progress={"trial": done, "trial_count": total}
+                ),
+            )
+            record = result.to_record()
+            evaluated = set(result.evaluation_seasons)
+            trained = set(model.trained_seasons)
+            record["evaluation_scope"] = (
+                "holdout" if evaluated.isdisjoint(trained)
+                else "mixed" if evaluated.difference(trained)
+                else "training_years"
+            )
+            record["scope_notice"] = (
+                "This is an out-of-sample historical check."
+                if record["evaluation_scope"] == "holdout"
+                else "At least one selected season was used to fit or evolve this model; "
+                "treat the result as an in-sample regression check."
+            )
+            self._set_job(job, status="complete", result=record)
+        except InterruptedError:
+            self._set_job(job, status="cancelled", error="Benchmark stopped safely.")
+        except Exception as error:
+            self._set_job(job, status="failed", error=str(error))
+
+    def _training_inputs(self, payload):
+        allowed = {"corpus_id", "league_config", "evolution_config", "resume_checkpoint_job_id"}
+        if not isinstance(payload, Mapping) or not set(payload).issubset(allowed) or not {
+            "corpus_id", "league_config", "evolution_config"
+        }.issubset(payload):
+            raise ValueError("training request fields are invalid")
+        corpus = self.store.load_corpus(payload["corpus_id"])
+        config = _league_config(payload["league_config"])
+        evolution = _evolution_config(payload["evolution_config"])
+        resume_id = payload.get("resume_checkpoint_job_id")
+        resume = None if resume_id is None else TrainingCheckpoint.from_record(
+            self.store.load_checkpoint(resume_id)
+        )
+        return corpus, config, evolution, resume
+
+    def _league_presets(self):
+        standard = DraftLeagueConfig.standard_ppr()
+        records = [{
+            "preset_id": "standard-ppr",
+            "source": "built_in",
+            "config": standard.to_record(),
+            "compatibility_notice": (
+                "All displayed built-in rules are represented directly."
+            ),
+        }]
+        for path in sorted(self.bundle_directory.glob("*.json")):
+            try:
+                bundle = load_engine_bundle(path)
+                config = config_from_engine_bundle(bundle)
+                records.append({
+                    "preset_id": bundle.bundle_id, "source": "synced_league",
+                    "season": bundle.state.season, "config": config.to_record(),
+                    "compatibility_notice": (
+                        "Team count, roster size, starter slots, regular-season end, "
+                        "playoff field, weeks, and linear scoring were imported. "
+                        "Review division berths, standings tiebreakers, and playoff "
+                        "reseeding; Draft Lab v1 does not model those three host rules."
+                    ),
+                })
+            except ValueError as error:
+                records.append({
+                    "preset_id": path.stem,
+                    "source": "synced_league",
+                    "status": "unsupported",
+                    "compatibility_notice": f"This synced league needs manual review: {error}",
+                })
+        return records
+
+    def _assistant_inputs(self, session_id):
+        session = self._load_session(session_id)
+        return session, self.store.load_model(session.model_id), self.store.load_board(session.board_id)
+
+    def _session_catalog(self):
+        records = []
+        for path in sorted(self.session_directory.glob("*.json")):
+            try:
+                session, model, board = self._assistant_inputs(path.stem)
+                records.append({
+                    "session_id": session.session_id,
+                    "model_id": session.model_id,
+                    "board_id": session.board_id,
+                    "user_drafter_number": session.user_drafter_number,
+                    "strategy": session.strategy.value,
+                    "pick_count": len(session.picks),
+                    "board_coverage": assistant_board_coverage(
+                        model,
+                        board,
+                        user_drafter_number=session.user_drafter_number,
+                        strategy=session.strategy,
+                    ),
+                    "draft_binding": (
+                        None if session.draft_binding is None
+                        else session.draft_binding.to_record()
+                    ),
+                })
+            except (OSError, ValueError):
+                records.append({"status": "invalid", "file": path.name})
+        return tuple(records)
+
+    def _session_path(self, session_id):
+        if not isinstance(session_id, str) or len(session_id) != 32 or any(
+            char not in "0123456789abcdef" for char in session_id
+        ):
+            raise ValueError("assistant session_id is invalid")
+        return self.session_directory / f"{session_id}.json"
+
+    def _save_session(self, session):
+        path = self._session_path(session.session_id)
+        temporary = path.with_name(f".{path.stem}.{uuid4().hex}.tmp.json")
+        try:
+            temporary.write_text(json.dumps(session.to_record(), sort_keys=True, separators=(",", ":")), encoding="utf-8")
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _load_session(self, session_id):
+        path = self._session_path(session_id)
+        try:
+            return DraftAssistantSession.from_record(json.loads(
+                path.read_text(encoding="utf-8"),
+                object_pairs_hook=_unique_json_object,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(f"invalid JSON constant {value!r}")
+                ),
+            ))
+        except FileNotFoundError:
+            raise
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"could not read assistant session: {error}") from None
+
+    def _ensure_recommendations_available(self, session, model):
+        total_picks = model.league_config.team_count * model.league_config.roster_size
+        next_pick = len(session.picks) + 1
+        recommendations_due = (
+            next_pick <= total_picks
+            and drafter_for_pick(
+                next_pick, model.league_config.team_count
+            ) == session.user_drafter_number
+        )
+        if recommendations_due:
+            self._heavy_work_guard()
+            if self.is_busy:
+                raise RuntimeError(
+                    "Draft assistant recommendations are unavailable while a Draft "
+                    "Lab training or benchmark job is running"
+                )
+
+    def _require_job(self, job_id):
+        if not isinstance(job_id, str) or len(job_id) != 32:
+            raise ValueError("Draft Lab job ID is invalid")
+        try:
+            return self._jobs[job_id]
+        except KeyError:
+            raise FileNotFoundError(job_id) from None
+
+    def _set_job(self, job, **changes):
+        with self._lock:
+            for name, value in changes.items():
+                setattr(job, name, value)
+            if job.status in _TERMINAL_JOB_STATUSES:
+                self._prune_terminal_jobs_locked()
+
+    def _prune_terminal_jobs_locked(self):
+        """Retain recent results without allowing completed jobs to grow forever."""
+
+        terminal_ids = [
+            job_id
+            for job_id, candidate in self._jobs.items()
+            if candidate.status in _TERMINAL_JOB_STATUSES
+        ]
+        for job_id in terminal_ids[:-_MAX_RETAINED_TERMINAL_JOBS]:
+            del self._jobs[job_id]
+
+    @staticmethod
+    def _job_record(job):
+        return {
+            "job_id": job.job_id, "kind": job.kind, "status": job.status,
+            "progress": dict(job.progress), "error": job.error,
+            "result_ready": job.result is not None,
+        }
+
+
+def _checkpoint_model_artifact(checkpoint: TrainingCheckpoint) -> DraftModelArtifact:
+    performance = checkpoint.champion_performance
+    return DraftModelArtifact(
+        checkpoint.champion,
+        checkpoint.league_config,
+        checkpoint.corpus_id,
+        checkpoint.evolution_config.training_years,
+        checkpoint.generation_completed,
+        {
+            "fitness": performance.fitness,
+            "championship_rate": performance.championships / performance.appearances,
+            "playoff_rate": performance.playoffs / performance.appearances,
+            "mean_finish": performance.mean_finish,
+        },
+        datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def _league_config(value):
+    if not isinstance(value, Mapping):
+        raise ValueError("league_config must be an object")
+    if value.get("kind") == "draft_league_config":
+        return DraftLeagueConfig.from_record(value)
+    keys = {
+        "name", "team_count", "starting_slots", "bench_slots", "slot_eligibility",
+        "position_limits", "scoring_weights", "regular_season_weeks",
+        "playoff_team_count", "playoff_weeks", "strategy_counts",
+    }
+    _exact_keys("league_config", value, keys)
+    try:
+        strategies = {DraftStrategy(key): count for key, count in value["strategy_counts"].items()}
+        return DraftLeagueConfig(
+            value["name"], value["team_count"], tuple(value["starting_slots"]),
+            value["bench_slots"], {key: tuple(rows) for key, rows in value["slot_eligibility"].items()},
+            value["position_limits"], value["scoring_weights"],
+            tuple(value["regular_season_weeks"]), value["playoff_team_count"],
+            tuple(value["playoff_weeks"]), strategies,
+        )
+    except (AttributeError, TypeError):
+        raise ValueError("league_config nested fields are invalid") from None
+
+
+def _evolution_config(value):
+    if not isinstance(value, Mapping):
+        raise ValueError("evolution_config must be an object")
+    if value.get("kind") == "draft_evolution_config":
+        return EvolutionConfig.from_record(value)
+    keys = {
+        "population_size", "generations", "appearances_per_generation",
+        "elite_fraction", "mutation_rate", "mutation_magnitude", "candidate_window",
+        "training_years", "seed",
+    }
+    _exact_keys("evolution_config", value, keys)
+    try:
+        return EvolutionConfig(
+            *(value[name] for name in (
+                "population_size", "generations", "appearances_per_generation",
+                "elite_fraction", "mutation_rate", "mutation_magnitude", "candidate_window",
+            )), tuple(value["training_years"]), value["seed"],
+        )
+    except TypeError:
+        raise ValueError("evolution_config nested fields are invalid") from None
+
+
+def _exact_keys(name, value, keys):
+    if not isinstance(value, Mapping) or set(value) != keys:
+        raise ValueError(f"{name} request fields are invalid")
+
+
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+__all__ = ("DraftLabService",)

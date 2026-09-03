@@ -16,11 +16,11 @@ class EspnFreeReadError(RuntimeError):
 
 
 class EspnUnauthorizedError(EspnFreeReadError):
-    """The public ESPN read requires the user's existing browser session."""
+    """ESPN explicitly denied access to an unauthenticated public read."""
 
 
 class EspnFreeReadClient:
-    """Perform exactly two bounded, unauthenticated ESPN JSON reads per refresh."""
+    """Perform allowlisted, bounded, unauthenticated ESPN JSON reads."""
 
     def __init__(
         self,
@@ -61,6 +61,28 @@ class EspnFreeReadClient:
         _season(season)
         _provider_id(league_id)
         return cls._league_url(season, league_id), cls._pro_team_url(season)
+
+    @classmethod
+    def draft_url(cls, season: int, league_id: str) -> str:
+        """Return the one allowlisted public Draft Lab observation URL."""
+
+        _season(season)
+        _provider_id(league_id)
+        return (
+            f"{_READ_ROOT}/seasons/{season}/segments/0/leagues/{league_id}"
+            "?view=mDraftDetail"
+        )
+
+    def read_draft(
+        self, season: int, league_id: str, cancelled: Callable[[], bool]
+    ) -> Mapping[str, object]:
+        """Read one public ``mDraftDetail`` payload without credentials."""
+
+        expected_url = self.draft_url(season, league_id)
+        _check_cancelled(cancelled)
+        result = self._read(expected_url, cancelled)
+        _check_cancelled(cancelled)
+        return result
 
     @staticmethod
     def _league_url(season: int, league_id: str) -> str:
@@ -181,7 +203,7 @@ def _check_cancelled(check):
     if not isinstance(value, bool):
         raise ValueError("cancelled must return a boolean")
     if value:
-        raise EspnFreeReadError("Weekly collection was cancelled")
+        raise EspnFreeReadError("ESPN read was cancelled")
 
 
 def _unique_object(pairs):

@@ -44,16 +44,30 @@ _COLLECTION_SIGN_IN_PATH = re.compile(
     r"^/api/weekly-collections/([0-9a-f]{32})/sign-in$"
 )
 _EXPORT_PATH = re.compile(r"^/api/exports/([^/]+\.xlsx)$")
+_DRAFT_JOB_PATH = re.compile(r"^/api/draft/jobs/([0-9a-f]{32})$")
+_DRAFT_JOB_ACTION_PATH = re.compile(r"^/api/draft/jobs/([0-9a-f]{32})/(cancel|result)$")
+_DRAFT_CHECKPOINT_ACTION_PATH = re.compile(
+    r"^/api/draft/checkpoints/([0-9a-f]{32})/promote$"
+)
+_DRAFT_ASSISTANT_PATH = re.compile(r"^/api/draft/assistants/([0-9a-f]{32})$")
+_DRAFT_ASSISTANT_ACTION_PATH = re.compile(
+    r"^/api/draft/assistants/([0-9a-f]{32})/(players|picks|undo|espn-sync)$"
+)
+_DRAFT_MODEL_PATH = re.compile(r"^/api/draft/models/(draft_model_[0-9a-f]{64})/export$")
 _STATIC = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/app_tabs.js": ("app_tabs.js", "text/javascript; charset=utf-8"),
     "/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
     "/dashboard_charts.js": ("dashboard_charts.js", "text/javascript; charset=utf-8"),
     "/dashboard_ui.js": ("dashboard_ui.js", "text/javascript; charset=utf-8"),
+    "/draft_lab.css": ("draft_lab.css", "text/css; charset=utf-8"),
+    "/draft_lab.js": ("draft_lab.js", "text/javascript; charset=utf-8"),
     "/trade_filter_ui.js": ("trade_filter_ui.js", "text/javascript; charset=utf-8"),
     "/three_way_ui.js": ("three_way_ui.js", "text/javascript; charset=utf-8"),
     "/styles.css": ("styles.css", "text/css; charset=utf-8"),
 }
 _MAX_JSON_BYTES = 256 * 1024 * 1024
+_MAX_DRAFT_DATA_BYTES = 128 * 1024 * 1024
 _EXTENSION_ROOT = "/api/browser-extension/v1"
 
 
@@ -206,6 +220,44 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/bundles":
             self._json(HTTPStatus.OK, self.server.app_service.bundle_catalog())
             return
+        if path == "/api/draft/catalog":
+            self._json(HTTPStatus.OK, self.server.app_service.draft_lab.catalog())
+            return
+        matched = _DRAFT_JOB_PATH.fullmatch(path)
+        if matched:
+            self._json(HTTPStatus.OK, self.server.app_service.draft_lab.job(matched.group(1)))
+            return
+        matched = _DRAFT_JOB_ACTION_PATH.fullmatch(path)
+        if matched and matched.group(2) == "result":
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.draft_lab.job_result(matched.group(1)),
+            )
+            return
+        matched = _DRAFT_ASSISTANT_PATH.fullmatch(path)
+        if matched:
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.draft_lab.assistant(matched.group(1)),
+            )
+            return
+        matched = _DRAFT_ASSISTANT_ACTION_PATH.fullmatch(path)
+        if matched and matched.group(2) == "players":
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.draft_lab.assistant_players(matched.group(1)),
+            )
+            return
+        matched = _DRAFT_MODEL_PATH.fullmatch(path)
+        if matched:
+            model_path = self.server.app_service.draft_lab.model_path(matched.group(1))
+            self._bytes(
+                HTTPStatus.OK,
+                model_path.read_bytes(),
+                "application/json; charset=utf-8",
+                disposition=f'attachment; filename="{model_path.name}"',
+            )
+            return
         matched = _DASHBOARD_PATH.fullmatch(path)
         if matched:
             self._json(
@@ -254,6 +306,82 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
             summary = self.server.app_service.import_bundle(self._read_json())
             self._json(HTTPStatus.CREATED, summary)
             return
+        if path == "/api/draft/corpora/import":
+            self._json(
+                HTTPStatus.CREATED,
+                self.server.app_service.draft_lab.import_corpus(
+                    self._read_json(max_bytes=_MAX_DRAFT_DATA_BYTES)
+                ),
+            )
+            return
+        if path == "/api/draft/boards/import":
+            self._json(
+                HTTPStatus.CREATED,
+                self.server.app_service.draft_lab.import_board(
+                    self._read_json(max_bytes=_MAX_DRAFT_DATA_BYTES)
+                ),
+            )
+            return
+        if path == "/api/draft/models/import":
+            self._json(
+                HTTPStatus.CREATED,
+                self.server.app_service.draft_lab.import_model(self._read_json(max_bytes=16 * 1024 * 1024)),
+            )
+            return
+        if path in {"/api/draft/trainings", "/api/draft/trainings/estimate"}:
+            payload = self._read_json()
+            if path.endswith("/estimate"):
+                self._json(
+                    HTTPStatus.OK,
+                    self.server.app_service.draft_lab.estimate_training(payload),
+                )
+            else:
+                self._json(
+                    HTTPStatus.ACCEPTED,
+                    self.server.app_service.draft_lab.start_training(payload),
+                )
+            return
+        if path == "/api/draft/trainings/resume":
+            payload = self._read_json(max_bytes=1024)
+            if (
+                not isinstance(payload, dict)
+                or not {"checkpoint_job_id"}.issubset(payload)
+                or not set(payload).issubset({"checkpoint_job_id", "generations"})
+            ):
+                raise ValueError("training resume fields are invalid")
+            self._json(
+                HTTPStatus.ACCEPTED,
+                self.server.app_service.draft_lab.resume_training(
+                    payload["checkpoint_job_id"], payload.get("generations")
+                ),
+            )
+            return
+        matched = _DRAFT_CHECKPOINT_ACTION_PATH.fullmatch(path)
+        if matched:
+            self._require_empty_body()
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.draft_lab.promote_checkpoint(
+                    matched.group(1)
+                ),
+            )
+            return
+        if path == "/api/draft/benchmarks":
+            self._json(
+                HTTPStatus.ACCEPTED,
+                self.server.app_service.draft_lab.start_benchmark(
+                    self._read_json(max_bytes=64 * 1024)
+                ),
+            )
+            return
+        if path == "/api/draft/assistants":
+            self._json(
+                HTTPStatus.CREATED,
+                self.server.app_service.draft_lab.create_assistant(
+                    self._read_json(max_bytes=64 * 1024)
+                ),
+            )
+            return
         if path == "/api/weekly-collections":
             request = WeeklyCollectionRequest.from_payload(
                 self._read_json(max_bytes=32 * 1024)
@@ -288,6 +416,38 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
         if matched and matched.group(2) == "export":
             self._require_empty_body()
             self._json(HTTPStatus.CREATED, self.server.app_service.export_job(matched.group(1)))
+            return
+        matched = _DRAFT_JOB_ACTION_PATH.fullmatch(path)
+        if matched and matched.group(2) == "cancel":
+            self._require_empty_body()
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.draft_lab.cancel_job(matched.group(1)),
+            )
+            return
+        matched = _DRAFT_ASSISTANT_ACTION_PATH.fullmatch(path)
+        if matched and matched.group(2) == "picks":
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.draft_lab.record_pick(
+                    matched.group(1), self._read_json(max_bytes=16 * 1024)
+                ),
+            )
+            return
+        if matched and matched.group(2) == "espn-sync":
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.draft_lab.sync_espn_draft(
+                    matched.group(1), self._read_json(max_bytes=1024)
+                ),
+            )
+            return
+        if matched and matched.group(2) == "undo":
+            self._require_empty_body()
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.draft_lab.undo_pick(matched.group(1)),
+            )
             return
         matched = _COLLECTION_CANCEL_PATH.fullmatch(path)
         if matched:

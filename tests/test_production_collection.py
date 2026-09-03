@@ -551,6 +551,37 @@ class EspnFreeReadClientTests(unittest.TestCase):
         self.assertFalse({"cookie", "authorization", "x-fantasy-filter"} & headers)
         self.assertEqual({timeout for _, timeout in calls}, {7.0})
 
+    def test_public_draft_read_uses_one_exact_cookie_free_endpoint(self):
+        calls = []
+
+        def opener(request, *, timeout):
+            calls.append((request, timeout))
+            return _Response(request.full_url, b'{"draftDetail":{"picks":[]}}')
+
+        client = EspnFreeReadClient(timeout_seconds=5, maximum_bytes=2048, opener=opener)
+        payload = client.read_draft(2026, "123", lambda: False)
+
+        self.assertEqual(payload, {"draftDetail": {"picks": []}})
+        self.assertEqual(len(calls), 1)
+        request, timeout = calls[0]
+        self.assertEqual(
+            request.full_url,
+            "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/"
+            "seasons/2026/segments/0/leagues/123?view=mDraftDetail",
+        )
+        self.assertEqual(timeout, 5.0)
+        self.assertEqual(request.get_method(), "GET")
+        headers = {key.casefold() for key, _ in request.header_items()}
+        self.assertFalse({"cookie", "authorization", "x-fantasy-filter"} & headers)
+
+    def test_public_draft_read_validates_only_numeric_source_coordinates(self):
+        client = EspnFreeReadClient(
+            opener=lambda *_args, **_kwargs: self.fail("network should not be reached")
+        )
+        for season, league_id in ((2011, "123"), (2026, "0"), (2026, "abc")):
+            with self.subTest(season=season, league_id=league_id), self.assertRaises(ValueError):
+                client.read_draft(season, league_id, lambda: False)
+
     def test_distinguishes_only_an_explicit_access_denial(self):
         def denied(request, *, timeout):
             raise HTTPError(request.full_url, 401, "denied", {}, None)

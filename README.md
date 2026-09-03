@@ -17,6 +17,12 @@ A local NFL trade-search app that uses current FantasyPros ECR, FantasyPros/ESPN
 
 FantasyPros power and fantasy-point projection are deliberately separate. Only FantasyPros evidence is used to reproduce FantasyPros power. ESPN and Yahoo affect the weekly point distributions, projected records, and playoff probabilities; they do not alter the reproduced FantasyPros power formula.
 
+## Draft Lab
+
+The app also includes a separate local Draft Lab for training a draft-ranking model from user-supplied, provenance-tagged historical preseason data. It supports editable league and scoring rules, deterministic historical snake-draft arenas, generation autosaves and resume, model inspection and export, paired regression-baseline benchmarks, persistent manual draft rooms, and optional public ESPN snake-draft synchronization.
+
+Draft Lab does not download or claim complete historical ESPN or Yahoo archives. ESPN synchronization is a credential-free read of a public draft and requires a current board carrying verified ESPN player-ID mappings; private ESPN leagues and Yahoo live drafts remain manual. See the [Draft Lab guide](docs/draft-lab.md) for the supported years, strict JSON contracts, no-leak rules, compute controls, workflow, privacy guarantees, and current limitations.
+
 ## Use an installed desktop build
 
 1. Install the build for the machine: Windows `Setup.exe`, macOS `.dmg`, or the Debian/Ubuntu archive. Python and developer tools are not required; use a current desktop Chrome or Edge browser for weekly collection.

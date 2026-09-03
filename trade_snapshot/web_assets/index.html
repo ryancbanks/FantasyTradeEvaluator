@@ -6,20 +6,29 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071014">
   <meta name="app-token" content="__APP_TOKEN__">
-  <title>Fantasy Trade Evaluator</title>
+  <title>Local Fantasy Lab</title>
   <link rel="stylesheet" href="/styles.css">
   <link rel="stylesheet" href="/dashboard.css">
+  <link rel="stylesheet" href="/draft_lab.css">
 </head>
 <body>
   <header class="topbar">
     <div>
       <p class="eyebrow">LOCAL FANTASY LAB</p>
-      <h1>Trade Evaluator</h1>
-      <p class="subtitle">Find trades that improve both teams without repeatedly calling a website.</p>
+      <h1>Fantasy Lab</h1>
+      <p class="subtitle">Evaluate trades, train a draft brain, and work through a manual draft room entirely on this computer.</p>
     </div>
     <div id="health" class="status-pill">Starting…</div>
   </header>
 
+  <nav class="app-tabs" aria-label="Fantasy Lab tools">
+    <div class="app-tab-list" role="tablist" aria-label="Choose a lab">
+      <button id="tradeLabTab" class="app-tab" type="button" role="tab" data-app-surface="trade" aria-selected="true" aria-controls="tradeLabPanel">Trade Lab</button>
+      <button id="draftLabTab" class="app-tab" type="button" role="tab" data-app-surface="draft" aria-selected="false" aria-controls="draftLabPanel" tabindex="-1">Draft Lab</button>
+    </div>
+  </nav>
+
+  <div id="tradeLabPanel" class="app-surface" role="tabpanel" aria-labelledby="tradeLabTab" tabindex="0">
   <main>
     <div id="errorBanner" class="error-banner hidden" role="alert"></div>
 
@@ -328,6 +337,221 @@
       </div>
     </section>
   </main>
+  </div>
+
+  <section id="draftLabPanel" class="app-surface draft-lab" role="tabpanel" aria-labelledby="draftLabTab" tabindex="0" hidden>
+    <div class="draft-main" role="main">
+    <div id="draftErrorBanner" class="error-banner hidden" role="alert" tabindex="-1"></div>
+
+    <section class="panel draft-hero" aria-labelledby="draftLabHeading">
+      <div>
+        <p class="eyebrow">LOCAL EVOLUTION WORKBENCH</p>
+        <h2 id="draftLabHeading">Draft Lab</h2>
+        <p>Train draft strategies against historical seasons, inspect simulated leagues, and bring a tested final-generation model into a draft room.</p>
+      </div>
+      <div id="draftCatalogSummary" class="draft-catalog-summary" aria-live="polite">Loading saved draft assets…</div>
+    </section>
+
+    <section class="panel" aria-labelledby="draftSourcesHeading">
+      <div class="section-heading draft-heading">
+        <div><span class="step">1</span><h2 id="draftSourcesHeading">Draft data</h2></div>
+        <p>Import each JSON file once. Corpora, current boards, and deployable models stay on this machine.</p>
+      </div>
+      <div class="draft-import-grid">
+        <label class="file-card">
+          <span>Historical corpus JSON</span>
+          <small>Leak-free preseason features plus completed weekly outcomes</small>
+          <input id="draftCorpusFile" type="file" accept="application/json,.json">
+          <strong id="draftCorpusStatus" class="draft-file-status">No new file selected</strong>
+        </label>
+        <label class="file-card">
+          <span>Draft model JSON</span>
+          <small>A previously trained portable .draftbrain model</small>
+          <input id="draftModelFile" type="file" accept="application/json,.json">
+          <strong id="draftModelStatus" class="draft-file-status">No new file selected</strong>
+        </label>
+        <label class="file-card">
+          <span>Current-board JSON</span>
+          <small>This season’s players and preseason-only features</small>
+          <input id="draftBoardFile" type="file" accept="application/json,.json">
+          <strong id="draftBoardStatus" class="draft-file-status">No new file selected</strong>
+        </label>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="draftTrainHeading">
+      <div class="section-heading draft-heading">
+        <div><span class="step">2</span><h2 id="draftTrainHeading">Train a draft brain</h2></div>
+        <p>Every completed generation is autosaved and can be resumed safely.</p>
+      </div>
+      <div class="draft-restore draft-checkpoint-actions">
+        <label><span>Resume an autosave</span><select id="draftCheckpoint"><option value="">No saved checkpoints yet</option></select></label>
+        <button id="draftResumeButton" class="secondary" type="button" disabled>Resume saved training</button>
+        <button id="draftPromoteButton" class="secondary" type="button" disabled>Use autosaved champion</button>
+      </div>
+      <form id="draftTrainingForm">
+        <div class="draft-config-block">
+          <div class="draft-block-title">
+            <div><p class="draft-kicker">ARENA</p><h3>League rules</h3></div>
+            <div class="draft-preset">
+              <label><span>Copy supported league structure</span><select id="draftPreset"><option value="">Loading presets…</option></select></label>
+              <p id="draftPresetNotice" class="field-help" aria-live="polite">Loading rule compatibility…</p>
+            </div>
+          </div>
+          <div class="draft-fields draft-fields-four">
+            <label><span>Historical corpus</span><select id="draftCorpus" required><option value="">Import a corpus first</option></select></label>
+            <label><span>League name</span><input id="draftLeagueName" value="12-team PPR" required></label>
+            <label><span>Team count</span><input id="draftTeamCount" type="number" min="2" max="32" value="12" required></label>
+            <label><span>Bench slots</span><input id="draftBenchSlots" type="number" min="0" max="40" value="7" required></label>
+            <label class="draft-span-two"><span>Starter slots <small>(comma separated, up to 16)</small></span><input id="draftStarterSlots" value="QB,RB,RB,WR,WR,TE,FLEX,DST,K" required></label>
+            <label><span>Regular-season weeks</span><input id="draftRegularWeeks" value="1-14" required></label>
+            <label><span>Playoff weeks</span><input id="draftPlayoffWeeks" value="15-17" required></label>
+            <label><span>Playoff teams</span><input id="draftPlayoffTeams" type="number" min="1" max="32" value="6" required></label>
+          </div>
+          <details class="draft-advanced">
+            <summary>Advanced scoring and position rules</summary>
+            <p class="field-help">The selected preset fills these automatically. Expand only when the league needs custom scoring, flex eligibility, or roster caps.</p>
+            <div class="draft-json-grid">
+              <label><span>Scoring JSON</span><textarea id="draftScoringWeights" rows="8" spellcheck="false" required></textarea></label>
+              <label><span>Slot eligibility JSON</span><textarea id="draftSlotEligibility" rows="8" spellcheck="false" required></textarea></label>
+              <label><span>Position limits JSON</span><textarea id="draftPositionLimits" rows="8" spellcheck="false" required></textarea></label>
+            </div>
+          </details>
+        </div>
+
+        <div class="draft-config-block">
+          <div class="draft-block-title"><div><p class="draft-kicker">EVOLUTION</p><h3>Training budget</h3></div></div>
+          <div class="draft-fields draft-fields-five">
+            <label><span>Population</span><input id="draftPopulation" type="number" min="2" max="5000" value="12" required></label>
+            <label><span>Generations</span><input id="draftGenerations" type="number" min="1" max="1000" value="1" required></label>
+            <label><span>Appearances / generation</span><input id="draftAppearances" type="number" min="1" max="20" value="1" required></label>
+            <label><span>Candidate window</span><input id="draftCandidateWindow" type="number" min="0" max="4096" value="16" required></label>
+            <label><span>Seed</span><input id="draftSeed" type="number" min="0" value="904221" required></label>
+            <label><span>Elite fraction</span><input id="draftEliteFraction" type="number" min="0.01" max="0.5" step="0.01" value="0.15" required></label>
+            <label><span>Mutation rate</span><input id="draftMutationRate" type="number" min="0" max="1" step="0.01" value="0.12" required></label>
+            <label><span>Mutation magnitude</span><input id="draftMutationMagnitude" type="number" min="0" max="10000000" value="25000" required></label>
+          </div>
+          <fieldset class="draft-choice-group">
+            <legend>Training years</legend>
+            <div id="draftTrainingYears" class="draft-check-grid">
+              <label class="check"><input type="checkbox" value="2015" checked><span>2015</span></label>
+              <label class="check"><input type="checkbox" value="2016" checked><span>2016</span></label>
+              <label class="check"><input type="checkbox" value="2017" checked><span>2017</span></label>
+              <label class="check"><input type="checkbox" value="2018" checked><span>2018</span></label>
+              <label class="check"><input type="checkbox" value="2019" checked><span>2019</span></label>
+              <label class="check"><input type="checkbox" value="2021" checked><span>2021</span></label>
+              <label class="check"><input type="checkbox" value="2022" checked><span>2022</span></label>
+              <label class="check"><input type="checkbox" value="2023" checked><span>2023</span></label>
+              <label class="check"><input type="checkbox" value="2024" checked><span>2024</span></label>
+              <label class="check"><input type="checkbox" value="2025" checked><span>2025</span></label>
+            </div>
+            <p id="draftYearNotice" class="field-help">2020 is intentionally excluded.</p>
+          </fieldset>
+          <fieldset class="draft-choice-group">
+            <legend>Strategy seats <small>must equal team count</small></legend>
+            <div class="draft-fields draft-fields-five">
+              <label><span>Balanced / none</span><input data-strategy="none" type="number" min="0" value="12"></label>
+              <label><span>Streaming QB</span><input data-strategy="streaming_qb" type="number" min="0" value="0"></label>
+              <label><span>Streaming TE</span><input data-strategy="streaming_te" type="number" min="0" value="0"></label>
+              <label><span>Streaming DST</span><input data-strategy="streaming_dst" type="number" min="0" value="0"></label>
+              <label><span>Late-round QB</span><input data-strategy="late_round_qb" type="number" min="0" value="0"></label>
+            </div>
+            <p id="draftStrategyTotal" class="draft-total" aria-live="polite">12 of 12 seats assigned</p>
+          </fieldset>
+        </div>
+
+        <div class="action-row draft-actions">
+          <button id="draftEstimateButton" class="secondary" type="button">Estimate local work</button>
+          <button id="draftStartButton" class="primary" type="submit">Start training</button>
+          <button id="draftCancelButton" class="danger hidden" type="button">Stop and keep last autosave</button>
+          <button id="draftDownloadModel" class="secondary hidden" type="button">Download trained model</button>
+        </div>
+      </form>
+      <div id="draftEstimate" class="estimate" aria-live="polite">Choose a corpus and league preset, then estimate the training batch.</div>
+      <div id="draftProgress" class="draft-progress hidden" role="status" aria-live="polite">
+        <div class="progress-track"><div id="draftProgressBar" class="progress-bar"></div></div>
+        <div class="draft-progress-copy"><strong id="draftProgressText">Preparing training…</strong><span id="draftAutosaveStatus">Autosaved generations will appear here.</span></div>
+      </div>
+    </section>
+
+    <section id="draftLastBatch" class="panel hidden" aria-labelledby="draftLastBatchHeading">
+      <div class="section-heading draft-heading">
+        <div><span class="step">3</span><h2 id="draftLastBatchHeading">Last batch</h2></div>
+        <p>Review same-seat improvement over the regression control and the final generation’s best-scoring simulated league.</p>
+      </div>
+      <div class="table-wrap draft-table-wrap">
+        <table><thead><tr><th>Generation</th><th>Champion fitness</th><th>Mean fitness</th><th>Championships</th><th>Playoffs</th><th>Arenas</th></tr></thead><tbody id="draftHistoryBody"></tbody></table>
+      </div>
+      <div class="draft-inspector-toolbar">
+        <div><p class="draft-kicker">SHOWCASE SEASON</p><h3 id="draftShowcaseTitle">Simulation inspection</h3></div>
+        <label><span>Select a team</span><select id="draftShowcaseTeam"><option value="">No showcase yet</option></select></label>
+      </div>
+      <div class="draft-inspector-grid">
+        <article class="draft-card"><h3>Roster</h3><div class="table-wrap draft-compact-table"><table><thead><tr><th>Player</th></tr></thead><tbody id="draftRosterBody"></tbody></table></div></article>
+        <article class="draft-card draft-card-wide"><h3>Weekly results</h3><div class="table-wrap draft-compact-table"><table><thead><tr><th>Week</th><th>Stage</th><th>Opponent</th><th>Result</th><th>Score</th></tr></thead><tbody id="draftWeekBody"></tbody></table></div></article>
+        <article class="draft-card draft-card-wide"><h3>Final standings</h3><div class="table-wrap draft-compact-table"><table><thead><tr><th>Finish</th><th>Team</th><th>Record</th><th>Points</th><th>Playoffs</th></tr></thead><tbody id="draftStandingsBody"></tbody></table></div></article>
+        <article class="draft-card draft-card-wide"><h3>Playoff bracket</h3><div class="table-wrap draft-compact-table"><table><thead><tr><th>Round / week</th><th>Matchup</th><th>Score</th><th>Winner</th></tr></thead><tbody id="draftBracketBody"></tbody></table></div></article>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="draftBenchmarkHeading">
+      <div class="section-heading draft-heading">
+        <div><span class="step">4</span><h2 id="draftBenchmarkHeading">Did it get worse?</h2></div>
+        <p>Run 100 paired counterfactual scenarios against the non-neural regression baseline using identical seats, selected years, and seeds.</p>
+      </div>
+      <div class="draft-benchmark-controls">
+        <label><span>Model to test</span><select id="draftBenchmarkModel"><option value="">Train or import a model first</option></select></label>
+        <button id="draftBenchmarkButton" class="primary" type="button">Run 100 paired scenarios</button>
+      </div>
+      <p id="draftBenchmarkScope" class="field-help" aria-live="polite">Evaluation scope appears with the completed benchmark.</p>
+      <div id="draftBenchmarkMetrics" class="draft-metrics" aria-live="polite"><p>No benchmark run yet.</p></div>
+    </section>
+
+    <section class="panel" aria-labelledby="assistantHeading">
+      <div class="section-heading draft-heading">
+        <div><span class="step">5</span><h2 id="assistantHeading">Manual draft assistant</h2></div>
+        <p>Enter picks in snake-draft order. Recommendations appear only when your selected Drafter # is on the clock.</p>
+      </div>
+      <div class="draft-restore">
+        <label><span>Reopen a saved room</span><select id="assistantSession"><option value="">No saved draft rooms yet</option></select></label>
+        <button id="assistantOpen" class="secondary" type="button" disabled>Reopen room</button>
+      </div>
+      <form id="assistantSetupForm" class="draft-fields draft-fields-four">
+        <label><span>Assistant model</span><select id="assistantModel" required><option value="">Train or import a model first</option></select></label>
+        <label><span>Current board</span><select id="assistantBoard" required><option value="">Import a current board first</option></select></label>
+        <label><span>Your Drafter #</span><input id="assistantUserSlot" type="number" min="1" value="1" required></label>
+        <label><span>Your strategy</span><select id="assistantStrategy"><option value="none">Balanced / none</option><option value="streaming_qb">Streaming QB</option><option value="streaming_te">Streaming TE</option><option value="streaming_dst">Streaming DST</option><option value="late_round_qb">Late-round QB</option></select></label>
+        <button id="assistantCreate" class="primary" type="submit">Start manual draft room</button>
+      </form>
+      <div id="assistantRoom" class="assistant-room hidden">
+        <div class="assistant-clock" aria-live="polite">
+          <div><p class="draft-kicker">ON THE CLOCK</p><h3 id="assistantTurn">Waiting for the draft…</h3></div>
+          <p id="assistantLiveNotice"></p>
+        </div>
+        <div class="draft-restore draft-live-controls" aria-label="Optional ESPN public draft sync">
+          <label><span>ESPN league ID</span><input id="assistantEspnLeague" inputmode="numeric" pattern="[0-9]+" placeholder="Public league ID"></label>
+          <label><span>Draft season</span><input id="assistantEspnSeason" type="number" min="2012" max="9999" value="2026"></label>
+          <button id="assistantEspnSync" class="secondary" type="button">Sync ESPN public draft</button>
+          <label class="check"><input id="assistantEspnAuto" type="checkbox"><span>Auto-refresh every 15 seconds</span></label>
+        </div>
+        <p class="field-help">Public ESPN snake drafts only. The imported board must contain ESPN player-ID mappings. No cookies or credentials are requested.</p>
+        <div class="assistant-pick-grid">
+          <label><span>Find available player</span><input id="assistantPlayerSearch" type="search" placeholder="Search name or position"></label>
+          <label><span>Player</span><select id="assistantPlayer" size="8"></select></label>
+          <label><span>Drafter making this pick</span><input id="assistantPickDrafter" type="number" min="1"></label>
+          <div class="action-row">
+            <button id="assistantRecordPick" class="primary" type="button">Record pick</button>
+            <button id="assistantUndo" class="danger" type="button">Undo last pick</button>
+          </div>
+        </div>
+        <div class="assistant-grid">
+          <article class="draft-card"><h3>Turn-aware recommendations</h3><div id="assistantRecommendations" class="assistant-recommendations"><p>Recommendations appear on your turn.</p></div></article>
+          <article class="draft-card"><h3>Pick log</h3><div class="table-wrap draft-compact-table"><table><thead><tr><th>Pick</th><th>Drafter</th><th>Player</th><th>Pos</th></tr></thead><tbody id="assistantPickBody"></tbody></table></div></article>
+        </div>
+      </div>
+    </section>
+    </div>
+  </section>
 
   <footer>All candidate scoring and season simulation run on this computer. Weekly source evidence stays in the selected bundle.</footer>
   <script src="/dashboard_charts.js" defer></script>
@@ -335,5 +559,7 @@
   <script src="/three_way_ui.js" defer></script>
   <script src="/trade_filter_ui.js" defer></script>
   <script src="/app.js" defer></script>
+  <script src="/app_tabs.js" defer></script>
+  <script src="/draft_lab.js" defer></script>
 </body>
 </html>

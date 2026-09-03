@@ -20,6 +20,7 @@ from ._app_support import (
 )
 from .dashboard import build_league_dashboard
 from .engine_bundle import EngineBundle, load_engine_bundle, save_engine_bundle
+from .draft_service import DraftLabService
 from .league_search import LeagueSearchOutcome, LeagueSearchProgress, ResumableLeagueTradeSearch
 from .roster_adjustment import (
     MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY,
@@ -249,6 +250,21 @@ class LocalAppService:
             self.bundle_directory,
             weekly_collection_workflow,
         )
+        self.draft_lab = DraftLabService(
+            self.data_directory,
+            self.bundle_directory,
+            heavy_work_guard=self._require_draft_capacity,
+            activity_lock=self._lock,
+        )
+
+    def _require_draft_capacity(self) -> None:
+        with self._lock:
+            if self._collections.is_running or any(
+                job.status in {"queued", "running"} for job in self._jobs.values()
+            ) or self._dashboard_futures:
+                raise RuntimeError(
+                    "weekly collection, trade search, or league dashboard must finish before Draft Lab starts"
+                )
 
     def import_bundle(self, record: Mapping[str, object]) -> dict[str, object]:
         bundle = EngineBundle.from_record(record)
@@ -282,6 +298,10 @@ class LocalAppService:
             future = self._dashboard_futures.get(bundle_id)
             owns_calculation = future is None
             if owns_calculation:
+                if self.draft_lab.is_busy:
+                    raise RuntimeError(
+                        "Draft Lab training or benchmark must finish before building a league dashboard"
+                    )
                 future = Future()
                 self._dashboard_futures[bundle_id] = future
         assert future is not None
@@ -368,6 +388,10 @@ class LocalAppService:
         self, request: WeeklyCollectionRequest
     ) -> dict[str, object]:
         with self._lock:
+            if self.draft_lab.is_busy:
+                raise RuntimeError("Draft Lab training or benchmark must finish before collecting")
+            if self._dashboard_futures:
+                raise RuntimeError("league dashboard calculation must finish before collecting")
             if any(job.status in {"queued", "running"} for job in self._jobs.values()):
                 raise RuntimeError("stop the local trade search before collecting a new week")
             return self._collections.start(request)
@@ -388,6 +412,10 @@ class LocalAppService:
         _require_surrogate_consent(bundle, request)
         _search_scope(bundle, request)
         with self._lock:
+            if self.draft_lab.is_busy:
+                raise RuntimeError("Draft Lab training or benchmark must finish before a trade search")
+            if self._dashboard_futures:
+                raise RuntimeError("league dashboard calculation must finish before a trade search")
             if self._collections.is_running:
                 raise RuntimeError("weekly collection must finish before a trade search starts")
             if any(job.status in {"queued", "running"} for job in self._jobs.values()):

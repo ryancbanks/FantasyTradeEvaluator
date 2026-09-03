@@ -1,4 +1,4 @@
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
@@ -60,6 +60,17 @@ def wait_for_job(service, job_id):
 
 
 class LocalAppServiceTests(unittest.TestCase):
+    def test_dashboard_calculation_blocks_other_heavy_work(self):
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            pending = Future()
+            service._dashboard_futures["busy"] = pending
+
+            with self.assertRaisesRegex(RuntimeError, "league dashboard"):
+                service._require_draft_capacity()
+
+        self.assertFalse(pending.done())
+
     def test_league_dashboard_is_available_without_a_search_and_cached(self):
         bundle = engine_bundle()
         with TemporaryDirectory() as directory:

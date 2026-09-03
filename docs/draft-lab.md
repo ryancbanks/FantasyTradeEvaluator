@@ -1,0 +1,129 @@
+# Draft Lab
+
+Draft Lab is the local workspace for training, checking, and using a fantasy-football draft model. It is separate from Trade Lab: it works from historical preseason data that you import, runs historical snake drafts and seasons on this computer, and turns the resulting model into a persistent manual or public-ESPN draft-day assistant.
+
+## The five-step workflow
+
+1. **Import honest data.** Import a historical corpus for training. You may also import a previously exported model and a current preseason board.
+2. **Configure the arena.** Start from the built-in PPR preset or a league preset created from one of your synced league bundles, then edit the teams, roster, scoring, schedule, playoff, and strategy settings.
+3. **Estimate and train.** Choose the historical years and training budget, inspect the local-work estimate, and start the background job. Every completed generation is autosaved.
+4. **Inspect and benchmark.** Review the captured showcase roster, weekly results, standings, and playoff bracket, then run paired scenarios against the non-neural regression baseline.
+5. **Use the draft assistant.** Choose a model, current board, draft slot, and strategy. Record picks manually, or connect a public ESPN snake draft for on-demand or 15-second automatic refresh; recommendations appear when your slot is on the clock.
+
+## Historical years and the no-leak rule
+
+Historical training accepts only **2015–2019 and 2021–2025**. The 2020 season is intentionally excluded. A 2015 pack is valid only when it contains a genuine 2015 preseason snapshot—not rankings reconstructed after games were played.
+
+Draft Lab does not include or claim access to complete historical ESPN or Yahoo projection archives. It does not download a training corpus for you. Import only data that you obtained lawfully and whose provenance you can describe.
+
+Each historical season keeps two kinds of data separate:
+
+- `preseason_features` are observations captured during that same calendar season before kickoff. The recorded `preseason_as_of` timestamp must include a timezone and precede `season_kickoff_at`; a stale prior-year snapshot is rejected.
+- `actual_weeks` are realized weekly outcomes used only after a draft choice has been made. During a historical season, lineup selection can use the preseason view and outcomes from earlier weeks, never the current week's result or a future result.
+
+Player names, player IDs, NFL-team IDs, and similar identity fields are metadata, not model inputs. Feature-policy v1 is opt-in: a model input must explicitly be a projection, rank, ECR, or ADP field, or a `projected_stat.<stat-name>` field. FantasyPros, ESPN, Yahoo, and ensemble copies may use their matching namespace. Identity fields and names suggesting actual, final, future, postseason, or other realized outcomes fail at import. This is stricter than guessing from a blacklist and prevents the model from memorizing identities or hindsight.
+
+For simulated lineup selection, `projected_fantasy_points`, `projected_points`, and `projected_stat.*` values are season totals. Draft Lab converts them to weekly estimates using the first finite positive value resolved from `projected_games` and then `projected_games_played`. Each field retains the normal source precedence: ensemble, generic, then the mean of available FantasyPros, ESPN, and Yahoo copies. If neither games field has a usable positive value, the divisor is the configured number of regular-season weeks. Rank, ECR, and ADP fallbacks are not rescaled.
+
+## JSON import contract
+
+Draft Lab accepts three strict, versioned JSON document types. An import must be one JSON object with exactly the documented fields. Duplicate keys, `NaN`, infinity, unknown fields, malformed types, and altered content-addressed IDs are rejected.
+
+### Historical corpus
+
+The root record has:
+
+| Field | Required value |
+| --- | --- |
+| `kind` | `historical_draft_corpus` |
+| `schema_version` | `1` |
+| `corpus_id` | `draft_corpus_` followed by the record's computed 64-character SHA-256 content ID |
+| `preseason_feature_policy_version` | `1` |
+| `seasons` | One or more historical-season records, with no duplicate year |
+| `provenance` | One or more source records |
+
+Each season contains `season`, `preseason_as_of`, `season_kickoff_at`, `available_weeks`, and `players`. Every player contains:
+
+- `player_id`, `display_name`, primary `position`, and `eligible_positions`;
+- `nfl_team_id`, `bye_week`, `nfl_experience_years`, `rookie`, and `first_year_on_team`;
+- numeric-or-null `preseason_features`; and
+- one `actual_weeks` row for every listed available week.
+
+An actual-week row contains `week`, `status`, and `stats`. Status is `played`, `inactive`, `bye`, or `missing`. A played row requires numeric statistics; every other status requires an empty stats object. A configured training or playoff week cannot remain `missing`. Every provenance row contains `source`, timezone-aware retrieval `captured_at`, `scope`, `preseason_feature_names`, `preseason_source_as_of`, `license`, and `source_url`; the final two fields may be `null`, but their keys must still be present. Each preseason feature name must be bound to exactly one provenance row, and `preseason_source_as_of` must give a pre-kickoff source timestamp for every season carrying those fields. Missing, extra, duplicated, post-kickoff, or source-after-retrieval contradictions fail closed.
+
+### Current player board
+
+The root record has `kind: "draft_player_board"`, `board_id`, `season`, `preseason_as_of`, `season_kickoff_at`, `preseason_feature_policy_version: 1`, and `players`. Player records use the same preseason metadata and features as a corpus, but `actual_weeks` must be an empty array. An unmapped board uses schema version 1. A board with a one-to-one `espn_player_ids` map uses schema version 2 and can reconcile a public ESPN draft. Any board used with a model must have enough unique players to complete every roster and expose every preseason feature family required by that model.
+
+### Trained model
+
+A model exported by Draft Lab is a `fantasy_draft_model` schema-version-1 record. It includes the learned brain, compatible league configuration, source corpus ID, training years and generation, summary metrics, and creation time. Use **Download trained model** and preserve that JSON unchanged; importing it later verifies all nested content IDs before it becomes selectable.
+
+Content IDs are integrity checks, not labels to invent. A placeholder such as `draft_corpus_<hash>` will not import. A corpus or board producer must serialize the matching versioned record and compute its canonical ID with the Draft Lab domain library; normal users should retain the ID supplied with a valid data pack or exported file. Browser imports are capped at 128 MB to keep parsing memory bounded; split or reduce wider source packs before importing.
+
+## League rules and strategy seats
+
+The built-in preset is a 12-team PPR snake draft. A synced league bundle can supply an editable starting structure only when its scoring capture exposes supported linear stat weights. Unsupported bundles remain visible but disabled with a reason; Draft Lab never guesses that a setting such as “yards per point” is a direct stat multiplier. All usable presets remain editable:
+
+- 2–32 teams;
+- ordered starting slots plus bench size;
+- explicit eligible positions for every starting-slot type;
+- optional per-position roster limits;
+- numeric scoring weights applied to the imported raw weekly statistics;
+- regular-season weeks, playoff-team count, and playoff weeks; and
+- a strategy assignment for every seat.
+
+Strategy-seat counts must add up exactly to the team count. **Balanced / none** imposes no positional delay. **Streaming QB** and **Streaming TE** defer that position to the final three rounds, **Streaming DST** defers defense to the final round, and **Late-round QB** defers quarterback until after round 9. These are hard draft constraints, not descriptive labels; an incompatible combination of roster rules, player supply, and strategies can leave a team without a legal pick.
+
+Historical simulation requires one playoff week per single-elimination round. For example, a six-team playoff needs three playoff weeks. Regular-season matchups use a deterministic round-robin schedule generated for the configured team count and weeks; they do not recreate a historical home league's actual schedule. Synced divisions, division-winner berths, host tiebreakers, reseeding, and multiweek matchups are not represented, so **Copy supported league structure** is deliberately not labeled an exact clone.
+
+## Training, autosave, resume, and export
+
+Choose **Estimate local work** before training. The estimate reports simulated leagues, brain appearances, neural scores, learned parameters, approximate autosave size, and approximate population memory. It is a work-unit estimate rather than a clock estimate; after the first completed generation, the progress view uses measured local runtime to show an ETA. The same corpus, league configuration, evolution settings, and seed produce deterministic results.
+
+The main work controls are:
+
+- **Population:** how many competing draft brains are evaluated per generation.
+- **Generations:** how many rounds of selection and mutation run.
+- **Appearances / generation:** how many arena appearances each brain receives.
+- **Training years:** which imported seasons supply the arenas.
+- **Candidate window:** the maximum preseason-ranked shortlist scored by the neural model at each pick. `0` scores every legal candidate; a smaller positive window reduces work while retaining leading candidates from each available position.
+- **Elite fraction:** the leading share copied into the next generation before crossover.
+- **Mutation rate and magnitude:** how often offspring parameters change and how far they may move. The UI starts at the calibrated `25,000` magnitude; lower values explore more cautiously.
+- **Seed:** the repeatable assignment, tie-break, and evolution stream.
+
+Population, generations, appearances, and the candidate window multiply the arena work quickly. Every brain appearance is evaluated in every selected historical season so one year cannot be silently skipped. Each competitive arena is paired with a same-seat, same-seed all-regression control league; selection fitness is the drafter's improvement over that control, so draft-slot and deterministic tie-break luck are not mistaken for learning. Reported championship, playoff, and finish totals remain the evolved drafter's raw outcomes, and fitness may be negative. The work estimate includes both leagues in every pair. Begin with one small generation, inspect its measured runtime and results, and scale only after the data and league rules behave as expected. Draft Lab runs one training or benchmark job at a time so two heavy jobs cannot silently compete for the machine.
+
+At the end of each completed generation, Draft Lab atomically saves a compact checkpoint: the shared feature schema and regression baseline are stored once, followed by learned genomes. If you request a stop during a generation, that partial generation is discarded and the latest completed checkpoint remains usable. The screen lists autosaves. You may continue the original target, increase the generation target, or choose **Use autosaved champion** to turn the checkpoint winner into a portable model immediately. Extending a one-generation trial is deterministic and matches an uninterrupted run. A changed corpus, league, population, strategy mix, seed, mutation setting, appearance count, or candidate window is rejected. Normally completed training also saves its final champion model automatically. Re-promoting the same checkpoint reuses an existing matching model instead of filling the catalog with duplicates. Legacy schema-version-1 checkpoints remain readable and migrate when resumed.
+
+## Inspecting and testing a model
+
+The **Last batch** view shows fitness by generation and the best single-arena showcase captured in the final generation. That showcase is not guaranteed to belong to the saved final-generation champion. Select any showcase team to inspect its drafted roster, weekly results, final standing, and single-elimination bracket. This is an audit trail and an example—not evidence by itself that the model generalized.
+
+Use **Run 100 paired scenarios** for the stronger check. Each scenario compares the evolved model with its zero-neural regression baseline under the same evaluation season, focal draft slot, opponent policies, and seed. Season and seat selection is stratified: every season×seat cell is visited before one repeats. Results report wins/ties/losses, point and point-percentile changes, finish improvement, playoff and championship-rate changes, and a season-clustered 95% interval for the mean point-percentile change. The verdict is `improved`, `worse`, or `inconclusive` from that interval.
+
+When possible, benchmark on imported years that were not used for training. Draft Lab allows overlapping years, so selecting a genuine holdout remains the user's responsibility. Paired historical performance reduces comparison noise, but it is not a guarantee of future-season results.
+
+## Draft assistant
+
+The assistant requires a compatible trained model and a current preseason board. The board must contain at least one finite, recognized model input for enough players to fill every roster; field names with only `null` values do not count as usable coverage. Select your Drafter number and optional strategy, then record every league pick in the displayed snake order. The app rejects skipped turns, duplicate players, and picks assigned to the wrong drafter. **Undo last pick** safely corrects the most recent entry.
+
+When it is your turn, Draft Lab ranks legal available players and shows an overall utility plus a short roster-need explanation. The saved result also retains the regression and learned-neural components for programmatic inspection. On other teams' turns the screen waits for the next manual entry. Each recorded or undone pick is saved to the local assistant session.
+
+For a public ESPN snake draft, enter its numeric league ID and matching season, then choose **Sync ESPN public draft** or enable 15-second automatic refresh. The first successful sync permanently binds that saved room to the provider, league, season, and ESPN team order; a different source requires a new room. The adapter reads one credential-free public draft response per poll, verifies an ordinary fixed-order snake draft, maps every observed ESPN player ID through the board, and appends only exact contiguous picks not already saved. Repeated polls are idempotent. It refuses auctions, keepers, traded or ambiguous pick orders, missing mappings, source conflicts, and automatic rollback. Private ESPN leagues and Yahoo live drafts remain manual; the app never asks for draft-site cookies or credentials.
+
+## Local files and privacy
+
+Corpus, board, checkpoint, model, and assistant-session files stay in the application's local data directory. Draft Lab performs training, simulation, benchmarking, ranking, and persistence locally; it makes no per-pick or per-simulation web request. The only optional draft-day network read is the public ESPN poll described above. The browser interface talks to the app through its private loopback session.
+
+An exported model contains its feature schema, learned parameters, league rules, corpus content ID, training years, and aggregate metrics. It does not embed the historical corpus rows, weekly outcomes, player names, or player IDs. Corpus and current-board JSON remain separate local files unless you choose to copy them elsewhere.
+
+## Current limitations
+
+- Historical data packs and current player boards must be supplied as strict JSON; Draft Lab does not scrape or license them.
+- There is no supported claim of complete ESPN or Yahoo historical projection archives.
+- Drafts are fixed-order snake drafts without pick trading, auctions, keepers, or third-round reversal.
+- Historical seasons use generated round-robin matchups and do not simulate waivers, free-agent moves, trades, or manager-specific lineup decisions.
+- Weekly scoring is only as complete and accurate as the imported raw stats and configured scoring weights.
+- The learned model is tied to its saved league configuration and the feature families available in its training corpus and current board.
+- Public live synchronization currently supports only ESPN fixed-order snake drafts with a fully mapped board; private leagues, Yahoo drafts, auctions, keepers, offline drafts, and traded-pick orders require manual entry.
