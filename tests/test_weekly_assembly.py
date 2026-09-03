@@ -177,6 +177,20 @@ def ecr_artifact(horizon):
     )
 
 
+def ecr_artifact_with_outside_player(horizon):
+    artifact = ecr_artifact(horizon)
+    return replace(
+        artifact,
+        rankings=(
+            *artifact.rankings,
+            ECRRankingRow(
+                "104", "Player Four", "BUF", "RB", 4, 3, 5, 4.1, .3,
+                "RB4", {"ECR": "4"},
+            ),
+        ),
+    )
+
+
 def projection_artifact(provider, horizon, week):
     links = {
         CaptureProvider.FANTASYPROS: (
@@ -233,6 +247,36 @@ def projection_artifact(provider, horizon, week):
     )
 
 
+def projection_artifact_with_outside_player(provider, horizon, week):
+    artifact = projection_artifact(provider, horizon, week)
+    links = {
+        CaptureProvider.FANTASYPROS:
+            "https://www.fantasypros.com/nfl/players/player-four.php",
+        CaptureProvider.ESPN:
+            "https://www.espn.com/nfl/player/_/id/204/player-four",
+        CaptureProvider.YAHOO:
+            "https://sports.yahoo.com/nfl/players/304/",
+        CaptureProvider.CBS:
+            "https://www.cbssports.com/nfl/players/404/player-four/fantasy/",
+        CaptureProvider.FFTODAY:
+            "https://www.fftoday.com/stats/players/504/Player_Four",
+        CaptureProvider.FANTASYSHARKS:
+            "https://www.fantasysharks.com/apps/bert/players/playerpage.php?id=604",
+    }
+    row = (
+        VisibleTableCell("Player Four", (links[provider],)),
+        VisibleTableCell("BUF"),
+        VisibleTableCell("RB"),
+        VisibleTableCell("2"),
+        VisibleTableCell("2"),
+        VisibleTableCell("17"),
+    )
+    return replace(
+        artifact,
+        tables=(VisibleTable((*artifact.tables[0].rows, row)),),
+    )
+
+
 def all_projection_artifacts():
     providers = (
         CaptureProvider.FANTASYPROS,
@@ -268,6 +312,48 @@ def broad_projection_artifacts():
 
 
 class WeeklyAssemblyTests(unittest.TestCase):
+    def test_retains_projected_players_outside_the_bounded_calculation_pool(self):
+        projections = tuple(
+            projection_artifact_with_outside_player(provider, horizon, week)
+            for provider in (
+                CaptureProvider.FANTASYPROS,
+                CaptureProvider.ESPN,
+                CaptureProvider.YAHOO,
+            )
+            for horizon, weeks in (
+                (RankingHorizon.WEEKLY, (1, 2)),
+                (RankingHorizon.ROS, (1,)),
+            )
+            for week in weeks
+        )
+        result = assemble_weekly_refresh_evidence(
+            host_snapshot=host_snapshot(),
+            fantasypros_league=league_artifact(),
+            projection_artifacts=projections,
+            ecr_artifacts=(
+                ecr_artifact_with_outside_player(RankingHorizon.WEEKLY),
+                ecr_artifact_with_outside_player(RankingHorizon.ROS),
+            ),
+            nfl_schedule=nfl_schedule(),
+            analyzer_bundle=BundleFingerprint(
+                "https://cdn.fantasypros.com/assets/js/min/pages/myplaybook/"
+                "trade-analyzer/bundle-1234567890abcdef.js",
+                "a" * 64,
+            ),
+            response_schema_sha256="b" * 64,
+            scoring="PPR",
+            expected_team_count=2,
+        )
+
+        self.assertEqual(
+            result.player_lab_projections.player_ids,
+            ("fantasypros:104",),
+        )
+        self.assertNotIn(
+            "fantasypros:104",
+            {row.canonical_player_id for row in result.evidence.projection_evidence},
+        )
+
     def test_broad_consensus_excludes_fantasypros_composite_from_forecast_votes(self):
         result = assemble_weekly_refresh_evidence(
             host_snapshot=host_snapshot(),

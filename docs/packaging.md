@@ -22,16 +22,22 @@ already signed in. The app never imports that profile, exports cookies, or opens
 remote-debugging connection.
 
 The extension is served as a ZIP from the running local app. Until it is published
-through a browser extension store, the user loads it once with Chrome or Edge's
+through a browser extension store, the user loads it once with Chrome, Brave, or Edge's
 **Load unpacked** control, then refreshes the already-open local app page once so
 the browser injects its content bridge. A one-time code and explicit popup approval
 pair that installed extension with one local app tab. The extension then owns at
 most one temporary scan tab and closes it when collection finishes.
 
-Every artifact contains `THIRD_PARTY_NOTICES` and a generated native dependency
-inventory. The build fails closed if an included native library lacks a reviewed
-license mapping. Playwright and Chrome for Testing are optional developer-test
-dependencies and are excluded from end-user artifacts.
+Every native release artifact contains `THIRD_PARTY_NOTICES` and a generated
+native dependency inventory. Wheels and source distributions carry the root
+`THIRD_PARTY_NOTICES.md`; source distributions also include the bootstrap and
+release tooling. The native build fails closed if an included library lacks a
+reviewed license mapping. Releases also carry the pinned DynastyProcess
+data-license text and the runtime data-source notice used by Player Lab; those
+notices describe data fetched after installation and do not alter the application
+source-code license.
+Playwright and Chrome for Testing are optional developer-test dependencies and
+are excluded from end-user artifacts.
 
 ## Install a published build
 

@@ -16,6 +16,8 @@ from .independent_waiver_pool import IndependentWaiverPool
 from .league_io import league_state_from_record, league_state_to_record
 from .league_state import LeagueState
 from .methodology_attestation import MethodologyAttestation
+from .player_lab_projections import PlayerLabProjectionSnapshot
+from .player_profiles import PlayerProfileSnapshot
 from .projection_io import projection_from_record, projection_to_record
 from .projection_source_policy import (
     validate_no_composite_double_count,
@@ -30,7 +32,10 @@ from .trade_space import TeamRoster
 from .waiver_pool import WaiverPool
 
 
-_BUNDLE_SCHEMA_VERSION = 8
+_BUNDLE_SCHEMA_VERSION = 10
+# Increment whenever ``from_record`` can canonicalize a record whose outer
+# schema version is unchanged (for example, a migrated nested snapshot).
+CANONICAL_ENGINE_BUNDLE_REVISION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +54,8 @@ class EngineBundle:
     methodology_attestation: MethodologyAttestation | None
     surrogate_disclosure: SurrogateDisclosure | None = None
     independent_power_disclosure: IndependentPowerDisclosure | None = None
+    player_profiles: PlayerProfileSnapshot | None = None
+    player_lab_projections: PlayerLabProjectionSnapshot | None = None
     bundle_id: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -95,6 +102,16 @@ class EngineBundle:
         if independent != isinstance(self.waiver_pool, IndependentWaiverPool):
             raise ValueError(
                 "independent methodology and waiver-pool provenance must be paired"
+            )
+        if self.player_profiles is not None and not isinstance(
+            self.player_profiles, PlayerProfileSnapshot
+        ):
+            raise ValueError("player_profiles must be a PlayerProfileSnapshot or None")
+        if self.player_lab_projections is not None and not isinstance(
+            self.player_lab_projections, PlayerLabProjectionSnapshot
+        ):
+            raise ValueError(
+                "player_lab_projections must be a PlayerLabProjectionSnapshot or None"
             )
         names = _names(self.player_names)
         _validate_identity(self, rosters, projections, eligibilities, ecr, evidence, names)
@@ -155,6 +172,16 @@ class EngineBundle:
                 else self.independent_power_disclosure.to_record()
             ),
             "player_names": dict(self.player_names),
+            "player_profiles": (
+                None
+                if self.player_profiles is None
+                else self.player_profiles.to_record()
+            ),
+            "player_lab_projections": (
+                None
+                if self.player_lab_projections is None
+                else self.player_lab_projections.to_record()
+            ),
             "projection_evidence": [
                 projection_to_record(row) for row in self.projection_evidence
             ],
@@ -209,13 +236,15 @@ class EngineBundle:
         if not isinstance(record, Mapping):
             raise ValueError("engine bundle record fields are invalid")
         version = record.get("schema_version")
-        if type(version) is not int or version not in {7, _BUNDLE_SCHEMA_VERSION}:
+        if type(version) is not int or version not in {7, 8, 9, _BUNDLE_SCHEMA_VERSION}:
             raise ValueError("engine bundle kind or schema version is invalid")
-        content_keys = legacy_content_keys | (
-            {"independent_power_disclosure"}
-            if version == _BUNDLE_SCHEMA_VERSION
-            else set()
-        )
+        content_keys = set(legacy_content_keys)
+        if version >= 8:
+            content_keys.add("independent_power_disclosure")
+        if version >= 9:
+            content_keys.add("player_profiles")
+        if version >= 10:
+            content_keys.add("player_lab_projections")
         if set(record) != content_keys | {
             "kind",
             "schema_version",
@@ -226,8 +255,14 @@ class EngineBundle:
             record["kind"] != "fantasy_trade_engine_bundle"
         ):
             raise ValueError("engine bundle kind or schema version is invalid")
-        if version == 7:
-            legacy_content = {key: record[key] for key in legacy_content_keys}
+        lab_record = record.get("player_lab_projections")
+        legacy_nested_lab = (
+            version == _BUNDLE_SCHEMA_VERSION
+            and isinstance(lab_record, Mapping)
+            and lab_record.get("schema_version") == 1
+        )
+        if version < _BUNDLE_SCHEMA_VERSION or legacy_nested_lab:
+            legacy_content = {key: record[key] for key in content_keys}
             if record["bundle_id"] != content_id("engine", legacy_content):
                 raise ValueError("engine bundle content does not match bundle_id")
         arrays = {
@@ -290,8 +325,7 @@ class EngineBundle:
                 )
             ),
             independent_power_disclosure=(
-                None
-                if version == 7 or record["independent_power_disclosure"] is None
+                None if version == 7 or record["independent_power_disclosure"] is None
                 else IndependentPowerDisclosure.from_record(
                     _mapping(
                         "independent_power_disclosure",
@@ -299,8 +333,26 @@ class EngineBundle:
                     )
                 )
             ),
+            player_profiles=(
+                None
+                if version < 9 or record["player_profiles"] is None
+                else PlayerProfileSnapshot.from_record(
+                    _mapping("player_profiles", record["player_profiles"])
+                )
+            ),
+            player_lab_projections=(
+                None
+                if version < 10 or record["player_lab_projections"] is None
+                else PlayerLabProjectionSnapshot.from_record(
+                    _mapping("player_lab_projections", record["player_lab_projections"])
+                )
+            ),
         )
-        if version == _BUNDLE_SCHEMA_VERSION and record["bundle_id"] != bundle.bundle_id:
+        if (
+            version == _BUNDLE_SCHEMA_VERSION
+            and not legacy_nested_lab
+            and record["bundle_id"] != bundle.bundle_id
+        ):
             raise ValueError("engine bundle content does not match bundle_id")
         return bundle
 
@@ -392,6 +444,36 @@ def _validate_identity(bundle, rosters, projections, eligibilities, ecr, evidenc
         )
     if not set(owned).issubset(projection_ids) or not projection_ids.issubset(names):
         raise ValueError("owned or projected player is missing normalized data or a display name")
+    profiles = bundle.player_profiles
+    if profiles is not None:
+        if (
+            profiles.league_snapshot_id != state.snapshot_id
+            or profiles.season != state.season
+            or profiles.as_of_week != state.first_remaining_week
+        ):
+            raise ValueError("player profile context does not match the league snapshot")
+        if not projection_ids.issubset(profiles.players_by_id):
+            raise ValueError("player profiles are missing a calculation player")
+        projection_by_player = {}
+        projected_team_by_player = {}
+        for row in projections:
+            projection_by_player.setdefault(row.canonical_player_id, row)
+            if row.nfl_team_id is not None:
+                projected_team_by_player.setdefault(
+                    row.canonical_player_id, row.nfl_team_id
+                )
+        for player_id in projection_ids:
+            profile = profiles.players_by_id[player_id]
+            projection = projection_by_player[player_id]
+            if _normalized_label(profile.display_name) != _normalized_label(names[player_id]):
+                raise ValueError("player profile display name conflicts with calculation data")
+            if profile.position is not None and profile.position != projection.position:
+                raise ValueError("player profile position conflicts with calculation data")
+            projected_team = projected_team_by_player.get(player_id)
+            if profile.nfl_team_id is not None and projected_team is not None and (
+                profile.nfl_team_id.strip().upper() != projected_team.strip().upper()
+            ):
+                raise ValueError("player profile NFL team conflicts with calculation data")
     expected_projection_keys = {
         (player_id, week)
         for player_id in projection_ids
@@ -409,6 +491,41 @@ def _validate_identity(bundle, rosters, projections, eligibilities, ecr, evidenc
     }
     validate_selectable_projection_providers(observation_providers)
     validate_no_composite_double_count(observation_providers)
+    lab_projections = bundle.player_lab_projections
+    if lab_projections is not None:
+        if (
+            lab_projections.league_snapshot_id != state.snapshot_id
+            or lab_projections.scoring_profile_id != state.scoring_profile_id
+            or lab_projections.season != state.season
+            or lab_projections.as_of_week != state.first_remaining_week
+            or lab_projections.remaining_weeks
+            != state.remaining_regular_season_weeks
+        ):
+            raise ValueError("Player Lab projection context does not match the league snapshot")
+        lab_ids = set(lab_projections.player_ids)
+        if lab_ids.intersection(projection_ids):
+            raise ValueError("Player Lab projections must remain outside the calculation pool")
+        if set(lab_projections.provider_names) != observation_providers:
+            raise ValueError("Player Lab and calculation projection publishers differ")
+        if profiles is not None:
+            for player_id in lab_projections.player_ids:
+                if player_id not in profiles.players_by_id:
+                    continue
+                profile = profiles.players_by_id[player_id]
+                if _normalized_label(profile.display_name) != _normalized_label(
+                    lab_projections.player_names[player_id]
+                ):
+                    raise ValueError("Player Lab projection name conflicts with its profile")
+                if (
+                    profile.position is not None
+                    and profile.position != lab_projections.player_positions[player_id]
+                ):
+                    raise ValueError("Player Lab projection position conflicts with its profile")
+                if profile.nfl_team_id is not None and (
+                    profile.nfl_team_id.strip().upper()
+                    != lab_projections.player_nfl_team_ids[player_id].strip().upper()
+                ):
+                    raise ValueError("Player Lab projection NFL team conflicts with its profile")
     independent = bundle.methodology_mode == "independent"
     periods = {row.period for row in ecr}
     if independent:
@@ -501,6 +618,10 @@ def _names(value):
     if any(not isinstance(key, str) or not key or not isinstance(name, str) or not name.strip() for key, name in value.items()):
         raise ValueError("player_names must map non-empty IDs to non-empty names")
     return MappingProxyType(dict(sorted((key, name.strip()) for key, name in value.items())))
+
+
+def _normalized_label(value):
+    return " ".join(value.split()).casefold()
 
 
 def _roster_from_record(value):

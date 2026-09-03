@@ -172,6 +172,7 @@ class WeeklyCollectionRequestTests(unittest.TestCase):
         request = WeeklyCollectionRequest(2026, 1, "PPR")
         self.assertFalse(request.include_future_weekly)
         self.assertIsNone(request.yahoo_projection_league_url)
+        self.assertFalse(request.refresh_public_player_data)
 
     def test_accepts_purpose_specific_urls_and_auto_discovers_team_count(self):
         record = request_payload()
@@ -187,6 +188,11 @@ class WeeklyCollectionRequestTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "boolean"):
             valid_request(allow_surrogate_power="yes")
+        self.assertTrue(
+            valid_request(refresh_public_player_data=True).refresh_public_player_data
+        )
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            valid_request(refresh_public_player_data="yes")
 
     def test_normalizes_host_pages_to_minimal_purpose_specific_urls(self):
         request = valid_request(
@@ -396,6 +402,7 @@ class WeeklyCollectionJobTests(unittest.TestCase):
         )
         self.assertIsNone(finished["request"]["expected_team_count"])
         self.assertFalse(finished["request"]["allow_surrogate_power"])
+        self.assertFalse(finished["request"]["refresh_public_player_data"])
         self.assertEqual(len(workflow.calls), 1)
 
     def test_publishes_bound_history_before_exposing_the_weekly_bundle(self):
@@ -456,14 +463,6 @@ class WeeklyCollectionJobTests(unittest.TestCase):
     def test_final_save_failure_keeps_a_bound_exact_stage_and_startup_recovers(self):
         workflow = HistoryWorkflow()
         expected = engine_bundle()
-        real_save = save_engine_bundle
-
-        def fail_final_save(bundle, path):
-            target = Path(path)
-            if target.parent.name == ".weekly-publications":
-                return real_save(bundle, target)
-            raise OSError("simulated final publication failure")
-
         with TemporaryDirectory() as directory:
             bundle_directory = Path(directory) / "bundles"
             staged_path = (
@@ -473,8 +472,8 @@ class WeeklyCollectionJobTests(unittest.TestCase):
             )
             final_path = bundle_directory / f"{expected.bundle_id}.json"
             with patch(
-                "trade_snapshot.weekly_collection.save_engine_bundle",
-                side_effect=fail_final_save,
+                "trade_snapshot.weekly_collection.save_bundle_with_summary",
+                side_effect=OSError("simulated final publication failure"),
             ):
                 jobs = WeeklyCollectionJobs(directory, bundle_directory, workflow)
                 started = jobs.start(valid_request())
@@ -675,6 +674,7 @@ class WeeklyCollectionHTTPTests(unittest.TestCase):
         self.assertIn('id="yahooProjectionUrl"', page)
         self.assertIn("Yahoo league or player-list link", page)
         self.assertIn('id="useFantasyPros" type="checkbox" checked', page)
+        self.assertIn('id="refreshPublicPlayerData" type="checkbox"', page)
         self.assertIn('id="useBroadConsensus" type="checkbox" checked', page)
         self.assertIn("sign in to ESPN and Yahoo normally", page)
         self.assertIn('id="sourceDebug"', page)

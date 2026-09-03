@@ -294,7 +294,9 @@ class EngineBundleTests(unittest.TestCase):
     def test_strict_json_round_trip_and_atomic_file_persistence(self):
         bundle = engine_bundle()
         record = bundle.to_record()
-        self.assertEqual(record["schema_version"], 8)
+        self.assertEqual(record["schema_version"], 10)
+        self.assertIsNone(record["player_profiles"])
+        self.assertIsNone(record["player_lab_projections"])
         self.assertIsNone(record["surrogate_disclosure"])
         self.assertEqual(
             record["methodology_attestation"]["attestation_id"],

@@ -91,6 +91,12 @@ For every player and remaining NFL week, retain:
 
 Retain a source-published remaining-season total separately. Derive a remaining-season total from weekly rows only when every applicable remaining week is present. Missing is never zero.
 
+## Player profiles and historical availability
+
+Player Lab is a read model over the immutable weekly bundle, not another calculator or a live per-player scraper. Its projection rows use the same accepted ensemble evidence as trade search. Public enrichment adds NFL team/depth metadata, current and prior-season weekly stat lines, seven-day add/drop interest, and three seasons of documented injury reports. Exact ESPN/Sleeper/GSIS identifiers are required for joins; an ambiguous crosswalk is quarantined rather than name-matched.
+
+The displayed weighted report index is deliberately simple and inspectable. Each distinct qualifying injury-coded game-report week is recency weighted, then weighted by designation (`out` 1.0, `doubtful` 0.6, `questionable` 0.3); current/prior/two-years-prior seasons receive weights 1.0/0.65/0.4. The weighted burden is multiplied by 20 and capped at 100 only to keep the display bounded. The UI also shows the underlying report weeks, practice-only evidence, non-injury contexts, and recurring reported body areas. This is a descriptive non-medical history, not a calibrated probability or prediction of future injury. Practice DNP, coach/rest/personal/illness-only rows, a missing stat line, and a missed projection do not count as injuries. With neither a qualifying designation nor at least eight recorded stat-line exposures in observed report seasons, the result is unknown rather than a clean history. Team D/ST historical actuals are explicitly not applicable because the player-stat source does not publish a complete team-defense scoring line.
+
 ## Projected records and playoffs
 
 The snapshot also needs current standings, every remaining fantasy matchup, points-for/against, exact tiebreakers, playoff qualifier count, and seeding rules.

@@ -6,6 +6,7 @@ from threading import Thread
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from zipfile import ZipFile
 
 from tests.test_app_service import filter_expression, payload, player_filter
@@ -206,12 +207,29 @@ class LocalServerTests(unittest.TestCase):
         player_outlook = json.loads(raw)
         self.assertEqual(status, 200)
         self.assertEqual(player_outlook["bundle_id"], bundle.bundle_id)
+        self.assertEqual(player_outlook["view"], "catalog")
         self.assertEqual(
             len(player_outlook["players"]),
             len({row.canonical_player_id for row in bundle.projections}),
         )
+        self.assertNotIn("weeks", player_outlook["players"][0])
+        self.assertNotIn(
+            "provider_remaining_season", player_outlook["players"][0]
+        )
         status, _, _ = self.request("GET", player_outlook_path, token=False)
         self.assertEqual(status, 403)
+
+        detail_path = f"{player_outlook_path}/players/p1"
+        status, _, raw = self.request("GET", detail_path)
+        detail = json.loads(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(detail["view"], "player_detail")
+        self.assertEqual(detail["player"]["player_id"], "p1")
+        self.assertIn("weeks", detail["player"])
+        status, _, _ = self.request(
+            "GET", f"{player_outlook_path}/players/unknown-player"
+        )
+        self.assertEqual(status, 404)
 
         gm_insights_path = f"/api/bundles/{bundle.bundle_id}/gm-insights"
         status, _, raw = self.request("GET", gm_insights_path)
@@ -295,6 +313,28 @@ class LocalServerTests(unittest.TestCase):
             },
             {"p1", "p2", "q1", "q2"},
         )
+
+    def test_player_detail_path_decoding_is_explicit_and_bounded(self):
+        bundle_id = f"engine_{'0' * 64}"
+        base = f"/api/bundles/{bundle_id}/player-outlook/players"
+        expected = {
+            "schema_version": 2,
+            "bundle_id": bundle_id,
+            "view": "player_detail",
+            "player": {"player_id": "sleeper:123"},
+        }
+        with patch.object(
+            self.server.app_service, "player_outlook_detail", return_value=expected
+        ) as detail:
+            status, _, raw = self.request("GET", f"{base}/sleeper%3A123")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["player"]["player_id"], "sleeper:123")
+        detail.assert_called_once_with(bundle_id, "sleeper:123")
+
+        for encoded in ("sleeper%2F123", "sleeper%5C123", "bad%00id", "x" * 257):
+            with self.subTest(encoded=encoded):
+                status, _, _ = self.request("GET", f"{base}/{encoded}")
+                self.assertEqual(status, 400)
 
     def test_static_assets_are_served_without_exposing_filesystem_paths(self):
         status, headers, body = self.request("GET", "/app.js", token=False)
@@ -557,6 +597,27 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b"Exact stored weight", player_lab_ui)
         self.assertIn(b"direct_source_count", player_lab_ui)
         self.assertNotIn(b"innerHTML", player_lab_ui)
+
+        status, headers, player_lab_catalog = self.request(
+            "GET", "/player_lab_catalog_ui.js", token=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/javascript", headers["Content-Type"])
+        self.assertIn(b"window.PlayerLabCatalogUi", player_lab_catalog)
+        self.assertIn(
+            b"players.slice(firstIndex, firstIndex + size)", player_lab_catalog
+        )
+        self.assertNotIn(b"innerHTML", player_lab_catalog)
+
+        status, headers, player_profile_ui = self.request(
+            "GET", "/player_lab_profile_ui.js", token=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/javascript", headers["Content-Type"])
+        self.assertIn(
+            b"Documented injury-report history", player_profile_ui
+        )
+        self.assertIn(b"not a medical prediction", player_profile_ui)
 
         status, headers, player_lab_styles = self.request(
             "GET", "/player_lab.css", token=False

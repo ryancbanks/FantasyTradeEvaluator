@@ -40,11 +40,21 @@
 }
 .player-lab-count {
   min-width: max-content;
-  margin: 0 0 11px;
+  margin: 0;
   color: var(--text-secondary);
   font-size: 13px;
   font-variant-numeric: tabular-nums;
 }
+.player-lab-pagination {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: -9px;
+}
+.player-lab-pagination > span { min-width: 92px; color: var(--text-secondary); text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; }
+.player-lab-pagination button { padding: 8px 11px; }
+.player-lab-pagination label { display: flex; align-items: center; gap: 7px; margin-left: auto; color: var(--text-secondary); font-size: 12px; }
+.player-lab-pagination select { width: auto; min-width: 76px; padding: 7px 9px; }
 
 .player-lab-layout { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(330px, .9fr); gap: 14px; align-items: start; }
 .player-lab-master-wrap,
@@ -60,7 +70,19 @@
 .player-lab-master tbody tr[aria-selected="true"] { background: var(--accent-surface); box-shadow: inset 3px 0 var(--accent); }
 .player-lab-master td,
 .player-lab-master th { vertical-align: top; }
-.player-lab-master tbody th { color: var(--text-primary); text-align: left; }
+.player-lab-master tbody th { position: static; color: var(--text-primary); text-align: left; }
+.player-lab-master .player-lab-group-row th {
+  position: sticky;
+  top: 41px;
+  z-index: 1;
+  border-block: 1px solid var(--border-strong);
+  background: var(--accent-surface);
+  color: var(--accent);
+  padding-block: 8px;
+  font-size: 11px;
+  letter-spacing: .08em;
+}
+.player-lab-group-row:hover { background: transparent; }
 
 .player-lab-player-button {
   display: block;
@@ -76,6 +98,21 @@
 .player-lab-number { white-space: nowrap; font-variant-numeric: tabular-nums; font-weight: 750; }
 .player-lab-muted { display: block; margin-top: 3px; color: var(--text-secondary); font-size: 11px; font-weight: 500; }
 .player-lab-no-results { color: var(--text-secondary); padding: 30px !important; text-align: center !important; }
+.player-lab-trend,
+.player-lab-risk {
+  display: inline-flex;
+  width: max-content;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  padding: 3px 8px;
+  font-size: 10px;
+  font-weight: 850;
+}
+.player-lab-trend.is-rising { border-color: var(--success-border); background: var(--success-surface); color: var(--success); }
+.player-lab-trend.is-falling { border-color: var(--danger-border); background: var(--danger-surface); color: var(--danger); }
+.player-lab-trend.is-steady { border-color: var(--warning-border); background: var(--warning-surface); color: var(--warning); }
 
 .player-lab-detail-card { display: grid; gap: 18px; padding: 18px; }
 .player-lab-detail { display: grid; gap: 15px; }
@@ -111,7 +148,108 @@
   padding: 10px 12px;
   font-size: 12px;
 }
+.player-lab-detail-loading,
+.player-lab-detail-error {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-inset);
+  color: var(--text-secondary);
+  padding: 12px;
+  font-size: 12px;
+}
+.player-lab-detail-error { border-color: var(--danger-border); color: var(--danger); }
 .player-lab-coverage-note { margin: -10px 0 0; color: var(--text-secondary); font-size: 11px; line-height: 1.45; }
+.player-lab-legacy-note {
+  margin: 0;
+  border: 1px solid var(--warning-border);
+  border-radius: 10px;
+  background: var(--warning-surface);
+  color: var(--warning);
+  padding: 10px 12px;
+  font-size: 12px;
+}
+.player-lab-facts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.player-lab-facts > * { min-width: 0; margin: 0; padding: 8px 10px; overflow-wrap: anywhere; }
+.player-lab-facts dt { color: var(--text-secondary); padding-bottom: 0; font-size: 10px; font-weight: 800; text-transform: uppercase; }
+.player-lab-facts dd { color: var(--text-primary); padding-top: 2px; font-size: 12px; }
+.player-lab-insight {
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--surface);
+  padding: 12px;
+}
+.player-lab-insight h4 { margin: 0 0 8px; color: var(--text-primary); font: 700 16px/1.2 Georgia, serif; }
+.player-lab-insight p { margin: 6px 0 0; color: var(--text-secondary); font-size: 12px; }
+.player-lab-market-net { display: block; color: var(--text-primary); font-size: 18px; }
+.player-lab-attribution { border-top: 1px solid var(--border); padding-top: 7px; }
+.player-lab-availability { border-left: 3px solid var(--player-lab-gold); }
+.player-lab-risk.is-lower { border-color: var(--success-border); background: var(--success-surface); color: var(--success); }
+.player-lab-risk.is-moderate { border-color: var(--warning-border); background: var(--warning-surface); color: var(--warning); }
+.player-lab-risk.is-elevated { border-color: var(--danger-border); background: var(--danger-surface); color: var(--danger); }
+.player-lab-current-designation strong,
+.player-lab-affected-areas strong,
+.player-lab-availability-contexts strong { color: var(--text-primary); }
+.player-lab-availability-evidence { margin-top: 8px; color: var(--text-secondary); font-size: 12px; }
+.player-lab-availability-evidence summary { width: max-content; max-width: 100%; color: var(--accent); font-weight: 750; cursor: pointer; }
+.player-lab-availability-evidence ul { margin: 7px 0 0; padding-left: 20px; }
+.player-lab-risk-caveat { border-top: 1px solid var(--border); padding-top: 8px; line-height: 1.45; }
+
+.player-lab-chart,
+.player-lab-season-stats { display: grid; gap: 10px; }
+.player-lab-chart-svg {
+  width: 100%;
+  height: auto;
+  overflow: visible;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--control);
+}
+.player-lab-chart-grid { stroke: var(--border); stroke-width: 1; }
+.player-lab-chart-line { fill: none; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+.player-lab-chart-line.actual-current { stroke: var(--accent); }
+.player-lab-chart-line.actual-prior { stroke: var(--player-lab-gold); stroke-dasharray: 7 5; }
+.player-lab-chart-line.projection { stroke: var(--success); stroke-dasharray: 3 5; }
+.player-lab-chart-point { stroke: var(--control); stroke-width: 2; }
+.player-lab-chart-point.actual-current { fill: var(--accent); }
+.player-lab-chart-point.actual-prior { fill: var(--player-lab-gold); }
+.player-lab-chart-point.projection { fill: var(--success); }
+.player-lab-chart-x-label,
+.player-lab-chart-y-label { fill: var(--text-secondary); font: 10px Inter, ui-sans-serif, system-ui, sans-serif; }
+.player-lab-chart-legend { display: flex; flex-wrap: wrap; gap: 7px 16px; margin: 0; padding: 0; color: var(--text-secondary); font-size: 11px; list-style: none; }
+.player-lab-chart-legend li { display: flex; align-items: center; gap: 6px; }
+.player-lab-chart-basis { margin: 0; color: var(--text-secondary); font-size: 11px; }
+.player-lab-chart-swatch { width: 18px; height: 3px; border-radius: 2px; background: var(--accent); }
+.player-lab-chart-swatch.actual-prior { background: var(--player-lab-gold); }
+.player-lab-chart-swatch.projection { background: var(--success); }
+.player-lab-chart-empty { margin: 0; border: 1px dashed var(--border); border-radius: 10px; color: var(--text-secondary); padding: 18px; text-align: center; }
+.player-lab-chart-table { color: var(--text-secondary); font-size: 12px; }
+.player-lab-chart-table summary { width: max-content; color: var(--accent); cursor: pointer; }
+.player-lab-chart-table table { min-width: 520px; margin-top: 8px; }
+.player-lab-chart-table th,
+.player-lab-chart-table td { padding: 7px 9px; }
+
+.player-lab-season-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.player-lab-season-card { min-width: 0; border: 1px solid var(--border); border-radius: 11px; background: var(--surface); padding: 12px; }
+.player-lab-season-card h5 { margin: 0 0 9px; color: var(--text-primary); font: 700 16px/1.2 Georgia, serif; }
+.player-lab-season-totals { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.player-lab-season-totals > span { border-radius: 8px; background: var(--surface-inset); padding: 7px 9px; }
+.player-lab-season-totals small,
+.player-lab-season-totals strong { display: block; }
+.player-lab-season-totals small { color: var(--text-secondary); font-size: 10px; }
+.player-lab-season-totals strong { color: var(--text-primary); font-size: 14px; }
+.player-lab-stat-list { display: grid; grid-template-columns: repeat(4, 1fr); margin: 10px 0 0; border-top: 1px solid var(--border); padding-top: 8px; }
+.player-lab-stat-list dt,
+.player-lab-stat-list dd { margin: 0; text-align: center; }
+.player-lab-stat-list dt { color: var(--text-secondary); font-size: 9px; text-transform: uppercase; }
+.player-lab-stat-list dd { grid-row: 2; color: var(--text-primary); font-size: 12px; font-weight: 750; }
 
 .player-lab-weekly-wrap { overflow-x: auto; overscroll-behavior-inline: contain; border: 1px solid var(--border); border-radius: 12px; }
 .player-lab-weekly { min-width: 1050px; }
@@ -158,6 +296,7 @@
 .player-lab-source-card-content,
 .player-lab-freshness-card { display: grid; align-content: start; gap: 2px; }
 .player-lab-freshness-card > strong { margin-bottom: 2px; color: var(--text-primary); font-size: 12px; }
+.player-lab-source-warning { border-color: var(--warning-border); background: var(--warning-surface); }
 
 .player-lab-master-wrap:focus-visible,
 .player-lab-weekly-wrap:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
@@ -179,6 +318,7 @@
 @media (max-width: 1060px) {
   .player-lab-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .player-lab-count { margin: 0; }
+  .player-lab-pagination { margin-top: -6px; }
   .player-lab-layout { grid-template-columns: 1fr; }
   .player-lab-master-wrap { max-height: 570px; }
 }
@@ -187,11 +327,16 @@
   .player-lab-filters,
   .player-lab-metrics,
   .player-lab-ros-sources,
-  .player-lab-freshness { grid-template-columns: 1fr; }
+  .player-lab-freshness,
+  .player-lab-season-stats,
+  .player-lab-facts { grid-template-columns: 1fr; }
   .player-lab-detail-heading,
   .player-lab-grid-heading { align-items: stretch; flex-direction: column; }
   .player-lab-grid-heading p { text-align: left; }
   .player-lab-tags { justify-content: flex-start; }
   .player-lab-detail-card { padding: 13px; }
   .player-lab-master-wrap { max-height: 500px; }
+  .player-lab-season-totals { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .player-lab-pagination { align-items: stretch; flex-wrap: wrap; }
+  .player-lab-pagination label { width: 100%; margin-left: 0; justify-content: space-between; }
 }

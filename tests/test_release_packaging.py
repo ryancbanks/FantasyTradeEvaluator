@@ -215,6 +215,22 @@ class ReleaseBuildTests(unittest.TestCase):
         self.assertIn("_required_web_assets", smoke)
         self.assertNotIn("('index.html','app.js','styles.css')", smoke)
 
+    def test_source_distribution_manifest_carries_release_inputs(self):
+        manifest = (PROJECT_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+        for entry in (
+            "include THIRD_PARTY_NOTICES.md",
+            "include bootstrap_install.py",
+            "include release_build.py",
+            "recursive-include docs *.md",
+            "recursive-include packaging *",
+        ):
+            self.assertIn(entry, manifest)
+        with (PROJECT_ROOT / "pyproject.toml").open("rb") as source:
+            project = tomllib.load(source)["project"]
+        self.assertEqual(project["license-files"], ["THIRD_PARTY_NOTICES.md"])
+        wheel_smoke = (PROJECT_ROOT / "packaging" / "smoke_wheel.py").read_text()
+        self.assertIn("distribution('fantasy-trade-evaluator').files", wheel_smoke)
+
     def test_release_notice_allowlist_excludes_source_only_browser_test_runtime(self):
         retired = {
             "Playwright-LICENSE.txt",

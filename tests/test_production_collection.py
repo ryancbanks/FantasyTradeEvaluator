@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -9,6 +10,7 @@ from urllib.error import HTTPError
 
 from tests.capture_fixtures import league_sources
 from tests.test_engine_bundle import engine_bundle
+from tests.test_player_profiles import _public_data, profile_snapshot
 from trade_snapshot.analyzer_contract import CURRENT_BUNDLE_FINGERPRINT
 from trade_snapshot.capture_schema import (
     CaptureKind,
@@ -47,10 +49,18 @@ from trade_snapshot.league_history import (
     LeagueHistoryCapture,
     make_league_key,
 )
+from trade_snapshot.independent_weekly_assembly import IndependentWeeklyEngine
 from trade_snapshot.production_calibration import (
     BrowserCalibrationFactory,
     CalibrationCaptureContext,
     InteractiveSignInGate,
+)
+from trade_snapshot.player_profile_materialize import PlayerProfileMaterializationError
+from trade_snapshot.player_lab_projections import PlayerLabProjectionSnapshot
+from trade_snapshot.public_player_data import (
+    DataAvailability,
+    PublicPlayerDataCancelled,
+    PublicPlayerDataError,
 )
 from trade_snapshot.production_collection import (
     CalibrationCallbacks,
@@ -67,6 +77,10 @@ from trade_snapshot.weekly_collection import (
 
 
 NOW = datetime(2026, 9, 1, tzinfo=timezone.utc)
+
+
+def _public_unavailable(*_args, **_kwargs):
+    raise PublicPlayerDataError("public profile fixture is intentionally unavailable")
 
 
 class _Gate:
@@ -171,6 +185,7 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
             schedule_adapter=schedule_adapter,
             plan_builder=_small_plan,
             assembler=assembler,
+            public_player_reader=_public_unavailable,
             refresher=refresher,
             activity_adapter=activity_adapter,
             history_adapter=history_adapter,
@@ -186,7 +201,11 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
             self.assertEqual(load_identity_registry(identity_path), assembled.identities)
 
         self.assertIsInstance(result, WeeklyCollectionPublication)
-        self.assertIs(result.bundle, bundle)
+        self.assertEqual(
+            result.bundle.player_lab_projections,
+            assembled.player_lab_projections,
+        )
+        self.assertIsNone(result.bundle.player_profiles)
         self.assertEqual(records["read"][:2], (2026, "123"))
         self.assertEqual(records["activity"], ({"league": True}, {"captured_at": NOW}))
         self.assertEqual(records["adapter"][2]["expected_team_count"], 2)
@@ -202,7 +221,7 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
         self.assertTrue(records["refresh"][1]["allow_surrogate_power"])
         self.assertIs(records["history"][0], activity)
         self.assertIs(records["history"][1], assembled)
-        self.assertIs(records["history"][2], bundle)
+        self.assertIs(records["history"][2], result.bundle)
         self.assertEqual(records["history"][3], {"bundle_captured_at": NOW})
         self.assertEqual(len(collector.calls), 2)
         self.assertEqual(len(collector.open_calls), 1)
@@ -239,6 +258,289 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
         self.assertEqual(assembly["analyzer_bundle"].sha256, CURRENT_BUNDLE_FINGERPRINT.sha256)
         self.assertLess(progress[-1].fraction, .99)
         self.assertTrue(any("Found 2 teams" in row.message for row in progress))
+
+    def test_collects_public_player_data_once_and_attaches_portable_profiles(self):
+        bundle = engine_bundle()
+        public_data = _public_data()
+        profiles = profile_snapshot(*bundle.player_names)
+        calls = []
+
+        def reader(season, **kwargs):
+            calls.append(("read", season, kwargs))
+            return public_data
+
+        def builder(**kwargs):
+            calls.append(("build", kwargs))
+            return profiles
+
+        progress = []
+        workflow = _workflow(
+            collector=_Collector(),
+            public_player_reader=reader,
+            profile_builder=builder,
+        )
+        with TemporaryDirectory() as directory:
+            result = workflow(
+                _request(),
+                data_directory=Path(directory),
+                progress=progress.append,
+                cancelled=lambda: False,
+            )
+
+        self.assertIs(result.bundle.player_profiles, profiles)
+        self.assertEqual(
+            result.bundle.player_lab_projections,
+            _assembled().player_lab_projections,
+        )
+        self.assertIsNone(bundle.player_profiles)
+        self.assertEqual(calls[0][0:2], ("read", 2026))
+        self.assertFalse(calls[0][2]["cancelled"]())
+        self.assertIs(calls[0][2]["clock"](), NOW)
+        self.assertEqual(calls[1][0], "build")
+        self.assertEqual(calls[1][1]["league_snapshot_id"], bundle.state.snapshot_id)
+        self.assertEqual(calls[1][1]["as_of_week"], bundle.state.first_remaining_week)
+        self.assertIs(calls[1][1]["public_data"], public_data)
+        self.assertEqual([row.fraction for row in progress], sorted(row.fraction for row in progress))
+        self.assertTrue(any("Player Lab retained" in row.message for row in progress))
+
+    def test_reuses_public_player_data_for_another_collection_in_the_same_week(self):
+        bundle = engine_bundle()
+        public_data = _public_data()
+        profiles = profile_snapshot(*bundle.player_names)
+        reads = []
+        builds = []
+
+        def reader(season, **_kwargs):
+            reads.append(season)
+            return public_data
+
+        def builder(**kwargs):
+            builds.append(kwargs["public_data"])
+            return profiles
+
+        workflow = _workflow(
+            collector=_Collector(),
+            public_player_reader=reader,
+            profile_builder=builder,
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow(
+                _request(), data_directory=root,
+                progress=lambda _row: None, cancelled=lambda: False,
+            )
+            second_progress = []
+            workflow(
+                _request(), data_directory=root,
+                progress=second_progress.append, cancelled=lambda: False,
+            )
+
+        self.assertEqual(reads, [2026])
+        self.assertEqual(builds, [public_data, public_data])
+        self.assertTrue(any("Reusing public Player Lab data" in row.message for row in second_progress))
+
+    def test_explicit_public_player_refresh_bypasses_the_weekly_cache(self):
+        public_data = _public_data()
+        profiles = profile_snapshot(*engine_bundle().player_names)
+        reads = []
+        workflow = _workflow(
+            collector=_Collector(),
+            public_player_reader=lambda season, **_kwargs: (
+                reads.append(season) or public_data
+            ),
+            profile_builder=lambda **_kwargs: profiles,
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow(
+                _request(), data_directory=root,
+                progress=lambda _row: None, cancelled=lambda: False,
+            )
+            workflow(
+                _request(refresh_public_player_data=True), data_directory=root,
+                progress=lambda _row: None, cancelled=lambda: False,
+            )
+
+        self.assertEqual(reads, [2026, 2026])
+
+    def test_transiently_unavailable_public_source_is_retried_next_scan(self):
+        healthy = _public_data()
+        degraded = replace(
+            healthy,
+            provenance=tuple(
+                replace(
+                    row,
+                    availability=DataAvailability.UNAVAILABLE,
+                    content_sha256=None,
+                    byte_count=0,
+                )
+                if row.provider == "dynastyprocess"
+                else row
+                for row in healthy.provenance
+            ),
+        )
+        profiles = profile_snapshot(*engine_bundle().player_names)
+        returned = iter((degraded, healthy))
+        reads = []
+
+        def reader(season, **_kwargs):
+            reads.append(season)
+            return next(returned)
+
+        workflow = _workflow(
+            collector=_Collector(),
+            public_player_reader=reader,
+            profile_builder=lambda **_kwargs: profiles,
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_progress = []
+            workflow(
+                _request(), data_directory=root,
+                progress=first_progress.append, cancelled=lambda: False,
+            )
+            workflow(
+                _request(), data_directory=root,
+                progress=lambda _row: None, cancelled=lambda: False,
+            )
+            cached = root / "public-player-cache" / "2026-week-01.json.gz"
+            self.assertTrue(cached.is_file())
+
+        self.assertEqual(reads, [2026, 2026])
+        self.assertTrue(
+            any("retry automatically" in row.message for row in first_progress)
+        )
+
+    def test_public_profile_source_failure_degrades_without_losing_trade_engine(self):
+        def unavailable(*_args, **_kwargs):
+            raise PublicPlayerDataError("upstream unavailable")
+
+        progress = []
+        workflow = _workflow(
+            collector=_Collector(), public_player_reader=unavailable
+        )
+        with TemporaryDirectory() as directory:
+            result = workflow(
+                _request(),
+                data_directory=Path(directory),
+                progress=progress.append,
+                cancelled=lambda: False,
+            )
+
+        self.assertIsNone(result.bundle.player_profiles)
+        self.assertEqual(
+            result.bundle.player_lab_projections,
+            _assembled().player_lab_projections,
+        )
+        self.assertTrue(any("history is unavailable" in row.message for row in progress))
+
+    def test_independent_engine_receives_the_same_profile_attachment(self):
+        bundle = engine_bundle()
+        independent = object.__new__(IndependentWeeklyEngine)
+        object.__setattr__(independent, "bundle", bundle)
+        object.__setattr__(independent, "identities", IdentityRegistry(()))
+        object.__setattr__(
+            independent,
+            "player_lab_projections",
+            _empty_lab_snapshot(bundle),
+        )
+        profiles = profile_snapshot(*bundle.player_names)
+        build_calls = []
+
+        def build(**kwargs):
+            build_calls.append(kwargs)
+            return profiles
+
+        workflow = _workflow(
+            collector=_Collector(),
+            espn_reader=lambda *_args: ({"teams": [{}, {}]}, {}),
+            independent_plan_builder=_small_independent_plan,
+            independent_assembler=lambda **_kwargs: independent,
+            public_player_reader=lambda *_args, **_kwargs: _public_data(),
+            profile_builder=build,
+        )
+        with TemporaryDirectory() as directory:
+            result = workflow(
+                _request(use_fantasypros=False),
+                data_directory=Path(directory),
+                progress=lambda _: None,
+                cancelled=lambda: False,
+            )
+
+        self.assertIs(result.bundle.player_profiles, profiles)
+        self.assertIs(
+            result.bundle.player_lab_projections,
+            independent.player_lab_projections,
+        )
+        self.assertEqual(len(build_calls), 1)
+        self.assertIs(build_calls[0]["identities"], independent.identities)
+
+    def test_public_profile_cancellation_publishes_nothing(self):
+        def cancelled(*_args, **_kwargs):
+            raise PublicPlayerDataCancelled("cancelled")
+
+        workflow = _workflow(
+            collector=_Collector(), public_player_reader=cancelled
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(WeeklyCollectionError, "cancelled"):
+                workflow(
+                    _request(),
+                    data_directory=root,
+                    progress=lambda _: None,
+                    cancelled=lambda: False,
+                )
+            self.assertFalse((root / "identity-registry.json").exists())
+
+    def test_profile_identity_incompatibility_degrades_without_guessing(self):
+        def incompatible(**_kwargs):
+            raise PlayerProfileMaterializationError("identity conflict")
+
+        progress = []
+        workflow = _workflow(
+            collector=_Collector(),
+            public_player_reader=lambda *_args, **_kwargs: _public_data(),
+            profile_builder=incompatible,
+        )
+        with TemporaryDirectory() as directory:
+            result = workflow(
+                _request(),
+                data_directory=Path(directory),
+                progress=progress.append,
+                cancelled=lambda: False,
+            )
+
+        self.assertIsNone(result.bundle.player_profiles)
+        self.assertEqual(
+            result.bundle.player_lab_projections,
+            _assembled().player_lab_projections,
+        )
+        self.assertTrue(any("could not be matched safely" in row.message for row in progress))
+
+    def test_profile_bundle_cross_validation_failure_does_not_block_trade_engine(self):
+        profiles = profile_snapshot(*engine_bundle().player_names)
+        mismatched = replace(
+            profiles,
+            players=(
+                replace(profiles.players[0], nfl_team_id="CONFLICT"),
+                *profiles.players[1:],
+            ),
+        )
+        progress = []
+        workflow = _workflow(
+            collector=_Collector(),
+            public_player_reader=lambda *_args, **_kwargs: _public_data(),
+            profile_builder=lambda **_kwargs: mismatched,
+        )
+        with TemporaryDirectory() as directory:
+            result = workflow(
+                _request(), data_directory=Path(directory),
+                progress=progress.append, cancelled=lambda: False,
+            )
+
+        self.assertIsNone(result.bundle.player_profiles)
+        self.assertTrue(any("could not be matched safely" in row.message for row in progress))
 
     def test_legacy_team_count_is_only_a_mismatch_guard(self):
         collector = _Collector()
@@ -897,7 +1199,12 @@ class _CookieContext:
 
 
 def _request(
-    host_id="123", *, expected_team_count=None, allow_surrogate_power=False
+    host_id="123",
+    *,
+    expected_team_count=None,
+    allow_surrogate_power=False,
+    use_fantasypros=True,
+    refresh_public_player_data=False,
 ):
     return WeeklyCollectionRequest(
         season=2026,
@@ -911,6 +1218,8 @@ def _request(
             "https://football.fantasysports.yahoo.com/f1/456/players"
         ),
         allow_surrogate_power=allow_surrogate_power,
+        use_fantasypros=use_fantasypros,
+        refresh_public_player_data=refresh_public_player_data,
     )
 
 
@@ -960,6 +1269,13 @@ def _small_plan(**dimensions):
             "https://www.fantasypros.com/nfl/rankings/ppr-rb.php",
         ),
     ))
+
+
+def _small_independent_plan(**dimensions):
+    return CapturePlan(
+        task for task in _small_plan(**dimensions).tasks
+        if task.provider.value in {"espn", "yahoo"}
+    )
 
 
 def _artifact(task):
@@ -1021,6 +1337,11 @@ def _assembled():
         "canonical-player-1": "1001", "canonical-player-2": "1002",
     })
     object.__setattr__(value, "identities", IdentityRegistry(()))
+    object.__setattr__(
+        value,
+        "player_lab_projections",
+        _empty_lab_snapshot(engine_bundle()),
+    )
     return value
 
 
@@ -1049,8 +1370,28 @@ def _history_pair(bundle):
     )
 
 
+def _empty_lab_snapshot(bundle):
+    return PlayerLabProjectionSnapshot(
+        league_snapshot_id=bundle.state.snapshot_id,
+        scoring_profile_id=bundle.state.scoring_profile_id,
+        season=bundle.state.season,
+        as_of_week=bundle.state.first_remaining_week,
+        remaining_weeks=bundle.state.remaining_regular_season_weeks,
+        provider_names=("espn",),
+    )
+
+
 def _workflow(
-    *, collector, host=None, assembler=None, refresher=None, espn_reader=None
+    *,
+    collector,
+    host=None,
+    assembler=None,
+    refresher=None,
+    espn_reader=None,
+    public_player_reader=None,
+    profile_builder=None,
+    independent_plan_builder=None,
+    independent_assembler=None,
 ):
     assembled = _assembled()
     return ProductionWeeklyCollectionWorkflow(
@@ -1061,7 +1402,18 @@ def _workflow(
         host_adapter=lambda *_args, **_kwargs: host or _host_snapshot(),
         schedule_adapter=lambda *_args, **_kwargs: SimpleNamespace(season=2026),
         plan_builder=_small_plan,
+        independent_plan_builder=(
+            independent_plan_builder or _small_independent_plan
+        ),
+        independent_assembler=(
+            independent_assembler
+            or (lambda *_args, **_kwargs: None)
+        ),
         assembler=assembler or (lambda **_kwargs: assembled),
+        public_player_reader=(
+            public_player_reader or _public_unavailable
+        ),
+        profile_builder=profile_builder or (lambda **_kwargs: None),
         refresher=refresher or (
             lambda *_args, **_kwargs: SimpleNamespace(bundle=engine_bundle())
         ),

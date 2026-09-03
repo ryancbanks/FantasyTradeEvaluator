@@ -120,14 +120,31 @@ function sourceStatusLabel(status) {
 function renderSourceCatalog(catalog) {
   const container = $("sourceDebugList");
   container.replaceChildren();
+  const preview = catalog.weekly_projection_preview || {};
+  const weeks = Array.isArray(preview.weeks) ? preview.weeks : [];
+  const weekScope = preview.scope === "remaining_nfl_weeks"
+    ? ` Weekly page routes are previewed for weeks ${weeks.join(", ")}; collection stops at your league's regular-season endpoint after ESPN supplies it.`
+    : weeks.length
+      ? ` Weekly pages are collected for week ${weeks[0]} only.`
+      : "";
   $("sourceDebugMode").textContent = `${catalog.mode === "independent"
     ? "Independent power mode: FantasyPros is neither opened nor required."
     : "FantasyPros power mode: exact or explicitly accepted surrogate replication is attempted."} ${
       catalog.projection_mode === "broad_consensus"
         ? "Forecasts equal-average independent publishers; composite products are excluded from that arithmetic."
         : "Broad consensus is off; the core FantasyPros, ESPN, and Yahoo ensemble is used."
-    }`;
-  for (const group of [catalog.calculation_sources, catalog.reference_sources]) {
+    }${weekScope}`;
+  const groups = [
+    ["Projection and league sources", catalog.calculation_sources],
+    ["Player profile sources", catalog.profile_sources || []],
+    ["Method and ranking references", catalog.reference_sources]
+  ];
+  for (const [title, group] of groups) {
+    if (!group.length) continue;
+    const groupHeading = document.createElement("h3");
+    groupHeading.className = "source-debug-group-heading";
+    groupHeading.textContent = title;
+    container.append(groupHeading);
     for (const source of group) {
       const card = document.createElement("section");
       card.className = `source-debug-card source-${source.status}`;
@@ -478,11 +495,8 @@ function changeBundle() {
       ? "Calculate trade timing when you want simulated proposal windows."
       : "Select a ready week, then calculate trade timing when you are ready."
   );
-  PlayerLabUi.reset(
-    currentBundle()
-      ? "Open Player Lab when you want the player-level projection evidence."
-      : undefined
-  );
+  PlayerLabUi.activateWorkspace("trade");
+  void PlayerLabUi.queueBundle(currentBundle(), {request: api, onError: showError});
   updateActivityControls();
 }
 
@@ -630,7 +644,9 @@ async function loadInsight(kind) {
       });
       tradeTimingBundleId = bundle.bundle_id;
     } else {
-      await PlayerLabUi.setBundle(bundle, {request: api, onError});
+      PlayerLabUi.reset("Preparing this week's player profiles…");
+      await PlayerLabUi.queueBundle(bundle, {request: api, onError});
+      PlayerLabUi.activateWorkspace("players");
       if (!failed) playerLabBundleId = bundle.bundle_id;
     }
   } finally {
@@ -732,7 +748,8 @@ function collectionPayload() {
     include_future_weekly: $("includeFutureWeekly").checked,
     allow_surrogate_power: $("allowSurrogatePower").checked,
     use_fantasypros: $("useFantasyPros").checked,
-    use_broad_consensus: $("useBroadConsensus").checked
+    use_broad_consensus: $("useBroadConsensus").checked,
+    refresh_public_player_data: $("refreshPublicPlayerData").checked
   };
 }
 
@@ -785,6 +802,7 @@ async function finishCollection(job) {
   activeCollection = null;
   setCollectionRunning(false);
   if (job.status === "complete") {
+    $("refreshPublicPlayerData").checked = false;
     await refreshBundles(job.bundle_id);
   } else if (job.status === "failed") {
     $("collectionProgressText").textContent = "Collection failed. No new weekly bundle was published.";

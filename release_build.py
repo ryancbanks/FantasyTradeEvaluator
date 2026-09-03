@@ -28,6 +28,8 @@ SOURCE_NOTICE_FILENAMES = (
     "PyInstaller-LICENSE.txt",
     "SQLite-LICENSE.md",
     "XZ-Utils-COPYING.txt",
+    "DynastyProcess-Data-GPL-3.0.txt",
+    "RUNTIME-DATA-SOURCES.md",
 )
 NOTICE_FILENAMES = SOURCE_NOTICE_FILENAMES + ("NATIVE-DEPENDENCY-INVENTORY.txt",)
 _REMOTE_NOTICES = {
@@ -42,6 +44,10 @@ _REMOTE_NOTICES = {
     "XZ-Utils-COPYING.txt": (
         "https://raw.githubusercontent.com/tukaani-project/xz/v5.8.1/COPYING",
         "616a3ad264ce29b8f1cb97e53037b139d406899ca8d1f799651e17bfa09830b8",
+    ),
+    "DynastyProcess-Data-GPL-3.0.txt": (
+        "https://raw.githubusercontent.com/dynastyprocess/data/master/LICENSE",
+        "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
     ),
 }
 
@@ -153,9 +159,14 @@ def _prepare_third_party_notices(destination: Path) -> None:
         _distribution_file("PyInstaller", "licenses/COPYING.txt"),
         destination / "PyInstaller-LICENSE.txt",
     )
+    shutil.copyfile(
+        PROJECT_ROOT / "THIRD_PARTY_NOTICES.md",
+        destination / "RUNTIME-DATA-SOURCES.md",
+    )
     (destination / "README.txt").write_text(
         "Fantasy Trade Evaluator — third-party notices\n\n"
-        "These files were collected from the exact dependencies included in this build.\n",
+        "These files cover the exact dependencies included in this build and the "
+        "public datasets the application can fetch at runtime.\n",
         encoding="utf-8",
         newline="\n",
     )

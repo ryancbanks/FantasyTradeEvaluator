@@ -2,14 +2,13 @@
 
 window.PlayerLabUi = (() => {
   const $ = id => document.getElementById(id);
-  const collator = new Intl.Collator(undefined, {numeric: true, sensitivity: "base"});
   const numberFormatter = new Intl.NumberFormat(undefined, {maximumFractionDigits: 1, minimumFractionDigits: 1});
   const evidenceNumberFormatter = new Intl.NumberFormat(undefined, {maximumFractionDigits: 3, minimumFractionDigits: 1});
   const integerFormatter = new Intl.NumberFormat();
   const dateFormatter = new Intl.DateTimeFormat(undefined, {
     year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit"
   });
-  const AVAILABLE_OWNER = "__available__";
+  const DETAIL_CACHE_LIMIT = 12;
   const STATUS_LABELS = Object.freeze({
     observed: "Observed",
     bye: "Bye",
@@ -21,19 +20,34 @@ window.PlayerLabUi = (() => {
     not_retained: "Evidence not retained",
     waiver_pool: "Available"
   });
-  const SORTS = Object.freeze([
-    ["ros_points", "Rest-of-season points"],
-    ["weekly_ecr", "Weekly ECR"],
-    ["ros_ecr", "Rest-of-season ECR"],
-    ["disagreement", "Provider disagreement"],
-    ["name", "Player name"]
-  ]);
+  const FILTER_CONTROL_EVENTS = Object.freeze({
+    playerLabSearch: "input",
+    playerLabOwnerFilter: "change",
+    playerLabNflTeamFilter: "change",
+    playerLabPositionFilter: "change",
+    playerLabGroup: "change",
+    playerLabTrendFilter: "change",
+    playerLabProjectionMin: "input",
+    playerLabProjectionMax: "input",
+    playerLabSort: "change"
+  });
 
   let requestRevision = 0;
   let activeController = null;
+  let detailController = null;
+  let detailPromise = null;
+  let detailRevision = 0;
+  let loadingDetailPlayerId = null;
+  let detailError = null;
+  const detailCache = new Map();
   let outlook = null;
   let visiblePlayers = [];
   let selectedPlayerId = null;
+  let pendingBundle = null;
+  let pendingOptions = null;
+  let activeWorkspace = "trade";
+  let currentPage = 1;
+  let loadingBundleId = null;
 
   function node(tag, className = "", text = "") {
     const element = document.createElement(tag);
@@ -47,6 +61,37 @@ window.PlayerLabUi = (() => {
     return value.replaceAll("_", " ").replace(/\b\w/g, letter => letter.toUpperCase());
   }
 
+  function array(value) {
+    return Array.isArray(value) ? value : [];
+  }
+
+  function finite(value) {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  function overallRank(player) {
+    return finite(player?.overall_rank) ?? finite(player?.projection_overall_rank);
+  }
+
+  function positionRank(player) {
+    return finite(player?.projection_position_rank);
+  }
+
+  function overallRankBasis(player) {
+    if (typeof player?.overall_rank_basis === "string" && player.overall_rank_basis) {
+      return humanize(player.overall_rank_basis);
+    }
+    const value = overallRank(player);
+    if (value !== null) {
+      return "Local remaining projection";
+    }
+    return "Ranking basis unavailable";
+  }
+
+  function playerDescription(player) {
+    return window.PlayerLabProfileUi.describe(player);
+  }
+
   function providerKey(value) {
     return String(typeof value === "object" && value ? value.provider : value || "").toLowerCase();
   }
@@ -57,6 +102,11 @@ window.PlayerLabUi = (() => {
     if (provider === "espn") return "ESPN";
     if (provider === "yahoo") return "Yahoo";
     if (provider === "fantasypros") return "FantasyPros";
+    if (provider === "cbs") return "CBS Sports";
+    if (provider === "fftoday") return "FFToday";
+    if (provider === "fantasysharks") return "FantasySharks";
+    if (provider === "nflverse") return "NFLverse";
+    if (provider === "sleeper") return "Sleeper";
     return humanize(provider);
   }
 
@@ -105,6 +155,20 @@ window.PlayerLabUi = (() => {
     }
     return details.join(" · ") || "Captured consensus rank";
   }
+
+  const catalogUi = window.PlayerLabCatalogUi.create({
+    describe: playerDescription,
+    humanize,
+    statusLabel,
+    number,
+    rank,
+    ecrRank,
+    ecrDetail,
+    finite,
+    overallRank,
+    overallRankBasis,
+    positionRank
+  });
 
   function timeNode(value, prefix) {
     if (typeof value !== "string" || !value) return null;
@@ -162,48 +226,90 @@ window.PlayerLabUi = (() => {
   function clearRenderedContent() {
     for (const id of [
       "playerLabTableBody", "playerLabDetail", "playerLabProviderHead",
-      "playerLabWeeklyBody", "playerLabRosSources", "playerLabFreshness"
+      "playerLabWeeklyBody", "playerLabRosSources", "playerLabFreshness",
+      "playerLabChart", "playerLabSeasonStats"
     ]) $(id).replaceChildren();
     $("playerLabCount").textContent = "";
+    $("playerLabPageStatus").textContent = "Page 1 of 1";
+    $("playerLabPreviousPage").disabled = true;
+    $("playerLabNextPage").disabled = true;
   }
 
-  function reset(message = "Select a ready week to explore its player projections.") {
+  function clearOutlook(message) {
     requestRevision += 1;
     if (activeController) activeController.abort();
     activeController = null;
+    clearDetailState();
+    loadingBundleId = null;
     outlook = null;
     visiblePlayers = [];
     selectedPlayerId = null;
+    currentPage = 1;
     $("playerLabSearch").value = "";
+    for (const id of ["playerLabProjectionMin", "playerLabProjectionMax"]) {
+      if ($(id)) $(id).value = "";
+    }
     clearRenderedContent();
     setState("empty", message);
   }
 
-  async function setBundle(bundle, {request, onError} = {}) {
+  function cancelDetailRequest() {
+    detailRevision += 1;
+    if (detailController) detailController.abort();
+    detailController = null;
+    detailPromise = null;
+    loadingDetailPlayerId = null;
+  }
+
+  function clearDetailState() {
+    cancelDetailRequest();
+    detailCache.clear();
+    detailError = null;
+  }
+
+  function reset(message = "Select a ready week to explore its player projections.") {
+    pendingBundle = null;
+    pendingOptions = null;
+    clearOutlook(message);
+  }
+
+  function queueBundle(bundle, {request, onError} = {}) {
     if (!bundle) {
       reset();
-      return;
+      return Promise.resolve();
     }
     if (typeof request !== "function") throw new Error("Player Lab request function is unavailable.");
+    pendingBundle = bundle;
+    pendingOptions = {request, onError};
+    if (outlook?.bundle_id === bundle.bundle_id || loadingBundleId === bundle.bundle_id) return Promise.resolve();
+    clearOutlook("Open Player Lab to load this week's player profiles.");
+    return activeWorkspace === "players" ? loadPendingBundle() : Promise.resolve();
+  }
+
+  async function loadPendingBundle() {
+    const bundle = pendingBundle;
+    const options = pendingOptions;
+    if (!bundle || !options || outlook?.bundle_id === bundle.bundle_id || loadingBundleId === bundle.bundle_id) return;
     const revision = ++requestRevision;
     if (activeController) activeController.abort();
     const controller = new AbortController();
     activeController = controller;
+    loadingBundleId = bundle.bundle_id;
     outlook = null;
     visiblePlayers = [];
     selectedPlayerId = null;
     setState("loading");
     try {
-      const value = await request(
+      const value = await options.request(
         `/api/bundles/${encodeURIComponent(bundle.bundle_id)}/player-outlook`,
         {signal: controller.signal}
       );
-      if (controller.signal.aborted || revision !== requestRevision) return;
+      if (controller.signal.aborted || revision !== requestRevision || pendingBundle?.bundle_id !== bundle.bundle_id) return;
       if (!value || !Array.isArray(value.players) || !Array.isArray(value.providers)) {
         throw new Error("Player outlook response is invalid.");
       }
       outlook = value;
-      prepareControls();
+      catalogUi.prepareControls(outlook);
       renderFreshness();
       render();
       setState("content");
@@ -211,83 +317,82 @@ window.PlayerLabUi = (() => {
       if (controller.signal.aborted || revision !== requestRevision) return;
       clearRenderedContent();
       setState("empty", "Player Lab could not load this week's projection evidence.");
-      if (typeof onError === "function") onError(error);
+      if (typeof options.onError === "function") options.onError(error);
     } finally {
-      if (revision === requestRevision) activeController = null;
+      if (revision === requestRevision) {
+        activeController = null;
+        loadingBundleId = null;
+      }
     }
   }
 
-  function prepareControls() {
-    $("playerLabSearch").value = "";
-    const owner = $("playerLabOwnerFilter");
-    owner.replaceChildren(new Option("All teams and available players", ""));
-    const owners = new Map();
-    for (const player of outlook.players) {
-      if (player.owner) owners.set(player.owner.team_id, player.owner.team_name);
-    }
-    for (const [teamId, teamName] of [...owners].sort((left, right) => collator.compare(left[1], right[1]))) {
-      owner.add(new Option(teamName, teamId));
-    }
-    if (outlook.players.some(player => !player.owner)) {
-      owner.add(new Option("Available · captured waiver pool", AVAILABLE_OWNER));
-    }
-
-    const position = $("playerLabPositionFilter");
-    position.replaceChildren(new Option("All positions", ""));
-    const positions = [...new Set(outlook.players.map(player => player.position))].sort(collator.compare);
-    for (const value of positions) position.add(new Option(value, value));
-
-    const sort = $("playerLabSort");
-    sort.replaceChildren(...SORTS.map(([value, label]) => new Option(label, value)));
-    sort.value = "ros_points";
-  }
-
-  function normalizedSearch(player) {
-    return [
-      player.name, player.position, player.nfl_team_id,
-      player.owner?.team_name, ...(player.eligible_slots || [])
-    ].filter(Boolean).join(" ").toLocaleLowerCase();
-  }
-
-  function metricCompare(left, right, field, descending) {
-    const leftValue = field === "weekly_ecr" || field === "rest_of_season_ecr" ? left[field]?.rank : left[field];
-    const rightValue = field === "weekly_ecr" || field === "rest_of_season_ecr" ? right[field]?.rank : right[field];
-    const leftMissing = !Number.isFinite(leftValue);
-    const rightMissing = !Number.isFinite(rightValue);
-    if (leftMissing !== rightMissing) return leftMissing ? 1 : -1;
-    if (!leftMissing && leftValue !== rightValue) {
-      return descending ? rightValue - leftValue : leftValue - rightValue;
-    }
-    return collator.compare(left.name, right.name) || collator.compare(left.player_id, right.player_id);
-  }
-
-  function playerCompare(left, right) {
-    switch ($("playerLabSort").value) {
-      case "weekly_ecr": return metricCompare(left, right, "weekly_ecr", false);
-      case "ros_ecr": return metricCompare(left, right, "rest_of_season_ecr", false);
-      case "disagreement": return metricCompare(left, right, "average_provider_disagreement", true);
-      case "name": return collator.compare(left.name, right.name) || collator.compare(left.player_id, right.player_id);
-      default: return metricCompare(left, right, "remaining_projected_points", true);
+  function cachePlayerDetail(player) {
+    detailCache.delete(player.player_id);
+    detailCache.set(player.player_id, player);
+    while (detailCache.size > DETAIL_CACHE_LIMIT) {
+      detailCache.delete(detailCache.keys().next().value);
     }
   }
 
-  function filteredPlayers() {
-    const query = $("playerLabSearch").value.trim().toLocaleLowerCase();
-    const owner = $("playerLabOwnerFilter").value;
-    const position = $("playerLabPositionFilter").value;
-    return outlook.players.filter(player => {
-      const ownerMatches = !owner || (owner === AVAILABLE_OWNER ? !player.owner : player.owner?.team_id === owner);
-      return ownerMatches && (!position || player.position === position) && (!query || normalizedSearch(player).includes(query));
-    }).sort(playerCompare);
+  function cachedPlayerDetail(playerId) {
+    const player = detailCache.get(playerId) || null;
+    if (player) cachePlayerDetail(player);
+    return player;
+  }
+
+  async function loadSelectedPlayerDetail() {
+    const playerId = selectedPlayerId;
+    const bundleId = outlook?.bundle_id;
+    const options = pendingOptions;
+    if (!playerId || !bundleId || !options || cachedPlayerDetail(playerId)) return;
+    if (loadingDetailPlayerId === playerId && detailPromise) return detailPromise;
+    cancelDetailRequest();
+    const revision = ++detailRevision;
+    const controller = new AbortController();
+    detailController = controller;
+    loadingDetailPlayerId = playerId;
+    detailError = null;
+    renderDetail();
+    detailPromise = options.request(
+      `/api/bundles/${encodeURIComponent(bundleId)}/player-outlook/players/${encodeURIComponent(playerId)}`,
+      {signal: controller.signal}
+    );
+    try {
+      const value = await detailPromise;
+      if (controller.signal.aborted || revision !== detailRevision || outlook?.bundle_id !== bundleId) return;
+      if (!value || value.bundle_id !== bundleId || value.player?.player_id !== playerId) {
+        throw new Error("Player detail response is invalid.");
+      }
+      cachePlayerDetail(value.player);
+      if (selectedPlayerId === playerId) renderDetail();
+    } catch (error) {
+      if (controller.signal.aborted || revision !== detailRevision) return;
+      detailError = "Detailed weekly evidence could not be loaded. Choose the player again to retry.";
+      if (selectedPlayerId === playerId) renderDetail();
+      if (typeof options.onError === "function") options.onError(error);
+    } finally {
+      if (revision === detailRevision) {
+        detailController = null;
+        detailPromise = null;
+        loadingDetailPlayerId = null;
+      }
+    }
   }
 
   function render() {
-    visiblePlayers = filteredPlayers();
-    if (!visiblePlayers.some(player => player.player_id === selectedPlayerId)) {
-      selectedPlayerId = visiblePlayers[0]?.player_id || null;
+    visiblePlayers = catalogUi.filteredPlayers(outlook);
+    currentPage = Math.min(currentPage, catalogUi.pageCount(visiblePlayers));
+    const pageSelection = catalogUi.selectionForPage(
+      visiblePlayers, currentPage, selectedPlayerId
+    );
+    if (pageSelection !== selectedPlayerId) {
+      cancelDetailRequest();
+      detailError = null;
+      selectedPlayerId = pageSelection;
     }
     renderMasterTable();
     renderDetail();
+    void loadSelectedPlayerDetail();
   }
 
   function ownerText(player) {
@@ -299,53 +404,20 @@ window.PlayerLabUi = (() => {
   }
 
   function renderMasterTable() {
-    const body = $("playerLabTableBody");
-    body.replaceChildren();
-    $("playerLabCount").textContent = `${visiblePlayers.length.toLocaleString()} of ${outlook.players.length.toLocaleString()} players`;
-    if (!visiblePlayers.length) {
-      const row = document.createElement("tr");
-      const cell = node("td", "player-lab-no-results", "No players match these filters.");
-      cell.colSpan = 8;
-      row.append(cell);
-      body.append(row);
-      return;
-    }
-    for (const player of visiblePlayers) {
-      const row = document.createElement("tr");
-      const selected = player.player_id === selectedPlayerId;
-      row.dataset.playerId = player.player_id;
-      row.setAttribute("aria-selected", String(selected));
-
-      const identity = document.createElement("th");
-      identity.scope = "row";
-      const choose = node("button", "player-lab-player-button", player.name);
-      choose.type = "button";
-      choose.dataset.playerId = player.player_id;
-      choose.setAttribute("aria-pressed", String(selected));
-      choose.addEventListener("click", () => selectPlayer(player.player_id, true));
-      identity.append(choose);
-      secondaryText(identity, player.nfl_team_id || "NFL team unavailable");
-
-      const owner = node("td", "", ownerText(player));
-      secondaryText(owner, humanize(player.availability));
-      const position = node("td", "", player.position);
-      secondaryText(position, (player.eligible_slots || []).join(" · ") || "No listed flex eligibility");
-      const points = node("td", "player-lab-number", number(player.remaining_projected_points));
-      const average = node("td", "player-lab-number", number(player.average_weekly_points));
-      const weeklyEcr = node("td", "player-lab-number", ecrRank(player.weekly_ecr));
-      const rosEcr = node("td", "player-lab-number", ecrRank(player.rest_of_season_ecr));
-      const sources = node("td", "", `${player.provider_complete_week_count}/${player.total_week_count} complete`);
-      secondaryText(sources, `${player.all_direct_week_count} all-direct · Provider σ ${number(player.average_provider_disagreement)}`);
-      row.append(identity, owner, position, points, average, weeklyEcr, rosEcr, sources);
-      body.append(row);
-    }
+    catalogUi.render(outlook, visiblePlayers, selectedPlayerId, currentPage, selectPlayer);
   }
 
   function selectPlayer(playerId, restoreFocus = false) {
     if (!visiblePlayers.some(player => player.player_id === playerId)) return;
+    const previousId = selectedPlayerId;
+    if (previousId !== playerId) {
+      cancelDetailRequest();
+      detailError = null;
+    }
     selectedPlayerId = playerId;
-    renderMasterTable();
+    catalogUi.updateSelection(previousId, playerId);
     renderDetail();
+    void loadSelectedPlayerDetail();
     if (restoreFocus) {
       const replacement = [...$("playerLabTableBody").querySelectorAll(".player-lab-player-button")]
         .find(button => button.dataset.playerId === playerId);
@@ -353,8 +425,12 @@ window.PlayerLabUi = (() => {
     }
   }
 
-  function selectedPlayer() {
+  function selectedCatalogPlayer() {
     return outlook?.players.find(player => player.player_id === selectedPlayerId) || null;
+  }
+
+  function selectedPlayer() {
+    return cachedPlayerDetail(selectedPlayerId) || selectedCatalogPlayer();
   }
 
   function metric(label, value, detail) {
@@ -368,11 +444,14 @@ window.PlayerLabUi = (() => {
     const detail = $("playerLabDetail");
     detail.replaceChildren();
     const player = selectedPlayer();
+    const hasDetailedEvidence = detailCache.has(selectedPlayerId);
     if (!player) {
       detail.append(node("p", "player-lab-no-results", "Choose a player to inspect weekly and source-level evidence."));
       renderProviderHeader();
       $("playerLabWeeklyBody").replaceChildren();
       $("playerLabRosSources").replaceChildren();
+      $("playerLabChart").replaceChildren();
+      $("playerLabSeasonStats").replaceChildren();
       return;
     }
 
@@ -386,6 +465,7 @@ window.PlayerLabUi = (() => {
     heading.append(title, tags);
 
     const metrics = node("div", "player-lab-metrics");
+    const description = playerDescription(player);
     metrics.append(
       metric(
         "Rest-of-season points",
@@ -395,20 +475,44 @@ window.PlayerLabUi = (() => {
       metric(
         "Average active week",
         number(player.average_weekly_points),
-        `${(player.weeks || []).filter(week => Number.isFinite(week.projected_points)).length} projected games`
+        `${finite(player.total_week_count) ?? 0} remaining projection rows`
       ),
-      metric("Weekly ECR", ecrRank(player.weekly_ecr), ecrDetail(player.weekly_ecr)),
-      metric("Rest-of-season ECR", ecrRank(player.rest_of_season_ecr), ecrDetail(player.rest_of_season_ecr)),
-      metric("Provider disagreement", number(player.average_provider_disagreement), "Average between-source σ"),
-      metric("Predictive uncertainty", number(player.average_predictive_uncertainty), "Average modeled σ")
+      metric(
+        "Overall ranking",
+        rank(overallRank(player)),
+        `${overallRankBasis(player)} · Local projected ${player.position || "position"} ${rank(positionRank(player))}`
+      ),
+      metric("Recent actual trend", description.performanceLabel, description.performanceDetail),
+      metric("Depth chart", description.depthLabel, description.profile ? "Captured public metadata" : "Not retained in this legacy bundle"),
+      metric("Rest-of-season ECR", ecrRank(player.rest_of_season_ecr), ecrDetail(player.rest_of_season_ecr))
     );
     const eligibility = node("p", "player-lab-eligibility", `Eligible lineup slots: ${(player.eligible_slots || []).join(", ") || "none listed"}.`);
     const notice = node("p", "player-lab-notice", outlook.waiver_scope_notice || "Waiver-wire scope is not available for this bundle.");
-    detail.append(heading, metrics, eligibility, notice);
-
+    detail.append(heading, metrics, eligibility);
+    if (!hasDetailedEvidence) {
+      const message = detailError || "Loading this player's weekly, source, and historical evidence…";
+      detail.append(node("p", detailError ? "player-lab-detail-error" : "player-lab-detail-loading", message), notice);
+      renderDeferredEvidence(message);
+      return;
+    }
+    window.PlayerLabProfileUi.render(outlook, player, detail);
+    detail.append(notice);
     renderProviderHeader();
     renderWeeklyEvidence(player);
     renderRemainingSeasonSources(player);
+  }
+
+  function renderDeferredEvidence(message) {
+    renderProviderHeader();
+    const body = $("playerLabWeeklyBody");
+    const row = document.createElement("tr");
+    const cell = node("td", "player-lab-no-results", message);
+    cell.colSpan = 5 + (outlook?.providers.length || 0);
+    row.append(cell);
+    body.replaceChildren(row);
+    $("playerLabRosSources").replaceChildren();
+    $("playerLabChart").replaceChildren();
+    $("playerLabSeasonStats").replaceChildren();
   }
 
   function renderProviderHeader() {
@@ -556,14 +660,59 @@ window.PlayerLabUi = (() => {
         "Latest evidence retained for this weekly bundle"
       ));
     }
+    const snapshot = outlook.profile_snapshot;
+    if (!snapshot) {
+      container.append(freshnessCard(
+        "Public player profiles",
+        null,
+        null,
+        "Not retained in this legacy bundle · projection-only Player Lab"
+      ));
+      return;
+    }
+    for (const source of array(snapshot.provenance)) {
+      container.append(freshnessCard(
+        `${providerLabel(source.provider)} · ${humanize(source.dataset)}`,
+        source.captured_at,
+        source.source_updated_at,
+        `${statusLabel(source.status)} · ${Number.isFinite(source.byte_count) ? `${integerFormatter.format(source.byte_count)}-byte source response size at capture` : "Source response size unavailable"}`
+      ));
+    }
+    if (array(snapshot.materialization_issues).length) {
+      const issue = node("article", "player-lab-freshness-card player-lab-source-warning");
+      issue.append(
+        node("strong", "", "Identity conflicts quarantined"),
+        node("span", "player-lab-muted", `${integerFormatter.format(snapshot.materialization_issues.length)} public rows were withheld instead of guessed.`)
+      );
+      container.append(issue);
+    }
   }
 
-  for (const id of ["playerLabSearch", "playerLabOwnerFilter", "playerLabPositionFilter", "playerLabSort"]) {
+  for (const [id, eventName] of Object.entries(FILTER_CONTROL_EVENTS)) {
     const control = $(id);
-    if (control) control.addEventListener(id === "playerLabSearch" ? "input" : "change", () => {
-      if (outlook) render();
+    if (control) control.addEventListener(eventName, () => {
+      if (outlook) {
+        currentPage = 1;
+        render();
+      }
     });
   }
+
+  $("playerLabPreviousPage")?.addEventListener("click", () => {
+    if (!outlook || currentPage <= 1) return;
+    currentPage -= 1;
+    render();
+  });
+  $("playerLabNextPage")?.addEventListener("click", () => {
+    if (!outlook || currentPage >= catalogUi.pageCount(visiblePlayers)) return;
+    currentPage += 1;
+    render();
+  });
+  $("playerLabPageSize")?.addEventListener("change", () => {
+    if (!outlook) return;
+    currentPage = 1;
+    render();
+  });
 
   $("playerLabTableBody")?.addEventListener("keydown", event => {
     if (!event.target.matches(".player-lab-player-button")) return;
@@ -579,5 +728,44 @@ window.PlayerLabUi = (() => {
     selectPlayer(target.dataset.playerId, true);
   });
 
-  return Object.freeze({reset, setBundle});
+  function activateWorkspace(name) {
+    const playerActive = name === "players";
+    activeWorkspace = playerActive ? "players" : "trade";
+    $("tradeWorkspace")?.classList.toggle("hidden", playerActive);
+    $("playerLabWorkspace")?.classList.toggle("hidden", !playerActive);
+    for (const [id, active] of [["tradeTab", !playerActive], ["playerLabTab", playerActive]]) {
+      const button = $(id);
+      button?.classList.toggle("active", active);
+      button?.setAttribute("aria-selected", String(active));
+      if (button) button.tabIndex = active ? 0 : -1;
+    }
+    if (playerActive) {
+      $("playerLabSearch")?.focus();
+      if (outlook) {
+        renderDetail();
+        void loadSelectedPlayerDetail();
+      }
+      void loadPendingBundle();
+    } else {
+      cancelDetailRequest();
+      if (activeController) {
+        clearOutlook("Open Player Lab to resume loading this week's player profiles.");
+      }
+    }
+  }
+
+  $("tradeTab")?.addEventListener("click", () => activateWorkspace("trade"));
+  $("playerLabTab")?.addEventListener("click", () => activateWorkspace("players"));
+  for (const button of [$("tradeTab"), $("playerLabTab")].filter(Boolean)) {
+    button.addEventListener("keydown", event => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const showPlayers = event.key === "ArrowRight" || event.key === "End";
+      activateWorkspace(showPlayers ? "players" : "trade");
+      $(showPlayers ? "playerLabTab" : "tradeTab").focus();
+    });
+  }
+  $("playerLabTab")?.setAttribute("tabindex", "-1");
+
+  return Object.freeze({activateWorkspace, queueBundle, reset});
 })();

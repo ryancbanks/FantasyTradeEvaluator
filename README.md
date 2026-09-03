@@ -17,21 +17,23 @@ A local NFL trade-search app with two power modes: optional FantasyPros ECR/cali
 - Builds **General Manager Insights** from verified completed league activity: completed-deal accessibility, exact transaction-time counterparty opportunity, package shape, frequent partners, waiver/free-agent pace, acquisition retention, verified short-term streaming, roster construction, and captured-lineup continuity. It keeps those behavioral questions separate from current roster compatibility, which exhaustively screens every eligible 1-for-1 swap and complementary position need without using manager history. Historical trades show their value at the time beside the same package and pre-trade roster revalued by the selected current model. Injury-screened foresight labels require enough weekly health evidence; injuries never count toward a good/bad foresight label.
 - Adds a **Trade Timing Lab** that joins each team's exact completed record to correlated future season simulations. It ranks schedule-pressure watch windows from loss risk, downward record-slope risk, and playoff sensitivity while separately showing losing-streak risk, then compares a shortlisted 1-for-1 trade in the current window with waiting. Future packages are valued only inside the pre-trade scenario paths where that opponent loses and its record slope is downward, after a minimum conditional-sample gate. A candidate must improve both teams by a declared playoff-probability materiality floor, and every displayed package still requires current-health and trade-deadline verification. Completed-deal timing is always labeled participation—not an offer-acceptance probability—and projected high/low scoring spots are never presented as future market prices or ECR.
 - Opens a fully local Player Lab for every rostered player and captured waiver candidate, with weekly opponents, ensemble points, uncertainty, source coverage, weekly/remaining-season ECR, and the exact FantasyPros/ESPN/Yahoo values and missing/bye/derived states behind each projection.
+- Builds a portable Player Lab from bulk public data: current/prior weekly statistics, NFL team and depth metadata, seven-day add/drop trends, and three seasons of documented injury reports.
+- Lets you search, filter, sort, and group players by position, NFL team/depth, fantasy-team owner, projection, ranking, and trend, then inspect weekly charts and season summaries.
 - Shows trades where every participant gains playoff probability first and writes the full result plus league outlook to a real `.xlsx` workbook.
 
 Power and fantasy-point forecasting are deliberately separate. In FantasyPros mode, FantasyPros evidence is used to reproduce FantasyPros power. In independent mode, power is transparently derived from the accepted point-projection ensemble. The core compatibility ensemble uses FantasyPros, ESPN, and Yahoo in FantasyPros mode and ESPN plus Yahoo in independent mode. Broad consensus excludes aggregate FantasyPros and FFA projections from the forecast average, then gives ESPN, Yahoo, and each accepted public publisher one vote. Yahoo public/editorial ranks are never converted into fantasy points; the app uses only the league-scored projection tables captured from the selected signed-in Yahoo league.
 
 ## Draft Lab
 
-The app also includes a separate local Draft Lab for training a draft-ranking model from user-supplied, provenance-tagged historical preseason data. It supports editable league and scoring rules, deterministic historical snake-draft arenas, generation autosaves and resume, model inspection and export, paired regression-baseline benchmarks, persistent manual draft rooms, and optional public ESPN snake-draft synchronization.
+The app also includes a separate local Draft Lab for training a draft-ranking model from provenance-tagged historical preseason data. Its one-click installer downloads the public 2015–2019 and 2021–2025 starter sources once, verifies them, and builds the corpus locally; strict custom corpora remain importable. Draft Lab supports editable league and scoring rules, deterministic historical snake-draft arenas, generation autosaves and resume, model inspection and export, paired regression-baseline benchmarks, persistent manual draft rooms, and optional public ESPN snake-draft synchronization.
 
 Draft Lab does not download or claim complete historical ESPN or Yahoo archives. ESPN synchronization is a credential-free read of a public draft and requires a current board carrying verified ESPN player-ID mappings; private ESPN leagues and Yahoo live drafts remain manual. See the [Draft Lab guide](docs/draft-lab.md) for the supported years, strict JSON contracts, no-leak rules, compute controls, workflow, privacy guarantees, and current limitations.
 
 ## Use an installed desktop build
 
-1. Install the build for the machine: Windows `Setup.exe`, macOS `.dmg`, or the Debian/Ubuntu archive. Python and developer tools are not required; use a current desktop Chrome or Edge browser for weekly collection.
+1. Install the build for the machine: Windows `Setup.exe`, macOS `.dmg`, or the Debian/Ubuntu archive. Python and developer tools are not required; use a current desktop Chrome, Brave, or Edge browser for weekly collection.
 2. Open **Fantasy Trade Evaluator**.
-3. The first time only, choose **Download extension**, extract the ZIP, open `chrome://extensions` (or `edge://extensions`), turn on **Developer mode**, choose **Load unpacked**, and select the extracted folder containing `manifest.json`.
+3. The first time only, choose **Download extension**, extract the ZIP, open `chrome://extensions` in Chrome or Brave (or `edge://extensions` in Edge), turn on **Developer mode**, choose **Load unpacked**, and select the extracted folder containing `manifest.json`.
 4. Return to the app and refresh that page once so the browser injects the newly loaded extension. Choose **Connect extension**, open **Fantasy Trade Evaluator Browser Bridge** from the browser's Extensions menu, verify the four-character code, and choose **Pair with app**. Pairing uses a one-time code and never exports browser cookies. Sign in to FantasyPros, ESPN, and Yahoo normally in that same browser before starting a scan; sessions from a different browser profile cannot be copied.
 
    If version 0.1.x of the browser extension was already installed, download and extract the current extension, replace the contents of the unpacked folder that the browser already uses, click **Reload** for it on the browser's Extensions page, refresh the app, and reconnect. Weekly collection stays disabled until extension 0.2.0 or newer is connected because verified league history requires its expanded ESPN activity capture.
@@ -47,6 +49,8 @@ Draft Lab does not download or claim complete historical ESPN or Yahoo archives.
 13. Choose **Count combinations**. The count is exact, including values larger than the browser's ordinary integer range, and does not construct every agreement in memory. A three-team count is required before its search can start because even small package limits can produce millions or billions of routes.
 14. Choose **Start local search**. The app checkpoints the search so an identical interrupted run can resume directly at its next decision-tree position.
 15. Choose **Download Excel workbook** for all qualified trades and the full projected league table. Three-team results include every directed transfer leg, each participant's roster/power/playoff impact, and the complete request/run provenance. To keep local export memory bounded, narrow a three-team search to at most 10,000 qualified trades before exporting.
+
+Open **Player Lab** at any time after selecting a ready week. Newly collected bundles include the full captured public player catalog; older imported bundles continue to work with their projection and bounded-waiver player set. The injury-history panel reports a transparent, non-medical tier based only on documented game reports. Its weighted report index is descriptive, not a probability of future injury or a claim of medical "injury proneness." Missing report coverage is shown as unknown, never as a clean history, and a missing stat line is never assumed to be an injury.
 
 On Windows, remove the installed app from **Settings > Apps > Installed apps**, the
 **Uninstall Fantasy Trade Evaluator** Start-menu shortcut, or the standalone
@@ -82,13 +86,15 @@ python3 bootstrap_install.py --uninstall
 ```
 
 The bootstrap needs network access to install the pinned Python dependencies.
-A current desktop Chrome or Edge installation is required for weekly collection.
+A current desktop Chrome, Brave, or Edge installation is required for weekly collection.
 No FantasyPros API key, paid API, OAuth application, or
 per-trade network request is required.
 
 ## Weekly evidence and local guarantees
 
 One collection run uses an explicitly paired extension in the user's ordinary signed-in browser and keeps exactly one temporary scan tab open at a time. The short-lived bridge token stays in browser-session storage; cookies, authorization headers, browser storage, owner/member records, and transport URLs are never returned to the app or written to a portable engine bundle or workbook. The standard workflow requires the user to be signed in to the selected ESPN and Yahoo leagues in that browser; FantasyPros sign-in is required only when FantasyPros mode is enabled.
+
+The first complete Player Lab collection for an NFL week makes nine bounded, credential-free bulk reads—never one call per player or trade. Later league scans in that week reuse the validated local cache unless the user explicitly refreshes it; a transiently incomplete collection is used for that run but is not cached, so the next scan retries it. The sources are two nflverse weekly-stat files, three nflverse injury-report files, Sleeper's active-player/add/drop feeds, and DynastyProcess's weekly exact-ID crosswalk. At most four independent downloads run concurrently. Each source fails independently and carries its URL, capture status, timestamp, and content digest in the portable bundle. These profile sources do not receive projection votes and cannot change the no-double-counting forecast ensemble.
 
 A weekly bundle is immutable and content-addressed. It contains the exact scoring profile and all calculation inputs, including explicit missing/bye/not-published states. Loading fails closed on old or altered schemas, incomplete player/week/provider grids, identity ambiguity, changed analyzer contracts, insufficient formula holdouts, or scoring/league mismatches.
 
@@ -98,7 +104,7 @@ Lineups are solved as exact assignments, including duplicate slots, FLEX, and su
 
 Trade timing reuses those league rules and common random draws. The observed side of a record trajectory appears only when the completed matchup ledger exactly reproduces the current standings. Future slopes use a last-four-point Theil–Sen trend over cumulative win-equivalent percentage (`win=1`, `tie=0.5`, `loss=0`) with a disclosed ±0.02-per-week neutral band. The timing service uses at most a deterministic 1,000-scenario prefix so switching opponents cannot trigger an unbounded recomputation. Historical trade periods are binary—multiple completed trades in one elapsed scoring period count once—and a Week W trade is classified only from results through Week W−1. The league deadline is not retained yet, so elapsed denominators may include periods in which trading was closed. Mixed proposal/execution timestamp meanings are never pooled. Until health evidence can be aligned to every historical decision period, those associations remain descriptive and cannot personalize a future participation projection.
 
-See [weekly source collection](docs/source-collection.md), [methodology notes](docs/model-notes.md), and [desktop packaging](docs/packaging.md) for the validation contract and supported release targets.
+See [weekly source collection](docs/source-collection.md), [runtime data-source notices](THIRD_PARTY_NOTICES.md), [methodology notes](docs/model-notes.md), and [desktop packaging](docs/packaging.md) for the validation contract and supported release targets.
 
 ## Build installers from this repository
 

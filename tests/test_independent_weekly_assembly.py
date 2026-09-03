@@ -4,6 +4,7 @@ from tests.test_weekly_assembly import (
     host_snapshot,
     nfl_schedule,
     projection_artifact,
+    projection_artifact_with_outside_player,
 )
 from trade_snapshot.capture_schema import CaptureProvider, RankingHorizon
 from trade_snapshot.engine_bundle import EngineBundle
@@ -45,6 +46,31 @@ def projection_artifacts(*, broad):
 
 
 class IndependentWeeklyAssemblyTests(unittest.TestCase):
+    def test_retains_projected_players_outside_the_bounded_waiver_pool(self):
+        artifacts = tuple(
+            projection_artifact_with_outside_player(provider, horizon, week)
+            for provider in (CaptureProvider.ESPN, CaptureProvider.YAHOO)
+            for horizon, weeks in (
+                (RankingHorizon.WEEKLY, (1, 2)),
+                (RankingHorizon.ROS, (1,)),
+            )
+            for week in weeks
+        )
+
+        assembled = assemble_independent_weekly_engine(
+            host_snapshot=host_snapshot(),
+            projection_artifacts=artifacts,
+            nfl_schedule=nfl_schedule(),
+            scoring="PPR",
+            expected_team_count=2,
+        )
+
+        self.assertEqual(assembled.player_lab_projections.player_ids, ("espn:204",))
+        self.assertNotIn(
+            "espn:204",
+            {row.canonical_player_id for row in assembled.bundle.projections},
+        )
+
     def test_builds_round_trippable_broad_engine_without_fantasypros(self):
         assembled = assemble_independent_weekly_engine(
             host_snapshot=host_snapshot(),

@@ -35,6 +35,8 @@ from .league_source import VerifiedHostLeagueSnapshot
 from .methodology import DEFAULT_POWER_METHODOLOGY, PowerMethodology
 from .nfl_schedule import NflSchedule
 from .positions import normalize_player_position
+from .player_lab_projection_builder import build_player_lab_projection_snapshot
+from .player_lab_projections import PlayerLabProjectionSnapshot
 from .projections import (
     ProjectionStatus,
     RemainingSeasonOrigin,
@@ -67,6 +69,7 @@ class AssembledWeeklyEvidence:
     league_inputs: NormalizedLeagueInputs
     fantasypros_team_ids: Mapping[str, str]
     fantasypros_player_ids: Mapping[str, str]
+    player_lab_projections: PlayerLabProjectionSnapshot
 
     def __post_init__(self) -> None:
         if not isinstance(self.evidence, WeeklyRefreshEvidence):
@@ -75,6 +78,10 @@ class AssembledWeeklyEvidence:
             raise ValueError("identities must be IdentityRegistry")
         if not isinstance(self.league_inputs, NormalizedLeagueInputs):
             raise ValueError("league_inputs must be NormalizedLeagueInputs")
+        if not isinstance(self.player_lab_projections, PlayerLabProjectionSnapshot):
+            raise ValueError(
+                "player_lab_projections must be a PlayerLabProjectionSnapshot"
+            )
         object.__setattr__(
             self,
             "fantasypros_team_ids",
@@ -223,6 +230,22 @@ def assemble_weekly_refresh_evidence(
         selection.minimum_observed_sources,
     )
     computation_players = rostered | frozenset(waiver_pool.player_ids)
+    player_lab_projections = build_player_lab_projection_snapshot(
+        state=league_inputs.league_state,
+        projection_evidence=all_projection_evidence,
+        player_names={
+            player_id: player.display_name for player_id, player in players.items()
+        },
+        player_positions={
+            player_id: player.position for player_id, player in players.items()
+        },
+        player_nfl_team_ids={
+            player_id: player.nfl_team_id for player_id, player in players.items()
+        },
+        nfl_schedule=nfl_schedule,
+        ensemble_config=ensemble,
+        exclude_player_ids=computation_players,
+    )
     player_ids = _fantasypros_player_ids(computation_players, identities)
     projection_evidence = tuple(
         row
@@ -304,6 +327,7 @@ def assemble_weekly_refresh_evidence(
         league_inputs,
         team_ids,
         player_ids,
+        player_lab_projections,
     )
 
 

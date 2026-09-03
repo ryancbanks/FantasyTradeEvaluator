@@ -45,6 +45,7 @@ def main() -> int:
         )
         asset_check = (
             "import importlib.util,json; from importlib.resources import files; "
+            "from importlib.metadata import distribution; "
             "from pathlib import PurePosixPath; "
             "from trade_snapshot.app_launcher import "
             "_required_extension_assets,_required_web_assets; "
@@ -56,6 +57,8 @@ def main() -> int:
             "assert manifest['manifest_version']==3; "
             "assert all(ext.joinpath(*PurePosixPath(name).parts).read_bytes() "
             "for name in _required_extension_assets(manifest)); "
+            "assert any(PurePosixPath(str(path)).name=='THIRD_PARTY_NOTICES.md' "
+            "for path in distribution('fantasy-trade-evaluator').files); "
             "assert all(importlib.util.find_spec(name) is None for name in "
             "('playwright','greenlet','pyee','typing_extensions'))"
         )

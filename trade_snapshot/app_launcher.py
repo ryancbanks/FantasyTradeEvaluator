@@ -13,9 +13,10 @@ from threading import Thread
 from urllib.parse import quote
 import webbrowser
 
-from .local_server import _STATIC, create_local_server, serve_local_app
+from .local_server import create_local_server, serve_local_app
 from .production_collection import create_production_weekly_collection_workflow
 from .extension_bridge import ExtensionCommandBridge
+from .web_asset_manifest import REQUIRED_WEB_ASSETS
 
 
 _EXTENSION_COMPANION_ASSETS = (
@@ -74,7 +75,7 @@ def runtime_self_check() -> dict[str, object]:
             name: web.joinpath(*PurePosixPath(name).parts).read_bytes()
             for name in _required_web_assets()
         }
-    except OSError:
+    except (OSError, TypeError):
         raise RuntimeError("local interface assets are missing") from None
     if (
         not all(web_assets.values())
@@ -104,10 +105,9 @@ def runtime_self_check() -> dict[str, object]:
 
 
 def _required_web_assets() -> tuple[str, ...]:
-    """Return the root page and every asset in the server's static route table."""
+    """Return the shared, release-checked local-interface inventory."""
 
-    served = {filename for filename, _content_type in _STATIC.values()}
-    return ("index.html", *sorted(served))
+    return REQUIRED_WEB_ASSETS
 
 
 def _required_extension_assets(manifest: dict[str, object]) -> tuple[str, ...]:

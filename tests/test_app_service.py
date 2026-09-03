@@ -1,3 +1,6 @@
+import copy
+from dataclasses import replace
+import json
 import time
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -13,6 +16,9 @@ from tests.test_engine_bundle import engine_bundle
 from tests.test_surrogate_disclosure import surrogate_bundle
 from tests.test_three_way_search import components as three_way_components
 from trade_snapshot.app_service import LocalAppService, LocalSearchRequest, _SearchJob
+from trade_snapshot._app_support import bundle_summary
+from trade_snapshot._scenario_random import content_id
+from trade_snapshot.engine_bundle import load_engine_bundle, save_engine_bundle
 from trade_snapshot.league_history import (
     HistoryBundleBinding,
     HistoryRosterPlayer,
@@ -23,6 +29,8 @@ from trade_snapshot.league_history import (
     LeagueHistoryStoreError,
     make_league_key,
 )
+from trade_snapshot.player_lab_projections import PlayerLabProjectionSnapshot
+from trade_snapshot.player_outlook_lazy import build_player_outlook_read_context
 from trade_snapshot.three_way_search import ThreeWaySearchOutcome
 from trade_snapshot.weekly_collection import LEAGUE_HISTORY_FILENAME
 
@@ -1345,6 +1353,228 @@ class LocalAppServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid export filename"):
                 service.export_path("../secret.xlsx")
 
+
+    def test_catalog_and_detail_never_materialize_the_full_player_outlook(self):
+        bundle = engine_bundle()
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            with patch(
+                "trade_snapshot.app_service.build_player_outlook",
+                side_effect=AssertionError("full outlook must stay lazy"),
+            ):
+                catalog = service.player_outlook_catalog(bundle.bundle_id)
+                detail = service.player_outlook_detail(bundle.bundle_id, "p1")
+
+        self.assertEqual(catalog["view"], "catalog")
+        self.assertNotIn("weeks", catalog["players"][0])
+        self.assertEqual(detail["view"], "player_detail")
+        self.assertEqual(detail["player"]["player_id"], "p1")
+        self.assertIn("weeks", detail["player"])
+
+    def test_catalog_and_multiple_details_share_one_parsed_bundle_and_context(self):
+        bundle = engine_bundle()
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            service._bundle_cache.clear()
+            with patch(
+                "trade_snapshot.app_service.load_engine_bundle",
+                wraps=load_engine_bundle,
+            ) as load, patch(
+                "trade_snapshot.app_service.build_player_outlook_read_context",
+                wraps=build_player_outlook_read_context,
+            ) as build_context:
+                service.player_outlook_catalog(bundle.bundle_id)
+                service.player_outlook_detail(bundle.bundle_id, "p1")
+                service.player_outlook_detail(bundle.bundle_id, "p2")
+
+        load.assert_called_once()
+        build_context.assert_called_once()
+
+    def test_listing_migrates_legacy_bundle_to_its_current_content_id(self):
+        bundle = engine_bundle()
+        legacy = copy.deepcopy(bundle.to_record())
+        legacy.pop("player_lab_projections")
+        legacy["schema_version"] = 9
+        legacy_content = {
+            key: value
+            for key, value in legacy.items()
+            if key not in {"kind", "schema_version", "bundle_id"}
+        }
+        legacy["bundle_id"] = content_id("engine", legacy_content)
+
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            old_path = service.bundle_directory / f"{legacy['bundle_id']}.json"
+            old_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+            catalog = service.list_bundles()
+            migrated_id = catalog[0]["bundle_id"]
+            migrated_path = service.bundle_directory / f"{migrated_id}.json"
+            detail = service.player_outlook_detail(migrated_id, "p1")
+
+            self.assertTrue(migrated_path.is_file())
+            self.assertFalse(old_path.exists())
+            self.assertTrue(
+                (service.bundle_directory / ".summaries" / f"{migrated_id}.json").is_file()
+            )
+        self.assertNotEqual(migrated_id, legacy["bundle_id"])
+        self.assertEqual(detail["player"]["player_id"], "p1")
+
+    def test_cached_nested_legacy_bundle_is_canonicalized_before_player_lab_reads(self):
+        base = engine_bundle()
+        source = next(row for row in base.projections if row.position == "RB")
+        projection = replace(
+            source,
+            canonical_player_id="outside",
+            nfl_team_id="NFL-outside",
+            provider_observations=(
+                replace(
+                    source.provider_observations[0],
+                    provider="espn",
+                    provider_player_id="espn-outside",
+                ),
+            ),
+        )
+        snapshot = PlayerLabProjectionSnapshot(
+            league_snapshot_id=base.state.snapshot_id,
+            scoring_profile_id=base.state.scoring_profile_id,
+            season=base.state.season,
+            as_of_week=base.state.first_remaining_week,
+            remaining_weeks=base.state.remaining_regular_season_weeks,
+            provider_names=("espn",),
+            projections=(projection,),
+            player_names={"outside": "Outside"},
+        )
+        from tests.test_player_profiles import profile_snapshot
+
+        current = replace(
+            base,
+            player_profiles=profile_snapshot(*base.player_names, "outside"),
+            player_lab_projections=snapshot,
+        )
+        legacy_snapshot = copy.deepcopy(snapshot.to_record())
+        for field in (
+            "player_positions", "player_nfl_team_ids", "provider_provenance"
+        ):
+            legacy_snapshot.pop(field)
+        legacy_snapshot["schema_version"] = 1
+        legacy_snapshot["projection_snapshot_id"] = content_id(
+            "player-lab-projections",
+            {
+                key: value
+                for key, value in legacy_snapshot.items()
+                if key != "projection_snapshot_id"
+            },
+        )
+        legacy = current.to_record()
+        legacy["player_lab_projections"] = legacy_snapshot
+        legacy["bundle_id"] = content_id(
+            "engine",
+            {
+                key: value
+                for key, value in legacy.items()
+                if key not in {"kind", "schema_version", "bundle_id"}
+            },
+        )
+
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            old_path = service.bundle_directory / f"{legacy['bundle_id']}.json"
+            old_path.write_text(json.dumps(legacy), encoding="utf-8")
+            stat = old_path.stat()
+            old_summary = bundle_summary(current)
+            old_summary["bundle_id"] = legacy["bundle_id"]
+            old_cache = {
+                "kind": "fantasy_trade_engine_summary_cache",
+                "schema_version": 1,
+                "bundle_id": legacy["bundle_id"],
+                "bundle_size": stat.st_size,
+                "bundle_mtime_ns": stat.st_mtime_ns,
+                "summary": old_summary,
+                "summary_id": content_id("bundle-summary", old_summary),
+            }
+            cache_path = (
+                service.bundle_directory / ".summaries" / f"{legacy['bundle_id']}.json"
+            )
+            cache_path.parent.mkdir(parents=True)
+            cache_path.write_text(json.dumps(old_cache), encoding="utf-8")
+
+            listed = service.list_bundles()
+            canonical_id = listed[0]["bundle_id"]
+            catalog = service.player_outlook_catalog(canonical_id)
+            detail = service.player_outlook_detail(canonical_id, "outside")
+
+            self.assertEqual(catalog["bundle_id"], canonical_id)
+            self.assertEqual(detail["bundle_id"], canonical_id)
+            self.assertEqual(detail["player"]["player_id"], "outside")
+            self.assertTrue(
+                (service.bundle_directory / f"{canonical_id}.json").is_file()
+            )
+            self.assertFalse(old_path.exists())
+
+    def test_bundle_catalog_uses_and_repairs_small_summary_caches(self):
+        bundle = engine_bundle()
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            with patch(
+                "trade_snapshot.app_service.load_engine_bundle",
+                side_effect=AssertionError("cached list must not parse the full bundle"),
+            ):
+                cached = service.list_bundles()
+            self.assertEqual(cached[0]["bundle_id"], bundle.bundle_id)
+
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            bundle_path = service.bundle_directory / f"{bundle.bundle_id}.json"
+            save_engine_bundle(bundle, bundle_path)
+            repaired = service.list_bundles()
+            self.assertEqual(repaired[0]["bundle_id"], bundle.bundle_id)
+            with patch(
+                "trade_snapshot.app_service.load_engine_bundle",
+                side_effect=AssertionError("repaired list must use its summary cache"),
+            ):
+                self.assertEqual(service.list_bundles(), repaired)
+
+    def test_different_player_outlooks_never_build_concurrently(self):
+        bundle = engine_bundle()
+        bundle_ids = tuple(f"engine_{digit * 64}" for digit in "01")
+        first_started = Event()
+        release_first = Event()
+        builds = []
+
+        def delayed_build(_bundle):
+            builds.append(len(builds) + 1)
+            if len(builds) == 1:
+                first_started.set()
+                self.assertTrue(release_first.wait(5))
+            return {"build": len(builds)}
+
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            with patch.object(
+                service,
+                "_bundle_path",
+                side_effect=lambda bundle_id: Path(directory) / f"{bundle_id}.json",
+            ), patch(
+                "trade_snapshot.app_service.load_engine_bundle",
+                return_value=bundle,
+            ), patch(
+                "trade_snapshot.app_service.build_player_outlook",
+                side_effect=delayed_build,
+            ), ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(service.player_outlook, bundle_ids[0])
+                self.assertTrue(first_started.wait(5))
+                second = pool.submit(service.player_outlook, bundle_ids[1])
+                time.sleep(0.05)
+                self.assertEqual(builds, [1])
+                release_first.set()
+                first.result(timeout=5)
+                second.result(timeout=5)
+
+        self.assertEqual(builds, [1, 2])
 
 if __name__ == "__main__":
     unittest.main()

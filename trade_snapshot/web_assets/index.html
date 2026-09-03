@@ -56,7 +56,7 @@
         <summary>First-time extension setup</summary>
         <ol>
           <li>Download the extension and extract the ZIP to a folder you will keep.</li>
-          <li>Open <strong>chrome://extensions</strong> in Chrome, turn on <strong>Developer mode</strong>, and choose <strong>Load unpacked</strong>.</li>
+          <li>Open <strong>chrome://extensions</strong> in Chrome or Brave, turn on <strong>Developer mode</strong>, and choose <strong>Load unpacked</strong>.</li>
           <li>Select the extracted folder—the one containing <strong>manifest.json</strong>—then return here, refresh this page once, and click <strong>Connect extension</strong>.</li>
           <li>Open the extension from Chrome’s Extensions menu, confirm that its four-character code matches the code shown here, and choose <strong>Pair with app</strong>.</li>
           <li>Before scanning, sign in to ESPN and Yahoo normally in this same browser. Sign in to FantasyPros too when its option below is on; then close those sign-in tabs.</li>
@@ -77,6 +77,7 @@
             <label class="check"><input id="useFantasyPros" type="checkbox" checked><span>Use FantasyPros for ECR and replicated power. Turn this off for a completely independent ESPN + Yahoo engine with optional public publishers.</span></label>
             <label class="check"><input id="useBroadConsensus" type="checkbox" checked><span>Broad projection consensus (recommended): equal-average independent ESPN, Yahoo, CBS, FFToday, and FantasySharks projections when available. Each publisher receives one vote.</span></label>
             <label class="check"><input id="includeFutureWeekly" type="checkbox"><span>Try every future week too (advanced; required sources must publish it)</span></label>
+            <label class="check"><input id="refreshPublicPlayerData" type="checkbox"><span>Refresh public Player Lab data even if it was already collected for this NFL week</span></label>
             <label class="check surrogate-consent"><input id="allowSurrogatePower" type="checkbox"><span>If exact FantasyPros replication fails, publish a <strong>SURROGATE</strong> weekly engine. Its power scores are approximations and will never be labeled exact.</span></label>
           </div>
           <div class="action-row compact-actions">
@@ -89,7 +90,7 @@
 
       <details id="sourceDebug" class="source-debug">
         <summary>Automatic source links &amp; debug</summary>
-        <p id="sourceDebugMode">Checking the URLs this scan will use…</p>
+        <p id="sourceDebugMode">Checking built-in source routes and capture scope…</p>
         <div id="sourceDebugList" class="source-debug-list" aria-live="polite"></div>
       </details>
 
@@ -350,33 +351,46 @@
       </div>
       <div id="playerLabLoading" class="player-lab-state player-lab-loading hidden" aria-live="polite">
         <span class="player-lab-spinner" aria-hidden="true"></span>
-        <span>Preparing the player-level projection evidence…</span>
+        <span>Preparing local player profiles…</span>
       </div>
       <div id="playerLabContent" class="player-lab-content hidden">
-        <div id="playerLabFreshness" class="player-lab-freshness" aria-label="Projection source freshness"></div>
+        <div id="playerLabFreshness" class="player-lab-freshness" aria-label="Player data freshness"></div>
 
         <div class="player-lab-filters" role="search" aria-label="Filter the Player Lab">
           <label class="player-lab-search"><span>Find a player</span><input id="playerLabSearch" type="search" autocomplete="off" placeholder="Name, NFL team, or fantasy team"></label>
-          <label><span>Owner</span><select id="playerLabOwnerFilter"><option value="all">All teams and available</option></select></label>
-          <label><span>Position</span><select id="playerLabPositionFilter"><option value="all">All positions</option></select></label>
-          <label><span>Sort by</span><select id="playerLabSort"><option value="ros_points">Remaining points</option><option value="weekly_ecr">Weekly ECR</option><option value="ros_ecr">ROS ECR</option><option value="disagreement">Provider disagreement</option><option value="name">Player name</option></select></label>
+          <label><span>Fantasy team</span><select id="playerLabOwnerFilter"><option value="">All fantasy teams</option></select></label>
+          <label><span>NFL team</span><select id="playerLabNflTeamFilter"><option value="">All NFL teams</option></select></label>
+          <label><span>Position</span><select id="playerLabPositionFilter"><option value="">All positions</option></select></label>
+          <label><span>Group players</span><select id="playerLabGroup"><option value="none">One overall list</option><option value="position">By position</option><option value="nfl_team">By NFL team / depth</option><option value="fantasy_team">By fantasy team</option></select></label>
+          <label><span>Trend</span><select id="playerLabTrendFilter"><option value="">Any trend</option><optgroup label="Recent performance"><option value="performance:rising">Performance rising</option><option value="performance:falling">Performance falling</option><option value="performance:steady">Performance steady</option><option value="performance:unknown">Performance history unavailable</option></optgroup><optgroup label="Sleeper market"><option value="market:rising">Market adds exceed drops</option><option value="market:falling">Market drops exceed adds</option><option value="market:steady">Market adds equal drops</option><option value="market:unknown">Market trend unavailable</option></optgroup></select></label>
+          <label><span>Minimum ROS points</span><input id="playerLabProjectionMin" type="number" min="0" step="1" placeholder="Any"></label>
+          <label><span>Maximum ROS points</span><input id="playerLabProjectionMax" type="number" min="0" step="1" placeholder="Any"></label>
+          <label><span>Sort by</span><select id="playerLabSort"><option value="overall">Overall ranking</option><option value="ros_points">Remaining points</option><option value="trend">Recent performance trend</option><option value="depth">Depth chart</option><option value="weekly_ecr">Weekly ECR</option><option value="ros_ecr">ROS ECR</option><option value="disagreement">Provider disagreement</option><option value="name">Player name</option></select></label>
         </div>
 
         <p id="playerLabCount" class="player-lab-count" aria-live="polite"></p>
+        <nav class="player-lab-pagination" aria-label="Player result pages">
+          <button id="playerLabPreviousPage" class="secondary" type="button">Previous</button>
+          <span id="playerLabPageStatus" aria-live="polite">Page 1 of 1</span>
+          <button id="playerLabNextPage" class="secondary" type="button">Next</button>
+          <label><span>Players per page</span><select id="playerLabPageSize"><option value="50">50</option><option value="100" selected>100</option><option value="200">200</option></select></label>
+        </nav>
         <div class="player-lab-layout">
           <div class="table-wrap player-lab-master-wrap" role="region" aria-label="Scrollable Player Lab results" tabindex="0">
             <table class="player-lab-master">
-              <caption class="player-lab-sr-only">Players with ownership, remaining projections, ECR, and source coverage</caption>
-              <thead><tr><th>Player</th><th>Team / status</th><th>Pos</th><th>ROS pts</th><th>Avg active</th><th>Weekly ECR</th><th>ROS ECR</th><th>Sources</th></tr></thead>
+              <caption class="player-lab-sr-only">Players with ownership, depth, projections, rankings, and trends</caption>
+              <thead><tr><th>Player</th><th>Fantasy team</th><th>Pos / depth</th><th>ROS pts</th><th>Trend</th><th>Overall</th><th>ROS ECR</th><th>Sources</th></tr></thead>
               <tbody id="playerLabTableBody"></tbody>
             </table>
           </div>
 
           <article class="player-lab-detail-card" aria-labelledby="playerLabDetailHeading">
-            <h3 id="playerLabDetailHeading" class="player-lab-sr-only">Selected player details</h3>
+            <h3 id="playerLabDetailHeading" class="player-lab-sr-only">Selected player profile</h3>
             <div id="playerLabDetail" class="player-lab-detail" aria-live="polite"></div>
-            <div class="player-lab-grid-heading"><h4>Weekly breakdown</h4><p>Ensemble alongside every retained provider value</p></div>
-            <p class="player-lab-coverage-note">Usable sources include direct weekly values and disclosed rest-of-season allocations. “All-direct” excludes every locally allocated value.</p>
+            <div id="playerLabChart" class="player-lab-chart" role="img" aria-label="Selected player's weekly actual and projected fantasy points"></div>
+            <div id="playerLabSeasonStats" class="player-lab-season-stats"></div>
+            <div class="player-lab-grid-heading"><h4>Weekly projection breakdown</h4><p>Ensemble alongside every retained provider value</p></div>
+            <p class="player-lab-coverage-note">Usable sources include direct weekly values and disclosed rest-of-season allocations. “All-direct” excludes locally allocated values.</p>
             <div class="table-wrap player-lab-weekly-wrap" role="region" aria-label="Scrollable weekly projection breakdown" tabindex="0">
               <table class="player-lab-weekly">
                 <caption class="player-lab-sr-only">Weekly ensemble and provider projections for the selected player</caption>
@@ -779,9 +793,11 @@
   <script src="/gm_insights_evidence_ui.js" defer></script>
   <script src="/gm_insights_ui.js" defer></script>
   <script src="/trade_timing_ui.js" defer></script>
-  <script src="/player_lab_ui.js" defer></script>
   <script src="/three_way_ui.js" defer></script>
   <script src="/trade_filter_ui.js" defer></script>
+  <script src="/player_lab_profile_ui.js" defer></script>
+  <script src="/player_lab_catalog_ui.js" defer></script>
+  <script src="/player_lab_ui.js" defer></script>
   <script src="/app.js" defer></script>
   <script src="/app_tabs.js" defer></script>
   <script src="/draft_lab.js" defer></script>

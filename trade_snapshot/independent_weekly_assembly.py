@@ -31,6 +31,8 @@ from .league_ingest import (
 )
 from .league_source import VerifiedHostLeagueSnapshot
 from .nfl_schedule import NflSchedule
+from .player_lab_projection_builder import build_player_lab_projection_snapshot
+from .player_lab_projections import PlayerLabProjectionSnapshot
 from .positions import normalize_player_position
 from .projections import (
     ProjectionStatus,
@@ -55,6 +57,7 @@ class IndependentWeeklyEngine:
     bundle: EngineBundle
     identities: IdentityRegistry
     league_inputs: NormalizedLeagueInputs
+    player_lab_projections: PlayerLabProjectionSnapshot
 
     def __post_init__(self) -> None:
         if not isinstance(self.bundle, EngineBundle):
@@ -65,6 +68,10 @@ class IndependentWeeklyEngine:
             raise ValueError("identities must be an IdentityRegistry")
         if not isinstance(self.league_inputs, NormalizedLeagueInputs):
             raise ValueError("league_inputs must be NormalizedLeagueInputs")
+        if not isinstance(self.player_lab_projections, PlayerLabProjectionSnapshot):
+            raise ValueError(
+                "player_lab_projections must be a PlayerLabProjectionSnapshot"
+            )
 
 
 def assemble_independent_weekly_engine(
@@ -209,6 +216,22 @@ def assemble_independent_weekly_engine(
         minimum_pool_size=state.roster_rules.roster_cap,
     )
     calculation_ids = owned | frozenset(waiver_pool.player_ids)
+    player_lab_projections = build_player_lab_projection_snapshot(
+        state=state,
+        projection_evidence=all_evidence,
+        player_names={
+            player_id: player.display_name for player_id, player in players.items()
+        },
+        player_positions={
+            player_id: player.position for player_id, player in players.items()
+        },
+        player_nfl_team_ids={
+            player_id: player.nfl_team_id for player_id, player in players.items()
+        },
+        nfl_schedule=nfl_schedule,
+        ensemble_config=ensemble,
+        exclude_player_ids=calculation_ids,
+    )
     final_eligibilities = tuple(
         eligibility[player_id] for player_id in sorted(calculation_ids)
     )
@@ -274,7 +297,7 @@ def assemble_independent_weekly_engine(
         methodology_attestation=None,
         independent_power_disclosure=disclosure,
     )
-    return IndependentWeeklyEngine(bundle, identities, league)
+    return IndependentWeeklyEngine(bundle, identities, league, player_lab_projections)
 
 
 def _validate_dimensions(host, artifacts, scoring) -> tuple[str, ...]:

@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -64,6 +64,23 @@ from .production_calibration import (
     InteractiveSignInGate,
 )
 from .projection_source_policy import select_projection_sources
+from .player_profile_materialize import (
+    PlayerProfileMaterializationError,
+    materialize_player_profiles,
+)
+from .player_profiles import PlayerProfileSnapshot
+from .public_player_cache import (
+    PublicPlayerCacheError,
+    load_public_player_week,
+    save_public_player_week,
+)
+from .public_player_data import (
+    DataAvailability,
+    PublicPlayerDataCancelled,
+    PublicPlayerDataError,
+    PublicPlayerDataSnapshot,
+    collect_public_player_data,
+)
 from .public_projection_collection import (
     assemble_with_public_fallback,
     capture_optional_public,
@@ -110,6 +127,8 @@ class ProductionWeeklyCollectionWorkflow:
         assembler: Callable = assemble_weekly_refresh_evidence,
         independent_plan_builder: Callable = build_independent_weekly_source_plan,
         independent_assembler: Callable = assemble_independent_weekly_engine,
+        public_player_reader: Callable = collect_public_player_data,
+        profile_builder: Callable = materialize_player_profiles,
         refresher: Callable = refresh_weekly_engine,
         activity_adapter: Callable = espn_activity_capture,
         history_adapter: Callable = canonicalize_espn_history,
@@ -123,6 +142,8 @@ class ProductionWeeklyCollectionWorkflow:
             assembler,
             independent_plan_builder,
             independent_assembler,
+            public_player_reader,
+            profile_builder,
             refresher,
             activity_adapter,
             history_adapter,
@@ -144,6 +165,8 @@ class ProductionWeeklyCollectionWorkflow:
         self._assembler = assembler
         self._independent_plan_builder = independent_plan_builder
         self._independent_assembler = independent_assembler
+        self._public_player_reader = public_player_reader
+        self._profile_builder = profile_builder
         self._refresher = refresher
         self._activity_adapter = activity_adapter
         self._history_adapter = history_adapter
@@ -206,7 +229,7 @@ class ProductionWeeklyCollectionWorkflow:
                 )
         except WeeklyCollectionError:
             raise
-        except (BrowserCaptureCancelled, RefreshCancelled):
+        except (BrowserCaptureCancelled, PublicPlayerDataCancelled, RefreshCancelled):
             raise WeeklyCollectionError("Weekly collection was cancelled.") from None
         except EspnFreeReadError as error:
             raise WeeklyCollectionError(str(error)) from None
@@ -445,6 +468,10 @@ class ProductionWeeklyCollectionWorkflow:
             "Projection page capture is complete; validating provider evidence locally",
         )
 
+        public_player_data = self._collect_public_player_data(
+            request, root, cancelled, progress
+        )
+
         previous = _previous_identities(root / _IDENTITY_FILE)
         validation.stage = "cross-source identity and weekly evidence assembly"
         _emit(progress, WeeklyCollectionStage.NORMALIZING, .7,
@@ -487,21 +514,28 @@ class ProductionWeeklyCollectionWorkflow:
                     ).providers
                 ),
             )
-            save_identity_registry(independent.identities, root / _IDENTITY_FILE)
             _emit(
                 progress,
                 WeeklyCollectionStage.BUILDING,
-                .97,
+                .95,
                 "Independent weekly engine is complete",
             )
+            bundle = self._attach_player_profiles(
+                independent.bundle,
+                independent.identities,
+                independent.player_lab_projections,
+                public_player_data,
+                progress,
+            )
+            save_identity_registry(independent.identities, root / _IDENTITY_FILE)
             history_capture, history_binding = self._history_adapter(
                 activity,
                 independent,
-                independent.bundle,
+                bundle,
                 bundle_captured_at=self._now(),
             )
             return WeeklyCollectionPublication(
-                independent.bundle,
+                bundle,
                 history_capture,
                 history_binding,
             )
@@ -566,6 +600,13 @@ class ProductionWeeklyCollectionWorkflow:
         bundle = getattr(result, "bundle", None)
         if not isinstance(bundle, EngineBundle):
             raise ValueError("refresher must return a weekly refresh result")
+        bundle = self._attach_player_profiles(
+            bundle,
+            assembled.identities,
+            assembled.player_lab_projections,
+            public_player_data,
+            progress,
+        )
         history_capture, history_binding = self._history_adapter(
             activity,
             assembled,
@@ -579,6 +620,127 @@ class ProductionWeeklyCollectionWorkflow:
         )
         save_identity_registry(assembled.identities, root / _IDENTITY_FILE)
         return publication
+
+    def _collect_public_player_data(self, request, root, cancelled, progress):
+        _emit(
+            progress,
+            WeeklyCollectionStage.COLLECTING_PUBLIC,
+            .66,
+            "Collecting public player history, depth charts, injuries, and trends",
+        )
+        _check_cancelled(cancelled)
+        if not request.refresh_public_player_data:
+            try:
+                cached = load_public_player_week(root, request.season, request.week)
+            except PublicPlayerCacheError:
+                cached = None
+                _emit(
+                    progress,
+                    WeeklyCollectionStage.COLLECTING_PUBLIC,
+                    .67,
+                    "The local Player Lab cache was invalid; collecting a fresh copy",
+                )
+            if cached is not None and _public_profile_cacheable(cached):
+                _emit(
+                    progress,
+                    WeeklyCollectionStage.COLLECTING_PUBLIC,
+                    .69,
+                    "Reusing public Player Lab data already collected for this NFL week; "
+                    + _public_profile_source_summary(cached),
+                )
+                return cached
+            if cached is not None:
+                _emit(
+                    progress,
+                    WeeklyCollectionStage.COLLECTING_PUBLIC,
+                    .67,
+                    "The cached Player Lab snapshot was incomplete; retrying its public sources",
+                )
+        try:
+            public_data = self._public_player_reader(
+                request.season,
+                as_of_week=request.week,
+                cancelled=cancelled,
+                clock=self._now,
+            )
+        except PublicPlayerDataCancelled:
+            raise
+        except PublicPlayerDataError:
+            _emit(
+                progress,
+                WeeklyCollectionStage.COLLECTING_PUBLIC,
+                .69,
+                "Player history is unavailable; projections and trade analysis will still be published",
+            )
+            return None
+        if not isinstance(public_data, PublicPlayerDataSnapshot):
+            raise ValueError(
+                "public_player_reader must return a PublicPlayerDataSnapshot"
+            )
+        if not _public_profile_cacheable(public_data):
+            cache_message = (
+                "Public player profiles are ready with incomplete source coverage; "
+                "unavailable sources will retry automatically on the next scan"
+            )
+        else:
+            try:
+                save_public_player_week(
+                    root, request.season, request.week, public_data
+                )
+            except PublicPlayerCacheError:
+                cache_message = (
+                    "Public player profiles are ready, but this week's local reuse cache "
+                    "could not be saved"
+                )
+            else:
+                cache_message = (
+                    "Public player profiles are ready and cached for this NFL week; "
+                    + _public_profile_source_summary(public_data)
+                )
+        _emit(
+            progress,
+            WeeklyCollectionStage.COLLECTING_PUBLIC,
+            .69,
+            cache_message,
+        )
+        return public_data
+
+    def _attach_player_profiles(
+        self, bundle, identities, player_lab_projections, public_data, progress
+    ):
+        projected_bundle = replace(
+            bundle, player_lab_projections=player_lab_projections
+        )
+        if public_data is None:
+            return projected_bundle
+        try:
+            profiles = self._profile_builder(
+                league_snapshot_id=projected_bundle.state.snapshot_id,
+                as_of_week=projected_bundle.state.first_remaining_week,
+                identities=identities,
+                public_data=public_data,
+            )
+            if not isinstance(profiles, PlayerProfileSnapshot):
+                raise ValueError("profile_builder must return a PlayerProfileSnapshot")
+            enriched = replace(
+                projected_bundle,
+                player_profiles=profiles,
+            )
+        except (PlayerProfileMaterializationError, ValueError):
+            _emit(
+                progress,
+                WeeklyCollectionStage.BUILDING,
+                .98,
+                "Public profile identities could not be matched safely; trade analysis remains ready",
+            )
+            return projected_bundle
+        _emit(
+            progress,
+            WeeklyCollectionStage.BUILDING,
+            .98,
+            f"Player Lab retained {len(profiles.players)} public player profiles",
+        )
+        return enriched
 
     @staticmethod
     def _authenticated_espn_read(collector, request, host_id):
@@ -784,6 +946,29 @@ def _refresh_progress(callback, value):
     stage = WeeklyCollectionStage.BUILDING if building else WeeklyCollectionStage.CALIBRATING
     fraction = .72 + min(value.fraction, 1) * .25
     _emit(callback, stage, fraction, value.message)
+
+
+def _public_profile_source_summary(snapshot):
+    statuses = [row.availability.value for row in snapshot.provenance]
+    observed = statuses.count("observed")
+    unavailable = statuses.count("unavailable")
+    unpublished = statuses.count("not_published")
+    total = len(statuses)
+    if observed == total:
+        return f"all {total} sources were captured"
+    details = [f"{observed} of {total} sources were captured"]
+    if unpublished:
+        details.append(f"{unpublished} not yet published")
+    if unavailable:
+        details.append(f"{unavailable} unavailable")
+    return "; ".join(details)
+
+
+def _public_profile_cacheable(snapshot):
+    return all(
+        row.availability is not DataAvailability.UNAVAILABLE
+        for row in snapshot.provenance
+    )
 
 
 def create_production_weekly_collection_workflow(

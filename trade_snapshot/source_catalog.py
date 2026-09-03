@@ -7,6 +7,7 @@ from .capture_schema import CaptureProvider
 from .espn_free_read import EspnFreeReadClient
 from .independent_source_plan import build_independent_weekly_source_plan
 from .positions import CANONICAL_PLAYER_POSITIONS
+from .public_player_data import public_player_source_urls
 from .source_plan import build_weekly_source_plan
 from .weekly_collection import WeeklyCollectionRequest
 
@@ -19,6 +20,7 @@ _CBS_CONSENSUS = (
 _SLEEPER_PLAYERS = "https://api.sleeper.app/v1/players/nfl"
 _SLEEPER_DOCS = "https://docs.sleeper.com/"
 _FFA_ACCURACY = "https://fantasyfootballanalytics.net/which-projections-are-most-accurate"
+_NFL_REGULAR_SEASON_END_WEEK = 18
 
 
 def weekly_source_catalog(request: WeeklyCollectionRequest) -> dict[str, object]:
@@ -32,13 +34,14 @@ def weekly_source_catalog(request: WeeklyCollectionRequest) -> dict[str, object]
         if request.use_fantasypros
         else build_independent_weekly_source_plan
     )
+    preview_weeks = _projection_preview_weeks(request)
     plan = builder(
         season=request.season,
         as_of_week=request.week,
-        remaining_weeks=(request.week,),
+        remaining_weeks=preview_weeks,
         scoring=request.scoring,
         player_positions=positions,
-        include_future_weekly=False,
+        include_future_weekly=request.include_future_weekly,
         broad_consensus=request.use_broad_consensus,
     )
     urls = defaultdict(list)
@@ -160,6 +163,39 @@ def weekly_source_catalog(request: WeeklyCollectionRequest) -> dict[str, object]
             "Documented public player metadata and API reference. Sleeper documents no equivalent projection endpoint, so it is not assigned invented point values.",
         ),
     )
+    public_profile_sources = public_player_source_urls(request.season)
+    profile_sources = (
+        _source(
+            "nflverse",
+            "best_effort",
+            tuple(
+                source.url
+                for source in public_profile_sources
+                if source.provider == "nflverse"
+            ),
+            "Public current/prior weekly player stats and three seasons of documented injury reports. Missing unpublished seasons stay explicitly unavailable. nflverse provenance is retained under its CC-BY-4.0 license.",
+        ),
+        _source(
+            "Sleeper",
+            "best_effort",
+            tuple(
+                source.url
+                for source in public_profile_sources
+                if source.provider == "sleeper"
+            ),
+            "Public player, team/depth, current status, and seven-day add/drop metadata for Player Lab. Trending data is displayed with Sleeper attribution and never becomes a projection vote.",
+        ),
+        _source(
+            "DynastyProcess",
+            "best_effort",
+            tuple(
+                source.url
+                for source in public_profile_sources
+                if source.provider == "dynastyprocess"
+            ),
+            "Public weekly exact ESPN/Sleeper/GSIS identifier crosswalk for Player Lab. It is runtime-fetched with attribution to the DynastyProcess data repository under GPL-3.0 and never becomes a projection vote.",
+        ),
+    )
     return {
         "mode": "fantasypros" if request.use_fantasypros else "independent",
         "projection_mode": (
@@ -167,6 +203,16 @@ def weekly_source_catalog(request: WeeklyCollectionRequest) -> dict[str, object]
         ),
         "calculation_sources": calculation,
         "reference_sources": list(reference),
+        "profile_sources": list(profile_sources),
+        "weekly_projection_preview": {
+            "scope": (
+                "remaining_nfl_weeks"
+                if request.include_future_weekly
+                else "current_week_only"
+            ),
+            "weeks": list(preview_weeks),
+            "league_end_discovered_during_scan": request.include_future_weekly,
+        },
     }
 
 
@@ -200,6 +246,15 @@ def _espn_league_id(url):
     if len(values) != 1:
         raise ValueError("normalized ESPN league URL has no unique league ID")
     return values[0]
+
+
+def _projection_preview_weeks(request):
+    """Return a safe superset until the league's exact endpoint is captured."""
+
+    if not request.include_future_weekly:
+        return (request.week,)
+    final_week = max(request.week, _NFL_REGULAR_SEASON_END_WEEK)
+    return tuple(range(request.week, final_week + 1))
 
 
 __all__ = ("weekly_source_catalog",)

@@ -10,6 +10,7 @@ from typing import Protocol
 from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
+from .bundle_summary_cache import save_bundle_with_summary
 from .engine_bundle import EngineBundle, load_engine_bundle, save_engine_bundle
 from .job_retention import (
     ACTIVE_JOB_STATUSES,
@@ -61,6 +62,9 @@ class WeeklyCollectionRequest:
     # Kept false for programmatic backward compatibility. The localhost UI
     # sends its checked, recommended consensus choice explicitly.
     use_broad_consensus: bool = False
+    # Normal runs reuse one sanitized public Player Lab snapshot per NFL week.
+    # This opt-in bypass exists for an explicit mid-week refresh or cache repair.
+    refresh_public_player_data: bool = False
 
     def __post_init__(self) -> None:
         if type(self.season) is not int or not 2012 <= self.season <= 9999:
@@ -94,6 +98,8 @@ class WeeklyCollectionRequest:
             raise ValueError("use_fantasypros must be a boolean")
         if not isinstance(self.use_broad_consensus, bool):
             raise ValueError("use_broad_consensus must be a boolean")
+        if not isinstance(self.refresh_public_player_data, bool):
+            raise ValueError("refresh_public_player_data must be a boolean")
         if not self.use_fantasypros and self.host_league_url is None:
             raise ValueError(
                 "An ESPN league link is required when FantasyPros is turned off."
@@ -118,6 +124,7 @@ class WeeklyCollectionRequest:
             "allow_surrogate_power",
             "use_fantasypros",
             "use_broad_consensus",
+            "refresh_public_player_data",
         }
         if (
             not isinstance(payload, Mapping)
@@ -136,6 +143,7 @@ class WeeklyCollectionRequest:
             allow_surrogate_power=payload.get("allow_surrogate_power", False),
             use_fantasypros=payload.get("use_fantasypros", True),
             use_broad_consensus=payload.get("use_broad_consensus", False),
+            refresh_public_player_data=payload.get("refresh_public_player_data", False),
         )
 
 
@@ -375,7 +383,7 @@ class WeeklyCollectionJobs:
                 ),
             )
             if publication is None:
-                save_engine_bundle(bundle, self._bundle_path(bundle.bundle_id))
+                save_bundle_with_summary(bundle, self._bundle_path(bundle.bundle_id))
             else:
                 self._publish_bound_publication(publication)
             self._update(
@@ -425,7 +433,7 @@ class WeeklyCollectionJobs:
 
     def _publish_staged_bundle(self, bundle: EngineBundle, staged_path: Path) -> None:
         final_path = self._bundle_path(bundle.bundle_id)
-        save_engine_bundle(bundle, final_path)
+        save_bundle_with_summary(bundle, final_path)
         published = load_engine_bundle(final_path)
         if (
             published.bundle_id != bundle.bundle_id
@@ -558,6 +566,9 @@ class WeeklyCollectionJobs:
                 "allow_surrogate_power": job.request.allow_surrogate_power,
                 "use_fantasypros": job.request.use_fantasypros,
                 "use_broad_consensus": job.request.use_broad_consensus,
+                "refresh_public_player_data": (
+                    job.request.refresh_public_player_data
+                ),
             },
             "progress": None
             if progress is None

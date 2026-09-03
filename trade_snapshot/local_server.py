@@ -31,6 +31,7 @@ from .extension_bridge import (
     ExtensionCommandBridge,
 )
 from .source_catalog import weekly_source_catalog
+from .web_asset_manifest import WEB_ASSET_ROUTES
 from .weekly_collection import WeeklyCollectionRequest, WeeklyCollectionWorkflow
 
 
@@ -41,6 +42,9 @@ _JOB_ACTION_PATH = re.compile(
 _DASHBOARD_PATH = re.compile(r"^/api/bundles/(engine_[0-9a-f]{64})/dashboard$")
 _PLAYER_OUTLOOK_PATH = re.compile(
     r"^/api/bundles/(engine_[0-9a-f]{64})/player-outlook$"
+)
+_PLAYER_OUTLOOK_DETAIL_PATH = re.compile(
+    r"^/api/bundles/(engine_[0-9a-f]{64})/player-outlook/players/([^/]+)$"
 )
 _GM_INSIGHTS_PATH = re.compile(
     r"^/api/bundles/(engine_[0-9a-f]{64})/gm-insights$"
@@ -71,28 +75,10 @@ _DRAFT_ASSISTANT_ACTION_PATH = re.compile(
     r"^/api/draft/assistants/([0-9a-f]{32})/(players|picks|undo|espn-sync)$"
 )
 _DRAFT_MODEL_PATH = re.compile(r"^/api/draft/models/(draft_model_[0-9a-f]{64})/export$")
-_STATIC = {
-    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-    "/app_tabs.js": ("app_tabs.js", "text/javascript; charset=utf-8"),
-    "/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
-    "/dashboard_charts.js": ("dashboard_charts.js", "text/javascript; charset=utf-8"),
-    "/dashboard_ui.js": ("dashboard_ui.js", "text/javascript; charset=utf-8"),
-    "/draft_lab.css": ("draft_lab.css", "text/css; charset=utf-8"),
-    "/draft_lab.js": ("draft_lab.js", "text/javascript; charset=utf-8"),
-    "/gm_insights.css": ("gm_insights.css", "text/css; charset=utf-8"),
-    "/gm_insights_evidence_ui.js": ("gm_insights_evidence_ui.js", "text/javascript; charset=utf-8"),
-    "/gm_insights_format.js": ("gm_insights_format.js", "text/javascript; charset=utf-8"),
-    "/gm_insights_ui.js": ("gm_insights_ui.js", "text/javascript; charset=utf-8"),
-    "/trade_timing.css": ("trade_timing.css", "text/css; charset=utf-8"),
-    "/trade_timing_ui.js": ("trade_timing_ui.js", "text/javascript; charset=utf-8"),
-    "/player_lab.css": ("player_lab.css", "text/css; charset=utf-8"),
-    "/player_lab_ui.js": ("player_lab_ui.js", "text/javascript; charset=utf-8"),
-    "/trade_filter_ui.js": ("trade_filter_ui.js", "text/javascript; charset=utf-8"),
-    "/three_way_ui.js": ("three_way_ui.js", "text/javascript; charset=utf-8"),
-    "/styles.css": ("styles.css", "text/css; charset=utf-8"),
-}
+_STATIC = WEB_ASSET_ROUTES
 _MAX_JSON_BYTES = 256 * 1024 * 1024
 _MAX_DRAFT_DATA_BYTES = 128 * 1024 * 1024
+_MAX_PLAYER_ID_LENGTH = 256
 _EXTENSION_ROOT = "/api/browser-extension/v1"
 _CLIENT_ID_HEADER = "X-FTE-Client"
 _CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -322,7 +308,16 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
         if matched:
             self._json(
                 HTTPStatus.OK,
-                self.server.app_service.player_outlook(matched.group(1)),
+                self.server.app_service.player_outlook_catalog(matched.group(1)),
+            )
+            return
+        matched = _PLAYER_OUTLOOK_DETAIL_PATH.fullmatch(path)
+        if matched:
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.player_outlook_detail(
+                    matched.group(1), _decode_player_id(matched.group(2))
+                ),
             )
             return
         matched = _GM_INSIGHTS_PATH.fullmatch(path)
@@ -773,6 +768,18 @@ def serve_local_app(
 
 def _asset(name: str) -> bytes:
     return files("trade_snapshot.web_assets").joinpath(name).read_bytes()
+
+
+def _decode_player_id(value: str) -> str:
+    try:
+        player_id = unquote(value, encoding="utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise ValueError("player ID path must be valid UTF-8") from None
+    if not player_id or len(player_id) > _MAX_PLAYER_ID_LENGTH:
+        raise ValueError("player ID path length is invalid")
+    if any(character in "/\\" or ord(character) < 32 or ord(character) == 127 for character in player_id):
+        raise ValueError("player ID path contains a forbidden character")
+    return player_id
 
 
 @lru_cache(maxsize=1)

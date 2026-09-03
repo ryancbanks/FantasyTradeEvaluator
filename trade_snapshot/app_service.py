@@ -19,9 +19,15 @@ from ._app_support import (
     workbook_sources,
 )
 from ._scenario_random import SAFE_INTEGER, content_id
+from .bundle_summary_cache import (
+    BundleSummaryCacheError,
+    load_cached_bundle_summary,
+    save_bundle_with_summary,
+    save_cached_bundle_summary,
+)
 from .dashboard import build_league_dashboard
 from .draft_service import DraftLabService
-from .engine_bundle import EngineBundle, load_engine_bundle, save_engine_bundle
+from .engine_bundle import EngineBundle, load_engine_bundle
 from .gm_insights import build_gm_insights
 from .job_retention import (
     ACTIVE_JOB_STATUSES,
@@ -37,6 +43,11 @@ from .league_search import (
     ResumableLeagueTradeSearch,
 )
 from .player_outlook import build_player_outlook
+from .player_outlook_detail import build_player_outlook_detail_from_bundle
+from .player_outlook_lazy import (
+    build_player_outlook_catalog_from_bundle,
+    build_player_outlook_read_context,
+)
 from .roster_adjustment import (
     MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY,
     PreparedRosterAdjuster,
@@ -84,10 +95,17 @@ _MAX_DASHBOARD_SCENARIOS = 10_000
 _MAX_BUNDLE_CACHE_SIZE = 4
 _MAX_DASHBOARD_CACHE_SIZE = 4
 _MAX_BASELINE_CACHE_SIZE = 1
-_MAX_PLAYER_OUTLOOK_CACHE_SIZE = 4
 _MAX_RETAINED_SEARCH_JOBS = DEFAULT_TERMINAL_JOB_LIMIT
 _MAX_GM_INSIGHTS_CACHE_SIZE = 4
 _MAX_TRADE_TIMING_CACHE_SIZE = 6
+
+
+# A full public-catalog outlook can be tens of MiB; one hot bundle avoids
+# multiplying that memory cost while still coalescing every concurrent request.
+_MAX_PLAYER_OUTLOOK_CACHE_SIZE = 1
+_MAX_PLAYER_OUTLOOK_CATALOG_CACHE_SIZE = 2
+_MAX_PLAYER_OUTLOOK_DETAIL_CACHE_SIZE = 16
+_MAX_PLAYER_OUTLOOK_READ_CACHE_SIZE = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,6 +316,25 @@ class LocalAppService:
             tuple[str, str], Future[dict[str, object]]
         ] = {}
         self._history_store: LeagueHistoryStore | None = None
+        self._player_outlook_catalog_cache: OrderedDict[
+            str, dict[str, object]
+        ] = OrderedDict()
+        self._player_outlook_catalog_futures: dict[
+            str, Future[dict[str, object]]
+        ] = {}
+        self._player_outlook_detail_cache: OrderedDict[
+            tuple[str, str], dict[str, object]
+        ] = OrderedDict()
+        self._player_outlook_detail_futures: dict[
+            tuple[str, str], Future[dict[str, object]]
+        ] = {}
+        self._player_outlook_read_cache: OrderedDict[
+            str, tuple[EngineBundle, Mapping[str, object]]
+        ] = OrderedDict()
+        self._player_outlook_read_futures: dict[
+            str, Future[tuple[EngineBundle, Mapping[str, object]]]
+        ] = {}
+        self._player_outlook_build_lock = Lock()
         self._collections = WeeklyCollectionJobs(
             self.data_directory,
             self.bundle_directory,
@@ -318,13 +355,39 @@ class LocalAppService:
             return bool(
                 self._export_in_progress
                 or self._dashboard_futures
-                or self._player_outlook_futures
+                or self._player_lab_is_busy()
                 or self._gm_insights_futures
                 or self._trade_timing_futures
                 or self._baseline_futures
                 or self._collections.is_running
                 or has_active_jobs(self._jobs)
                 or self.draft_lab.is_busy
+            )
+
+    def _player_lab_is_busy(self) -> bool:
+        return bool(
+            self._player_outlook_futures
+            or self._player_outlook_catalog_futures
+            or self._player_outlook_detail_futures
+            or self._player_outlook_read_futures
+        )
+
+    def _require_player_lab_capacity(self) -> None:
+        if self.draft_lab.is_busy:
+            raise RuntimeError(
+                "Draft Lab training or benchmark must finish before opening Player Lab"
+            )
+        if (
+            self._export_in_progress
+            or self._collections.is_running
+            or self._dashboard_futures
+            or self._gm_insights_futures
+            or self._trade_timing_futures
+            or has_active_jobs(self._jobs)
+        ):
+            raise RuntimeError(
+                "weekly collection, trade search, export, league dashboard, General "
+                "Manager Insights, or Trade Timing must finish before opening Player Lab"
             )
 
     def active_search_job(self) -> dict[str, object] | None:
@@ -375,7 +438,7 @@ class LocalAppService:
                 self._collections.is_running
                 or has_active_jobs(self._jobs)
                 or self._dashboard_futures
-                or self._player_outlook_futures
+                or self._player_lab_is_busy()
                 or self._gm_insights_futures
                 or self._trade_timing_futures
                 or self._export_in_progress
@@ -387,23 +450,34 @@ class LocalAppService:
     def import_bundle(self, record: Mapping[str, object]) -> dict[str, object]:
         bundle = EngineBundle.from_record(record)
         path = self.bundle_directory / f"{bundle.bundle_id}.json"
-        save_engine_bundle(bundle, path)
+        save_bundle_with_summary(bundle, path)
         self._remember_bundle(bundle)
         return bundle_summary(bundle)
 
     def list_bundles(self) -> tuple[dict[str, object], ...]:
-        summaries = []
+        summaries = OrderedDict()
         for path in sorted(self.bundle_directory.glob("*.json")):
             try:
-                bundle = (
-                    self._load_bundle(path.stem)
-                    if BUNDLE_ID_PATTERN.fullmatch(path.stem)
-                    else load_engine_bundle(path)
-                )
-                summaries.append(bundle_summary(bundle))
+                try:
+                    summary = load_cached_bundle_summary(path)
+                except BundleSummaryCacheError:
+                    summary = None
+                if summary is None:
+                    bundle = load_engine_bundle(path)
+                    if path.stem != bundle.bundle_id:
+                        path = self._canonicalize_migrated_bundle(path, bundle)
+                    summary = bundle_summary(bundle)
+                    try:
+                        save_cached_bundle_summary(bundle, path)
+                    except BundleSummaryCacheError:
+                        pass
+                summaries.setdefault(summary["bundle_id"], summary)
             except ValueError as error:
-                summaries.append({"file": path.name, "status": "invalid", "error": str(error)})
-        return tuple(summaries)
+                summaries.setdefault(
+                    f"invalid:{path.name}",
+                    {"file": path.name, "status": "invalid", "error": str(error)},
+                )
+        return tuple(summaries.values())
 
     def bundle_readiness(self) -> dict[str, object]:
         return self._bundle_readiness(self.list_bundles())
@@ -437,7 +511,7 @@ class LocalAppService:
                     raise RuntimeError(
                         "weekly collection, trade search, export, General Manager Insights, or Trade Timing must finish before building a league dashboard"
                     )
-                if self._player_outlook_futures:
+                if self._player_lab_is_busy():
                     raise RuntimeError(
                         "Player Lab calculation must finish before building a league dashboard"
                     )
@@ -493,21 +567,7 @@ class LocalAppService:
             future = self._player_outlook_futures.get(bundle_id)
             owns_calculation = future is None
             if owns_calculation:
-                if self.draft_lab.is_busy:
-                    raise RuntimeError(
-                        "Draft Lab training or benchmark must finish before opening Player Lab"
-                    )
-                if (
-                    self._export_in_progress
-                    or self._collections.is_running
-                    or self._dashboard_futures
-                    or self._gm_insights_futures
-                    or self._trade_timing_futures
-                    or has_active_jobs(self._jobs)
-                ):
-                    raise RuntimeError(
-                        "weekly collection, trade search, export, league dashboard, General Manager Insights, or Trade Timing must finish before opening Player Lab"
-                    )
+                self._require_player_lab_capacity()
                 future = Future()
                 self._player_outlook_futures[bundle_id] = future
         assert future is not None
@@ -515,7 +575,8 @@ class LocalAppService:
             return future.result()
 
         try:
-            outlook = build_player_outlook(self._load_bundle(bundle_id))
+            with self._player_outlook_build_lock:
+                outlook = build_player_outlook(self._load_bundle(bundle_id))
         except BaseException as error:
             future.set_exception(error)
             raise
@@ -548,7 +609,7 @@ class LocalAppService:
                     self._export_in_progress
                     or self._collections.is_running
                     or self._dashboard_futures
-                    or self._player_outlook_futures
+                    or self._player_lab_is_busy()
                     or self._trade_timing_futures
                     or has_active_jobs(self._jobs)
                 ):
@@ -617,7 +678,7 @@ class LocalAppService:
                     self._export_in_progress
                     or self._collections.is_running
                     or self._dashboard_futures
-                    or self._player_outlook_futures
+                    or self._player_lab_is_busy()
                     or self._gm_insights_futures
                     or has_active_jobs(self._jobs)
                 ):
@@ -662,6 +723,144 @@ class LocalAppService:
             with self._lock:
                 if self._trade_timing_futures.get(request_key) is future:
                     del self._trade_timing_futures[request_key]
+
+    def _player_outlook_read_model(
+        self, bundle_id: str
+    ) -> tuple[EngineBundle, Mapping[str, object]]:
+        """Coalesce one bounded parsed-bundle/index cache for catalog and detail."""
+
+        with self._lock:
+            cached = self._player_outlook_read_cache.get(bundle_id)
+            if cached is not None:
+                self._player_outlook_read_cache.move_to_end(bundle_id)
+                return cached
+            future = self._player_outlook_read_futures.get(bundle_id)
+            owns_calculation = future is None
+            if owns_calculation:
+                future = Future()
+                self._player_outlook_read_futures[bundle_id] = future
+        assert future is not None
+        if not owns_calculation:
+            return future.result()
+
+        try:
+            with self._player_outlook_build_lock:
+                bundle = self._load_bundle(bundle_id)
+                context = build_player_outlook_read_context(bundle)
+                read_model = (bundle, context)
+                with self._lock:
+                    self._player_outlook_read_cache[bundle_id] = read_model
+                    self._player_outlook_read_cache.move_to_end(bundle_id)
+                    while (
+                        len(self._player_outlook_read_cache)
+                        > _MAX_PLAYER_OUTLOOK_READ_CACHE_SIZE
+                    ):
+                        self._player_outlook_read_cache.popitem(last=False)
+        except BaseException as error:
+            future.set_exception(error)
+            raise
+        else:
+            future.set_result(read_model)
+            return read_model
+        finally:
+            with self._lock:
+                if self._player_outlook_read_futures.get(bundle_id) is future:
+                    del self._player_outlook_read_futures[bundle_id]
+
+    def player_outlook_catalog(self, bundle_id: str) -> dict[str, object]:
+        """Build and cache list/filter fields without creating full-player detail."""
+
+        with self._lock:
+            cached = self._player_outlook_catalog_cache.get(bundle_id)
+            if cached is not None:
+                self._player_outlook_catalog_cache.move_to_end(bundle_id)
+                return cached
+            future = self._player_outlook_catalog_futures.get(bundle_id)
+            owns_calculation = future is None
+            if owns_calculation:
+                self._require_player_lab_capacity()
+                future = Future()
+                self._player_outlook_catalog_futures[bundle_id] = future
+        assert future is not None
+        if not owns_calculation:
+            return future.result()
+
+        try:
+            bundle, context = self._player_outlook_read_model(bundle_id)
+            with self._player_outlook_build_lock:
+                catalog = build_player_outlook_catalog_from_bundle(
+                    bundle, context=context
+                )
+                with self._lock:
+                    self._player_outlook_catalog_cache[bundle_id] = catalog
+                    self._player_outlook_catalog_cache.move_to_end(bundle_id)
+                    while (
+                        len(self._player_outlook_catalog_cache)
+                        > _MAX_PLAYER_OUTLOOK_CATALOG_CACHE_SIZE
+                    ):
+                        self._player_outlook_catalog_cache.popitem(last=False)
+        except BaseException as error:
+            future.set_exception(error)
+            raise
+        else:
+            future.set_result(catalog)
+            return catalog
+        finally:
+            with self._lock:
+                if self._player_outlook_catalog_futures.get(bundle_id) is future:
+                    del self._player_outlook_catalog_futures[bundle_id]
+
+    def player_outlook_detail(
+        self, bundle_id: str, player_id: str
+    ) -> dict[str, object]:
+        """Return full evidence for one exact canonical player ID."""
+
+        if not isinstance(player_id, str) or not player_id:
+            raise ValueError("player_id must be a non-empty string")
+        cache_key = (bundle_id, player_id)
+        with self._lock:
+            cached = self._player_outlook_detail_cache.get(cache_key)
+            if cached is not None:
+                self._player_outlook_detail_cache.move_to_end(cache_key)
+                return cached
+            future = self._player_outlook_detail_futures.get(cache_key)
+            owns_calculation = future is None
+            if owns_calculation:
+                self._require_player_lab_capacity()
+                future = Future()
+                self._player_outlook_detail_futures[cache_key] = future
+        assert future is not None
+        if not owns_calculation:
+            return future.result()
+
+        try:
+            catalog = self.player_outlook_catalog(bundle_id)
+            bundle, context = self._player_outlook_read_model(bundle_id)
+            with self._player_outlook_build_lock:
+                detail = build_player_outlook_detail_from_bundle(
+                    bundle,
+                    player_id,
+                    catalog=catalog,
+                    context=context,
+                )
+                with self._lock:
+                    self._player_outlook_detail_cache[cache_key] = detail
+                    self._player_outlook_detail_cache.move_to_end(cache_key)
+                    while (
+                        len(self._player_outlook_detail_cache)
+                        > _MAX_PLAYER_OUTLOOK_DETAIL_CACHE_SIZE
+                    ):
+                        self._player_outlook_detail_cache.popitem(last=False)
+        except BaseException as error:
+            future.set_exception(error)
+            raise
+        else:
+            future.set_result(detail)
+            return detail
+        finally:
+            with self._lock:
+                if self._player_outlook_detail_futures.get(cache_key) is future:
+                    del self._player_outlook_detail_futures[cache_key]
 
     def _bundle_readiness(self, bundles) -> dict[str, object]:
         ready_count = sum(row.get("status") == "ready" for row in bundles)
@@ -717,7 +916,7 @@ class LocalAppService:
                 raise RuntimeError("Draft Lab training or benchmark must finish before collecting")
             if self._export_in_progress:
                 raise RuntimeError("trade export must finish before collecting")
-            if self._dashboard_futures or self._player_outlook_futures:
+            if self._dashboard_futures or self._player_lab_is_busy():
                 raise RuntimeError(
                     "league dashboard or Player Lab calculation must finish before collecting"
                 )
@@ -760,7 +959,7 @@ class LocalAppService:
                 raise RuntimeError(
                     "league dashboard calculation must finish before a trade search"
                 )
-            if self._player_outlook_futures:
+            if self._player_lab_is_busy():
                 raise RuntimeError("Player Lab calculation must finish before a trade search")
             if self._gm_insights_futures:
                 raise RuntimeError(
@@ -889,7 +1088,7 @@ class LocalAppService:
                 raise RuntimeError(
                     "weekly collection or active trade search must finish before export"
                 )
-            if self._dashboard_futures or self._player_outlook_futures:
+            if self._dashboard_futures or self._player_lab_is_busy():
                 raise RuntimeError(
                     "league dashboard or Player Lab calculation must finish before export"
                 )
@@ -1144,6 +1343,36 @@ class LocalAppService:
                     self.data_directory / LEAGUE_HISTORY_FILENAME
                 )
             return self._history_store
+
+    def _canonicalize_migrated_bundle(
+        self, legacy_path: Path, bundle: EngineBundle
+    ) -> Path:
+        """Persist a migrated bundle under its new content ID before retiring legacy."""
+
+        source = legacy_path.resolve()
+        if source.parent != self.bundle_directory or source.suffix.casefold() != ".json":
+            raise ValueError("legacy bundle path is outside the bundle directory")
+        target = self.bundle_directory / f"{bundle.bundle_id}.json"
+        if target.exists():
+            existing = load_engine_bundle(target)
+            if existing.to_record() != bundle.to_record():
+                raise ValueError("canonical migrated bundle conflicts with saved content")
+            try:
+                save_cached_bundle_summary(existing, target)
+            except BundleSummaryCacheError:
+                pass
+        else:
+            save_bundle_with_summary(bundle, target)
+        if source != target:
+            source.unlink()
+            legacy_summary = (
+                self.bundle_directory / ".summaries" / f"{source.stem}.json"
+            )
+            try:
+                legacy_summary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return target
 
     def _bundle_path(self, bundle_id: str) -> Path:
         if not isinstance(bundle_id, str) or not BUNDLE_ID_PATTERN.fullmatch(bundle_id):
