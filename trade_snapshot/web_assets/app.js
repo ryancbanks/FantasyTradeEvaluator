@@ -294,6 +294,7 @@ function changeBundle() {
   threeTeamEstimateSignature = null;
   renderBundle();
   void DashboardUi.setBundle(currentBundle(), {request: api, onError: showError});
+  void PlayerLabUi.setBundle(currentBundle(), {request: api, onError: showError});
 }
 
 function syncCounterparties() {

@@ -71,6 +71,96 @@ class LocalAppServiceTests(unittest.TestCase):
 
         self.assertFalse(pending.done())
 
+    def test_player_outlook_is_available_without_a_search_and_cached(self):
+        bundle = engine_bundle()
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            first = service.player_outlook(bundle.bundle_id)
+            with patch(
+                "trade_snapshot.app_service.build_player_outlook",
+                side_effect=AssertionError("cached player outlook must not be rebuilt"),
+            ):
+                second = service.player_outlook(bundle.bundle_id)
+
+        self.assertIs(first, second)
+        self.assertEqual(first["bundle_id"], bundle.bundle_id)
+        self.assertEqual(
+            len(first["players"]),
+            len({row.canonical_player_id for row in bundle.projections}),
+        )
+
+    def test_concurrent_player_outlook_requests_share_one_calculation(self):
+        bundle = engine_bundle()
+        calculation_started = Event()
+        release_calculation = Event()
+        second_started = Event()
+
+        from trade_snapshot.player_outlook import build_player_outlook as build
+
+        def delayed_build(*args):
+            calculation_started.set()
+            self.assertTrue(release_calculation.wait(5))
+            return build(*args)
+
+        def second_request(service):
+            second_started.set()
+            return service.player_outlook(bundle.bundle_id)
+
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            with patch(
+                "trade_snapshot.app_service.build_player_outlook",
+                side_effect=delayed_build,
+            ) as mocked_build, ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(service.player_outlook, bundle.bundle_id)
+                self.assertTrue(calculation_started.wait(5))
+                second = pool.submit(second_request, service)
+                self.assertTrue(second_started.wait(5))
+                time.sleep(0.02)
+                self.assertFalse(second.done())
+                release_calculation.set()
+                first_result = first.result(timeout=5)
+                second_result = second.result(timeout=5)
+
+        self.assertIs(first_result, second_result)
+        mocked_build.assert_called_once()
+
+    def test_player_outlook_cache_is_bounded_and_least_recently_used(self):
+        bundle = engine_bundle()
+        bundle_ids = tuple(f"engine_{digit * 64}" for digit in "012")
+        build_count = 0
+
+        def build(_bundle):
+            nonlocal build_count
+            build_count += 1
+            return {"calculation": build_count}
+
+        with TemporaryDirectory() as directory, patch(
+            "trade_snapshot.app_service._MAX_PLAYER_OUTLOOK_CACHE_SIZE", 2
+        ):
+            service = LocalAppService(directory)
+            with patch.object(
+                service,
+                "_bundle_path",
+                side_effect=lambda bundle_id: Path(directory) / f"{bundle_id}.json",
+            ), patch(
+                "trade_snapshot.app_service.load_engine_bundle",
+                return_value=bundle,
+            ), patch(
+                "trade_snapshot.app_service.build_player_outlook",
+                side_effect=build,
+            ):
+                first = service.player_outlook(bundle_ids[0])
+                service.player_outlook(bundle_ids[1])
+                self.assertIs(service.player_outlook(bundle_ids[0]), first)
+                service.player_outlook(bundle_ids[2])
+                self.assertIs(service.player_outlook(bundle_ids[0]), first)
+                service.player_outlook(bundle_ids[1])
+
+        self.assertEqual(build_count, 4)
+
     def test_league_dashboard_is_available_without_a_search_and_cached(self):
         bundle = engine_bundle()
         with TemporaryDirectory() as directory:
