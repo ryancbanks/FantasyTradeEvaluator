@@ -27,6 +27,7 @@ from trade_snapshot.projections import (
     RemainingSeasonProjection,
     WeeklyProjection,
 )
+from trade_snapshot.ros_matchup_allocation import ROS_MATCHUP_ALLOCATION_LIMITATION
 
 
 def _timestamp(value):
@@ -39,7 +40,7 @@ class BundleDataReadinessTests(unittest.TestCase):
 
         report = build_bundle_data_readiness(bundle)
 
-        self.assertEqual(report["schema_version"], 4)
+        self.assertEqual(report["schema_version"], 5)
         self.assertEqual(report["status"], "ready_with_known_limitations")
         self.assertEqual(
             {
@@ -510,7 +511,12 @@ class BundleDataReadinessTests(unittest.TestCase):
 
         self.assertEqual(coverage["ros_derived_provider_cells"], 1)
         self.assertEqual(coverage["unattributed_provider_cells"], 0)
-        self.assertIn("divided evenly", snapshot.ros_allocation_limitation)
+        self.assertEqual(
+            snapshot.ros_allocation_limitation,
+            ROS_MATCHUP_ALLOCATION_LIMITATION,
+        )
+        self.assertIn("matchup-weighted", snapshot.ros_allocation_limitation)
+        self.assertIn("neutral allocation", snapshot.ros_allocation_limitation)
         self.assertTrue(
             any(
                 "not provider-published matchup projections" in limitation

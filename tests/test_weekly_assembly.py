@@ -58,6 +58,7 @@ from trade_snapshot.projection_source import (
     ProjectionInputPresence,
     ProjectionSourceAttempt,
 )
+from trade_snapshot.ros_matchup_allocation import neutral_ros_matchup_allocation
 from trade_snapshot.weekly_assembly import (
     _validate_capture_before_first_remaining_kickoff,
     _dedupe_player_records,
@@ -409,6 +410,37 @@ def projection_attempt(artifact):
 
 
 class WeeklyAssemblyTests(unittest.TestCase):
+    def test_retains_the_season_bound_matchup_allocation_for_refresh(self):
+        host = host_snapshot()
+        allocation = neutral_ros_matchup_allocation(
+            season=2026,
+            as_of_week=1,
+            scoring="PPR",
+            scoring_profile_id=host.scoring_profile.scoring_profile_id,
+        )
+
+        result = assemble_weekly_refresh_evidence(
+            host_snapshot=host,
+            fantasypros_league=league_artifact(),
+            projection_artifacts=all_projection_artifacts(),
+            ecr_artifacts=(
+                ecr_artifact(RankingHorizon.WEEKLY),
+                ecr_artifact(RankingHorizon.ROS),
+            ),
+            nfl_schedule=nfl_schedule(),
+            analyzer_bundle=BundleFingerprint(
+                "https://cdn.fantasypros.com/assets/js/min/pages/myplaybook/"
+                "trade-analyzer/bundle-1234567890abcdef.js",
+                "a" * 64,
+            ),
+            response_schema_sha256="b" * 64,
+            scoring="PPR",
+            expected_team_count=2,
+            ros_matchup_allocation=allocation,
+        )
+
+        self.assertIs(result.evidence.ros_matchup_allocation, allocation)
+
     def test_retains_projected_players_outside_the_bounded_calculation_pool(self):
         projections = tuple(
             projection_artifact_with_outside_player(provider, horizon, week)

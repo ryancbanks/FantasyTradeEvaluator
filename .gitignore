@@ -29,6 +29,7 @@ Thumbs.db
 
 # Authenticated browser/runtime data must never enter source control.
 /tmp*/
+/.tmp-brave-history.sqlite3
 /browser-profile/
 /bundles/
 /exports/

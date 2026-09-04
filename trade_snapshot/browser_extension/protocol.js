@@ -249,14 +249,16 @@
 
   function validateOperationEnvelope(value) {
     if (!hasOnlyKeys(value,
-      ["protocol_version", "state", "command_id", "op", "payload"]) ||
+      ["protocol_version", "state", "command_id", "op", "payload", "expires_in_ms"]) ||
         value.protocol_version !== VERSION || value.state !== "command" ||
-        !isIdentifier(value.command_id) || !OPERATION_SET.has(value.op)) return null;
+        !isIdentifier(value.command_id) || !OPERATION_SET.has(value.op) ||
+        !isInteger(value.expires_in_ms, 1, 60 * 60 * 1000)) return null;
     const payload = validateOperationPayload(value.op, value.payload);
     return payload ? Object.freeze({
       commandId: value.command_id,
       operation: value.op,
-      payload
+      payload,
+      expiresInMs: value.expires_in_ms
     }) : null;
   }
 

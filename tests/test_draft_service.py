@@ -2,6 +2,7 @@ from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from tempfile import TemporaryDirectory
 from threading import Event
+import json
 import time
 from types import SimpleNamespace
 import unittest
@@ -10,11 +11,13 @@ from unittest.mock import patch
 import trade_snapshot.draft_service as draft_service_module
 from tests.draft_fixtures import small_draft_config, small_historical_corpus
 from tests.test_engine_bundle import engine_bundle
+from trade_snapshot._scenario_random import content_id
 from trade_snapshot.draft_assistant import (
     DraftAssistantSession,
     assistant_board_coverage,
 )
 from trade_snapshot.draft_config import DraftStrategy
+from trade_snapshot.draft_corpus_sources import STARTER_TRANSFORM_VERSION
 from trade_snapshot.draft_espn_live import EspnDraftObservation, EspnDraftSyncError
 from trade_snapshot.draft_features import build_baseline_brain
 from trade_snapshot.draft_history import DraftPlayerBoard
@@ -127,7 +130,7 @@ class DraftLabServiceTests(unittest.TestCase):
             "league_config": self.config.to_record(),
             "evolution_config": evolution.to_record(),
         }
-        self.assertEqual(self.service.estimate_training(payload)["total_leagues"], 2)
+        self.assertEqual(self.service.estimate_training(payload)["total_leagues"], 5)
         job = self.service.start_training(payload)
         complete = self.wait(job["job_id"])
         self.assertEqual(complete["status"], "complete")
@@ -136,6 +139,9 @@ class DraftLabServiceTests(unittest.TestCase):
         model_id = result["model"]["model_id"]
         self.assertTrue(self.service.model_path(model_id).is_file())
         catalog = self.service.catalog()
+        self.assertEqual(
+            catalog["starter_corpus_transform_version"], STARTER_TRANSFORM_VERSION,
+        )
         self.assertEqual(catalog["models"][0]["model_id"], model_id)
         self.assertEqual(catalog["corpora"][0]["seasons"], [2025])
         self.assertEqual(catalog["checkpoints"][0]["checkpoint_job_id"], job["job_id"])
@@ -234,6 +240,46 @@ class DraftLabServiceTests(unittest.TestCase):
         self.assertEqual(promoted["trained_seasons"], [2025])
         self.assertEqual(promoted["metrics"], exact_metrics)
         self.assertEqual(len(self.service.catalog()["models"]), 3)
+
+    def test_legacy_evaluation_artifacts_cannot_power_runtime_features(self):
+        brain = build_baseline_brain(self.corpus, self.config, (2025,))
+        artifact = DraftModelArtifact(
+            brain, self.config, self.corpus.corpus_id, (2025,), 1,
+            {"fitness": 1.0}, "2026-09-02T12:00:00+00:00",
+        )
+        legacy = artifact.to_record()
+        legacy.pop("evaluation_policy_version")
+        legacy["schema_version"] = 1
+        legacy["model_id"] = content_id("draft_model", {
+            name: legacy[name]
+            for name in (
+                "brain", "league_config", "corpus_id", "trained_seasons",
+                "generation", "metrics", "created_at",
+            )
+        })
+        (self.service.store.model_directory / (
+            f"{legacy['model_id']}.draftbrain.json"
+        )).write_text(json.dumps(legacy), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "Retrain"):
+            self.service.model_path(legacy["model_id"])
+        with self.assertRaisesRegex(ValueError, "Retrain"):
+            self.service.start_benchmark({
+                "model_id": legacy["model_id"], "trials": 1, "seed": 1,
+                "candidate_window": 4, "evaluation_years": [2025],
+            })
+        with self.assertRaisesRegex(ValueError, "Retrain"):
+            self.service.create_assistant({
+                "model_id": legacy["model_id"], "board_id": "missing",
+                "user_drafter_number": 1, "strategy": "none",
+            })
+
+        checkpoint_job_id = "d" * 32
+        self.service.store.save_checkpoint(checkpoint_job_id, {
+            "kind": "draft_training_checkpoint", "schema_version": 2,
+        })
+        with self.assertRaisesRegex(ValueError, "Retrain"):
+            self.service.promote_checkpoint(checkpoint_job_id)
 
     def test_concurrent_checkpoint_promotion_creates_one_model(self):
         evolution = EvolutionConfig(4, 1, 1, 0.25, 0.1, 1_000, 4, (2025,), 2)

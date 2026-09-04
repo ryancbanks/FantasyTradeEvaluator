@@ -11,7 +11,8 @@
     "analyzer.abort",
     "ecr.capture",
     "league.capture",
-    "espn.authenticated_json"
+    "espn.authenticated_json",
+    "espn.season_projections"
   ]);
   const handlers = globalThis.__FTE_MAIN_HANDLERS;
   Object.freeze(handlers);

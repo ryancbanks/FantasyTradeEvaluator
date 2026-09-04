@@ -63,6 +63,7 @@ from .projection_source_policy import (
     validate_no_composite_double_count,
     validate_selectable_projection_providers,
 )
+from .ros_matchup_allocation import RosMatchupAllocation
 from .projections import (
     ProjectionStatus,
     RemainingSeasonProjection,
@@ -134,6 +135,7 @@ def assemble_weekly_refresh_evidence(
     broad_consensus: bool = False,
     league_binding_id: str | None = None,
     projection_source_attempts: Iterable[ProjectionSourceAttempt] | None = None,
+    ros_matchup_allocation: RosMatchupAllocation | None = None,
 ) -> AssembledWeeklyEvidence:
     """Build one complete local-engine input or fail before publishing anything."""
 
@@ -172,6 +174,17 @@ def assemble_weekly_refresh_evidence(
         raise ValueError("NFL schedule does not describe the host season")
 
     scoring = _scoring(scoring)
+    if ros_matchup_allocation is not None:
+        if not isinstance(ros_matchup_allocation, RosMatchupAllocation):
+            raise ValueError(
+                "ros_matchup_allocation must be a RosMatchupAllocation or None"
+            )
+        ros_matchup_allocation.validate_context(
+            season=host_snapshot.season,
+            as_of_week=host_snapshot.first_remaining_week,
+            scoring_profile_id=host_snapshot.scoring_profile.scoring_profile_id,
+            scoring=scoring,
+        )
     _validate_fantasypros_league_scoring(fantasypros_league, scoring)
     projections = _typed_tuple(
         "projection_artifacts", projection_artifacts, GenericTableArtifact
@@ -300,6 +313,7 @@ def assemble_weekly_refresh_evidence(
         nfl_schedule=nfl_schedule,
         ensemble_config=ensemble,
         exclude_player_ids=computation_players,
+        ros_matchup_allocation=ros_matchup_allocation,
     )
     player_ids = _fantasypros_player_ids(computation_players, identities)
     positions = {
@@ -377,6 +391,7 @@ def assemble_weekly_refresh_evidence(
         power_methodology=power_methodology,
         role_definitions=roles,
         waiver_pool=waiver_pool,
+        ros_matchup_allocation=ros_matchup_allocation,
     )
     return AssembledWeeklyEvidence(
         evidence,

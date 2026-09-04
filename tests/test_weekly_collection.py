@@ -281,9 +281,9 @@ def history_publication(bundle):
 
 
 class WeeklyCollectionRequestTests(unittest.TestCase):
-    def test_direct_request_defaults_to_maximum_weekly_projection_coverage(self):
+    def test_direct_request_defaults_to_efficient_current_week_collection(self):
         request = WeeklyCollectionRequest(2026, 1, "PPR")
-        self.assertTrue(request.include_future_weekly)
+        self.assertFalse(request.include_future_weekly)
         self.assertIsNone(request.yahoo_projection_league_url)
         self.assertFalse(request.refresh_public_player_data)
 

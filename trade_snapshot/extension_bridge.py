@@ -28,7 +28,7 @@ from typing import TypeAlias, cast
 
 
 PROTOCOL_VERSION = 1
-MINIMUM_EXTENSION_VERSION = "0.2.0"
+MINIMUM_EXTENSION_VERSION = "0.2.1"
 SESSION_TOKEN_HEADER = "X-FTE-Extension-Token"
 PAIR_REQUEST_MAX_BYTES = 4 * 1024
 POLL_WAIT_MAX_SECONDS = 20.0
@@ -307,12 +307,20 @@ class ExtensionCommandBridge:
                 command = self._command
                 if command is not None and command.state == "queued":
                     command.state = "claimed"
+                    expires_in_ms = max(
+                        1,
+                        min(
+                            60 * 60 * 1000,
+                            math.ceil((command.deadline - self._clock()) * 1000),
+                        ),
+                    )
                     return {
                         "protocol_version": PROTOCOL_VERSION,
                         "state": "command",
                         "command_id": command.command_id,
                         "op": command.op,
                         "payload": _copy_json(command.payload),
+                        "expires_in_ms": expires_in_ms,
                     }
                 remaining = deadline - self._clock()
                 if remaining <= 0:

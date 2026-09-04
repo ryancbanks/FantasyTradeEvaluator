@@ -229,10 +229,20 @@
     const bestRaw = value.best_free_agents;
     if (!Array.isArray(bestRaw) || !bestRaw.length || bestRaw.length > 1000) return null;
     const best_free_agent_ids = bestRaw.map((row) => identifier(own(row, ['id'])));
+    const best_free_agent_players = bestRaw.map((row) => {
+      const player = {
+        player_id: identifier(own(row, ['id'])),
+        name: text(own(row, ['name', 'player_name']))
+      };
+      if (!player.player_id || !player.name) return null;
+      const position = text(own(row, ['position']));
+      if (position) player.position = position;
+      return player;
+    }).filter(Boolean);
     return standings.length === value.standings.length &&
       best_free_agent_ids.every(Boolean) &&
       new Set(best_free_agent_ids).size === best_free_agent_ids.length
-      ? {standings, best_free_agent_ids} : null;
+      ? {standings, best_free_agent_ids, best_free_agent_players} : null;
   };
   const projectProjected = (value) => {
     if (!record(value) || Object.hasOwn(value, 'error') || !Array.isArray(value.standings)) {
@@ -296,11 +306,24 @@
   const [initial, projected] = await Promise.all([takeInit(), takeProjected()]);
   if (!initial) return {error: 'analyzer_init_incomplete'};
   if (!projected) return {error: 'projected_standings_incomplete'};
+  const knownPlayerIds = new Set(bootstrap.players.map((player) => player.player_id));
+  for (const player of initial.best_free_agent_players) {
+    if (!knownPlayerIds.has(player.player_id)) {
+      bootstrap.players.push(player);
+      knownPlayerIds.add(player.player_id);
+    }
+  }
+  if (!initial.best_free_agent_ids.every((playerId) => knownPlayerIds.has(playerId))) {
+    return {error: 'analyzer_init_incomplete'};
+  }
   return {
     team_count: bootstrap.teams.length,
     sources: [
       {source: 'bootstrap', body: {payload: bootstrap}},
-      {source: 'analyzer_init', body: {payload: initial}},
+      {source: 'analyzer_init', body: {payload: {
+        standings: initial.standings,
+        best_free_agent_ids: initial.best_free_agent_ids
+      }}},
       {source: 'projected_standings', body: {payload: projected}}
     ]
   };

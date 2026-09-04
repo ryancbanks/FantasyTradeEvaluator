@@ -108,7 +108,7 @@
           <div class="collection-options">
             <label class="check"><input id="useFantasyPros" type="checkbox" checked><span>Use FantasyPros for ECR and holdout-validated FantasyPros-style power. Turn this off for a completely independent ESPN + Yahoo engine with optional public publishers.</span></label>
             <label class="check"><input id="useBroadConsensus" type="checkbox" checked><span>Broad projection consensus (recommended): equal-average independent ESPN, Yahoo, CBS, FFToday, and FantasySharks projections when available. Each publisher receives one vote.</span></label>
-            <label class="check"><input id="includeFutureWeekly" type="checkbox" checked><span>Try every remaining ESPN and Yahoo weekly page when available (recommended for matchup-level forecasts). Every remaining FantasyPros week is also attempted; unpublished future pages are recorded explicitly.</span></label>
+            <label class="check"><input id="includeFutureWeekly" type="checkbox"><span>Advanced: visit publisher pages for every remaining week when they offer distinct weekly projections. Leave off for the faster recommended refresh: current-week tables and full-season totals are captured once, then the remaining schedule is modeled locally. ESPN's full-season table is never duplicated as fake weekly data.</span></label>
             <label class="check"><input id="refreshPublicPlayerData" type="checkbox"><span>Refresh public Player Lab data even if it was already collected for this NFL week</span></label>
             <label class="check surrogate-consent"><input id="allowSurrogatePower" type="checkbox"><span>If the formula does not pass the blind-holdout validation gate, publish a <strong>SURROGATE</strong> weekly engine. Its results remain approximations and are labeled surrogate or surrogate extrapolated.</span></label>
           </div>
@@ -431,7 +431,7 @@
             <div id="playerLabChart" class="player-lab-chart" role="img" aria-label="Selected player's weekly actual and projected fantasy points"></div>
             <div id="playerLabSeasonStats" class="player-lab-season-stats"></div>
             <div class="player-lab-grid-heading"><h4>Fantasy regular-season weekly breakdown</h4><p>Ensemble alongside every retained provider value</p></div>
-            <p class="player-lab-coverage-note">Usable sources include direct weekly values and disclosed rest-of-season allocations. Residual points and stat components are divided evenly across missing active weeks; that shape is local, not a provider-published matchup projection. “All-direct” excludes every locally allocated value.</p>
+            <p class="player-lab-coverage-note">Usable sources include direct weekly values and disclosed rest-of-season allocations. Missing QB/RB/WR/TE/K weeks are weighted by local position-versus-opponent evidence from completed pre-snapshot current/prior nflverse games; sparse, unavailable, and other-position evidence falls back to neutral weighting. The shape is local—not a provider-published matchup projection—and “All-direct” excludes every locally allocated value.</p>
             <div class="table-wrap player-lab-weekly-wrap" role="region" aria-label="Scrollable weekly projection breakdown" tabindex="0">
               <table class="player-lab-weekly">
                 <caption class="player-lab-sr-only">Weekly ensemble and provider projections for the selected player</caption>
@@ -620,7 +620,7 @@
         <div class="draft-corpus-installer-copy">
           <p class="draft-kicker">ONE-CLICK STARTER HISTORY</p>
           <h3 id="draftStarterCorpusHeading">Build the historical training library</h3>
-          <p>Downloads public preseason ADP and completed NFL results once, verifies each file, then builds the corpus locally. Interrupted downloads can resume.</p>
+          <p>Downloads public preseason ADP plus prior and target NFL seasons once, verifies each file, then builds projection-rich training history locally. Interrupted downloads can resume.</p>
         </div>
         <div class="draft-corpus-installer-actions">
           <button id="draftInstallCorpusButton" class="primary" type="button">Install 2015–2019 and 2021–2025 starter corpus</button>
@@ -634,7 +634,7 @@
         <div id="draftInstallCorpusCoverage" class="draft-install-coverage hidden" aria-label="Starter corpus coverage"></div>
         <details class="draft-install-disclosure">
           <summary>What this starter corpus includes</summary>
-          <p>Preseason features come from Fantasy Football Calculator 12-team PPR ADP. Weekly rosters, schedules, and realized outcomes come from nflverse under CC-BY-4.0. It does not claim historical ESPN, Yahoo, or FantasyPros projections.</p>
+          <p>Fantasy Football Calculator supplies preseason ADP and rank range. nflverse supplies weekly rosters, schedules, and stats under CC-BY-4.0. Draft Lab turns only the preceding regular season into transparent per-game carry-forward point and detailed-stat projections; the target season remains outcome-only. It does not claim those local baselines are archived ESPN, Yahoo, or FantasyPros projections.</p>
           <p>Identity matches are exact—never fuzzy. Draft Lab uses one fixed preseason bye; a player-season is excluded if actual play appears during that team’s original bye. The starter corpus is for the portable standard scoring rules; review coverage before using custom scoring.</p>
         </details>
       </article>
@@ -699,6 +699,15 @@
               <label><span>Position limits JSON</span><textarea id="draftPositionLimits" rows="8" spellcheck="false" required></textarea></label>
             </div>
           </details>
+          <fieldset class="draft-choice-group">
+            <legend>Optional zero-point absence inference</legend>
+            <p class="field-help" id="draftAbsenceHelp">Explicit out/IR reports always drive roster management. These optional thresholds use consecutive completed zero-point weeks for QB/RB/WR/TE only; byes pause the streak and missing data resets it. Zero points may mean a healthy bench player, not an injury. All start disabled (0). If desired, try 2 / 4 / 8 weeks; enabled thresholds must increase. An inferred drop models extended absence, not a confirmed season-ending injury.</p>
+            <div class="draft-fields draft-fields-four">
+              <label><span>Bench after zero-point weeks</span><input id="draftZeroOutWeeks" type="number" min="0" max="25" value="0" required aria-describedby="draftAbsenceHelp"></label>
+              <label><span>Model IR after zero-point weeks</span><input id="draftZeroIrWeeks" type="number" min="0" max="25" value="0" required aria-describedby="draftAbsenceHelp"></label>
+              <label><span>Drop after zero-point weeks</span><input id="draftZeroDropWeeks" type="number" min="0" max="25" value="0" required aria-describedby="draftAbsenceHelp"></label>
+            </div>
+          </fieldset>
         </div>
 
         <div class="draft-config-block">
@@ -706,13 +715,14 @@
           <div class="draft-fields draft-fields-five">
             <label><span>Population</span><input id="draftPopulation" type="number" min="2" max="5000" value="12" required></label>
             <label><span>Generations</span><input id="draftGenerations" type="number" min="1" max="1000" value="1" required></label>
-            <label><span>Appearances / generation</span><input id="draftAppearances" type="number" min="1" max="20" value="1" required></label>
+            <label><span>Full seat sweeps / generation</span><input id="draftAppearances" type="number" min="1" max="20" value="1" required aria-describedby="draftSeatSweepHelp"></label>
             <label><span>Candidate window</span><input id="draftCandidateWindow" type="number" min="0" max="4096" value="16" required></label>
             <label><span>Seed</span><input id="draftSeed" type="number" min="0" value="904221" required></label>
             <label><span>Elite fraction</span><input id="draftEliteFraction" type="number" min="0.01" max="0.5" step="0.01" value="0.15" required></label>
             <label><span>Mutation rate</span><input id="draftMutationRate" type="number" min="0" max="1" step="0.01" value="0.12" required></label>
             <label><span>Mutation magnitude</span><input id="draftMutationMagnitude" type="number" min="0" max="10000000" value="25000" required></label>
           </div>
+          <p id="draftSeatSweepHelp" class="field-help">One sweep evaluates every draft brain from every draft position. Every simulated draft is snake order, reversing the seats each round; fitness averages the complete seat sweep.</p>
           <fieldset class="draft-choice-group">
             <legend>Training years</legend>
             <div id="draftTrainingYears" class="draft-check-grid">
@@ -747,6 +757,7 @@
           <button id="draftStartButton" class="primary" type="submit">Start training</button>
           <button id="draftCancelButton" class="danger hidden" type="button">Stop and keep last autosave</button>
           <button id="draftDownloadModel" class="secondary hidden" type="button">Download trained model</button>
+          <button id="draftRevealModel" class="secondary hidden" type="button">Show saved model</button>
         </div>
       </form>
       <div id="draftEstimate" class="estimate" aria-live="polite">Choose a corpus and league preset, then estimate the training batch.</div>
@@ -768,9 +779,20 @@
         <div><p class="draft-kicker">SHOWCASE SEASON</p><h3 id="draftShowcaseTitle">Simulation inspection</h3></div>
         <label><span>Select a team</span><select id="draftShowcaseTeam"><option value="">No showcase yet</option></select></label>
       </div>
+      <p id="draftRosterPolicy" class="draft-install-coverage-summary"></p>
       <div class="draft-inspector-grid">
-        <article class="draft-card"><h3>Roster</h3><div class="table-wrap draft-compact-table"><table><thead><tr><th>Player</th></tr></thead><tbody id="draftRosterBody"></tbody></table></div></article>
+        <article class="draft-card"><h3>Final roster</h3><div class="table-wrap draft-compact-table"><table><thead><tr><th>Player</th></tr></thead><tbody id="draftRosterBody"></tbody></table></div>
+          <details><summary>Original drafted roster</summary><div class="table-wrap draft-compact-table"><table><thead><tr><th>Player</th></tr></thead><tbody id="draftOriginalRosterBody"></tbody></table></div></details>
+        </article>
         <article class="draft-card draft-card-wide"><h3>Weekly results</h3><div class="table-wrap draft-compact-table"><table><thead><tr><th>Week</th><th>Stage</th><th>Opponent</th><th>Result</th><th>Score</th></tr></thead><tbody id="draftWeekBody"></tbody></table></div></article>
+        <article class="draft-card draft-card-wide"><h3>Injury roster activity</h3>
+          <div class="table-wrap draft-compact-table"><table><thead><tr><th>Week</th><th>Action</th><th>Player</th><th>Reason</th><th>Source</th></tr></thead><tbody id="draftRosterMovesBody"></tbody></table></div>
+        </article>
+        <article class="draft-card draft-card-wide"><h3>Weekly starting lineup</h3>
+          <label><span>Inspect week</span><select id="draftShowcaseWeek" disabled><option value="">No showcase yet</option></select></label>
+          <p id="draftLineupNotice" class="draft-install-coverage-summary"></p>
+          <div class="table-wrap draft-compact-table"><table><thead><tr><th>Slot</th><th>Player</th><th>Weekly lineup estimate</th><th>Actual points</th></tr></thead><tbody id="draftLineupBody"></tbody></table></div>
+        </article>
         <article class="draft-card draft-card-wide"><h3>Final standings</h3><div class="table-wrap draft-compact-table"><table><thead><tr><th>Finish</th><th>Team</th><th>Record</th><th>Points</th><th>Playoffs</th></tr></thead><tbody id="draftStandingsBody"></tbody></table></div></article>
         <article class="draft-card draft-card-wide"><h3>Playoff bracket</h3><div class="table-wrap draft-compact-table"><table><thead><tr><th>Round / week</th><th>Matchup</th><th>Score</th><th>Winner</th></tr></thead><tbody id="draftBracketBody"></tbody></table></div></article>
       </div>

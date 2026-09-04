@@ -39,7 +39,7 @@ class LocalAppUiRuntimeTests(unittest.TestCase):
                 offer["pair_code"],
                 protocol_version=PROTOCOL_VERSION,
                 capabilities=V1_CAPABILITIES,
-                extension_version="0.1.0",
+                extension_version="0.2.0",
             )
             serving = Thread(
                 target=server.serve_forever,
@@ -67,7 +67,7 @@ class LocalAppUiRuntimeTests(unittest.TestCase):
                             "Reconnect updated extension",
                         )
                         help_text = page.locator("#extensionHelp").text_content()
-                        self.assertIn("Version 0.2.0 or newer", help_text)
+                        self.assertIn("Version 0.2.1 or newer", help_text)
                         self.assertIn("Reload", help_text)
                         self.assertEqual(page_errors, [])
                     finally:
@@ -516,6 +516,15 @@ class LocalAppUiRuntimeTests(unittest.TestCase):
                             "Training complete",
                             page.locator("#draftProgressText").text_content(),
                         )
+                        finishes = [int(value) for value in page.locator(
+                            "#draftStandingsBody tr td:first-child"
+                        ).all_text_contents()]
+                        self.assertEqual(finishes, sorted(finishes))
+                        winners = page.locator(
+                            "#draftBracketBody tr td:last-child"
+                        ).all_text_contents()
+                        self.assertTrue(winners)
+                        self.assertTrue(all(value.startswith("Drafter #") for value in winners))
                         _wait_until(
                             lambda: server.app_service.active_job_catalog()["draft"]
                             is None,

@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlsplit
 
 from tests.capture_fixtures import league_sources
 from tests.ecr_fixtures import ecr_source_details
@@ -47,6 +48,7 @@ from trade_snapshot.browser_capture import (
 )
 from trade_snapshot.identity import IdentityRegistry
 from trade_snapshot.identity_io import load_identity_registry
+from trade_snapshot.independent_source_plan import build_independent_weekly_source_plan
 from trade_snapshot.league_history import (
     HistoryBundleBinding,
     HistoryTeam,
@@ -69,6 +71,7 @@ from trade_snapshot.public_player_data import (
     PublicPlayerDataCancelled,
     PublicPlayerDataError,
 )
+from trade_snapshot.ros_matchup_allocation import RosMatchupAllocation
 from trade_snapshot.production_collection import (
     CalibrationCallbacks,
     ProductionWeeklyCollectionWorkflow,
@@ -79,6 +82,7 @@ from trade_snapshot.production_collection import (
     create_production_weekly_collection_workflow,
 )
 from trade_snapshot.projection_archive import projection_archive_catalog
+from trade_snapshot.projection_source_policy import select_projection_sources
 from trade_snapshot.source_plan import build_weekly_source_plan
 from trade_snapshot.projection_source import ProjectionAttemptStatus
 from trade_snapshot.weekly_assembly import AssembledWeeklyEvidence
@@ -146,7 +150,80 @@ class _Collector:
 
 
 class ProductionWeeklyCollectionTests(unittest.TestCase):
-    def test_plan_records_unpublished_and_optional_failures_without_losing_quorum(self):
+    def test_partial_fantasysharks_provider_is_quarantined_for_both_engines(self):
+        class PartialFantasySharksCollector(_Collector):
+            def collect(self, task_plan, options, **kwargs):
+                self.calls.append((task_plan, options, kwargs))
+                task = task_plan.tasks[0]
+                if (
+                    isinstance(task, PageCaptureTask)
+                    and task.provider.value == "fantasysharks"
+                    and task.projection.horizon is RankingHorizon.ROS
+                ):
+                    raise BrowserCaptureError("sanitized unsupported layout")
+                return (_artifact(task),)
+
+        for use_fantasypros, builder in (
+            (True, build_weekly_source_plan),
+            (False, build_independent_weekly_source_plan),
+        ):
+            with self.subTest(use_fantasypros=use_fantasypros):
+                complete = builder(
+                    season=2026,
+                    as_of_week=1,
+                    remaining_weeks=(1, 2),
+                    scoring="PPR",
+                    player_positions=("RB",),
+                    broad_consensus=True,
+                )
+                plan = CapturePlan(
+                    task
+                    for task in complete.tasks
+                    if task.kind is not CaptureKind.LEAGUE_SOURCE
+                )
+                rows, attempts = _collect_remaining_sources(
+                    PartialFantasySharksCollector(),
+                    plan,
+                    BrowserCaptureOptions(Path("profile")),
+                    object(),
+                    _Gate(),
+                    {},
+                    first_remaining_week=1,
+                    attempt_clock=lambda: NOW,
+                )
+
+                projections, _ = _source_artifacts(
+                    rows,
+                    plan,
+                    "PPR",
+                    attempts,
+                    require_ecr=use_fantasypros,
+                )
+                providers = {row.provider.value for row in projections}
+                selected = select_projection_sources(
+                    providers,
+                    broad_consensus=True,
+                    fantasypros_available=use_fantasypros,
+                )
+
+                self.assertNotIn("fantasysharks", providers)
+                self.assertNotIn("fantasysharks", selected.providers)
+                self.assertTrue(
+                    any(
+                        row.provider.value == "fantasysharks"
+                        and row.status is ProjectionAttemptStatus.CAPTURED
+                        for row in attempts
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        row.provider.value == "fantasysharks"
+                        and row.status is ProjectionAttemptStatus.UNAVAILABLE
+                        for row in attempts
+                    )
+                )
+
+    def test_plan_records_optional_period_failure_without_losing_provider_quorum(self):
         complete = build_weekly_source_plan(
             season=2026,
             as_of_week=1,
@@ -165,13 +242,7 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
                 task = task_plan.tasks[0]
                 if (
                     isinstance(task, PageCaptureTask)
-                    and task.provider.value == "fantasypros"
-                    and task.week == 2
-                ):
-                    raise ProjectionNotPublished("sanitized unpublished page")
-                if (
-                    isinstance(task, PageCaptureTask)
-                    and task.provider.value == "espn"
+                    and task.provider.value == "yahoo"
                     and task.projection.horizon is RankingHorizon.ROS
                 ):
                     raise BrowserCaptureError("sanitized unsupported layout")
@@ -203,8 +274,8 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
         self.assertEqual(
             {status: sum(row.status is status for row in attempts) for status in ProjectionAttemptStatus},
             {
-                ProjectionAttemptStatus.CAPTURED: 4,
-                ProjectionAttemptStatus.NOT_PUBLISHED: 1,
+                ProjectionAttemptStatus.CAPTURED: 3,
+                ProjectionAttemptStatus.NOT_PUBLISHED: 0,
                 ProjectionAttemptStatus.UNAVAILABLE: 1,
             },
         )
@@ -307,7 +378,7 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
         self.assertEqual(tuple(captured["remaining_weeks"]), tuple(range(1, 19)))
         self.assertEqual(set(captured["player_positions"]), {"QB", "DL", "K"})
 
-    def test_default_collection_plan_attempts_every_remaining_fantasypros_week(self):
+    def test_default_collection_plan_uses_current_week_plus_single_espn_ros(self):
         workflow = _workflow(collector=_Collector())
         workflow._plan_builder = build_weekly_source_plan
 
@@ -321,7 +392,7 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
         )
         self.assertEqual(
             {(task.week, task.projection.position_scope) for task in fantasypros},
-            {(week, ("RB",)) for week in range(1, 19)},
+            {(1, ("RB",))},
         )
         optional_weekly = tuple(
             task
@@ -333,11 +404,17 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
         self.assertEqual(
             {(task.provider.value, task.week) for task in optional_weekly},
             {
-                (provider, week)
-                for provider in ("espn", "yahoo")
-                for week in range(1, 19)
+                ("yahoo", 1),
             },
         )
+        espn = tuple(
+            task
+            for task in plan.tasks
+            if isinstance(task, PageCaptureTask)
+            and task.provider.value == "espn"
+        )
+        self.assertEqual(len(espn), 1)
+        self.assertIs(espn[0].projection.horizon, RankingHorizon.ROS)
 
     def test_collects_two_single_page_phases_and_forwards_strict_calibration(self):
         collector = _Collector()
@@ -514,12 +591,14 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
         self.assertEqual(assembly["analyzer_bundle"].sha256, CURRENT_BUNDLE_FINGERPRINT.sha256)
         self.assertLess(progress[-1].fraction, .99)
         self.assertTrue(any("Found 2 teams" in row.message for row in progress))
+        self.assertTrue(any(row.message.startswith("Source 1 of ") for row in progress))
 
     def test_collects_public_player_data_once_and_attaches_portable_profiles(self):
         bundle = engine_bundle()
         public_data = _public_data()
         profiles = profile_snapshot(*bundle.player_names)
         calls = []
+        assembly_calls = []
 
         def reader(season, **kwargs):
             calls.append(("read", season, kwargs))
@@ -532,6 +611,9 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
         progress = []
         workflow = _workflow(
             collector=_Collector(),
+            assembler=lambda **kwargs: (
+                assembly_calls.append(kwargs) or _assembled()
+            ),
             public_player_reader=reader,
             profile_builder=builder,
         )
@@ -556,6 +638,9 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
         self.assertEqual(calls[1][1]["league_snapshot_id"], bundle.state.snapshot_id)
         self.assertEqual(calls[1][1]["as_of_week"], bundle.state.first_remaining_week)
         self.assertIs(calls[1][1]["public_data"], public_data)
+        allocation = assembly_calls[0]["ros_matchup_allocation"]
+        self.assertIsInstance(allocation, RosMatchupAllocation)
+        self.assertEqual(allocation.source_data_id, public_data.data_id)
         self.assertEqual([row.fraction for row in progress], sorted(row.fraction for row in progress))
         self.assertTrue(any("Player Lab retained" in row.message for row in progress))
 
@@ -672,8 +757,13 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
             raise PublicPlayerDataError("upstream unavailable")
 
         progress = []
+        assembly_calls = []
         workflow = _workflow(
-            collector=_Collector(), public_player_reader=unavailable
+            collector=_Collector(),
+            assembler=lambda **kwargs: (
+                assembly_calls.append(kwargs) or _assembled()
+            ),
+            public_player_reader=unavailable,
         )
         with TemporaryDirectory() as directory:
             result = workflow(
@@ -688,6 +778,10 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
             result.bundle.player_lab_projections,
             _assembled().player_lab_projections,
         )
+        fallback = assembly_calls[0]["ros_matchup_allocation"]
+        self.assertIsInstance(fallback, RosMatchupAllocation)
+        self.assertIsNone(fallback.source_data_id)
+        self.assertIn("unavailable", fallback.provenance)
         self.assertTrue(any("history is unavailable" in row.message for row in progress))
 
     def test_independent_engine_receives_the_same_profile_attachment(self):
@@ -702,6 +796,7 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
         )
         profiles = profile_snapshot(*bundle.player_names)
         build_calls = []
+        assembly_calls = []
 
         def build(**kwargs):
             build_calls.append(kwargs)
@@ -711,7 +806,9 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
             collector=_Collector(),
             espn_reader=lambda *_args: ({"teams": [{}, {}]}, {}),
             independent_plan_builder=_small_independent_plan,
-            independent_assembler=lambda **_kwargs: independent,
+            independent_assembler=lambda **kwargs: (
+                assembly_calls.append(kwargs) or independent
+            ),
             public_player_reader=lambda *_args, **_kwargs: _public_data(),
             profile_builder=build,
         )
@@ -730,6 +827,10 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
         )
         self.assertEqual(len(build_calls), 1)
         self.assertIs(build_calls[0]["identities"], independent.identities)
+        self.assertIsInstance(
+            assembly_calls[0]["ros_matchup_allocation"],
+            RosMatchupAllocation,
+        )
 
     def test_public_profile_cancellation_publishes_nothing(self):
         def cancelled(*_args, **_kwargs):
@@ -1159,14 +1260,14 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
         class OutdatedCollector(_Collector):
             def open_session(self, *_args, **_kwargs):
                 raise BrowserExtensionUpgradeRequired(
-                    "Update the browser extension to version 0.2.0 or newer, "
+                    "Update the browser extension to version 0.2.1 or newer, "
                     "reload it, then reconnect."
                 )
 
         workflow = _workflow(collector=OutdatedCollector())
         with TemporaryDirectory() as directory, self.assertRaisesRegex(
             WeeklyCollectionError,
-            r"Update.*version 0\.2\.0 or newer.*reload.*reconnect",
+            r"Update.*version 0\.2\.1 or newer.*reload.*reconnect",
         ):
             workflow(
                 _request(),
@@ -1356,7 +1457,7 @@ class ProductionCalibrationTests(unittest.TestCase):
 
 
 class EspnFreeReadClientTests(unittest.TestCase):
-    def test_uses_two_exact_cookie_free_bounded_reads(self):
+    def test_uses_exact_cookie_free_bounded_transaction_snapshots(self):
         calls = []
 
         league_payload = {
@@ -1401,11 +1502,21 @@ class EspnFreeReadClientTests(unittest.TestCase):
 
         def opener(request, *, timeout):
             calls.append((request, timeout))
-            payload = (
-                pro_team_payload
-                if "proTeamSchedules_wl" in request.full_url
-                else league_payload
-            )
+            query = parse_qs(urlsplit(request.full_url).query)
+            if "proTeamSchedules_wl" in query.get("view", ()):
+                payload = pro_team_payload
+            elif "mTransactions2" in query.get("view", ()):
+                period_values = query.get("scoringPeriodId")
+                payload = {
+                    "id": 123,
+                    "seasonId": 2026,
+                    "scoringPeriodId": (
+                        1 if period_values is None else int(period_values[0])
+                    ),
+                    "transactions": [],
+                }
+            else:
+                payload = league_payload
             return _Response(request.full_url, json.dumps(payload).encode("utf-8"))
 
         client = EspnFreeReadClient(timeout_seconds=7, maximum_bytes=2048, opener=opener)
@@ -1424,23 +1535,38 @@ class EspnFreeReadClientTests(unittest.TestCase):
         )
         self.assertNotIn("PRIVATE", repr((league, pro_teams)))
         self.assertNotIn("SECRET", repr((league, pro_teams)))
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 4)
         first = calls[0][0]
         self.assertEqual(first.get_method(), "GET")
         self.assertIn("/seasons/2026/segments/0/leagues/123?", first.full_url)
         self.assertEqual(first.full_url.count("view="), 6)
-        self.assertIn("view=mTransactions2", first.full_url)
-        self.assertTrue(calls[1][0].full_url.endswith("?view=proTeamSchedules_wl"))
+        self.assertIn("view=mStatus", first.full_url)
+        self.assertNotIn("view=mTransactions2", first.full_url)
+        self.assertTrue(calls[-1][0].full_url.endswith("?view=proTeamSchedules_wl"))
         headers = {key.casefold() for key, _ in first.header_items()}
         self.assertFalse({"cookie", "authorization"} & headers)
-        self.assertIn("x-fantasy-filter", headers)
+        self.assertNotIn("x-fantasy-filter", headers)
+        transaction_calls = calls[1:-1]
         self.assertEqual(
-            dict(first.header_items())["X-fantasy-filter"],
-            '{"transactions":{"limit":1000}}',
+            [
+                parse_qs(urlsplit(request.full_url).query).get("scoringPeriodId")
+                for request, _ in transaction_calls
+            ],
+            [["0"], None],
         )
-        second_headers = {key.casefold() for key, _ in calls[1][0].header_items()}
-        self.assertNotIn("x-fantasy-filter", second_headers)
-        self.assertEqual({timeout for _, timeout in calls}, {7.0})
+        for request, _ in transaction_calls:
+            self.assertEqual(
+                parse_qs(urlsplit(request.full_url).query)["view"],
+                ["mTransactions2"],
+            )
+            self.assertEqual(
+                dict(request.header_items())["X-fantasy-filter"],
+                '{"transactions":{"limit":1000,"sortProcessDate":'
+                '{"sortPriority":1,"sortAsc":false}}}',
+            )
+        final_headers = {key.casefold() for key, _ in calls[-1][0].header_items()}
+        self.assertNotIn("x-fantasy-filter", final_headers)
+        self.assertTrue(all(0 < timeout <= 7 for _, timeout in calls))
 
     def test_public_draft_read_uses_one_exact_cookie_free_endpoint(self):
         calls = []
@@ -1524,6 +1650,7 @@ class EspnFreeReadClientTests(unittest.TestCase):
     def test_authenticated_reader_keeps_cookie_header_inside_bounded_transport(self):
         context = _CookieContext()
         calls = []
+        timeouts = []
 
         league_payload = {
             "id": 123,
@@ -1535,18 +1662,29 @@ class EspnFreeReadClientTests(unittest.TestCase):
 
         def transport(request, *, timeout):
             calls.append(request)
-            payload = (
-                pro_team_payload
-                if "proTeamSchedules_wl" in request.full_url
-                else league_payload
-            )
+            timeouts.append(timeout)
+            query = parse_qs(urlsplit(request.full_url).query)
+            if "proTeamSchedules_wl" in query.get("view", ()):
+                payload = pro_team_payload
+            elif "mTransactions2" in query.get("view", ()):
+                period_values = query.get("scoringPeriodId")
+                payload = {
+                    "id": 123,
+                    "seasonId": 2026,
+                    "scoringPeriodId": (
+                        1 if period_values is None else int(period_values[0])
+                    ),
+                    "transactions": [],
+                }
+            else:
+                payload = league_payload
             return _Response(request.full_url, json.dumps(payload).encode("utf-8"))
 
         result = read_authenticated_espn_json(
             context,
             2026,
             "123",
-            4000,
+            45_000,
             2048,
             lambda: False,
             transport=transport,
@@ -1567,11 +1705,12 @@ class EspnFreeReadClientTests(unittest.TestCase):
                 }
             },
         )
-        self.assertEqual(tuple(context.urls), EspnFreeReadClient.urls(2026, "123"))
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(tuple(context.urls), EspnFreeReadClient.all_urls(2026, "123"))
+        self.assertEqual(len(calls), 4)
         for request in calls:
             headers = dict(request.header_items())
             self.assertEqual(headers["Cookie"], "espn_s2=worker-only-secret")
+        self.assertTrue(all(30 < timeout <= 45 for timeout in timeouts))
         self.assertNotIn("worker-only-secret", repr(result))
         self.assertNotIn("Cookie", repr(result))
         self.assertNotIn("PRIVATE OWNER", repr(result))
@@ -1733,6 +1872,11 @@ def _artifact(task):
         "espn": "https://www.espn.com/nfl/player/_/id/201/player-one",
         "yahoo": "https://sports.yahoo.com/nfl/players/301/",
         "cbs": "https://www.cbssports.com/nfl/players/401/player-one/fantasy/",
+        "fftoday": "https://www.fftoday.com/stats/players/401/player-one",
+        "fantasysharks": (
+            "https://www.fantasysharks.com/apps/bert/players/"
+            "playerpage.php?id=401"
+        ),
     }
     table = VisibleTable((
         tuple(VisibleTableCell(value) for value in ("PLAYER", "TEAM", "POS", "FPTS")),
@@ -1761,6 +1905,7 @@ def _host_snapshot(**changes):
         "scoring_profile": SimpleNamespace(
             platform="espn",
             settings={"scoring_settings": {"playerRankType": "PPR"}},
+            scoring_profile_id="profile-1",
         ),
     }
     values.update(changes)

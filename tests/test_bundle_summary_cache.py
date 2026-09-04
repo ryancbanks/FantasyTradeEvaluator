@@ -26,6 +26,7 @@ class BundleSummaryCacheTests(unittest.TestCase):
             cache_files = tuple((bundle_path.parent / ".summaries").glob("*.json"))
             self.assertEqual(len(cache_files), 1)
             record = json.loads(cache_files[0].read_text(encoding="utf-8"))
+            self.assertEqual(record["schema_version"], 3)
             self.assertEqual(record["bundle_id"], bundle.bundle_id)
             self.assertEqual(
                 record["engine_bundle_revision"],

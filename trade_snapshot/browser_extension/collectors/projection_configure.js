@@ -34,16 +34,20 @@
     return {action: 'ready'};
   }
   if (request.provider === 'fftoday') {
-    const positionIds = {QB: '10', RB: '20', WR: '30', TE: '40', DL: '50',
-      LB: '60', DB: '70', K: '80'};
+    const positionDetails = {QB: ['10', 'QUARTERBACK'], RB: ['20', 'RUNNING BACK'],
+      WR: ['30', 'WIDE RECEIVER'], TE: ['40', 'TIGHT END'],
+      DL: ['50', 'DEFENSIVE LINEMAN'], LB: ['60', 'LINEBACKER'],
+      DB: ['70', 'DEFENSIVE BACK'], K: ['80', 'KICKER']};
     const scoringIds = {STD: '1', HALF: '193033', PPR: '107644'};
+    const scoringLabels = {STD: 'FFTODAY STANDARD', HALF: 'FFTODAY HALF PPR',
+      PPR: 'FFTODAY PPR'};
     const weekly = request.horizon === 'weekly';
     const supportedPositions = weekly
       ? ['QB', 'RB', 'WR', 'TE', 'K']
       : ['QB', 'RB', 'WR', 'TE', 'K', 'DL', 'LB', 'DB'];
     if (request.positions.length !== 1 ||
         !supportedPositions.includes(request.positions[0]) ||
-        !positionIds[request.positions[0]] ||
+        !positionDetails[request.positions[0]] ||
         !scoringIds[request.scoring]) {
       return {action: 'error', dimension: 'fftoday request'};
     }
@@ -53,16 +57,68 @@
     }
     const target = new URL(expectedPath, location.origin);
     target.searchParams.set('LeagueID', scoringIds[request.scoring]);
-    target.searchParams.set('PosID', positionIds[request.positions[0]]);
+    target.searchParams.set('PosID', positionDetails[request.positions[0]][0]);
     target.searchParams.set('Season', String(request.season));
     if (weekly) target.searchParams.set('GameWeek', String(request.week));
+    target.hash = location.hash;
     const current = new URL(location.href);
     const keys = weekly
       ? ['LeagueID', 'PosID', 'Season', 'GameWeek']
       : ['LeagueID', 'PosID', 'Season'];
-    if (keys.some((key) => current.searchParams.get(key) !== target.searchParams.get(key))) {
+    const currentEntries = Array.from(current.searchParams.entries());
+    const exactUrl = current.pathname === expectedPath &&
+      currentEntries.length === keys.length && keys.every((key) =>
+        currentEntries.filter(([name, value]) =>
+          name === key && value === target.searchParams.get(key)).length === 1);
+    const normalized = (value) => upper(value).replace(/[^A-Z0-9]+/g, ' ').trim()
+      .replace(/\bFF TODAY\b/g, 'FFTODAY');
+    const projectionHeaders = () => Array.from(document.querySelectorAll('.pageheader'))
+      .filter(visible).map((node) => normalized(node.innerText))
+      .filter((text) => text.includes('PROJECTIONS'));
+    const scoringControls = () => controls.filter((control) => control.name === 'LeagueID');
+    const tableHeaderRows = () => Array.from(document.querySelectorAll('tr.tableclmhdr'))
+      .filter(visible);
+    const tableDimensionLinks = (row) => Array.from(row.querySelectorAll('a[href]'))
+      .map((anchor) => { try { return new URL(anchor.href); } catch (_) { return null; } })
+      .filter((url) => url && url.pathname === expectedPath &&
+        url.searchParams.has('order_by') && url.searchParams.has('sort_order'));
+    const tableDimensionsMatch = (row) => {
+      const links = tableDimensionLinks(row);
+      return links.length >= 2 && links.every((url) => keys.every((key) =>
+        url.searchParams.getAll(key).length === 1 &&
+        url.searchParams.get(key) === target.searchParams.get(key)));
+    };
+    const pageFingerprint = () => JSON.stringify([
+      normalized(document.title), projectionHeaders(),
+      scoringControls().map((control) => [control.value,
+        normalized(control.selectedOptions[0]?.textContent)]),
+      tableHeaderRows().map((row) => [
+        normalized(row.previousElementSibling?.matches('tr.tablehdr')
+          ? row.previousElementSibling.innerText : ''),
+        normalized(row.innerText),
+        tableDimensionLinks(row).slice(0, 32).map((url) =>
+          `${url.pathname}?${url.searchParams.toString()}`)
+      ])
+    ]);
+    const positionLabel = positionDetails[request.positions[0]][1];
+    const expectedTitle = `${positionLabel} PROJECTIONS ${request.season} ${weekly
+      ? `WEEK ${request.week}` : 'REGULAR SEASON'} FFTODAY`;
+    const expectedHeader = `${positionLabel} PROJECTIONS`;
+    const headers = projectionHeaders();
+    const scoring = scoringControls();
+    const tableRows = tableHeaderRows();
+    const pageReady = normalized(document.title) === expectedTitle &&
+      headers.length === 1 &&
+      [expectedHeader, `${expectedHeader} ${request.season}`].includes(headers[0]) &&
+      scoring.length === 1 && scoring[0].value === scoringIds[request.scoring] &&
+      scoring[0].selectedOptions.length === 1 &&
+      normalized(scoring[0].selectedOptions[0].textContent) === scoringLabels[request.scoring] &&
+      tableRows.length === 1 && tableDimensionsMatch(tableRows[0]);
+    if (!exactUrl) {
+      const fingerprint = pageFingerprint().slice(0, 8192);
       location.replace(target.href);
-      return {action: 'changed', dimension: 'fftoday dimensions'};
+      return {action: 'changed', dimension: 'fftoday dimensions', fingerprint,
+        require_change: !pageReady};
     }
     const unavailable = Array.from(document.querySelectorAll('p'))
       .filter(visible).map((node) => upper(node.innerText))
@@ -70,7 +126,9 @@
     if (unavailable) {
       return {action: 'error', dimension: 'fftoday availability'};
     }
-    return {action: 'ready'};
+    const fingerprint = pageFingerprint().slice(0, 8192);
+    return pageReady ? {action: 'ready', fingerprint} :
+      {action: 'waiting', dimension: 'fftoday content', fingerprint};
   }
   if (request.provider === 'fantasysharks') {
     const one = (name) => {
@@ -98,21 +156,46 @@
     if (!desiredSegment) {
       return {action: 'error', dimension: 'fantasysharks period'};
     }
+    const tableFingerprint = () => {
+      const tables = Array.from(document.querySelectorAll('table#toolData')).filter(visible);
+      return JSON.stringify(tables.map((table) => {
+        const rows = Array.from(table.rows).filter(visible);
+        return [rows.length, ...rows.slice(0, 24).map((row) => [
+          upper(row.innerText).slice(0, 600),
+          Array.from(row.querySelectorAll('a[href]')).slice(0, 8).map((anchor) => {
+            try {
+              const url = new URL(anchor.href);
+              return `${url.pathname}?${url.searchParams.toString()}`;
+            } catch (_) { return ''; }
+          })
+        ])];
+      })).slice(0, 8192);
+    };
+    const visibleProjectionTable = () => {
+      const tables = Array.from(document.querySelectorAll('table#toolData')).filter(visible);
+      return tables.length === 1 && Array.from(
+        tables[0].querySelectorAll('a[href*="playerpage.php?id="]')
+      ).some(visible);
+    };
     for (const [control, value, dimension] of [
       [segment, desiredSegment, 'period'],
       [position, positionIds[request.positions[0]], 'position'],
       [scoring, scoringIds[request.scoring], 'scoring']
     ]) {
       if (control.value === value) continue;
+      const fingerprint = tableFingerprint();
       control.value = value;
       const selected = Array.from(control.options).find((option) => option.value === value);
       if (!selected) return {action: 'error', dimension};
       selected.selected = true;
       control.dispatchEvent(new Event('input', {bubbles: true}));
       control.dispatchEvent(new Event('change', {bubbles: true}));
-      return {action: 'changed', dimension};
+      return {action: 'changed', dimension, fingerprint, require_change: true};
     }
-    return {action: 'ready'};
+    const fingerprint = tableFingerprint();
+    return visibleProjectionTable()
+      ? {action: 'ready', fingerprint}
+      : {action: 'waiting', dimension: 'fantasysharks content', fingerprint};
   }
   if (request.provider === 'yahoo') {
     const exactControl = (selector) => {

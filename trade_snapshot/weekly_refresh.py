@@ -25,6 +25,7 @@ from .nfl_schedule import NflSchedule
 from .projections import RemainingSeasonProjection, WeeklyProjection
 from .projection_source import ProjectionSourceManifest
 from .scenario_config import CorrelatedScenarioConfig, PlayerEligibility
+from .ros_matchup_allocation import RosMatchupAllocation
 from .scoring import ScoringProfile
 from .source_manifest import WeeklySourceManifest
 from .strength import CalibrationStatus, RoleDefinition
@@ -85,6 +86,7 @@ class WeeklyRefreshEvidence:
     power_methodology: PowerMethodology
     role_definitions: tuple[RoleDefinition, ...]
     waiver_pool: WaiverPool
+    ros_matchup_allocation: RosMatchupAllocation | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, LeagueState):
@@ -139,6 +141,16 @@ class WeeklyRefreshEvidence:
         _rows("role_definitions", self.role_definitions, RoleDefinition)
         if not isinstance(self.waiver_pool, WaiverPool):
             raise ValueError("waiver_pool must be a WaiverPool")
+        if self.ros_matchup_allocation is not None:
+            if not isinstance(self.ros_matchup_allocation, RosMatchupAllocation):
+                raise ValueError(
+                    "ros_matchup_allocation must be a RosMatchupAllocation or None"
+                )
+            self.ros_matchup_allocation.validate_context(
+                season=self.state.season,
+                as_of_week=self.state.first_remaining_week,
+                scoring_profile_id=self.state.scoring_profile_id,
+            )
         if (
             self.waiver_pool.snapshot_id != self.state.snapshot_id
             or self.waiver_pool.scoring_profile_id != self.state.scoring_profile_id
@@ -374,6 +386,7 @@ def refresh_weekly_engine(
         methodology_fingerprint=fingerprint,
         formula_decision=decision,
         reuse_verification=verification,
+        ros_matchup_allocation=evidence.ros_matchup_allocation,
         allow_surrogate_power=allow_surrogate_power,
     )
     _cancel(cancelled)

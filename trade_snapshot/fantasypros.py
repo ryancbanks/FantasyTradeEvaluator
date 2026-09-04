@@ -53,7 +53,7 @@ def fetch_datasets(
             endpoint,
             headers={
                 "Accept": "application/json",
-                "User-Agent": "fantasy-trade-evaluator/0.2.0",
+                "User-Agent": "fantasy-trade-evaluator/0.2.1",
                 "x-api-key": api_key,
             },
         )

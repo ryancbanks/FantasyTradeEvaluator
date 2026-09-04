@@ -21,6 +21,7 @@ from .projection_source_policy import (
     validate_selectable_projection_providers,
 )
 from .projection_source import ProjectionSourceManifest
+from .ros_matchup_allocation import RosMatchupAllocation
 from .positions import normalize_player_position
 from .scenario_config import CorrelatedScenarioConfig, PlayerEligibility
 from .scoring import ScoringProfile
@@ -60,6 +61,7 @@ def build_weekly_engine(
     methodology_fingerprint: MethodologyFingerprint,
     formula_decision: FormulaReuseDecision,
     reuse_verification: FormulaVerificationReport | None,
+    ros_matchup_allocation: RosMatchupAllocation | None = None,
     allow_surrogate_power: bool = False,
 ) -> EngineBundle:
     """Fuse providers, refresh calibrated scores, and seal a weekly bundle."""
@@ -129,6 +131,7 @@ def build_weekly_engine(
         player_nfl_team_ids=player_nfl_team_ids,
         nfl_schedule=nfl_schedule,
         ensemble_config=ensemble_config,
+        ros_matchup_allocation=ros_matchup_allocation,
     )
     model = strength_formula.build_model(prepared.features, rosters)
     if strength_formula.calibration.status is CalibrationStatus.EXACT:
@@ -188,6 +191,7 @@ def prepare_weekly_model_inputs(
     player_nfl_team_ids: Mapping[str, str],
     nfl_schedule: NflSchedule,
     ensemble_config: EnsembleConfig,
+    ros_matchup_allocation: RosMatchupAllocation | None = None,
 ) -> WeeklyModelInputs:
     """Build the exact shared player inputs used by calibration and local scoring."""
 
@@ -212,6 +216,7 @@ def prepare_weekly_model_inputs(
         player_nfl_team_ids=player_nfl_team_ids,
         nfl_schedule=nfl_schedule,
         ensemble_config=ensemble_config,
+        ros_matchup_allocation=ros_matchup_allocation,
     )
     providers = tuple(
         row.provider for row in ensemble_config.provider_weights
@@ -244,6 +249,7 @@ def prepare_projection_ensemble(
     player_nfl_team_ids: Mapping[str, str],
     nfl_schedule: NflSchedule,
     ensemble_config: EnsembleConfig,
+    ros_matchup_allocation: RosMatchupAllocation | None = None,
 ) -> tuple[EnsembleProjection, ...]:
     """Materialize and fuse provider evidence without requiring ECR features."""
 
@@ -264,6 +270,8 @@ def prepare_projection_ensemble(
         provider_names=providers,
         nfl_schedule=nfl_schedule,
         player_nfl_team_ids=player_nfl_team_ids,
+        player_positions=positions,
+        ros_matchup_allocation=ros_matchup_allocation,
     )
     return _fuse_grid(state, weekly, positions, ensemble_config)
 

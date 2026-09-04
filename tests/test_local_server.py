@@ -1,6 +1,7 @@
 import http.client
 from io import BytesIO
 import json
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
 import time
@@ -75,8 +76,47 @@ class LocalServerTests(unittest.TestCase):
         status, _, body = self.request("GET", "/api/health")
         self.assertEqual(status, 200)
         self.assertEqual(
-            json.loads(body), {"status": "ready", "version": "0.2.0"}
+            json.loads(body), {"status": "ready", "version": "0.2.1"}
         )
+
+    def test_model_export_uses_a_short_lived_capability_not_the_app_token(self):
+        model_id = "draft_model_" + "a" * 64
+        model = Path(self.directory.name) / f"{model_id}.draftbrain.json"
+        model.write_bytes(b'{"portable":true}')
+        with patch.object(self.server.app_service.draft_lab, "model_path", return_value=model):
+            self.assertEqual(self.request(
+                "POST", f"/api/draft/models/{model_id}/export-ticket", token=False
+            )[0], 403)
+            status, _, raw = self.request(
+                "POST", f"/api/draft/models/{model_id}/export-ticket"
+            )
+            self.assertEqual(status, 201)
+            ticket = json.loads(raw)
+            url = ticket["url"]
+            self.assertGreaterEqual(ticket["expires_in_seconds"], 60)
+            self.assertEqual(ticket["saved_path"], str(model))
+            self.assertNotIn(self.server.app_token, url)
+            status, headers, raw = self.request("GET", url, token=False)
+        self.assertEqual(status, 200)
+        self.assertEqual(raw, b'{"portable":true}')
+        self.assertIn("attachment", headers["Content-Disposition"])
+        self.assertIn(model.name, headers["Content-Disposition"])
+        self.assertEqual(self.request("GET", "/api/draft/model-download/" + "x" * 43, token=False)[0], 404)
+
+    def test_model_reveal_is_authenticated_and_limited_to_a_saved_model(self):
+        model_id = "draft_model_" + "b" * 64
+        model = Path(self.directory.name) / f"{model_id}.draftbrain.json"
+        model.write_bytes(b'{"portable":true}')
+        route = f"/api/draft/models/{model_id}/reveal"
+        with (
+            patch.object(self.server.app_service.draft_lab, "model_path", return_value=model),
+            patch("trade_snapshot.local_server.reveal_file", return_value=True) as reveal,
+        ):
+            self.assertEqual(self.request("POST", route, token=False)[0], 403)
+            status, _, raw = self.request("POST", route)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw), {"opened": True, "saved_path": str(model)})
+        reveal.assert_called_once_with(model)
 
     def test_active_job_catalog_is_authenticated_and_read_only(self):
         status, _, raw = self.request("GET", "/api/activity")
@@ -438,6 +478,11 @@ class LocalServerTests(unittest.TestCase):
         )
         self.assertIn(b"Model estimate with limitations", body)
         self.assertIn(b"retained projection source artifacts", body)
+        self.assertIn(b"Current player projection audit", body)
+        self.assertIn(
+            b"rostered_players_missing_provider_current_projection", body
+        )
+        self.assertIn(b"Fetched reference rows and usable projections", body)
         self.assertIn(b"bundle.league_label", body)
         self.assertIn(b'<meta name="color-scheme" content="dark">', page)
         self.assertIn(b"Package contents", page)
@@ -821,7 +866,7 @@ class LocalServerTests(unittest.TestCase):
                 "pair_code": offer["pair_code"],
                 "protocol_version": 1,
                 "capabilities": list(V1_CAPABILITIES),
-                "extension_version": "0.1.0",
+                "extension_version": "0.2.1",
             },
         )
         self.assertEqual(status, 200)
@@ -847,6 +892,8 @@ class LocalServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         command = json.loads(raw)
         self.assertEqual(command["op"], "session.open")
+        self.assertIsInstance(command["expires_in_ms"], int)
+        self.assertGreater(command["expires_in_ms"], 0)
         status, _, _ = self.request(
             "POST",
             "/api/browser-extension/v1/result",

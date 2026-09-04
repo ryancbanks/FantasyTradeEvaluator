@@ -49,7 +49,11 @@ from .extension_bridge import (
 )
 
 
-_NAVIGATION_RESULT_DELIVERY_GRACE_MS = 5_000
+# The worker reserves this tail of every bridge command for serializing and
+# delivering its result.  Keep this value equal to RESULT_DELIVERY_GRACE_MS in
+# browser_extension/service_worker.js; the extension's minimum version gate
+# prevents pairing an older worker that does not honor the reservation.
+_RESULT_DELIVERY_GRACE_MS = 10_000
 
 
 class ExtensionCaptureBackend:
@@ -125,7 +129,7 @@ class _ExtensionSession:
             self._bridge,
             "session.navigate",
             {"url": url, "timeout_ms": timeout_ms},
-            timeout_ms + _NAVIGATION_RESULT_DELIVERY_GRACE_MS,
+            timeout_ms,
             cancelled,
             "browser extension navigation failed",
         )
@@ -437,7 +441,12 @@ def _execute(bridge, op, payload, timeout_ms, cancelled, failure_message):
     if type(timeout_ms) is not int or timeout_ms <= 0:
         raise BrowserCaptureTimeout("browser extension operation timed out")
     try:
-        return bridge.execute(op, payload, timeout_ms / 1000, cancelled)
+        return bridge.execute(
+            op,
+            payload,
+            (timeout_ms + _RESULT_DELIVERY_GRACE_MS) / 1000,
+            cancelled,
+        )
     except BridgeCancelledError:
         raise BrowserCaptureCancelled("browser capture was cancelled") from None
     except BridgeTimeoutError:

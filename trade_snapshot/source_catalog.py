@@ -83,12 +83,14 @@ def weekly_source_catalog(request: WeeklyCollectionRequest) -> dict[str, object]
         runtime = f"{_ESPN_PROJECTIONS}?leagueId={league_id}"
         espn_urls = [runtime, *EspnFreeReadClient.urls(request.season, league_id)]
         espn_note = (
-            "Required league rosters, rules, standings, schedule, and point projections. "
+            "Required league rosters, rules, standings, schedule, and one exact "
+            "current-season full-season projection table. "
             "Private leagues are read through the paired browser session when necessary."
         )
     else:
         espn_note = (
-            "Required host-league data and point projections. The league-specific URL "
+            "Required host-league data and one exact current-season full-season "
+            "projection table. The league-specific URL "
             "appears here after an ESPN league ID is pasted or discovered from FantasyPros."
         )
     if request.use_broad_consensus:
@@ -109,7 +111,8 @@ def weekly_source_catalog(request: WeeklyCollectionRequest) -> dict[str, object]
             "Yahoo",
             "required",
             yahoo_urls,
-            "Signed-in league projections and league scoring verification. Yahoo is "
+            "Signed-in current-season player projections and league scoring verification. "
+            "Position pages are traversed to their verified end before capture. Yahoo is "
             "a calculation input in both the core ensemble and broad consensus.",
         )
     )

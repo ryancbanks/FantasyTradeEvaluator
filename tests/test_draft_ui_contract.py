@@ -62,9 +62,11 @@ class DraftUiContractTests(unittest.TestCase):
 
     def test_starter_corpus_installer_is_transparent_resumable_and_job_backed(self):
         for disclosure in (
-            "Fantasy Football Calculator 12-team PPR ADP",
-            "nflverse under CC-BY-4.0",
-            "does not claim historical ESPN, Yahoo, or FantasyPros projections",
+            "Fantasy Football Calculator supplies preseason ADP and rank range",
+            "nflverse supplies weekly rosters, schedules, and stats under CC-BY-4.0",
+            "preceding regular season",
+            "per-game carry-forward point and detailed-stat projections",
+            "does not claim those local baselines are archived ESPN, Yahoo, or FantasyPros projections",
             "one fixed preseason bye",
             "player-season is excluded",
             "portable standard scoring rules",
@@ -77,6 +79,10 @@ class DraftUiContractTests(unittest.TestCase):
         self.assertIn("Incompatible", self.draft)
         self.assertIn("catalog.starter_corpus_installs", self.draft)
         self.assertIn("catalog.starter_corpus_install_state", self.draft)
+        self.assertIn("catalog.starter_corpus_transform_version", self.draft)
+        self.assertIn("your existing ADP-only corpus remains usable", self.draft)
+        self.assertIn("projected_player_seasons", self.draft)
+        self.assertIn("Player names, IDs, and NFL-team IDs are excluded", self.draft)
 
     def test_training_years_and_strategies_are_explicit_and_safe(self):
         for year in (*range(2015, 2020), *range(2021, 2026)):

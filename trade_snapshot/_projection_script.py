@@ -207,28 +207,68 @@ PROJECTION_PAGE_SCRIPT = r"""
   const fftodaySource = () => {
     const weekly = location.pathname === '/rankings/playerwkproj.php';
     const seasonPage = location.pathname === '/rankings/playerproj.php';
-    const positionById = {10: 'QB', 20: 'RB', 30: 'WR', 40: 'TE', 50: 'DL',
-      60: 'LB', 70: 'DB', 80: 'K'};
-    const scoringById = {1: 'STD', 193033: 'HALF', 107644: 'PPR'};
+    const positionById = {10: ['QB', 'QUARTERBACK'], 20: ['RB', 'RUNNING BACK'],
+      30: ['WR', 'WIDE RECEIVER'], 40: ['TE', 'TIGHT END'],
+      50: ['DL', 'DEFENSIVE LINEMAN'], 60: ['LB', 'LINEBACKER'],
+      70: ['DB', 'DEFENSIVE BACK'], 80: ['K', 'KICKER']};
+    const scoringById = {1: ['STD', 'FFTODAY STANDARD'],
+      193033: ['HALF', 'FFTODAY HALF PPR'], 107644: ['PPR', 'FFTODAY PPR']};
     const query = new URL(location.href).searchParams;
     const season = Number(query.get('Season'));
     const week = weekly ? Number(query.get('GameWeek')) : null;
-    const position = positionById[Number(query.get('PosID'))] || null;
-    const scoring = scoringById[Number(query.get('LeagueID'))] || null;
-    const pageText = clean(document.title + ' ' +
-      Array.from(document.querySelectorAll('h1, h2, .pagetitle, .bodycontent'))
-        .filter(visible).slice(0, 20).map((node) => node.innerText).join(' '));
-    const periodMatches = weekly
-      ? new RegExp(`\\b${request.season}\\s+WEEK\\s+${request.week}\\b`, 'i').test(pageText)
-      : new RegExp(`\\b${request.season}\\b`, 'i').test(pageText) &&
-        /\bREGULAR SEASON\b/i.test(pageText);
+    const positionDetail = positionById[Number(query.get('PosID'))] || null;
+    const scoringDetail = scoringById[Number(query.get('LeagueID'))] || null;
+    const position = positionDetail ? positionDetail[0] : null;
+    const scoring = scoringDetail ? scoringDetail[0] : null;
+    const coreKeys = weekly
+      ? ['LeagueID', 'PosID', 'Season', 'GameWeek']
+      : ['LeagueID', 'PosID', 'Season'];
+    const entries = Array.from(query.entries());
+    const extras = entries.filter(([key]) => !coreKeys.includes(key));
+    const exactQuery = coreKeys.every((key) => query.getAll(key).length === 1) &&
+      (extras.length === 0 || (
+        extras.length === 3 && query.getAll('cur_page').length === 1 &&
+        /^[1-9]\d*$/.test(query.get('cur_page') || '') &&
+        query.getAll('order_by').length === 1 && query.get('order_by') === 'FFPts' &&
+        query.getAll('sort_order').length === 1 && query.get('sort_order') === 'DESC'
+      ));
+    const expectedTitle = positionDetail
+      ? `${positionDetail[1]} PROJECTIONS ${request.season} ${weekly
+        ? `WEEK ${request.week}` : 'REGULAR SEASON'} FFTODAY`
+      : null;
+    const title = normalized(document.title).replace(/\bFF TODAY\b/g, 'FFTODAY');
+    const expectedHeader = positionDetail ? `${positionDetail[1]} PROJECTIONS` : null;
+    const pageHeaders = Array.from(document.querySelectorAll('.pageheader'))
+      .filter(visible).map((node) => normalized(node.innerText))
+      .filter((text) => text.includes('PROJECTIONS'));
+    const scoringControls = Array.from(document.querySelectorAll('select[name="LeagueID"]'))
+      .filter(visible);
+    const tableRows = Array.from(document.querySelectorAll('tr.tableclmhdr'))
+      .filter(visible);
+    const expectedPath = weekly ? '/rankings/playerwkproj.php' : '/rankings/playerproj.php';
+    const dimensionLinks = tableRows.length === 1
+      ? Array.from(tableRows[0].querySelectorAll('a[href]')).map((anchor) => {
+        try { return new URL(anchor.href); } catch (_) { return null; }
+      }).filter((url) => url && url.pathname === expectedPath &&
+        url.searchParams.has('order_by') && url.searchParams.has('sort_order'))
+      : [];
+    const tableMatches = dimensionLinks.length >= 2 && dimensionLinks.every((url) =>
+      coreKeys.every((key) => url.searchParams.getAll(key).length === 1 &&
+        url.searchParams.get(key) === query.get(key)));
     const supportedPositions = weekly
       ? ['QB', 'RB', 'WR', 'TE', 'K']
       : ['QB', 'RB', 'WR', 'TE', 'K', 'DL', 'LB', 'DB'];
     const exact = (weekly || seasonPage) && request.positions.length === 1 &&
-      supportedPositions.includes(position) &&
+      supportedPositions.includes(position) && exactQuery &&
       season === request.season && position === request.positions[0] &&
-      scoring === request.scoring && periodMatches &&
+      scoring === request.scoring && title === expectedTitle &&
+      pageHeaders.length === 1 &&
+      [expectedHeader, `${expectedHeader} ${request.season}`].includes(pageHeaders[0]) &&
+      scoringControls.length === 1 &&
+      scoringControls[0].value === query.get('LeagueID') &&
+      scoringControls[0].selectedOptions.length === 1 &&
+      normalized(scoringControls[0].selectedOptions[0].textContent) === scoringDetail?.[1] &&
+      tableRows.length === 1 && tableMatches &&
       ((request.horizon === 'weekly' && weekly && week === request.week) ||
        (request.horizon === 'ros' && seasonPage));
     return {
@@ -585,9 +625,16 @@ PROJECTION_PAGE_SCRIPT = r"""
   }
   const confirmedEmptyFantasyProsWeek = emptyFantasyProsCandidate &&
     Date.now() - globalThis.__fteProjectionEmpty.since >= 1500;
+  const invalidFFTodayDimensions = provider === 'fftoday' && (
+    source.season !== request.season || source.horizon !== request.horizon ||
+    source.scoring !== request.scoring || source.positions.length !== 1 ||
+    source.positions[0] !== request.positions[0]
+  );
   const availability = staleFantasyProsWeek || confirmedEmptyFantasyProsWeek
-    ? 'not_published' : tables.length ? 'available' : 'unavailable';
-  return {availability, source, tables: availability === 'not_published' ? [] : tables};
+    ? 'not_published' : invalidFFTodayDimensions ? 'unavailable' :
+      tables.length ? 'available' : 'unavailable';
+  return {availability, source,
+    tables: availability === 'not_published' || invalidFFTodayDimensions ? [] : tables};
 }
 """
 

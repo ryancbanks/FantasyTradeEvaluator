@@ -1,11 +1,17 @@
 import copy
+import json
 from tempfile import TemporaryDirectory
 import unittest
 
 from tests.test_draft_brain import components
 from tests.test_draft_history import historical_corpus
+from trade_snapshot._scenario_random import content_id
 from trade_snapshot.draft_brain import DraftBrain
 from trade_snapshot.draft_config import DraftLeagueConfig
+from trade_snapshot.draft_evaluation_policy import (
+    EVALUATION_POLICY_VERSION,
+    LEGACY_EVALUATION_POLICY_NOTICE,
+)
 from trade_snapshot.draft_persistence import DraftFileStore, DraftModelArtifact
 
 
@@ -33,7 +39,57 @@ class DraftPersistenceTests(unittest.TestCase):
             self.assertTrue(path.name.endswith(".draftbrain.json"))
             self.assertEqual(store.load_model(artifact.model_id), artifact)
             self.assertEqual(store.list_models()[0]["brain_id"], brain.brain_id)
+            self.assertEqual(
+                store.list_models()[0]["evaluation_policy_version"],
+                EVALUATION_POLICY_VERSION,
+            )
+            self.assertEqual(artifact.to_record()["schema_version"], 2)
             self.assertEqual(store.model_path(artifact.model_id), path.resolve())
+
+    def test_legacy_model_stays_visible_but_cannot_be_loaded_or_exported(self):
+        corpus = historical_corpus()
+        config = DraftLeagueConfig.standard_ppr(team_count=2)
+        schema, baseline = components()
+        brain = DraftBrain.zero_residual(schema, baseline, config.config_id)
+        artifact = DraftModelArtifact(
+            brain, config, corpus.corpus_id, (2025,), 1, {"fitness": 1},
+            "2026-09-02T12:00:00Z",
+        )
+        legacy = artifact.to_record()
+        legacy.pop("evaluation_policy_version")
+        legacy["schema_version"] = 1
+        legacy["model_id"] = content_id("draft_model", {
+            name: legacy[name]
+            for name in (
+                "brain", "league_config", "corpus_id", "trained_seasons",
+                "generation", "metrics", "created_at",
+            )
+        })
+
+        with TemporaryDirectory() as directory:
+            store = DraftFileStore(directory)
+            asset_path = store.model_directory / f"{legacy['model_id']}.draftbrain.json"
+            asset_path.write_text(json.dumps(legacy), encoding="utf-8")
+            summary = artifact.summary()
+            summary.pop("evaluation_policy_version")
+            summary["model_id"] = legacy["model_id"]
+            summary_path = store.model_directory / (
+                f"{legacy['model_id']}.draftbrain-summary.json"
+            )
+            summary_path.write_text(json.dumps({
+                "kind": "draft_model_summary", "schema_version": 1, **summary,
+            }), encoding="utf-8")
+
+            row = store.list_models()[0]
+            self.assertEqual(row["model_id"], legacy["model_id"])
+            self.assertEqual(row["status"], "invalid")
+            self.assertTrue(row["legacy"])
+            self.assertEqual(row["error"], LEGACY_EVALUATION_POLICY_NOTICE)
+            with self.assertRaisesRegex(ValueError, "Retrain"):
+                store.load_model(legacy["model_id"])
+            with self.assertRaisesRegex(ValueError, "Retrain"):
+                store.model_path(legacy["model_id"])
+            self.assertTrue(asset_path.is_file())
 
     def test_tampered_artifacts_and_unsafe_checkpoint_names_are_rejected(self):
         corpus = historical_corpus()
@@ -48,6 +104,10 @@ class DraftPersistenceTests(unittest.TestCase):
         changed["generation"] = 2
         with self.assertRaisesRegex(ValueError, "model_id"):
             DraftModelArtifact.from_record(changed)
+        float_schema = copy.deepcopy(artifact.to_record())
+        float_schema["schema_version"] = 2.0
+        with self.assertRaisesRegex(ValueError, "schema version"):
+            DraftModelArtifact.from_record(float_schema)
         with TemporaryDirectory() as directory:
             store = DraftFileStore(directory)
             with self.assertRaisesRegex(ValueError, "job ID"):
@@ -71,7 +131,26 @@ class DraftPersistenceTests(unittest.TestCase):
             self.assertEqual(rows[0]["checkpoint_job_id"], job_id)
             self.assertEqual(rows[0]["checkpoint_id"], checkpoint.checkpoint_id)
             self.assertEqual(rows[0]["generation_completed"], 1)
+            self.assertEqual(
+                rows[0]["evaluation_policy_version"], EVALUATION_POLICY_VERSION,
+            )
             self.assertNotIn("population", rows[0])
+
+            legacy = checkpoint.to_record()
+            legacy.pop("evaluation_policy_version")
+            legacy["schema_version"] = 2
+            legacy_job_id = "c" * 32
+            legacy_path = store.save_checkpoint(legacy_job_id, legacy)
+            legacy_row = next(
+                row for row in store.list_checkpoints()
+                if row["checkpoint_job_id"] == legacy_job_id
+            )
+            self.assertEqual(legacy_row["status"], "invalid")
+            self.assertTrue(legacy_row["legacy"])
+            self.assertEqual(
+                legacy_row["error"], LEGACY_EVALUATION_POLICY_NOTICE,
+            )
+            self.assertTrue(legacy_path.is_file())
 
     def test_catalog_rejects_dangling_summary_sidecars(self):
         corpus = historical_corpus()

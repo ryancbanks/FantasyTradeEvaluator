@@ -24,6 +24,8 @@ def configure_projection(
 ) -> None:
     request = projection_request(task)
     changes = 0
+    prior_content_fingerprint = None
+    content_change_providers = {"fftoday", "fantasysharks"}
     while True:
         if cancelled():
             from ._capture_errors import BrowserCaptureCancelled
@@ -35,11 +37,33 @@ def configure_projection(
             raise BrowserCaptureError("projection filter configuration failed") from None
         require_page()
         if not isinstance(result, Mapping) or result.get("action") not in {
-            "ready", "changed", "error"
+            "ready", "changed", "waiting", "error"
         }:
             raise BrowserCaptureError("projection filter configuration returned invalid data")
+        fingerprint = result.get("fingerprint")
+        if (
+            task.provider.value in content_change_providers
+            and result["action"] != "error"
+            and (
+                not isinstance(fingerprint, str)
+                or not fingerprint
+                or len(fingerprint) > 8192
+            )
+        ):
+            raise BrowserCaptureError("projection filter configuration returned invalid data")
+        if (
+            task.provider.value in content_change_providers
+            and result["action"] == "changed"
+            and not isinstance(result.get("require_change"), bool)
+        ):
+            raise BrowserCaptureError("projection filter configuration returned invalid data")
         if result["action"] == "ready":
-            return
+            if (
+                task.provider.value not in content_change_providers
+                or prior_content_fingerprint != fingerprint
+            ):
+                return
+            result = {"action": "waiting"}
         if result["action"] == "error":
             if task.provider.value == "yahoo":
                 dimension = result.get("dimension")
@@ -66,13 +90,20 @@ def configure_projection(
                     f"ESPN projections did not expose one verifiable {dimension} filter."
                 )
             raise BrowserCaptureError("projection filters were ambiguous")
-        changes += 1
-        if changes > 12:
-            if task.provider.value == "yahoo":
-                raise BrowserCaptureError(
-                    "Yahoo Player List did not finish applying the requested filters."
+        if result["action"] == "changed":
+            if task.provider.value in content_change_providers:
+                prior_content_fingerprint = (
+                    fingerprint if result["require_change"] else None
                 )
-            raise BrowserCaptureError("projection filters did not reach the requested state")
+            changes += 1
+            if changes > 12:
+                if task.provider.value == "yahoo":
+                    raise BrowserCaptureError(
+                        "Yahoo Player List did not finish applying the requested filters."
+                    )
+                raise BrowserCaptureError(
+                    "projection filters did not reach the requested state"
+                )
         wait(min(action_delay_ms, remaining_ms(deadline)), cancelled)
 
 

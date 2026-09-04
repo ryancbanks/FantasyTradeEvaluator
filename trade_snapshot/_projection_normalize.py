@@ -59,7 +59,7 @@ def projection_evidence_from_artifact(
         weeks = ()
     if (
         artifact.horizon is RankingHorizon.ROS
-        and artifact.provider.value in {"cbs", "fftoday"}
+        and artifact.provider.value in {"cbs", "espn", "fftoday"}
         and not isinstance(nfl_schedule, NflSchedule)
     ):
         raise ValueError(
@@ -230,7 +230,7 @@ def _projected_values(row, artifact, weeks, nfl_schedule):
             stats,
             RemainingSeasonOrigin.PROVIDER_PUBLISHED,
         )
-    if artifact.provider.value == "fftoday":
+    if artifact.provider.value in {"espn", "fftoday"}:
         if row.nfl_team_id == "FA":
             return None, {}, RemainingSeasonOrigin.DERIVED_FULL_SEASON
         active_games = _active_games(nfl_schedule, row.nfl_team_id, weeks)

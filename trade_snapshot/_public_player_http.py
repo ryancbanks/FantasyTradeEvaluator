@@ -140,7 +140,7 @@ def _request(url):
         url,
         headers={
             "Accept": "application/json,text/csv,application/gzip;q=0.9,*/*;q=0.1",
-            "User-Agent": "FantasyTradeEvaluator/0.2.0 public-weekly-data",
+            "User-Agent": "FantasyTradeEvaluator/0.2.1 public-weekly-data",
         },
         method="GET",
     )

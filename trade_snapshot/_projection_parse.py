@@ -23,6 +23,40 @@ _POINT_HEADER_TIERS = (
 )
 _POSITIONS = CANONICAL_PLAYER_POSITIONS
 _MISSING = {"", "-", "--", "—", "N/A", "NA"}
+_FANTASYPROS_DEFENSE_TEAMS = {
+    "arizona-defense": "ARI",
+    "atlanta-defense": "ATL",
+    "baltimore-defense": "BAL",
+    "buffalo-defense": "BUF",
+    "carolina-defense": "CAR",
+    "chicago-defense": "CHI",
+    "cincinnati-defense": "CIN",
+    "cleveland-defense": "CLE",
+    "dallas-defense": "DAL",
+    "denver-defense": "DEN",
+    "detroit-defense": "DET",
+    "green-bay-defense": "GB",
+    "houston-defense": "HOU",
+    "indianapolis-defense": "IND",
+    "jacksonville-defense": "JAX",
+    "kansas-city-defense": "KC",
+    "las-vegas-defense": "LV",
+    "los-angeles-chargers-defense": "LAC",
+    "los-angeles-rams-defense": "LAR",
+    "miami-defense": "MIA",
+    "minnesota-defense": "MIN",
+    "new-england-defense": "NE",
+    "new-orleans-defense": "NO",
+    "new-york-giants-defense": "NYG",
+    "new-york-jets-defense": "NYJ",
+    "philadelphia-defense": "PHI",
+    "pittsburgh-defense": "PIT",
+    "san-francisco-defense": "SF",
+    "seattle-defense": "SEA",
+    "tampa-bay-defense": "TB",
+    "tennessee-defense": "TEN",
+    "washington-defense": "WSH",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +122,11 @@ def projection_artifact_rows(
                 None if position_index is None else cells[position_index].text,
                 (
                     link_id
-                    if is_team_link and artifact.provider is CaptureProvider.CBS
+                    if is_team_link
+                    and artifact.provider in {
+                        CaptureProvider.CBS,
+                        CaptureProvider.FANTASYPROS,
+                    }
                     else None if team_index is None else cells[team_index].text
                 ),
                 artifact,
@@ -97,9 +135,14 @@ def projection_artifact_rows(
             if is_team_link:
                 if position != "DST" or team == "FA":
                     raise ValueError(
-                        "Yahoo team identity links are valid only for an NFL team defense"
+                        "team identity links are valid only for an NFL team defense"
                     )
                 provider_id = f"dst:{team}"
+            elif artifact.provider is CaptureProvider.ESPN and position == "DST":
+                # ESPN represents team defenses as negative player IDs (for
+                # example, -16034) even though a safe synthetic public detail
+                # link can encode only the unsigned numeric component.
+                provider_id = f"-{link_id}"
             else:
                 provider_id = link_id
             key = identity_provider, provider_id
@@ -243,7 +286,12 @@ def _provider_link(provider, link):
         pattern = patterns[provider]
         match = re.fullmatch(pattern, path, flags=re.IGNORECASE)
         if match is not None:
-            return identity_provider, match.group(1), False
+            provider_id = match.group(1).casefold()
+            if provider is CaptureProvider.FANTASYPROS:
+                defense_team = _FANTASYPROS_DEFENSE_TEAMS.get(provider_id)
+                if defense_team is not None:
+                    return identity_provider, defense_team, True
+            return identity_provider, provider_id, False
     if provider is CaptureProvider.YAHOO:
         team = re.fullmatch(
             r"^/nfl/teams/([a-z0-9]+(?:-[a-z0-9]+)*)/?$",

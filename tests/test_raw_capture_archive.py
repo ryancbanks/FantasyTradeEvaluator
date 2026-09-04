@@ -1,7 +1,9 @@
 import json
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from tests.test_production_collection import _league_artifact
 from trade_snapshot.capture_schema import (
@@ -99,6 +101,30 @@ class RawCaptureArchiveTests(unittest.TestCase):
                 ValueError, "credential-bearing"
             ):
                 _credential_free(value)
+
+    def test_atomic_staging_name_does_not_repeat_the_long_artifact_id(self):
+        projection_task, projection = _projection_capture()
+        replaced = []
+        real_replace = os.replace
+
+        def recording_replace(source, target):
+            replaced.append((Path(source), Path(target)))
+            real_replace(source, target)
+
+        with TemporaryDirectory() as directory, patch(
+            "trade_snapshot.raw_capture_archive.os.replace",
+            side_effect=recording_replace,
+        ):
+            archived = archive_public_captures(
+                Path(directory), ((projection_task, projection),)
+            )[0]
+
+        self.assertEqual(len(replaced), 1)
+        temporary, target = replaced[0]
+        self.assertEqual(target.name, archived.name)
+        self.assertEqual(temporary.suffix, ".tmp")
+        self.assertNotIn(projection.artifact_id, temporary.name)
+        self.assertLessEqual(len(temporary.name), 48)
 
 
 def _projection_capture() -> tuple[PageCaptureTask, GenericTableArtifact]:

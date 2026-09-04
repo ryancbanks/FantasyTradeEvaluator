@@ -17,6 +17,8 @@ let extensionPairing = false;
 let extensionPairAcknowledged = false;
 let extensionPairFailure = null;
 let extensionPairHint = null;
+let extensionDisconnectReason = null;
+let extensionStatusGeneration = 0;
 let threeTeamEstimateSignature = null;
 let searchRunning = false;
 let activeSearchFormat = "two_team";
@@ -40,7 +42,7 @@ let recoveredSearchScopeOnly = false;
 let sourceDebugTimer = null;
 const heartbeatInterval = 20000;
 const extensionProtocolVersion = 1;
-const minimumHistoryExtensionVersion = [0, 2, 0, 0];
+const minimumHistoryExtensionVersion = [0, 2, 1, 0];
 
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
@@ -84,6 +86,7 @@ window.addEventListener("message", event => {
   }
   if (value.type === "pair.accepted") {
     extensionPairAcknowledged = true;
+    extensionDisconnectReason = null;
     void refreshExtensionStatus();
     return;
   }
@@ -91,7 +94,11 @@ window.addEventListener("message", event => {
     extensionPairFailure = "The extension did not accept this connection. Try Connect extension again.";
     return;
   }
-  if (value.type === "session.closed") void refreshExtensionStatus();
+  if (value.type === "session.closed") {
+    extensionDisconnectReason = typeof value.reason === "string" &&
+      /^[a-z0-9_]{1,64}$/.test(value.reason) ? value.reason : "unknown_disconnect";
+    void refreshExtensionStatus();
+  }
 });
 
 function showError(error) {
@@ -306,7 +313,7 @@ function renderExtensionStatus(status) {
   let buttonText = "Connect extension";
   if (updateRequired) {
     statusText = `Browser extension update required${status.extension_version ? ` · ${status.extension_version}` : ""}`;
-    helpText = "Install the newly downloaded extension, click Reload for it on the browser’s Extensions page, refresh this app, then reconnect. Version 0.2.0 or newer is required to collect verified league history.";
+    helpText = "Install the newly downloaded extension, click Reload for it on the browser’s Extensions page, refresh this app, then reconnect. Version 0.2.1 or newer is required for reliable collection and verified league history.";
     buttonText = "Reconnect updated extension";
   } else if (extensionConnected) {
     statusText = `Browser extension connected${status.extension_version ? ` · ${status.extension_version}` : ""}`;
@@ -316,6 +323,20 @@ function renderExtensionStatus(status) {
     statusText = "Approve pairing in the extension…";
     helpText = "Open Chrome’s Extensions menu, choose Fantasy Trade Evaluator Browser Bridge, and click Pair with app.";
     buttonText = "Waiting for approval";
+  } else if (extensionDisconnectReason) {
+    const explanations = {
+      complete: "The previous scan finished and released its browser connection.",
+      cancelled: "The previous scan was cancelled.",
+      scan_tab_closed: "The temporary scan tab was closed before the scan finished.",
+      app_tab_closed: "The app tab used for pairing was closed.",
+      app_tab_origin_changed: "The app tab used for pairing navigated away from this app.",
+      invalid_command_response: "The installed extension rejected an app command. Reload the current extension before reconnecting.",
+      bridge_request_rejected: "The app rejected the extension session. This can happen after the app restarts.",
+      bridge_unreachable: "The extension could not reach the local app after retrying.",
+      result_delivery_failed: "The extension could not deliver the scan result to the local app."
+    };
+    helpText = `${explanations[extensionDisconnectReason] || "The browser connection ended."} ` +
+      `Connect extension to retry. Connection detail: ${extensionDisconnectReason}.`;
   }
   $("extensionDot").classList.toggle("connected", extensionConnected);
   $("extensionStatus").textContent = statusText;
@@ -332,12 +353,14 @@ function renderExtensionStatus(status) {
 }
 
 async function refreshExtensionStatus() {
+  const generation = ++extensionStatusGeneration;
   try {
     const status = await api("/api/browser-extension/status");
+    if (generation !== extensionStatusGeneration) return null;
     renderExtensionStatus(status);
     return status;
   } catch (_) {
-    renderExtensionStatus(null);
+    if (generation === extensionStatusGeneration) renderExtensionStatus(null);
     return null;
   }
 }
@@ -530,6 +553,83 @@ function appendTextElement(parent, tag, className, value) {
   return element;
 }
 
+function renderCurrentPlayerProjectionAudit(content, audit) {
+  if (!audit || typeof audit !== "object") return;
+  const card = appendTextElement(content, "article", "bundle-capability", "");
+  const heading = appendTextElement(card, "div", "bundle-capability-heading", "");
+  appendTextElement(heading, "h3", "", "Current player projection audit");
+  const complete = audit.status === "complete";
+  appendTextElement(
+    heading,
+    "span",
+    `bundle-capability-status status-${complete ? "ready-with-attested-scope" : "not-ready"}`,
+    complete ? "Complete for declared scope" : audit.status === "unavailable" ? "Reference unavailable" : "Incomplete"
+  );
+  const counts = audit.counts || {};
+  const positions = Array.isArray(audit.configured_positions)
+    ? audit.configured_positions.join(", ")
+    : "unknown";
+  appendTextElement(
+    card,
+    "p",
+    "bundle-readiness-overview",
+    `Sleeper active-player reference · scope ${positions} · ${Number(counts.reference_count || 0)} ` +
+      `in-scope identities, ${Number(counts.projected_count || 0)} with complete numeric ` +
+      `remaining-season projections, ${Number(counts.missing_count || 0)} missing, ` +
+      `${Number(counts.unmatched_count || 0)} unmatched, and ` +
+      `${Number(counts.unsupported_count || 0)} active rows outside the declared scope.`
+  );
+  appendTextElement(
+    card,
+    "p",
+    "bundle-capability-fallback",
+    audit.counting_policy || "Fetched reference rows and usable projections are counted separately."
+  );
+  const rows = Array.isArray(audit.coverage_rows)
+    ? audit.coverage_rows.filter(row => row && row.position === "ALL")
+    : [];
+  if (rows.length) {
+    const list = appendTextElement(card, "ul", "", "");
+    for (const row of rows) {
+      const horizon = row.horizon === "current_week" ? `week ${audit.current_week}` : "remaining season";
+      appendTextElement(
+        list,
+        "li",
+        "",
+        `${String(row.provider)} ${horizon}: ${Number(row.covered_count || 0)} of ` +
+          `${Number(row.reference_count || 0)} covered, ${Number(row.projected_count || 0)} ` +
+          `numeric, ${Number(row.missing_count || 0)} missing, ${Number(row.unmatched_count || 0)} unmatched.`
+      );
+    }
+  }
+  const rosterMissing = Array.isArray(audit.rostered_players_missing_current_projection)
+    ? audit.rostered_players_missing_current_projection
+    : [];
+  const providerMissing = Array.isArray(audit.rostered_players_missing_provider_current_projection)
+    ? audit.rostered_players_missing_provider_current_projection
+    : [];
+  appendTextElement(
+    card,
+    "p",
+    "bundle-readiness-overview",
+    rosterMissing.length
+      ? `Rostered players missing an ensemble projection for week ${audit.current_week}: ${rosterMissing.map(row => row.display_name).join(", ")}.`
+      : `All ${Number(audit.rostered_player_count || 0)} rostered players have an ensemble projection or verified bye for week ${audit.current_week}.`
+  );
+  if (providerMissing.length) {
+    appendTextElement(
+      card,
+      "p",
+      "bundle-capability-fallback",
+      `Rostered provider gaps: ${providerMissing.map(row => `${row.display_name} (${row.missing_providers.join(", ")})`).join("; ")}.`
+    );
+  }
+  if (Array.isArray(audit.limitations) && audit.limitations.length) {
+    const limitations = appendTextElement(card, "ul", "", "");
+    for (const note of audit.limitations) appendTextElement(limitations, "li", "", note);
+  }
+}
+
 function renderBundleDataReadiness(bundle) {
   const panel = $("bundleDataReadiness");
   const content = $("bundleDataReadinessContent");
@@ -573,6 +673,10 @@ function renderBundleDataReadiness(bundle) {
       `Source scoring: ${sourceFormats}; ${Number(projectionSources.provider_total_sources || 0)} ` +
       `provider-total/base-format sources and ` +
       `${Number(projectionSources.locally_recomputed_sources || 0)} locally recomputed sources.`
+  );
+  renderCurrentPlayerProjectionAudit(
+    content,
+    coverage.current_player_projection_audit
   );
 
   const grid = appendTextElement(content, "div", "bundle-capability-grid", "");

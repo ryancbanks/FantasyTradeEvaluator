@@ -151,7 +151,7 @@ def _read_public(url: str, *, maximum: int, timeout: float, expected_url: str) -
         url,
         headers={
             "Accept": "text/html,application/javascript;q=0.9,*/*;q=0.1",
-            "User-Agent": "FantasyTradeEvaluator/0.2.0 public-methodology-fingerprint",
+            "User-Agent": "FantasyTradeEvaluator/0.2.1 public-methodology-fingerprint",
         },
         method="GET",
     )

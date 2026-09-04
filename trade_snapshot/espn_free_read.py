@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Mapping
 import json
+from math import isfinite
 from time import monotonic
 from urllib.error import HTTPError
 from urllib.parse import urlencode
@@ -14,8 +15,16 @@ from .espn_payload_projection import (
 
 
 _READ_ROOT = "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl"
+_PRESEASON_TRANSACTION_PERIOD = 0
+_TRANSACTION_LIMIT = 1000
+_MAXIMUM_SAFE_JSON_INTEGER = (1 << 53) - 1
 _TRANSACTION_FILTER = json.dumps(
-    {"transactions": {"limit": 1000}},
+    {
+        "transactions": {
+            "limit": _TRANSACTION_LIMIT,
+            "sortProcessDate": {"sortPriority": 1, "sortAsc": False},
+        }
+    },
     separators=(",", ":"),
 )
 
@@ -41,9 +50,9 @@ class EspnFreeReadClient:
         if (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
-            or not 1 <= timeout_seconds <= 30
+            or not 1 <= timeout_seconds <= 60
         ):
-            raise ValueError("timeout_seconds must be from 1 through 30")
+            raise ValueError("timeout_seconds must be from 1 through 60")
         if type(maximum_bytes) is not int or not 1024 <= maximum_bytes <= 64 * 1024 * 1024:
             raise ValueError("maximum_bytes must be from 1024 through 67108864")
         if opener is not None and not callable(opener):
@@ -56,28 +65,57 @@ class EspnFreeReadClient:
         self, season: int, league_id: str, cancelled: Callable[[], bool]
     ) -> tuple[Mapping[str, object], Mapping[str, object]]:
         league_url, pro_team_url = self.urls(season, league_id)
+        deadline = monotonic() + self._timeout
+        remaining_bytes = [self._maximum]
         _check_cancelled(cancelled)
         league = project_espn_league_payload(
-            self._read(
-                league_url,
-                cancelled,
-                extra_headers={"X-Fantasy-Filter": _TRANSACTION_FILTER},
-            )
+            self._read(league_url, cancelled, deadline, remaining_bytes)
         )
+        transactions, transaction_evidence = self._read_transactions(
+            season,
+            league_id,
+            cancelled,
+            deadline,
+            remaining_bytes,
+        )
+        if transaction_evidence:
+            league["transactions"] = transactions
+        else:
+            league.pop("transactions", None)
         _check_cancelled(cancelled)
         pro_teams = project_espn_pro_team_payload(
-            self._read(pro_team_url, cancelled)
+            self._read(pro_team_url, cancelled, deadline, remaining_bytes)
         )
         _check_cancelled(cancelled)
         return league, pro_teams
 
     @classmethod
     def urls(cls, season: int, league_id: str) -> tuple[str, str]:
-        """Return the only two allowlisted JSON URLs used by a refresh."""
+        """Return the base-league and NFL schedule URLs used by a refresh."""
 
         _season(season)
         _provider_id(league_id)
         return cls._league_url(season, league_id), cls._pro_team_url(season)
+
+    @classmethod
+    def transaction_urls(cls, season: int, league_id: str) -> tuple[str, ...]:
+        """Return the preseason and current transaction snapshot URLs."""
+
+        _season(season)
+        _provider_id(league_id)
+        return (
+            cls._transaction_url(
+                season, league_id, period=_PRESEASON_TRANSACTION_PERIOD
+            ),
+            cls._transaction_url(season, league_id),
+        )
+
+    @classmethod
+    def all_urls(cls, season: int, league_id: str) -> tuple[str, ...]:
+        """Return the complete authenticated-read URL allowlist."""
+
+        league_url, pro_team_url = cls.urls(season, league_id)
+        return (league_url, *cls.transaction_urls(season, league_id), pro_team_url)
 
     @classmethod
     def draft_url(cls, season: int, league_id: str) -> str:
@@ -109,7 +147,7 @@ class EspnFreeReadClient:
             "mSettings",
             "mMatchup",
             "mStandings",
-            "mTransactions2",
+            "mStatus",
         )
         query = urlencode(tuple(("view", view) for view in views))
         return f"{_READ_ROOT}/seasons/{season}/segments/0/leagues/{league_id}?{query}"
@@ -118,16 +156,94 @@ class EspnFreeReadClient:
     def _pro_team_url(season: int) -> str:
         return f"{_READ_ROOT}/seasons/{season}?view=proTeamSchedules_wl"
 
+    @staticmethod
+    def _transaction_url(
+        season: int, league_id: str, *, period: int | None = None
+    ) -> str:
+        parameters = [("view", "mTransactions2")]
+        if period is not None:
+            parameters.append(("scoringPeriodId", str(period)))
+        query = urlencode(parameters)
+        return f"{_READ_ROOT}/seasons/{season}/segments/0/leagues/{league_id}?{query}"
+
+    def _read_transactions(
+        self,
+        season,
+        league_id,
+        cancelled,
+        deadline,
+        remaining_bytes,
+    ) -> tuple[list[object], bool]:
+        by_id: dict[str, tuple[dict[str, object], object]] = {}
+        complete_evidence = True
+        for expected_period, url in zip(
+            (_PRESEASON_TRANSACTION_PERIOD, None),
+            self.transaction_urls(season, league_id),
+            strict=True,
+        ):
+            payload = self._read(
+                url,
+                cancelled,
+                deadline,
+                remaining_bytes,
+                extra_headers={"X-Fantasy-Filter": _TRANSACTION_FILTER},
+            )
+            _validate_transaction_payload(
+                payload, season, league_id, expected_period
+            )
+            if "transactions" not in payload:
+                complete_evidence = False
+                continue
+            raw_rows = payload["transactions"]
+            if not isinstance(raw_rows, list) or len(raw_rows) > _TRANSACTION_LIMIT:
+                raise EspnFreeReadError("ESPN returned invalid transaction data")
+            if len(raw_rows) == _TRANSACTION_LIMIT:
+                complete_evidence = False
+            projected = project_espn_league_payload(
+                {"transactions": raw_rows}
+            ).get("transactions", [])
+            source_ids = set()
+            for row in projected:
+                transaction_id = _transaction_id(row)
+                if transaction_id in source_ids:
+                    raise EspnFreeReadError(
+                        "ESPN returned duplicate transaction data"
+                    )
+                source_ids.add(transaction_id)
+                fingerprint = _json_fingerprint(row)
+                previous = by_id.get(transaction_id)
+                if previous is not None and previous[1] != fingerprint:
+                    raise EspnFreeReadError(
+                        "ESPN returned conflicting transaction data"
+                    )
+                by_id[transaction_id] = (row, fingerprint)
+        ordered = sorted(
+            (entry[0] for entry in by_id.values()), key=_transaction_sort_key
+        )
+        return ordered[:_TRANSACTION_LIMIT], complete_evidence
+
     def _read(
         self,
         expected_url: str,
         cancelled,
+        deadline: float | None = None,
+        remaining_bytes: list[int] | None = None,
         *,
         extra_headers: Mapping[str, str] | None = None,
     ) -> Mapping[str, object]:
+        if deadline is None:
+            timeout = self._timeout
+            deadline = monotonic() + timeout
+        else:
+            timeout = deadline - monotonic()
+        if timeout <= 0:
+            raise EspnFreeReadError("ESPN read exceeded the time limit")
+        available = self._maximum if remaining_bytes is None else remaining_bytes[0]
+        if available <= 0:
+            raise EspnFreeReadError("ESPN responses exceeded the size limit")
         headers = {
             "Accept": "application/json",
-            "User-Agent": "fantasy-trade-evaluator/0.2.0",
+            "User-Agent": "fantasy-trade-evaluator/0.2.1",
         }
         if extra_headers is not None:
             headers.update(extra_headers)
@@ -137,7 +253,7 @@ class EspnFreeReadClient:
             method="GET",
         )
         try:
-            with self._opener(request, timeout=self._timeout) as response:
+            with self._opener(request, timeout=timeout) as response:
                 status = getattr(response, "status", 200)
                 if response.geturl() != expected_url:
                     raise EspnFreeReadError("ESPN returned an unexpected read response")
@@ -152,11 +268,13 @@ class EspnFreeReadClient:
                 if media_type != "application/json" or headers.get("Content-Encoding"):
                     raise EspnFreeReadError("ESPN returned an unsupported response format")
                 declared = headers.get("Content-Length")
-                if declared is not None and _content_length(declared) > self._maximum:
+                if declared is not None and _content_length(declared) > available:
                     raise EspnFreeReadError("ESPN response exceeded the size limit")
                 body = _bounded_body(
-                    response, self._maximum, self._timeout, cancelled
+                    response, available, deadline, cancelled
                 )
+                if monotonic() > deadline:
+                    raise EspnFreeReadError("ESPN response exceeded the time limit")
         except EspnFreeReadError:
             raise
         except HTTPError as error:
@@ -167,8 +285,10 @@ class EspnFreeReadClient:
             raise EspnFreeReadError("ESPN league data could not be read") from None
         except Exception:
             raise EspnFreeReadError("ESPN league data could not be read") from None
-        if not body or len(body) > self._maximum:
+        if not body or len(body) > available:
             raise EspnFreeReadError("ESPN response had an invalid size")
+        if remaining_bytes is not None:
+            remaining_bytes[0] -= len(body)
         try:
             value = json.loads(
                 body.decode("utf-8"),
@@ -182,6 +302,91 @@ class EspnFreeReadClient:
         return value
 
 
+def _validate_transaction_payload(payload, season, league_id, expected_period):
+    payload_league_id = payload.get("id")
+    if (
+        isinstance(payload_league_id, bool)
+        or not isinstance(payload_league_id, (str, int))
+        or (
+            isinstance(payload_league_id, int)
+            and abs(payload_league_id) > _MAXIMUM_SAFE_JSON_INTEGER
+        )
+        or str(payload_league_id) != league_id
+        or payload.get("seasonId") != season
+        or (
+            expected_period is not None
+            and (
+                isinstance(payload.get("scoringPeriodId"), bool)
+                or payload.get("scoringPeriodId") != expected_period
+            )
+        )
+    ):
+        raise EspnFreeReadError("ESPN transaction data did not match the request")
+
+
+def _transaction_id(row):
+    if not isinstance(row, Mapping):
+        raise EspnFreeReadError("ESPN returned invalid transaction data")
+    value = row.get("id")
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise EspnFreeReadError("ESPN returned invalid transaction data")
+    if isinstance(value, int) and abs(value) > _MAXIMUM_SAFE_JSON_INTEGER:
+        raise EspnFreeReadError("ESPN returned invalid transaction data")
+    text = str(value)
+    if (
+        not 1 <= len(text) <= 128
+        or not text.isascii()
+        or not any(character.isalnum() for character in text)
+        or any(not (character.isalnum() or character in "-_") for character in text)
+        or (
+            (text.isdigit() or (text.startswith("-") and text[1:].isdigit()))
+            and int(text) <= 0
+        )
+    ):
+        raise EspnFreeReadError("ESPN returned invalid transaction data")
+    return text
+
+
+def _transaction_sort_key(row):
+    processed = _date_value(row.get("processDate"))
+    proposed = _date_value(row.get("proposedDate"))
+    return (
+        processed is None,
+        0 if processed is None else -processed,
+        proposed is None,
+        0 if proposed is None else -proposed,
+        _transaction_id(row),
+    )
+
+
+def _json_fingerprint(value):
+    if value is None:
+        return ("null",)
+    if isinstance(value, bool):
+        return ("boolean", value)
+    if isinstance(value, (int, float)):
+        return ("number", value)
+    if isinstance(value, str):
+        return ("string", value)
+    if isinstance(value, list):
+        return ("array", tuple(_json_fingerprint(item) for item in value))
+    if isinstance(value, Mapping):
+        return (
+            "object",
+            tuple(
+                (key, _json_fingerprint(item))
+                for key, item in sorted(value.items())
+            ),
+        )
+    raise EspnFreeReadError("ESPN returned invalid transaction data")
+
+
+def _date_value(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
+        return None
+    return float(value)
+
+
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, request, file_pointer, code, message, headers, new_url):
         return None
@@ -191,11 +396,10 @@ def _open_without_redirects(request, *, timeout):
     return build_opener(_NoRedirect()).open(request, timeout=timeout)
 
 
-def _bounded_body(response, maximum, timeout, cancelled):
+def _bounded_body(response, maximum, deadline, cancelled):
     read_once = getattr(response, "read1", None)
     if not callable(read_once):
         return response.read(maximum + 1)
-    deadline = monotonic() + timeout
     chunks, size = [], 0
     while size <= maximum:
         _check_cancelled(cancelled)

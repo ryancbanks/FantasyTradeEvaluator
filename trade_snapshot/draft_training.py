@@ -10,6 +10,11 @@ from types import MappingProxyType
 from ._scenario_random import SAFE_INTEGER, canonical_json, content_id
 from .draft_brain import DraftBrain, crossover_and_mutate, initialize_genome
 from .draft_config import DraftLeagueConfig, DraftStrategy
+from .draft_evaluation_policy import (
+    EVALUATION_POLICY_VERSION,
+    LEGACY_EVALUATION_POLICY_NOTICE,
+    is_current_evaluation_policy,
+)
 from .draft_features import build_baseline_brain, fit_feature_schema
 from .draft_history import HistoricalCorpus
 from .draft_history import ActualWeekStatus
@@ -78,7 +83,9 @@ class EvolutionConfig:
             "candidate_window", "training_years", "seed",
         }
         _record(record, content | {"kind", "schema_version", "config_id"}, "evolution config")
-        if record["kind"] != "draft_evolution_config" or record["schema_version"] != 1:
+        if record["kind"] != "draft_evolution_config" or not _is_schema_version(
+            record["schema_version"], 1
+        ):
             raise ValueError("evolution config kind or version is invalid")
         if not isinstance(record["training_years"], list):
             raise ValueError("training_years must be a JSON array")
@@ -208,6 +215,7 @@ class TrainingCheckpoint:
     def _content(self):
         reference = self.population[0]
         return {
+            "evaluation_policy_version": EVALUATION_POLICY_VERSION,
             "corpus_id": self.corpus_id,
             "league_config": self.league_config.to_record(),
             "evolution_config": self.evolution_config.to_record(),
@@ -223,7 +231,7 @@ class TrainingCheckpoint:
         }
 
     def to_record(self):
-        return {"kind": "draft_training_checkpoint", "schema_version": 2,
+        return {"kind": "draft_training_checkpoint", "schema_version": 3,
                 **self._content(), "checkpoint_id": self.checkpoint_id}
 
     @classmethod
@@ -232,17 +240,20 @@ class TrainingCheckpoint:
             raise ValueError("checkpoint record fields are invalid")
         if record.get("kind") != "draft_training_checkpoint":
             raise ValueError("checkpoint kind or version is invalid")
-        if record.get("schema_version") == 1:
-            return cls._from_legacy_record(record)
-        if record.get("schema_version") != 2:
+        if any(_is_schema_version(record.get("schema_version"), version) for version in (1, 2)):
+            raise ValueError(LEGACY_EVALUATION_POLICY_NOTICE)
+        if not _is_schema_version(record.get("schema_version"), 3):
             raise ValueError("checkpoint kind or version is invalid")
         content = {
+            "evaluation_policy_version",
             "corpus_id", "league_config", "evolution_config", "generation_completed",
             "feature_schema", "regression_baseline", "league_config_fingerprint",
             "population_genomes", "champion_genome", "champion_performance",
             "history", "showcase",
         }
         _record(record, content | {"kind", "schema_version", "checkpoint_id"}, "checkpoint")
+        if not is_current_evaluation_policy(record["evaluation_policy_version"]):
+            raise ValueError("checkpoint evaluation policy is invalid")
         for name in (
             "league_config", "evolution_config", "feature_schema",
             "regression_baseline", "champion_genome", "champion_performance", "showcase",
@@ -273,44 +284,17 @@ class TrainingCheckpoint:
             raise ValueError("checkpoint content does not match checkpoint_id")
         return result
 
-    @classmethod
-    def _from_legacy_record(cls, record):
-        content = {
-            "corpus_id", "league_config", "evolution_config", "generation_completed",
-            "population", "champion", "champion_performance", "history", "showcase",
-        }
-        _record(record, content | {"kind", "schema_version", "checkpoint_id"}, "checkpoint")
-        legacy_content = {key: record[key] for key in content}
-        if record["checkpoint_id"] != content_id("draft_checkpoint", legacy_content):
-            raise ValueError("checkpoint content does not match checkpoint_id")
-        for name in (
-            "league_config", "evolution_config", "champion",
-            "champion_performance", "showcase",
-        ):
-            if not isinstance(record[name], Mapping):
-                raise ValueError(f"checkpoint {name} must be an object")
-        if not isinstance(record["population"], list) or not isinstance(record["history"], list):
-            raise ValueError("checkpoint population and history must be arrays")
-        return cls(
-            record["corpus_id"], DraftLeagueConfig.from_record(record["league_config"]),
-            EvolutionConfig.from_record(record["evolution_config"]),
-            record["generation_completed"],
-            tuple(DraftBrain.from_record(row) for row in record["population"]),
-            DraftBrain.from_record(record["champion"]),
-            _performance_from_record(record["champion_performance"]),
-            tuple(_summary_from_record(row) for row in record["history"]),
-            record["showcase"],
-        )
-
 
 def training_estimate(corpus, config, evolution):
     seasons = _validate_training_inputs(corpus, config, evolution)
-    competitive_leagues_per_season = (
+    cohorts_per_season = (
         math.ceil(evolution.population_size / config.team_count)
         * evolution.appearances_per_generation
     )
-    # Every competitive arena has a same-seat, same-seed all-baseline control.
-    leagues_per_season = competitive_leagues_per_season * 2
+    # One same-seed all-baseline control supplies every seat in a cohort sweep.
+    candidate_leagues_per_season = cohorts_per_season * config.team_count
+    control_leagues_per_season = cohorts_per_season
+    leagues_per_season = candidate_leagues_per_season + control_leagues_per_season
     leagues_per_generation = leagues_per_season * len(evolution.training_years)
     picks = config.team_count * config.roster_size
     candidates = evolution.candidate_window or max(len(row.players) for row in seasons)
@@ -330,6 +314,9 @@ def training_estimate(corpus, config, evolution):
     )
     return {
         "training_season_count": len(evolution.training_years),
+        "draft_positions_per_sweep": config.team_count,
+        "candidate_leagues_per_season": candidate_leagues_per_season,
+        "control_leagues_per_season": control_leagues_per_season,
         "leagues_per_season": leagues_per_season,
         "leagues_per_generation": leagues_per_generation,
         "total_leagues": total_leagues,
@@ -338,6 +325,7 @@ def training_estimate(corpus, config, evolution):
             * evolution.appearances_per_generation
             * len(evolution.training_years)
             * evolution.generations
+            * config.team_count
         ),
         "ranked_picks_estimate": ranked_picks,
         "candidate_scores_estimate": ranked_picks * candidates,
@@ -427,92 +415,75 @@ def _evaluate_population(
     strategy_scores = {strategy.value: {} for strategy in DraftStrategy}
     showcase = None
     arena_count = 0
-    indices = list(range(len(population)))
     group_count = math.ceil(len(population) / config.team_count)
-    rotation_step = _coprime_rotation_step(len(indices))
     expected_arenas = (
         group_count
         * evolution.appearances_per_generation
         * len(scoring_contexts)
-        * 2
+        * (config.team_count + 1)
     )
-    for appearance in range(evolution.appearances_per_generation):
-        for season_index, scoring_context in enumerate(scoring_contexts):
-            season = scoring_context.season
-            simulation_cache = simulation_caches[season_index]
-            # A step coprime to every population size visits distinct seats
-            # instead of aliasing at sizes such as 31.
-            exposure = (
-                (generation - 1)
-                * evolution.appearances_per_generation
-                * len(scoring_contexts)
-                + appearance * len(scoring_contexts)
-                + season_index
+    arenas = _seat_sweep_arenas(
+        len(population), config.team_count, evolution.appearances_per_generation,
+        len(scoring_contexts), generation,
+    )
+    control_by_team = None
+    for appearance, season_index, group_index, seat_rotation, entries in arenas:
+        if should_cancel():
+            raise InterruptedError("draft brain training was cancelled")
+        scoring_context = scoring_contexts[season_index]
+        season = scoring_context.season
+        simulation_cache = simulation_caches[season_index]
+        arena_seed = (
+            evolution.seed
+            + generation * 1_000_003
+            + appearance * 10_007
+            + season_index * 101
+            + group_index
+        )
+        if seat_rotation == 0:
+            control_draft = simulate_snake_draft(
+                season, config, (baseline,) * config.team_count,
+                seed=arena_seed,
+                candidate_window=evolution.candidate_window,
+                should_cancel=should_cancel,
+                _simulation_cache=simulation_cache,
             )
-            offset = exposure * rotation_step % len(indices)
-            ordered = indices[offset:] + indices[:offset]
-            for group_index in range(group_count):
-                if should_cancel():
-                    raise InterruptedError("draft brain training was cancelled")
-                members = ordered[
-                    group_index * config.team_count:(group_index + 1) * config.team_count
-                ]
-                scored_count = len(members)
-                # A partial final cohort borrows cyclic population members as
-                # opponents. Borrowed seats are not scored twice; this avoids
-                # giving only the remainder cohort easier baseline opponents.
-                seats = members + [
-                    ordered[index % len(ordered)]
-                    for index in range(config.team_count - scored_count)
-                ]
-                arena_seed = (
-                    evolution.seed
-                    + generation * 1_000_003
-                    + appearance * 10_007
-                    + season_index * 101
-                    + group_index
-                )
-                brains = tuple(population[index] for index in seats)
-                draft = simulate_snake_draft(
-                    season, config, brains, seed=arena_seed,
-                    candidate_window=evolution.candidate_window, should_cancel=should_cancel,
-                    _simulation_cache=simulation_cache,
-                )
-                trace = simulate_historical_season(
-                    draft.rosters, season, config, _prepared=scoring_context
-                )
-                control_draft = simulate_snake_draft(
-                    season, config, (baseline,) * config.team_count,
-                    seed=arena_seed,
-                    candidate_window=evolution.candidate_window,
-                    should_cancel=should_cancel,
-                    _simulation_cache=simulation_cache,
-                )
-                control_trace = simulate_historical_season(
-                    control_draft.rosters, season, config,
-                    _prepared=scoring_context,
-                )
-                arena_count += 2
-                by_team = _arena_team_scores(trace, config)
-                control_by_team = _arena_team_scores(control_trace, config)
-                for seat, index in enumerate(seats[:scored_count]):
-                    standing, points_pct, raw_fitness = by_team[
-                        f"drafter-{seat + 1}"
-                    ]
-                    control_fitness = control_by_team[standing.team_id][2]
-                    champion = int(standing.team_id == trace.champion_team_id)
-                    fitness = raw_fitness - control_fitness
-                    total = totals[index]
-                    total[0] += fitness; total[1] += 1; total[2] += champion
-                    total[3] += int(standing.made_playoffs)
-                    total[4] += standing.finish_rank
-                    total[5] += points_pct
-                    strategy = draft.strategies[seat].value
-                    strategy_scores[strategy].setdefault(index, []).append(fitness)
-                    if showcase is None or fitness > showcase[0]:
-                        showcase = (fitness, draft, trace, index, seat, season)
-                if on_arena is not None:
-                    on_arena(generation, arena_count, expected_arenas)
+            control_trace = simulate_historical_season(
+                control_draft.rosters, season, config, _prepared=scoring_context,
+            )
+            control_by_team = _arena_team_scores(control_trace, config)
+            arena_count += 1
+        brains = tuple(population[index] for index, _ in entries)
+        draft = simulate_snake_draft(
+            season, config, brains, seed=arena_seed,
+            candidate_window=evolution.candidate_window, should_cancel=should_cancel,
+            _simulation_cache=simulation_cache,
+        )
+        trace = simulate_historical_season(
+            draft.rosters, season, config, _prepared=scoring_context
+        )
+        arena_count += 1
+        by_team = _arena_team_scores(trace, config)
+        assert control_by_team is not None
+        for seat, (index, scored) in enumerate(entries):
+            if not scored:
+                continue
+            team_id = f"drafter-{seat + 1}"
+            standing, points_pct, raw_fitness = by_team[team_id]
+            control_fitness = control_by_team[team_id][2]
+            champion = int(team_id == trace.champion_team_id)
+            fitness = raw_fitness - control_fitness
+            total = totals[index]
+            total[0] += fitness; total[1] += 1; total[2] += champion
+            total[3] += int(standing.made_playoffs)
+            total[4] += standing.finish_rank
+            total[5] += points_pct
+            strategy = draft.strategies[seat].value
+            strategy_scores[strategy].setdefault(index, []).append(fitness)
+            if showcase is None or fitness > showcase[0]:
+                showcase = (fitness, draft, trace, index, seat, season)
+        if on_arena is not None:
+            on_arena(generation, arena_count, expected_arenas)
     performances = tuple(_aggregate_performance(row) for row in totals)
     ranked = sorted(range(len(population)), key=lambda i: (-performances[i].fitness, population[i].brain_id))
     champion_index = ranked[0]
@@ -535,6 +506,37 @@ def _evaluate_population(
     )
     assert showcase is not None
     return performances, summary, _showcase_record(*showcase[1:])
+
+
+def _seat_sweep_arenas(
+    population_size, team_count, appearance_count, season_count, generation
+):
+    """Yield rotated ``(genome index, is scored)`` entries for every arena."""
+    indices = list(range(population_size))
+    group_count = math.ceil(population_size / team_count)
+    rotation_step = _coprime_rotation_step(population_size)
+    for appearance in range(appearance_count):
+        for season_index in range(season_count):
+            # This offset varies opponents between sweeps without aliasing at
+            # population sizes such as 31. The inner rotation visits all seats.
+            exposure = (
+                (generation - 1) * appearance_count * season_count
+                + appearance * season_count
+                + season_index
+            )
+            offset = exposure * rotation_step % population_size
+            ordered = indices[offset:] + indices[:offset]
+            for group_index in range(group_count):
+                members = ordered[
+                    group_index * team_count:(group_index + 1) * team_count
+                ]
+                entries = tuple((index, True) for index in members) + tuple(
+                    (ordered[index % population_size], False)
+                    for index in range(team_count - len(members))
+                )
+                for seat_rotation in range(team_count):
+                    rotated = entries[seat_rotation:] + entries[:seat_rotation]
+                    yield appearance, season_index, group_index, seat_rotation, rotated
 
 
 def _aggregate_performance(values):
@@ -761,6 +763,10 @@ def _freeze_json(value):
     if isinstance(value, list):
         return tuple(_freeze_json(child) for child in value)
     return value
+
+
+def _is_schema_version(value, expected):
+    return type(value) is int and value == expected
 
 
 def _thaw_json(value):

@@ -601,7 +601,7 @@ class EspnActivityCaptureTests(unittest.TestCase):
         valid = transaction(1, "WAIVER", [item(303, 0, 1)])
         mutations = []
         missing = deepcopy(valid)
-        missing.pop("status")
+        missing.pop("type")
         mutations.append(missing)
         extra = deepcopy(valid)
         extra["unexpected"] = True
@@ -639,6 +639,18 @@ class EspnActivityCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "multiple current rosters"):
             espn_activity_capture(duplicate_player, captured_at=NOW)
 
+    def test_missing_status_is_retained_as_a_nonexecuted_activity_attempt(self):
+        row = transaction(19, "TRADE_ACCEPT", [])
+        row.pop("status")
+
+        capture = espn_activity_capture(league_payload([row]), captured_at=NOW)
+
+        self.assertEqual(capture.transactions, ())
+        self.assertEqual(
+            capture.skipped_transactions,
+            (EspnActivitySkipCount(EspnActivitySkipReason.NOT_EXECUTED, 1),),
+        )
+
     def test_packaged_authenticated_reader_requests_transactions_in_existing_read(self):
         source = (
             ROOT / "trade_snapshot" / "browser_extension" / "collectors" / "espn_main.js"
@@ -647,7 +659,14 @@ class EspnActivityCaptureTests(unittest.TestCase):
         self.assertIn('"mTransactions2"', source)
         self.assertIn('"X-Fantasy-Filter"', source)
         self.assertIn("limit: 1000", source)
-        self.assertEqual(source.count("await readJson("), 2)
+        self.assertIn(
+            "sortProcessDate: {sortPriority: 1, sortAsc: false}", source
+        )
+        self.assertIn("for (const expectedPeriod of [0, null])", source)
+        self.assertIn("if (merged.completeEvidence)", source)
+        self.assertIn("response.body.getReader()", source)
+        self.assertIn("const budget = {remaining: options.maximum_bytes}", source)
+        self.assertEqual(source.count("await readJson("), 3)
 
 
 if __name__ == "__main__":

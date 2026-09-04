@@ -28,14 +28,17 @@ from .draft_benchmark import compare_to_regression_baseline
 from .draft_config import (
     DraftLeagueConfig,
     DraftStrategy,
+    ZERO_POINT_RULE_FIELDS,
     config_from_engine_bundle,
 )
 from .draft_corpus_install import CorpusInstallCancelled, DraftCorpusInstaller
+from .draft_corpus_sources import STARTER_TRANSFORM_VERSION
 from .draft_espn_live import (
     EspnDraftObservation,
     EspnDraftSyncError,
     EspnPublicDraftAdapter,
 )
+from .draft_evaluation_policy import EVALUATION_POLICY_VERSION
 from .draft_persistence import DraftFileStore, DraftModelArtifact
 from .draft_training import (
     EvolutionConfig,
@@ -57,6 +60,10 @@ _MAX_RETAINED_TERMINAL_JOBS = DEFAULT_TERMINAL_JOB_LIMIT
 _MAX_ASSISTANT_SESSION_BYTES = 16 * 1024 * 1024
 _MAX_CACHED_ASSETS_PER_KIND = 2
 _MAX_CACHED_LEAGUE_PRESETS = 64
+_OBSOLETE_STARTER_NOTICE = (
+    "This starter corpus has incorrect DST scoring. Reinstall the starter corpus "
+    "and retrain; its old models and checkpoints cannot be used."
+)
 
 
 @dataclass(slots=True)
@@ -158,15 +165,18 @@ class DraftLabService:
             return {"job_id": job_id, "acknowledged": acknowledged}
 
     def catalog(self) -> dict[str, object]:
-        return {
+        installs = self._corpus_installer.catalog()
+        obsolete = self._obsolete_starter_corpora(installs)
+        catalog = {
             "corpora": self.store.list_corpora(),
             "boards": self.store.list_boards(),
             "models": self.store.list_models(),
             "checkpoints": self.store.list_checkpoints(),
             "assistant_sessions": self._session_catalog(),
             "league_presets": self._league_presets(),
-            "starter_corpus_installs": self._corpus_installer.catalog(),
+            "starter_corpus_installs": installs,
             "starter_corpus_install_state": self._corpus_installer.recoverable_state(),
+            "starter_corpus_transform_version": STARTER_TRANSFORM_VERSION,
             "supported_training_seasons": [
                 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025
             ],
@@ -186,6 +196,16 @@ class DraftLabService:
                 ),
             },
         }
+        for kind in ("corpora", "models", "checkpoints"):
+            for row in catalog[kind]:
+                corpus_id = row.get("corpus_id")
+                if (
+                    row.get("status") != "invalid"
+                    and isinstance(corpus_id, str)
+                    and corpus_id in obsolete
+                ):
+                    row.update(status="invalid", error=_OBSOLETE_STARTER_NOTICE)
+        return catalog
 
     def import_corpus(self, record):
         return self.store.import_corpus(record)
@@ -257,9 +277,7 @@ class DraftLabService:
             with self._lock:
                 if self.is_busy:
                     raise RuntimeError("another Draft Lab background job is running")
-            checkpoint = TrainingCheckpoint.from_record(
-                self.store.load_checkpoint(checkpoint_job_id)
-            )
+            checkpoint = self._load_checkpoint(checkpoint_job_id)
             evolution = checkpoint.evolution_config
             if generations is not None:
                 if type(generations) is not int or not 1 <= generations <= 1_000:
@@ -467,9 +485,7 @@ class DraftLabService:
         """Make an autosaved champion usable without running another generation."""
 
         with self._lock:
-            checkpoint = TrainingCheckpoint.from_record(
-                self.store.load_checkpoint(checkpoint_job_id)
-            )
+            checkpoint = self._load_checkpoint(checkpoint_job_id)
             performance = checkpoint.champion_performance
             expected_metrics = {
                 "fitness": performance.fitness,
@@ -489,6 +505,8 @@ class DraftLabService:
                     and summary.get("trained_seasons") == expected_seasons
                     and summary.get("generation") == checkpoint.generation_completed
                     and summary.get("metrics") == expected_metrics
+                    and summary.get("evaluation_policy_version")
+                    == EVALUATION_POLICY_VERSION
                 ):
                     return summary
             artifact = _checkpoint_model_artifact(checkpoint)
@@ -627,9 +645,7 @@ class DraftLabService:
         config = _league_config(payload["league_config"])
         evolution = _evolution_config(payload["evolution_config"])
         resume_id = payload.get("resume_checkpoint_job_id")
-        resume = None if resume_id is None else TrainingCheckpoint.from_record(
-            self.store.load_checkpoint(resume_id)
-        )
+        resume = None if resume_id is None else self._load_checkpoint(resume_id)
         return corpus, config, evolution, resume
 
     def _league_presets(self):
@@ -772,10 +788,34 @@ class DraftLabService:
             raise ValueError(f"could not read assistant session: {error}") from None
 
     def _load_corpus(self, corpus_id):
+        self._require_usable_corpus(corpus_id)
         return self._load_asset(self._corpus_cache, corpus_id, self.store.load_corpus)
 
     def _load_model(self, model_id):
-        return self._load_asset(self._model_cache, model_id, self.store.load_model)
+        model = self._load_asset(self._model_cache, model_id, self.store.load_model)
+        self._require_usable_corpus(model.corpus_id)
+        return model
+
+    def _load_checkpoint(self, checkpoint_job_id):
+        checkpoint = TrainingCheckpoint.from_record(
+            self.store.load_checkpoint(checkpoint_job_id)
+        )
+        self._require_usable_corpus(checkpoint.corpus_id)
+        return checkpoint
+
+    def _obsolete_starter_corpora(self, installs=None):
+        if installs is None:
+            installs = self._corpus_installer.catalog()
+        return {
+            row["corpus_id"] for row in installs
+            if isinstance(row.get("corpus_id"), str)
+            and type(row.get("transform_version")) is int
+            and row["transform_version"] < 3
+        }
+
+    def _require_usable_corpus(self, corpus_id):
+        if isinstance(corpus_id, str) and corpus_id in self._obsolete_starter_corpora():
+            raise ValueError(_OBSOLETE_STARTER_NOTICE)
 
     def _load_board(self, board_id):
         return self._load_asset(self._board_cache, board_id, self.store.load_board)
@@ -857,6 +897,7 @@ def _checkpoint_model_artifact(checkpoint: TrainingCheckpoint) -> DraftModelArti
             "mean_finish": performance.mean_finish,
         },
         datetime.now(timezone.utc).isoformat(),
+        evaluation_policy_version=EVALUATION_POLICY_VERSION,
     )
 
 
@@ -870,7 +911,7 @@ def _league_config(value):
         "position_limits", "scoring_weights", "regular_season_weeks",
         "playoff_team_count", "playoff_weeks", "strategy_counts",
     }
-    _exact_keys("league_config", value, keys)
+    _exact_keys("league_config", value, keys | set(ZERO_POINT_RULE_FIELDS).intersection(value))
     try:
         strategies = {DraftStrategy(key): count for key, count in value["strategy_counts"].items()}
         return DraftLeagueConfig(
@@ -879,6 +920,7 @@ def _league_config(value):
             value["position_limits"], value["scoring_weights"],
             tuple(value["regular_season_weeks"]), value["playoff_team_count"],
             tuple(value["playoff_weeks"]), strategies,
+            **{name: value.get(name, 0) for name in ZERO_POINT_RULE_FIELDS},
         )
     except (AttributeError, TypeError):
         raise ValueError("league_config nested fields are invalid") from None

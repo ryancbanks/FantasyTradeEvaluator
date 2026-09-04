@@ -664,11 +664,7 @@ def _player_record(
 
 def _player_nfl_team(player_id, rows, evidence, waiver_players):
     values = [row.nfl_team_id for row in rows if row.nfl_team_id is not None]
-    values.extend(
-        row.nfl_team_id
-        for (raw_player_id, _, _), row in evidence.weekly.items()
-        if raw_player_id == player_id and row.nfl_team_id is not None
-    )
+    values.extend(evidence._weekly_nfl_teams_by_player.get(player_id, ()))
     waiver = waiver_players.get(player_id)
     if waiver is not None:
         values.append(waiver.nfl_team_id)

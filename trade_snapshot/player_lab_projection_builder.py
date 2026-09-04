@@ -19,6 +19,7 @@ from .projections import (
     RemainingSeasonProjection,
     WeeklyProjection,
 )
+from .ros_matchup_allocation import RosMatchupAllocation
 
 
 def build_player_lab_projection_snapshot(
@@ -31,6 +32,7 @@ def build_player_lab_projection_snapshot(
     nfl_schedule: NflSchedule,
     ensemble_config: EnsembleConfig,
     exclude_player_ids: Iterable[str] = (),
+    ros_matchup_allocation: RosMatchupAllocation | None = None,
 ) -> PlayerLabProjectionSnapshot:
     """Build full-catalog projections without expanding calculation scope."""
 
@@ -122,6 +124,8 @@ def build_player_lab_projection_snapshot(
             provider_names=providers,
             nfl_schedule=nfl_schedule,
             player_nfl_team_ids=teams,
+            player_positions=positions,
+            ros_matchup_allocation=ros_matchup_allocation,
         )
         projections = _complete_ensembles(weekly, positions, ensemble_config)
     else:

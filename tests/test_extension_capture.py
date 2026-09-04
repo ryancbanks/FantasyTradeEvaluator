@@ -81,8 +81,9 @@ class ExtensionCaptureTests(unittest.TestCase):
         self.assertEqual(bridge.calls[3][1]["request"]["provider"], "espn")
         self.assertEqual(bridge.calls[0][1], {"action_delay_ms": 200})
         self.assertEqual(bridge.calls[1][1]["timeout_ms"], 5000)
-        self.assertEqual(bridge.calls[1][2], 10.0)
+        self.assertEqual(bridge.calls[1][2], 15.0)
         self.assertEqual(bridge.calls[3][1]["timeout_ms"], 5000)
+        self.assertEqual(bridge.calls[3][2], 15.0)
 
     def test_analyzer_phase_bundle_and_raw_body_are_revalidated_in_python(self):
         bridge, session = self.open({
@@ -149,6 +150,9 @@ class ExtensionCaptureTests(unittest.TestCase):
             session.capture_league_sources(league_task(), 5000, lambda: False).team_count,
             2,
         )
+        league_call = next(call for call in bridge.calls if call[0] == "league.capture")
+        self.assertEqual(league_call[1]["timeout_ms"], 5000)
+        self.assertEqual(league_call[2], 15.0)
         captured_ecr = session.capture_ecr_rankings(
             ecr_task(expected=False), 5000, lambda: False
         )
@@ -174,6 +178,11 @@ class ExtensionCaptureTests(unittest.TestCase):
         )
         self.assertNotIn("PRIVATE OWNER", repr(espn))
         self.assertNotIn("secret", repr(espn))
+        espn_call = next(
+            call for call in bridge.calls if call[0] == "espn.authenticated_json"
+        )
+        self.assertEqual(espn_call[1]["timeout_ms"], 5000)
+        self.assertEqual(espn_call[2], 15.0)
         self.assertEqual(
             session.read_yahoo_scoring(yahoo, settings, 5000, lambda: False),
             "PPR",
@@ -252,7 +261,7 @@ class ExtensionCaptureTests(unittest.TestCase):
         bridge = Outdated()
         with self.assertRaisesRegex(
             BrowserExtensionUpgradeRequired,
-            r"version 0\.2\.0 or newer.*reload.*reconnect",
+            r"version 0\.2\.1 or newer.*reload.*reconnect",
         ):
             ExtensionCaptureBackend(bridge).open(
                 BrowserCaptureOptions(Path("unused-profile")), 5000, lambda: False

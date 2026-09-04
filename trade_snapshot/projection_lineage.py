@@ -90,6 +90,16 @@ class ProjectionLineageIndex:
         self._rows_by_provider = MappingProxyType(
             {key: tuple(rows) for key, rows in rows_by_provider.items()}
         )
+        weekly_nfl_teams_by_player = defaultdict(list)
+        for (player_id, _, _), row in weekly.items():
+            if row.nfl_team_id is not None:
+                weekly_nfl_teams_by_player[player_id].append(row.nfl_team_id)
+        self._weekly_nfl_teams_by_player = MappingProxyType(
+            {
+                player_id: tuple(values)
+                for player_id, values in weekly_nfl_teams_by_player.items()
+            }
+        )
         self._lineages = MappingProxyType(lineages)
         self._observations = MappingProxyType(observations)
 

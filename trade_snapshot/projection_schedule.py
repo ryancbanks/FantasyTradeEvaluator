@@ -13,6 +13,7 @@ from .projections import (
     WeeklyProjection,
     WeeklyProjectionOrigin,
 )
+from .ros_matchup_allocation import RosMatchupAllocation
 
 
 _ROS_DERIVATION_STATUSES = frozenset(
@@ -100,6 +101,8 @@ def materialize_weekly_grid(
     provider_names: Iterable[str],
     nfl_schedule: NflSchedule,
     player_nfl_team_ids: Mapping[str, str],
+    player_positions: Mapping[str, str] | None = None,
+    ros_matchup_allocation: RosMatchupAllocation | None = None,
 ) -> tuple[WeeklyProjection, ...]:
     """Fill the weekly grid and attach only verified schedule context."""
 
@@ -112,6 +115,12 @@ def materialize_weekly_grid(
     players = _texts("player_ids", player_ids)
     providers = _texts("provider_names", provider_names)
     player_teams = _player_teams(player_nfl_team_ids, players)
+    positions = _allocation_positions(
+        player_positions,
+        players,
+        state,
+        ros_matchup_allocation,
+    )
     for player in players:
         for week in state.remaining_regular_season_weeks:
             nfl_schedule.team_week(player_teams[player], week)
@@ -164,13 +173,24 @@ def materialize_weekly_grid(
                 nfl_schedule,
                 weekly,
                 ros.get((player, provider)),
+                positions.get(player),
+                ros_matchup_allocation,
             )
         )
     return _harmonize_game_context(tuple(materialized))
 
 
 def _player_provider_rows(
-    state, player, provider, provider_id, nfl_team, nfl_schedule, weekly, ros
+    state,
+    player,
+    provider,
+    provider_id,
+    nfl_team,
+    nfl_schedule,
+    weekly,
+    ros,
+    player_position,
+    ros_matchup_allocation,
 ) -> tuple[WeeklyProjection, ...]:
     weeks = state.remaining_regular_season_weeks
     scope_weeks, schedule, active = _ros_schedule_scope(
@@ -188,7 +208,13 @@ def _player_provider_rows(
     }
     _validate_published_schedule(published, schedule)
     derived_points, derived_stats = _ros_derivation(
-        scope_weeks, active, published, ros
+        scope_weeks,
+        schedule,
+        active,
+        published,
+        ros,
+        player_position,
+        ros_matchup_allocation,
     )
     result = []
     for week in weeks:
@@ -259,8 +285,11 @@ def _player_provider_rows(
                     for row in (published_row, ros)
                     if row is not None
                 ),
-                derived_points,
-                derived_stats,
+                derived_points[week],
+                {
+                    name: allocations[week]
+                    for name, allocations in derived_stats.items()
+                },
                 nfl_team_id=nfl_team,
                 nfl_game_id=team_week.nfl_game_id,
                 opponent_team_id=team_week.opponent_team_id,
@@ -320,7 +349,15 @@ def _validate_published_schedule(published, schedule):
             _scheduled_row(row, team_week)
 
 
-def _ros_derivation(weeks, active, published, ros):
+def _ros_derivation(
+    weeks,
+    schedule,
+    active,
+    published,
+    ros,
+    player_position,
+    ros_matchup_allocation,
+):
     missing = tuple(
         week
         for week in weeks
@@ -336,12 +373,18 @@ def _ros_derivation(weeks, active, published, ros):
     )
     if unsafe:
         return None, {}
-    return _derived_points(ros, published, missing, active), _derived_stats(
-        ros, published, missing, active
+    weights = _allocation_weights(
+        missing,
+        schedule,
+        player_position,
+        ros_matchup_allocation,
+    )
+    return _derived_points(ros, published, missing, active, weights), _derived_stats(
+        ros, published, missing, active, weights
     )
 
 
-def _derived_points(ros, published, missing_weeks, active):
+def _derived_points(ros, published, missing_weeks, active, weights):
     if not missing_weeks or ros is None or ros.status is not ProjectionStatus.OBSERVED:
         return None
     observed = fsum(
@@ -349,15 +392,16 @@ def _derived_points(ros, published, missing_weeks, active):
         for week, row in published.items()
         if week in active and row.status is ProjectionStatus.OBSERVED
     )
-    return _residual_average(
+    return _residual_allocations(
         "projected fantasy points",
         ros.projected_fantasy_points,
         observed,
-        len(missing_weeks),
+        missing_weeks,
+        weights,
     )
 
 
-def _derived_stats(ros, published, missing_weeks, active):
+def _derived_stats(ros, published, missing_weeks, active, weights):
     if not missing_weeks or ros is None or ros.status is not ProjectionStatus.OBSERVED:
         return {}
     result = {}
@@ -372,16 +416,17 @@ def _derived_stats(ros, published, missing_weeks, active):
         observed = fsum(
             row.raw_projected_stats[name] for row in observed_rows
         )
-        result[name] = _residual_average(
+        result[name] = _residual_allocations(
             f"raw projection stat {name!r}",
             total,
             observed,
-            len(missing_weeks),
+            missing_weeks,
+            weights,
         )
     return result
 
 
-def _residual_average(label, total, observed, missing_count):
+def _residual_allocations(label, total, observed, missing_weeks, weights):
     residual = total - observed
     tolerance = max(1e-9, abs(total) * 1e-12)
     if residual < -tolerance:
@@ -389,7 +434,23 @@ def _residual_average(label, total, observed, missing_count):
             f"ROS {label} total is smaller than its observed weekly subtotal; "
             "the captures are not coherent enough for residual allocation"
         )
-    return max(0.0, residual) / missing_count
+    residual = max(0.0, residual)
+    total_weight = fsum(weights[week] for week in missing_weeks)
+    allocated = {}
+    for week in missing_weeks[:-1]:
+        allocated[week] = residual * weights[week] / total_weight
+    final_week = missing_weeks[-1]
+    allocated[final_week] = residual - fsum(allocated.values())
+    return allocated
+
+
+def _allocation_weights(missing_weeks, schedule, position, allocation):
+    if allocation is None:
+        return {week: 1.0 for week in missing_weeks}
+    return {
+        week: allocation.factor(position, schedule[week].opponent_team_id)
+        for week in missing_weeks
+    }
 
 
 def _scheduled_row(row: WeeklyProjection, team_week: NflTeamWeek) -> WeeklyProjection:
@@ -523,4 +584,30 @@ def _player_teams(value, players):
         result[player_id] = team_id
     if set(result) != set(players):
         raise ValueError("player_nfl_team_ids must cover exactly the materialized players")
+    return result
+
+
+def _allocation_positions(value, players, state, allocation):
+    if allocation is None:
+        return {}
+    if not isinstance(allocation, RosMatchupAllocation):
+        raise ValueError(
+            "ros_matchup_allocation must be a RosMatchupAllocation or None"
+        )
+    allocation.validate_context(
+        season=state.season,
+        as_of_week=state.first_remaining_week,
+        scoring_profile_id=state.scoring_profile_id,
+    )
+    if not isinstance(value, Mapping):
+        raise ValueError("player_positions must be a mapping for matchup allocation")
+    result = {}
+    for player_id, position in value.items():
+        if not isinstance(player_id, str) or not player_id:
+            raise ValueError("player_positions keys must be non-empty strings")
+        if not isinstance(position, str) or not position:
+            raise ValueError("player_positions values must be non-empty strings")
+        result[player_id] = position
+    if set(result) != set(players):
+        raise ValueError("player_positions must cover exactly the materialized players")
     return result

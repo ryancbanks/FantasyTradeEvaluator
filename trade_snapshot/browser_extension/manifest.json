@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Fantasy Trade Evaluator Browser Bridge",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Uses one ordinary-browser tab for explicitly paired Fantasy Trade Evaluator scans.",
   "minimum_chrome_version": "111",
   "permissions": [
@@ -60,6 +60,7 @@
         "collectors/ecr_main.js",
         "collectors/league_main.js",
         "collectors/espn_main.js",
+        "collectors/espn_projection_main.js",
         "main_dispatcher.js"
       ],
       "run_at": "document_start",

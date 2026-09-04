@@ -1,5 +1,8 @@
 """Stable limitation and interpretation text for data-readiness outputs."""
 
+from .ros_matchup_allocation import ROS_MATCHUP_ALLOCATION_LIMITATION
+
+
 _SCORING_LIMITATION = (
     "Provider fantasy-point totals are verified to the selected STD/HALF/PPR "
     "format, but have not been recomputed from raw stats under every custom host rule."
@@ -32,11 +35,7 @@ _AS_OF_TIME_LIMITATION = (
     "timestamp, so the bundle cannot prove that every game was unplayed at capture "
     "time; partially played weeks are not modeled."
 )
-_ROS_ALLOCATION_LIMITATION = (
-    "Residual rest-of-season points and raw stat components are divided evenly "
-    "across missing active NFL weeks. Those weekly shapes are local allocations, "
-    "not provider-published matchup projections."
-)
+_ROS_ALLOCATION_LIMITATION = ROS_MATCHUP_ALLOCATION_LIMITATION
 _FANTASYPROS_BENCHMARK_POLICY = (
     "Comparison only: retained FantasyPros standings and probabilities are used "
     "for model-drift review and are never blended into local team outlooks or "

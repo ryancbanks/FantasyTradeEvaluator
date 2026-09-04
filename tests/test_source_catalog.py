@@ -31,9 +31,9 @@ class SourceCatalogTests(unittest.TestCase):
         self.assertEqual(
             catalog["weekly_projection_preview"],
             {
-                "scope": "remaining_nfl_weeks",
-                "weeks": list(range(1, 19)),
-                "league_end_discovered_during_scan": True,
+                "scope": "current_week_only",
+                "weeks": [1],
+                "league_end_discovered_during_scan": False,
             },
         )
         self.assertEqual(calculation["FantasyPros"]["status"], "required")
@@ -91,7 +91,7 @@ class SourceCatalogTests(unittest.TestCase):
         self.assertEqual(calculation["FantasyPros"]["status"], "off")
         self.assertEqual(calculation["ESPN"]["status"], "required")
         self.assertEqual(calculation["Yahoo"]["status"], "required")
-        self.assertIn("point projections", calculation["ESPN"]["note"])
+        self.assertIn("current-season", calculation["ESPN"]["note"])
         for provider in ("CBS Sports", "FFToday", "FantasySharks"):
             self.assertEqual(calculation[provider]["status"], "off")
         self.assertEqual(

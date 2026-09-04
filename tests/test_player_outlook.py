@@ -20,17 +20,20 @@ from trade_snapshot.ensemble import (
 )
 from trade_snapshot.nfl_schedule import NflSchedule, NflTeamWeek, NflTeamWeekStatus
 from trade_snapshot.player_outlook import (
+    _player_nfl_team,
     build_player_outlook,
     build_player_outlook_catalog,
     select_player_outlook_detail,
 )
 from trade_snapshot.player_outlook_detail import build_player_outlook_detail_from_bundle
+from trade_snapshot.player_outlook_evidence import _EvidenceIndex
 from trade_snapshot.player_outlook_lazy import build_player_outlook_catalog_from_bundle
 from trade_snapshot.player_lab_projections import (
     PlayerLabProjectionSnapshot,
     PlayerLabProviderProvenance,
 )
 from trade_snapshot.player_profile_outlook import assign_player_ranks
+from trade_snapshot.projection_lineage import ProjectionLineageIndex
 from trade_snapshot.projections import (
     ProjectionStatus,
     ProviderStatusObservation,
@@ -1321,6 +1324,65 @@ class PlayerOutlookTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "NFL team"):
             replace(bundle, projection_evidence=evidence)
+
+    def test_nfl_team_resolution_indexes_weekly_evidence_without_changing_order(self):
+        bundle = player_bundle()
+        rows = tuple(
+            replace(
+                row,
+                nfl_team_id=None,
+                nfl_game_id=None,
+                opponent_team_id=None,
+                is_home=None,
+            )
+            for row in bundle.projections
+            if row.canonical_player_id == "p1"
+        )
+        weekly_indexes = [
+            index
+            for index, row in enumerate(bundle.projection_evidence)
+            if isinstance(row, WeeklyProjection)
+            and row.canonical_player_id == "p1"
+        ]
+        self.assertGreaterEqual(len(weekly_indexes), 2)
+        expected_team = bundle.projection_evidence[weekly_indexes[0]].nfl_team_id
+
+        def replace_team(index, team):
+            evidence = list(bundle.projection_evidence)
+            evidence[index] = replace(
+                evidence[index],
+                nfl_team_id=team,
+                nfl_game_id=None,
+                opponent_team_id=None,
+                is_home=None,
+            )
+            return tuple(evidence)
+
+        cases = (
+            ("duplicate", bundle.projection_evidence, expected_team),
+            ("null", replace_team(weekly_indexes[0], None), expected_team),
+            ("conflict", replace_team(weekly_indexes[-1], "WRONG"), ValueError),
+        )
+
+        class ItemsForbidden(dict):
+            def items(self):
+                raise AssertionError("NFL-team lookup rescanned weekly evidence")
+
+        for label, evidence, expected in cases:
+            for index_name, index in (
+                ("catalog", _EvidenceIndex(evidence)),
+                ("full", ProjectionLineageIndex(rows, evidence)),
+            ):
+                with self.subTest(case=label, index=index_name):
+                    index.weekly = ItemsForbidden(index.weekly)
+                    if expected is ValueError:
+                        with self.assertRaisesRegex(ValueError, "inconsistent NFL teams"):
+                            _player_nfl_team("p1", rows, index, {})
+                    else:
+                        self.assertEqual(
+                            _player_nfl_team("p1", rows, index, {}),
+                            expected,
+                        )
 
 
 if __name__ == "__main__":

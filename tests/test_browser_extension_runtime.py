@@ -132,6 +132,11 @@ class BrowserExtensionRuntimeTests(unittest.TestCase):
                                 "101": {"player_id": 101, "player_name": "A"},
                                 "102": {"player_id": 102, "player_name": "B"},
                                 "103": {"player_id": 103, "player_name": "C"},
+                                "105": {
+                                    "player_id": 105,
+                                    "player_name": "Known Free Agent",
+                                    "position": "WR",
+                                },
                             },
                         }
                         initial = {
@@ -139,7 +144,17 @@ class BrowserExtensionRuntimeTests(unittest.TestCase):
                                 {"teamId": 1, "wins": 1, "losses": 0, "ties": 0},
                                 {"teamId": 2, "wins": 0, "losses": 1, "ties": 0},
                             ],
-                            "best_free_agents": [{"id": 104}],
+                            "best_free_agents": [
+                                {
+                                    "id": 104, "name": "Available D", "position": "RB",
+                                    "fpLink": "https://example.test/private-provider-route",
+                                },
+                                {
+                                    "id": 105,
+                                    "name": "Conflicting Fallback",
+                                    "position": "TE",
+                                },
+                            ],
                         }
                         projected = {
                             "playoffsTeam": 1,
@@ -253,6 +268,25 @@ class BrowserExtensionRuntimeTests(unittest.TestCase):
                         self.assertTrue(popup.locator("#connected-actions").is_visible())
                         popup.close()
 
+                        stale_result = worker.evaluate(
+                            """async commandId => {
+                              const owner = session;
+                              const outcome = await postCompletion(owner, {
+                                command_id: commandId,
+                                result: null
+                              }, commandId, Date.now() + 2000);
+                              return {
+                                outcome,
+                                same_session: session === owner,
+                                phase: statusSnapshot().phase
+                              };
+                            }""",
+                            "0" * 32,
+                        )
+                        self.assertEqual(stale_result["outcome"], "stale")
+                        self.assertTrue(stale_result["same_session"])
+                        self.assertEqual(server.extension_bridge.state, "paired")
+
                         session = ExtensionCaptureBackend(server.extension_bridge).open(
                             BrowserCaptureOptions(Path(data) / "unused", action_delay_ms=200),
                             5000,
@@ -270,14 +304,43 @@ class BrowserExtensionRuntimeTests(unittest.TestCase):
                             page,
                             lambda: session.navigate(analyzer_url, 5000, lambda: False),
                         )
-                        session.assert_page_provenance(
-                            PageCaptureTask(
-                                "fantasypros", 2026, 1, "league_source", analyzer_url
-                            ),
-                            analyzer_url,
-                            5000,
-                            lambda: False,
+                        worker.evaluate(
+                            """() => {
+                              const original = sendScanAction;
+                              let provenanceCalls = 0;
+                              sendScanAction = async (...args) => {
+                                if (args[0] === "page.provenance" &&
+                                    provenanceCalls++ === 0) {
+                                  throw new BridgeError("collector_unavailable", true);
+                                }
+                                return original(...args);
+                              };
+                              globalThis.__fteProvenanceRetryTest = {
+                                calls: () => provenanceCalls,
+                                restore: () => { sendScanAction = original; }
+                              };
+                            }"""
                         )
+                        try:
+                            session.assert_page_provenance(
+                                PageCaptureTask(
+                                    "fantasypros", 2026, 1, "league_source", analyzer_url
+                                ),
+                                analyzer_url,
+                                5000,
+                                lambda: False,
+                            )
+                        finally:
+                            provenance_calls = worker.evaluate(
+                                """() => {
+                                  const calls = __fteProvenanceRetryTest.calls();
+                                  __fteProvenanceRetryTest.restore();
+                                  delete globalThis.__fteProvenanceRetryTest;
+                                  return calls;
+                                }"""
+                            )
+                        self.assertEqual(provenance_calls, 2)
+                        self.assertEqual(server.extension_bridge.state, "paired")
                         captured = []
                         self._call_while_pumping(
                             page,
@@ -300,6 +363,23 @@ class BrowserExtensionRuntimeTests(unittest.TestCase):
                         self.assertEqual(bootstrap.body["payload"]["league"]["roster_size"], 2)
                         self.assertEqual(bootstrap.body["payload"]["league"]["id"], "77")
                         self.assertEqual(bootstrap.body["payload"]["league"]["team_id"], "1")
+                        self.assertEqual(
+                            bootstrap.body["payload"]["players"][-1],
+                            {"player_id": "104", "name": "Available D", "position": "RB"},
+                        )
+                        known_free_agent = next(
+                            row for row in bootstrap.body["payload"]["players"]
+                            if row["player_id"] == "105"
+                        )
+                        self.assertEqual(
+                            known_free_agent,
+                            {
+                                "player_id": "105",
+                                "name": "Known Free Agent",
+                                "position": "WR",
+                            },
+                        )
+                        self.assertNotIn("private-provider-route", str(bootstrap.body))
                         projected_capture = next(
                             source for source in captured[0].sources
                             if source.source.value == "projected_standings"

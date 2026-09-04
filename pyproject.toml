@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fantasy-trade-evaluator"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local, weekly NFL trade evaluation and playoff simulation"
 readme = "README.md"
 license-files = ["THIRD_PARTY_NOTICES.md"]

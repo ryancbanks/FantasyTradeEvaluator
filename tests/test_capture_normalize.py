@@ -272,6 +272,7 @@ class CaptureNormalizeTests(unittest.TestCase):
             snapshot_id="week-8",
             scoring_profile_id="ppr",
             applicable_weeks=(8, 9, 10),
+            nfl_schedule=three_week_schedule(),
         )
         ros_omitted = next(
             row
@@ -340,6 +341,36 @@ class CaptureNormalizeTests(unittest.TestCase):
             {"yds": 200.0, "gp": 2.0, "avg": 10.0},
         )
 
+    def test_espn_full_season_total_is_scaled_but_rates_are_preserved(self):
+        source = public_projection_artifact(
+            CaptureProvider.ESPN,
+            "https://www.espn.com/nfl/player/_/id/501/aj-brown",
+            points="30",
+            extra_headers=("RUSH YDS", "GP", "FPPG"),
+            extra_values=("300", "3", "10"),
+            scoring="PPR",
+        )
+        registry = reconcile_player_identities(
+            projection_provider_records(source), anchor_provider="espn"
+        )
+
+        evidence = projection_evidence_from_artifact(
+            source,
+            registry,
+            snapshot_id="week-8",
+            scoring_profile_id="ppr",
+            applicable_weeks=(8, 9),
+            nfl_schedule=three_week_schedule(),
+        )
+
+        row = evidence[0]
+        self.assertEqual(row.origin, RemainingSeasonOrigin.DERIVED_FULL_SEASON)
+        self.assertAlmostEqual(row.projected_fantasy_points, 20.0)
+        self.assertEqual(
+            dict(row.raw_projected_stats),
+            {"rush_yds": 200.0, "gp": 2.0, "fppg": 10.0},
+        )
+
     def test_cbs_ppr_season_rate_becomes_remaining_points_and_half_ppr_adjusts(self):
         source = public_projection_artifact(
             CaptureProvider.CBS,
@@ -383,6 +414,33 @@ class CaptureNormalizeTests(unittest.TestCase):
             projection_evidence_from_artifact(
                 source,
                 registry,
+                snapshot_id="week-8",
+                scoring_profile_id="ppr",
+                applicable_weeks=(8, 9),
+            )
+        espn = replace(
+            source,
+            provider=CaptureProvider.ESPN,
+            tables=(
+                VisibleTable((
+                    source.tables[0].rows[0],
+                    (
+                        VisibleTableCell(
+                            "A.J. Brown",
+                            ("https://www.espn.com/nfl/player/_/id/501/aj-brown",),
+                        ),
+                        *source.tables[0].rows[1][1:],
+                    ),
+                )),
+            ),
+        )
+        espn_registry = reconcile_player_identities(
+            projection_provider_records(espn), anchor_provider="espn"
+        )
+        with self.assertRaisesRegex(ValueError, "espn.*requires the NFL schedule"):
+            projection_evidence_from_artifact(
+                espn,
+                espn_registry,
                 snapshot_id="week-8",
                 scoring_profile_id="ppr",
                 applicable_weeks=(8, 9),

@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 
+from ._current_projection_coverage import build_current_player_projection_coverage
 from ._data_readiness_bound_inputs import bound_inputs as _bound_inputs
 from ._data_readiness_capabilities import _capability_decisions
 from ._data_readiness_evidence import (
@@ -30,7 +31,11 @@ from .projections import ProjectionStatus, WeeklyProjectionOrigin
 from .remaining_projection import summarize_remaining_projection
 
 
-def build_bundle_data_readiness(bundle: EngineBundle) -> dict[str, object]:
+def build_bundle_data_readiness(
+    bundle: EngineBundle,
+    *,
+    player_projection_positions=None,
+) -> dict[str, object]:
     """Describe usable, inferred, and missing data without changing readiness gates."""
 
     if not isinstance(bundle, EngineBundle):
@@ -223,7 +228,7 @@ def build_bundle_data_readiness(bundle: EngineBundle) -> dict[str, object]:
     )
 
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "status": (
             "ready_with_known_limitations" if core_ready else "not_ready"
         ),
@@ -279,6 +284,12 @@ def build_bundle_data_readiness(bundle: EngineBundle) -> dict[str, object]:
             ),
             "projection_sources": projection_source_coverage,
             "provider_status_observations": provider_status_coverage,
+            "current_player_projection_audit": (
+                build_current_player_projection_coverage(
+                    bundle,
+                    positions=player_projection_positions,
+                )
+            ),
         },
         "capabilities": capabilities,
         "missing_data_plan": [

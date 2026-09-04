@@ -5,12 +5,14 @@
 
   const protocol = globalThis.FTEProtocol;
   const handlers = globalThis.FTECollectors || Object.create(null);
+  const MAIN_RESPONSE_MARGIN_MS = 250;
   const mainOperations = new Set([
     "analyzer.finish",
     "analyzer.abort",
     "ecr.capture",
     "league.capture",
-    "espn.authenticated_json"
+    "espn.authenticated_json",
+    "espn.season_projections"
   ]);
   const isolatedOperations = new Set([
     "analyzer.bundle",
@@ -32,13 +34,13 @@
     return /^[a-z0-9_]{1,64}$/.test(value) ? value : "collector_failed";
   };
 
-  function callMain(operation, payload) {
+  function callMain(operation, payload, timeoutMs) {
     return new Promise((resolve, reject) => {
       const id = requestId();
       const timer = setTimeout(() => {
         window.removeEventListener("message", receive);
         reject(new Error("main_operation_timeout"));
-      }, 65000);
+      }, Math.max(1, timeoutMs - MAIN_RESPONSE_MARGIN_MS));
       function receive(event) {
         const message = event.data;
         if (event.source !== window || event.origin !== location.origin ||
@@ -64,13 +66,15 @@
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || message.kind !== "fte.scan.action" ||
         sender.id !== chrome.runtime.id || typeof message.action !== "string" ||
+        !Number.isInteger(message.timeout_ms) || message.timeout_ms < 1 ||
+        message.timeout_ms > 60 * 60 * 1000 ||
         (!mainOperations.has(message.action) && !isolatedOperations.has(message.action))) {
       return undefined;
     }
     const action = message.action;
     const payload = protocol.isRecord(message.payload) ? message.payload : {};
     const operation = mainOperations.has(action) ?
-      callMain(action, payload) :
+      callMain(action, payload, message.timeout_ms) :
       Promise.resolve().then(() => {
         const handler = handlers[action];
         if (typeof handler !== "function") throw new Error("collector_unavailable");

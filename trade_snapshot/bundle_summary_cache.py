@@ -15,7 +15,7 @@ from .engine_bundle import (
 )
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _MAX_SUMMARY_BYTES = 4 * 1024 * 1024
 _RECORD_FIELDS = {
     "kind",

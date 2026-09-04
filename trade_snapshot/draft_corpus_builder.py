@@ -30,8 +30,14 @@ from .draft_history import (
     HistoricalSeason,
     PreseasonPlayer,
 )
+from .draft_preseason_projection import (
+    PRESEASON_PROJECTION_FEATURE_NAMES,
+    PROJECTION_METHOD,
+    build_preseason_projection,
+)
+from .draft_roster_sources import load_roster_availability
 
-_FEATURE_NAMES = (
+_ADP_FEATURE_NAMES = (
     "adp",
     "adp_standard_deviation",
     "best_rank",
@@ -77,13 +83,14 @@ def build_starter_corpus(
     """Build and revalidate a leak-free corpus from already verified downloads."""
 
     years = _years(years)
+    source_years = tuple(sorted(set(years) | {year - 1 for year in years}))
     _validate_file_map("FFC ADP", files.ffc_adp, years)
-    _validate_file_map("player stats", files.player_stats, years)
-    _validate_file_map("team stats", files.team_stats, years)
+    _validate_file_map("player stats", files.player_stats, source_years)
+    _validate_file_map("team stats", files.team_stats, source_years)
     _validate_file_map(
         "rosters", files.rosters, (*years, *(year - 1 for year in years))
     )
-    schedules = load_schedules(files.schedule, years)
+    schedules = load_schedules(files.schedule, source_years)
     seasons = []
     coverage_rows = []
     source_dates = {}
@@ -95,18 +102,40 @@ def build_starter_corpus(
         roster = load_week_one_roster(files.rosters[season], season)
         prior_teams = load_previous_roster_teams(files.rosters[season - 1], season - 1)
         player_stats = load_player_week_stats(files.player_stats[season], season)
+        prior_player_stats = load_player_week_stats(
+            files.player_stats[season - 1], season - 1
+        )
         team_stats = load_team_week_stats(files.team_stats[season], season)
+        prior_team_stats = load_team_week_stats(
+            files.team_stats[season - 1], season - 1
+        )
         built, row = _build_season(
             season,
             schedule,
+            schedules[season - 1],
             ffc.players,
             roster.players,
             prior_teams,
             player_stats,
+            prior_player_stats,
             team_stats,
+            prior_team_stats,
             roster.rejected_row_count,
             roster.excluded_status_counts,
         )
+        availability, availability_coverage = load_roster_availability(
+            files.rosters[season], season,
+            (player.player_id for player in built if player.position != "DST"),
+            schedule.available_weeks,
+        )
+        row["availability"] = availability_coverage
+        unknown_availability = sum(int(availability_coverage[key]) for key in (
+            "missing_player_weeks", "unknown_status_player_weeks", "ambiguous_player_weeks",
+        ))
+        if unknown_availability:
+            row["gaps"]["unknown_weekly_availability"] = unknown_availability
+            row["gap_count"] += unknown_availability
+            row["status"] = "ready_with_gaps"
         seasons.append(
             HistoricalSeason(
                 season,
@@ -114,6 +143,7 @@ def build_starter_corpus(
                 schedule.kickoff_at,
                 schedule.available_weeks,
                 built,
+                availability,
             )
         )
         coverage_rows.append(row)
@@ -130,7 +160,7 @@ def build_starter_corpus(
             ),
             license=None,
             source_url="https://fantasyfootballcalculator.com/adp",
-            preseason_feature_names=_FEATURE_NAMES,
+            preseason_feature_names=_ADP_FEATURE_NAMES,
             preseason_source_as_of=source_dates,
         ),
         DataProvenance(
@@ -138,10 +168,16 @@ def build_starter_corpus(
             captured_at=nflverse_updated_at,
             scope=(
                 "Historical regular-season schedules, weekly rosters, player stats, "
-                "and team stats used only for metadata and realized outcomes."
+                "and team stats. Target-season statistics are realized outcomes only. "
+                "From 2016, weekly roster status is delayed one full week for in-season "
+                "availability decisions; no same-week or season-ending injury is inferred. "
+                "Preseason point, per-game, game-count, and detailed-stat baselines "
+                "are generated only from the preceding regular season."
             ),
             license="CC-BY-4.0",
             source_url="https://github.com/nflverse/nflverse-data",
+            preseason_feature_names=PRESEASON_PROJECTION_FEATURE_NAMES,
+            preseason_source_as_of=source_dates,
         ),
     )
     corpus = HistoricalCorpus(tuple(seasons), provenance)
@@ -154,6 +190,10 @@ def build_starter_corpus(
         )
     gaps = sum(int(row["gap_count"]) for row in coverage_rows)
     status = "ready" if gaps == 0 else "ready_with_gaps"
+    projected_player_seasons = sum(
+        int(row["projected_players"]) for row in coverage_rows
+    )
+    player_seasons = sum(int(row["installed_players"]) for row in coverage_rows)
     return StarterCorpusBuild(
         corpus,
         status,
@@ -164,9 +204,38 @@ def build_starter_corpus(
             "status": status,
             "seasons": coverage_rows,
             "season_count": len(coverage_rows),
-            "player_seasons": sum(
-                int(row["installed_players"]) for row in coverage_rows
+            "player_seasons": player_seasons,
+            "availability_report_count": sum(len(row.availability_reports) for row in seasons),
+            "availability_policy": (
+                "2016 onward: conservative prior-week roster-status observations. "
+                "2015 status is unavailable because the source reconstructs season-level status. "
+                "No starter source proves season-ending IR; zero-point inference is optional and off by default."
             ),
+            "projected_player_seasons": projected_player_seasons,
+            "missing_projection_player_seasons": (
+                player_seasons - projected_player_seasons
+            ),
+            "projection_coverage_percent": round(
+                100 * projected_player_seasons / player_seasons, 2
+            ),
+            "projection_method": PROJECTION_METHOD,
+            "preseason_feature_names": [
+                *_ADP_FEATURE_NAMES,
+                *PRESEASON_PROJECTION_FEATURE_NAMES,
+            ],
+            "model_input_families": [
+                "position_and_eligibility",
+                "projected_fantasy_points",
+                "projected_fantasy_points_per_game",
+                "projected_games",
+                "detailed_projected_stats",
+                "adp_and_rank_range",
+                "bye_week",
+                "nfl_experience",
+                "rookie",
+                "first_year_on_team",
+                "draft_and_roster_context",
+            ],
             "gap_count": gaps,
             "fixed_bye_policy": (
                 "A player-season is excluded if nflverse records actual play during "
@@ -187,11 +256,14 @@ def build_starter_corpus(
 def _build_season(
     season: int,
     schedule: ScheduleSeason,
+    prior_schedule: ScheduleSeason,
     ffc_players: tuple[FfcAdpPlayer, ...],
     roster_players: tuple[RosterPlayer, ...],
     prior_teams: Mapping[str, str],
     player_stats: Mapping[str, Mapping[int, Mapping[str, float]]],
+    prior_player_stats: Mapping[str, Mapping[int, Mapping[str, float]]],
     team_stats: Mapping[tuple[str, int], Mapping[str, float]],
+    prior_team_stats: Mapping[tuple[str, int], Mapping[str, float]],
     rejected_roster_rows: int,
     excluded_status_counts: Mapping[str, int],
 ):
@@ -218,6 +290,8 @@ def _build_season(
     gaps = Counter()
     gap_samples: defaultdict[str, list[str]] = defaultdict(list)
     finite_features = Counter()
+    projected_players = 0
+    projected_games = len(schedule.available_weeks) - 1
     for roster in roster_players:
         key = normalized_player_name(roster.display_name), roster.position, roster.team
         matches = ffc_by_key.get(key, ())
@@ -248,7 +322,20 @@ def _build_season(
                 roster.display_name,
             )
             continue
-        features = _features(adp)
+        features = _features(
+            adp,
+            prior_player_stats.get(roster.player_id, {}),
+            projected_games,
+        )
+        if features["projected_fantasy_points"] is None:
+            _gap(
+                gaps,
+                gap_samples,
+                "preseason_projection_unavailable",
+                roster.display_name,
+            )
+        else:
+            projected_players += 1
         finite_features.update(
             name for name, value in features.items() if value is not None
         )
@@ -287,7 +374,29 @@ def _build_season(
             _gap(gaps, gap_samples, "defense_without_adp", f"{team} DST")
         else:
             matched_source_ids.add(adp.source_player_id)
-        features = _features(adp)
+        prior_weeks = {
+            week: _dst_week(team, week, prior_team_stats, prior_schedule)
+            for week in prior_schedule.available_weeks
+            if (team, week) in prior_schedule.points_allowed
+        }
+        for source_season, source_stats, source_schedule in (
+            (season - 1, prior_team_stats, prior_schedule),
+            (season, team_stats, schedule),
+        ):
+            for source_week in source_schedule.available_weeks:
+                if source_stats.get((team, source_week), {}).get("fumble_recovery_tds", 0):
+                    _gap(gaps, gap_samples, "dst_recovery_touchdown_unit_unknown",
+                         f"{source_season} {team} week {source_week}")
+        features = _features(adp, prior_weeks, projected_games)
+        if features["projected_fantasy_points"] is None:
+            _gap(
+                gaps,
+                gap_samples,
+                "preseason_projection_unavailable",
+                f"{team} Defense",
+            )
+        else:
+            projected_players += 1
         finite_features.update(
             name for name, value in features.items() if value is not None
         )
@@ -331,6 +440,12 @@ def _build_season(
         "installed_by_position": dict(sorted(installed_by_position.items())),
         "ffc_players": len(ffc_players),
         "ffc_exact_matches": len(matched_source_ids),
+        "projected_players": projected_players,
+        "missing_projection_players": len(built) - projected_players,
+        "projection_coverage_percent": round(
+            100 * projected_players / len(built), 2
+        ),
+        "projection_method": PROJECTION_METHOD,
         "finite_feature_counts": dict(sorted(finite_features.items())),
         "gap_count": gap_count,
         "gaps": dict(sorted(gaps.items())),
@@ -339,7 +454,11 @@ def _build_season(
     }
 
 
-def _features(player: FfcAdpPlayer | None) -> dict[str, float | None]:
+def _features(
+    player: FfcAdpPlayer | None,
+    prior_weeks: Mapping[int, Mapping[str, float]],
+    projected_games: int,
+) -> dict[str, float | None]:
     return {
         "adp": None if player is None else player.adp,
         "adp_standard_deviation": None
@@ -348,6 +467,10 @@ def _features(player: FfcAdpPlayer | None) -> dict[str, float | None]:
         "best_rank": None if player is None else player.best_rank,
         "position_rank": None if player is None else float(player.position_rank),
         "worst_rank": None if player is None else player.worst_rank,
+        **build_preseason_projection(
+            prior_weeks,
+            projected_games=projected_games,
+        ),
     }
 
 
@@ -365,36 +488,32 @@ def _dst_week(
     team_stats: Mapping[tuple[str, int], Mapping[str, float]],
     schedule: ScheduleSeason,
 ) -> dict[str, float]:
-    raw = dict(team_stats.get((team, week), {}))
+    raw = team_stats.get((team, week), {})
     allowed = schedule.points_allowed.get((team, week))
     if allowed is None:
         raise ValueError(f"schedule is missing {team} points allowed in week {week}")
-    raw.update(
-        {
-            "dst_sacks": raw.get("def_sacks", 0.0),
-            "dst_interceptions": raw.get("def_interceptions", 0.0),
-            "dst_fumble_recoveries": raw.get(
-                "def_fumbles", raw.get("fumble_recovery_opp", 0.0)
-            ),
-            "dst_touchdowns": math.fsum(
-                (
-                    raw.get("def_tds", 0.0),
-                    raw.get("fumble_recovery_tds", 0.0),
-                    raw.get("special_teams_tds", 0.0),
-                )
-            ),
-            "dst_safeties": raw.get("def_safeties", 0.0),
-            "dst_points_allowed": allowed,
-            "dst_points_allowed_0": float(allowed == 0),
-            "dst_points_allowed_1_6": float(1 <= allowed <= 6),
-            "dst_points_allowed_7_13": float(7 <= allowed <= 13),
-            "dst_points_allowed_14_20": float(14 <= allowed <= 20),
-            "dst_points_allowed_21_27": float(21 <= allowed <= 27),
-            "dst_points_allowed_28_34": float(28 <= allowed <= 34),
-            "dst_points_allowed_35_plus": float(allowed >= 35),
-        }
-    )
-    return dict(sorted(raw.items()))
+    # Team rows also contain the entire offense. A DST must never earn that
+    # team's passing, receiving, rushing, or kicking points. This same boundary
+    # feeds actual outcomes and prior-season preseason projection baselines.
+    stats = {
+        "dst_sacks": raw.get("def_sacks", 0.0),
+        "dst_interceptions": raw.get("def_interceptions", 0.0),
+        "dst_fumble_recoveries": raw.get("fumble_recovery_opp", 0.0),
+        "dst_touchdowns": math.fsum((raw.get("def_tds", 0.0), raw.get("special_teams_tds", 0.0))),
+        # Team aggregates cannot identify the unit that scored a recovery TD.
+        # Retain this evidence separately instead of silently awarding it to DST.
+        "dst_unclassified_recovery_touchdowns": raw.get("fumble_recovery_tds", 0.0),
+        "dst_safeties": raw.get("def_safeties", 0.0),
+        "dst_points_allowed": allowed,
+        "dst_points_allowed_0": float(allowed == 0),
+        "dst_points_allowed_1_6": float(1 <= allowed <= 6),
+        "dst_points_allowed_7_13": float(7 <= allowed <= 13),
+        "dst_points_allowed_14_20": float(14 <= allowed <= 20),
+        "dst_points_allowed_21_27": float(21 <= allowed <= 27),
+        "dst_points_allowed_28_34": float(28 <= allowed <= 34),
+        "dst_points_allowed_35_plus": float(allowed >= 35),
+    }
+    return dict(sorted(stats.items()))
 
 
 def _dst_player_week(team, week, bye, team_stats, schedule):

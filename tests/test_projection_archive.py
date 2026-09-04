@@ -17,6 +17,99 @@ CAPTURED_AT = "2026-09-03T12:34:56Z"
 
 
 class ProjectionArchiveTests(unittest.TestCase):
+    def test_espn_team_defense_uses_the_negative_roster_identity(self):
+        artifact = GenericTableArtifact(
+            task_id="captask_" + "4" * 64,
+            provider="espn",
+            season=2026,
+            week=1,
+            kind="visible_table",
+            captured_at=CAPTURED_AT,
+            horizon="ros",
+            scoring="PPR",
+            position_scope=("ALL",),
+            source_period_text="2026 | Full Season | PPR | ALL | ESPN",
+            segments_captured=1,
+            complete=True,
+            tables=(
+                VisibleTable(
+                    (
+                        tuple(VisibleTableCell(value) for value in (
+                            "PLAYER", "TEAM", "POS", "GP", "FPTS", "FPPG",
+                        )),
+                        (
+                            VisibleTableCell(
+                                "Houston Texans D/ST",
+                                (
+                                    "https://www.espn.com/nfl/player/_/id/"
+                                    "16034/houston-texans-dst",
+                                ),
+                            ),
+                            VisibleTableCell("HOU"),
+                            VisibleTableCell("DST"),
+                            VisibleTableCell("17"),
+                            VisibleTableCell("118.0"),
+                            VisibleTableCell("6.94"),
+                        ),
+                    )
+                ),
+            ),
+        )
+
+        with TemporaryDirectory() as directory:
+            archive = load_projection_archive(
+                save_projection_archive(directory, (artifact,))
+            )
+
+        self.assertEqual(archive.rows[0].identity_provider, "espn")
+        self.assertEqual(archive.rows[0].provider_player_id, "-16034")
+        self.assertEqual(archive.rows[0].position, "DST")
+        self.assertEqual(archive.rows[0].nfl_team_id, "HOU")
+
+    def test_fantasypros_team_defenses_have_stable_team_identity(self):
+        artifact = GenericTableArtifact(
+            task_id="captask_" + "3" * 64,
+            provider="fantasypros",
+            season=2026,
+            week=1,
+            kind="visible_table",
+            captured_at=CAPTURED_AT,
+            horizon="weekly",
+            scoring="PPR",
+            position_scope=("DST",),
+            source_period_text="2026 | Week 1 | PPR | DST",
+            segments_captured=1,
+            complete=True,
+            tables=(
+                VisibleTable(
+                    (
+                        (VisibleTableCell("PLAYER"), VisibleTableCell("FPTS")),
+                        (
+                            VisibleTableCell(
+                                "Arizona Cardinals",
+                                (
+                                    "https://www.fantasypros.com/nfl/projections/"
+                                    "arizona-defense.php",
+                                ),
+                            ),
+                            VisibleTableCell("4.7"),
+                        ),
+                    )
+                ),
+            ),
+        )
+
+        with TemporaryDirectory() as directory:
+            archive = load_projection_archive(
+                save_projection_archive(directory, (artifact,))
+            )
+
+        self.assertEqual(len(archive.rows), 1)
+        self.assertEqual(archive.rows[0].provider_player_id, "dst:ARI")
+        self.assertEqual(archive.rows[0].display_name, "Arizona Cardinals")
+        self.assertEqual(archive.rows[0].position, "DST")
+        self.assertEqual(archive.rows[0].nfl_team_id, "ARI")
+
     def test_preserves_every_structured_row_stat_and_traversal_evidence(self):
         artifact = projection_artifact()
         with TemporaryDirectory() as directory:

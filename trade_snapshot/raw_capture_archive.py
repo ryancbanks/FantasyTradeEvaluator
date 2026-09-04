@@ -110,7 +110,11 @@ def _store(directory, artifact_id, payload):
         if _read(target) != payload:
             raise ValueError("raw capture archive contains an artifact ID collision")
         return target.resolve()
-    temporary = directory / f".{artifact_id}.{uuid4().hex}.tmp"
+    # Keep the atomic staging name short. The final content-addressed path can
+    # legitimately sit close to Windows' legacy path limit once it is nested in
+    # a per-league private partition; repeating the artifact ID here can push
+    # only the temporary write over that limit.
+    temporary = directory / f".capture-{uuid4().hex}.tmp"
     try:
         temporary.write_bytes(payload)
         os.replace(temporary, target)

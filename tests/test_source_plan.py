@@ -21,7 +21,7 @@ class SourcePlanTests(unittest.TestCase):
             include_future_weekly=True,
         )
         self.assertEqual(CapturePlan.from_record(plan.to_record()), plan)
-        self.assertEqual(len(plan.tasks), 29)
+        self.assertEqual(len(plan.tasks), 25)
         self.assertEqual({task.week for task in plan.tasks}, {1, 2})
         fantasypros_projections = tuple(
             task for task in plan.tasks
@@ -29,14 +29,14 @@ class SourcePlanTests(unittest.TestCase):
             and task.kind is CaptureKind.VISIBLE_TABLE
             and task.provider.value == "fantasypros"
         )
-        self.assertEqual(len(fantasypros_projections), 4)
+        self.assertEqual(len(fantasypros_projections), 2)
         self.assertTrue(all(task.projection.horizon is RankingHorizon.WEEKLY for task in fantasypros_projections))
         self.assertEqual(
             {task.url for task in fantasypros_projections},
             {
                 f"https://www.fantasypros.com/nfl/projections/{position}.php"
                 f"?week={week}&scoring=PPR"
-                for position in ("rb", "db") for week in (1, 2)
+                for position in ("rb", "db") for week in (1,)
             },
         )
         ecr = tuple(task for task in plan.tasks if isinstance(task, FantasyProsECRTask))
@@ -71,7 +71,7 @@ class SourcePlanTests(unittest.TestCase):
             )
         )
 
-    def test_future_toggle_never_removes_required_fantasypros_ros_weeks(self):
+    def test_current_week_capture_plus_ros_avoids_unpublished_future_pages(self):
         plan = build_weekly_source_plan(
             season=2026,
             as_of_week=3,
@@ -91,8 +91,6 @@ class SourcePlanTests(unittest.TestCase):
             {(task.week, task.projection.horizon) for task in fantasypros_projections},
             {
                 (3, RankingHorizon.WEEKLY),
-                (4, RankingHorizon.WEEKLY),
-                (5, RankingHorizon.WEEKLY),
             },
         )
         self.assertTrue(
@@ -139,6 +137,14 @@ class SourcePlanTests(unittest.TestCase):
                 (task.provider.value, task.week)
                 for task in optional_provider_tasks
                 if task.projection.horizon is RankingHorizon.WEEKLY
+            },
+            {("yahoo", 3)},
+        )
+        self.assertEqual(
+            {
+                (task.provider.value, task.week)
+                for task in optional_provider_tasks
+                if task.projection.horizon is RankingHorizon.ROS
             },
             {("espn", 3), ("yahoo", 3)},
         )

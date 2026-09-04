@@ -32,6 +32,7 @@ from trade_snapshot.independent_weekly_assembly import (
     assemble_independent_weekly_engine,
 )
 from trade_snapshot.search_runner import TradeSearchSettings
+from trade_snapshot.ros_matchup_allocation import neutral_ros_matchup_allocation
 from trade_snapshot.trade_space import TradeConstraints
 
 
@@ -39,7 +40,7 @@ def projection_artifacts(*, broad):
     providers = (
         (
             CaptureProvider.ESPN,
-            (RankingHorizon.WEEKLY, RankingHorizon.ROS),
+            (RankingHorizon.ROS,),
         ),
         (
             CaptureProvider.YAHOO,
@@ -77,12 +78,36 @@ def independent_bundle():
 
 
 class IndependentWeeklyAssemblyTests(unittest.TestCase):
+    def test_accepts_a_season_bound_matchup_allocation(self):
+        host = host_snapshot()
+        allocation = neutral_ros_matchup_allocation(
+            season=2026,
+            as_of_week=1,
+            scoring="PPR",
+            scoring_profile_id=host.scoring_profile.scoring_profile_id,
+        )
+
+        assembled = assemble_independent_weekly_engine(
+            host_snapshot=host,
+            projection_artifacts=projection_artifacts(broad=False),
+            nfl_schedule=nfl_schedule(),
+            scoring="PPR",
+            expected_team_count=2,
+            ros_matchup_allocation=allocation,
+        )
+
+        self.assertTrue(assembled.bundle.projections)
+
     def test_retains_projected_players_outside_the_bounded_waiver_pool(self):
         artifacts = tuple(
             projection_artifact_with_outside_player(provider, horizon, week)
             for provider in (CaptureProvider.ESPN, CaptureProvider.YAHOO)
             for horizon, weeks in (
-                (RankingHorizon.WEEKLY, (1, 2)),
+                *(
+                    ((RankingHorizon.WEEKLY, (1, 2)),)
+                    if provider is CaptureProvider.YAHOO
+                    else ()
+                ),
                 (RankingHorizon.ROS, (1,)),
             )
             for week in weeks

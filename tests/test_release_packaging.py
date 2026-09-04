@@ -111,7 +111,7 @@ class ReleaseBuildTests(unittest.TestCase):
         with (PROJECT_ROOT / "pyproject.toml").open("rb") as source:
             metadata = tomllib.load(source)
         project = metadata["project"]
-        self.assertEqual(project["version"], "0.2.0")
+        self.assertEqual(project["version"], "0.2.1")
         self.assertEqual(release_build.project_version(), project["version"])
         self.assertEqual(project["dependencies"], ["XlsxWriter==3.2.9"])
         self.assertEqual(

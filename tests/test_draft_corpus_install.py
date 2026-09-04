@@ -16,6 +16,7 @@ from trade_snapshot.draft_corpus_install import (
     CorpusInstallManifest,
     DraftCorpusInstaller,
 )
+from trade_snapshot.draft_corpus_sources import STARTER_TRANSFORM_VERSION
 
 
 class _Response:
@@ -80,6 +81,18 @@ class _Transport:
 
 
 class DraftCorpusInstallerTests(unittest.TestCase):
+    def test_projection_transform_is_versioned_without_invalidating_v1_corpora(self):
+        manifest, _ = _manifest_and_payloads()
+
+        self.assertEqual(STARTER_TRANSFORM_VERSION, 4)
+        with self.assertRaisesRegex(ValueError, "transform version"):
+            CorpusInstallManifest(manifest.years, manifest.assets, 1)
+        legacy_corpus = small_historical_corpus()
+        self.assertEqual(
+            type(legacy_corpus).from_record(legacy_corpus.to_record()),
+            legacy_corpus,
+        )
+
     def test_rejects_non_allowlisted_or_non_https_sources(self):
         for url in ("http://github.com/file", "https://evil.example/file"):
             with self.subTest(url=url), self.assertRaisesRegex(ValueError, "allowlist"):
@@ -110,6 +123,10 @@ class DraftCorpusInstallerTests(unittest.TestCase):
             installer = DraftCorpusInstaller(
                 root, transport=transport, clock=lambda: 10.0, sleeper=lambda _: None
             )
+            schedule = next(row for row in manifest.assets if row.key == "schedule")
+            legacy_downloads = installer.root / "legacy-transform" / "downloads"
+            legacy_downloads.mkdir(parents=True)
+            (legacy_downloads / schedule.filename).write_bytes(payloads[schedule.url])
             _cache_manifest(installer, manifest)
             with self.assertRaises(CorpusInstallCancelled):
                 installer.install(should_cancel=interrupted.is_set)
@@ -139,6 +156,7 @@ class DraftCorpusInstallerTests(unittest.TestCase):
                 if url == first_url and "Range" in headers
             ]
             self.assertEqual(len(resumed), 1)
+            self.assertNotIn(schedule.url, [url for url, _, _ in transport.calls])
             self.assertEqual(installer.store.load_corpus(corpus.corpus_id), corpus)
 
     def test_digest_mismatch_fails_without_promoting_part_file(self):
@@ -165,7 +183,9 @@ def _manifest_and_payloads(*, corrupt_digest=False):
     specs = (
         ("schedule", "schedule", None, "games.csv.gz"),
         ("ffc_adp:2025", "ffc_adp", 2025, "ffc_adp_2025.json"),
+        ("player_stats:2024", "player_stats", 2024, "stats_player_week_2024.csv.gz"),
         ("player_stats:2025", "player_stats", 2025, "stats_player_week_2025.csv.gz"),
+        ("team_stats:2024", "team_stats", 2024, "stats_team_week_2024.csv.gz"),
         ("team_stats:2025", "team_stats", 2025, "stats_team_week_2025.csv.gz"),
         ("roster:2024", "roster", 2024, "roster_weekly_2024.csv.gz"),
         ("roster:2025", "roster", 2025, "roster_weekly_2025.csv.gz"),
@@ -196,7 +216,7 @@ def _manifest_and_payloads(*, corrupt_digest=False):
 
 
 def _cache_manifest(installer, manifest):
-    path = installer.root / "starter-manifest-v1.json"
+    path = installer.root / f"starter-manifest-v{STARTER_TRANSFORM_VERSION}.json"
     path.write_text(json.dumps(manifest.to_record()), encoding="utf-8")
 
 

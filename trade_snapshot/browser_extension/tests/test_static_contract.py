@@ -52,7 +52,7 @@ class ExtensionStaticContractTests(unittest.TestCase):
 
     def test_manifest_has_minimal_fixed_surface(self) -> None:
         self.assertEqual(self.manifest["manifest_version"], 3)
-        self.assertEqual(self.manifest["version"], "0.2.0")
+        self.assertEqual(self.manifest["version"], "0.2.1")
         self.assertEqual(self.manifest["permissions"], ["storage"])
         self.assertEqual(self.manifest["host_permissions"], HOST_PERMISSIONS)
         self.assertNotIn("<all_urls>", json.dumps(self.manifest))
@@ -80,6 +80,8 @@ class ExtensionStaticContractTests(unittest.TestCase):
         advertised = re.findall(r'"([a-z_.]+)"', match.group(1))
         self.assertEqual(advertised, OPERATIONS)
         self.assertIn("validateOperationEnvelope", source)
+        self.assertIn('"expires_in_ms"', source)
+        self.assertIn("expiresInMs: value.expires_in_ms", source)
 
     def test_yahoo_projection_and_scoring_are_in_the_live_extension_contract(self) -> None:
         manifest_text = json.dumps(self.manifest)
@@ -135,6 +137,37 @@ class ExtensionStaticContractTests(unittest.TestCase):
         self.assertIn("chrome.runtime.getPlatformInfo()", worker)
         self.assertIn("response.body.getReader()", worker)
         self.assertNotIn("await response.text()", worker)
+        self.assertIn("const COLLECTOR_RECOVERY_GRACE_MS = 3000", worker)
+        self.assertIn("const RESULT_DELIVERY_GRACE_MS = 10000", worker)
+        self.assertIn(
+            "const operationDeadline = commandDeadline - RESULT_DELIVERY_GRACE_MS",
+            worker,
+        )
+        self.assertIn(
+            'error.code === "command_completion_stale"',
+            worker,
+        )
+        self.assertIn(
+            'value.error === "command completion is stale"',
+            worker,
+        )
+        self.assertIn('error.code === "collector_unavailable"', worker)
+        self.assertIn(
+            "Date.now() - collectorUnavailableSince >= COLLECTOR_RECOVERY_GRACE_MS",
+            worker,
+        )
+        self.assertIn(
+            "return retryScanAction(operation, payload, deadline, true)",
+            worker,
+        )
+        self.assertIn(
+            'onlyCollectorUnavailable && error.code !== "collector_unavailable"',
+            worker,
+        )
+
+        scan_agent = self.javascript["scan_agent.js"]
+        self.assertIn("const MAIN_RESPONSE_MARGIN_MS = 250", scan_agent)
+        self.assertIn("message.timeout_ms", scan_agent)
 
     def test_explicit_rejection_is_returned_to_the_requesting_app_tab(self) -> None:
         worker = self.javascript["service_worker.js"]

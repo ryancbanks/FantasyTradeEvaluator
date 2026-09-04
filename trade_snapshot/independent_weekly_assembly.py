@@ -46,6 +46,7 @@ from .projection_source_policy import (
     validate_selectable_projection_providers,
 )
 from .role_design import build_calibration_roles
+from .ros_matchup_allocation import RosMatchupAllocation
 from .scenario_config import CorrelatedScenarioConfig, FactorLoadings, PlayerEligibility
 from .trade_space import TeamRoster
 from .waiver_pool import required_waiver_positions, waiver_eligible_slots
@@ -85,6 +86,7 @@ def assemble_independent_weekly_engine(
     ensemble_config: EnsembleConfig | None = None,
     scenario_config: CorrelatedScenarioConfig | None = None,
     broad_consensus: bool = False,
+    ros_matchup_allocation: RosMatchupAllocation | None = None,
 ) -> IndependentWeeklyEngine:
     """Normalize public projections and seal a transparently independent bundle."""
 
@@ -104,6 +106,17 @@ def assemble_independent_weekly_engine(
         raise ValueError("previous_identities must be an IdentityRegistry or None")
     projections = _typed_artifacts(projection_artifacts)
     captured_providers = _validate_dimensions(host_snapshot, projections, scoring)
+    if ros_matchup_allocation is not None:
+        if not isinstance(ros_matchup_allocation, RosMatchupAllocation):
+            raise ValueError(
+                "ros_matchup_allocation must be a RosMatchupAllocation or None"
+            )
+        ros_matchup_allocation.validate_context(
+            season=host_snapshot.season,
+            as_of_week=host_snapshot.first_remaining_week,
+            scoring_profile_id=host_snapshot.scoring_profile.scoring_profile_id,
+            scoring=scoring,
+        )
     selection = select_projection_sources(
         captured_providers,
         broad_consensus=broad_consensus,
@@ -190,6 +203,7 @@ def assemble_independent_weekly_engine(
         player_nfl_team_ids=nfl_teams,
         nfl_schedule=nfl_schedule,
         ensemble_config=ensemble,
+        ros_matchup_allocation=ros_matchup_allocation,
     )
     projected_points = _remaining_points(preliminary_ensemble)
     required_positions = required_waiver_positions(
@@ -230,6 +244,7 @@ def assemble_independent_weekly_engine(
         nfl_schedule=nfl_schedule,
         ensemble_config=ensemble,
         exclude_player_ids=calculation_ids,
+        ros_matchup_allocation=ros_matchup_allocation,
     )
     final_eligibilities = tuple(
         eligibility[player_id] for player_id in sorted(calculation_ids)
@@ -321,7 +336,7 @@ def _validate_dimensions(host, artifacts, scoring) -> tuple[str, ...]:
         horizons = {
             row.horizon for row in artifacts if row.provider.value == provider
         }
-        if provider == "cbs":
+        if provider in {"cbs", "espn"}:
             complete = horizons == {RankingHorizon.ROS}
         elif provider == "fftoday":
             # FFToday's public weekly IDP tables do not expose stable player

@@ -71,12 +71,13 @@ def project_espn_league_payload(value: object) -> dict[str, object]:
                 _project_matchup(matchup)
                 for matchup in _rows(league.get("schedule"))
             ],
-            "transactions": [
-                _project_transaction(transaction)
-                for transaction in _rows(league.get("transactions"))
-            ],
         }
     )
+    if "transactions" in league:
+        result["transactions"] = [
+            _project_transaction(transaction)
+            for transaction in _rows(league.get("transactions"))
+        ]
     return result
 
 

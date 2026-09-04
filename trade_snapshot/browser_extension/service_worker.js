@@ -9,6 +9,9 @@ const DEFAULT_ACTION_DELAY_MS = 500;
 const CONTROL_RESPONSE_LIMIT = 256 * 1024;
 const PAIR_LIFETIME_MS = 120000;
 const WAIT_KEEPALIVE_MS = 10000;
+const COLLECTOR_RECOVERY_GRACE_MS = 3000;
+// Keep this equal to _RESULT_DELIVERY_GRACE_MS in _extension_capture.py.
+const RESULT_DELIVERY_GRACE_MS = 10000;
 const RESULT_LIMIT = protocol.CAPABILITIES.maximum_result_bytes;
 
 class BridgeError extends Error {
@@ -103,7 +106,7 @@ async function restoreSession() {
       await postCompletion(session, {
         command_id: interruptedCommandId,
         error: "worker_restarted_during_command"
-      }, interruptedCommandId);
+      }, interruptedCommandId, Date.now() + RESULT_DELIVERY_GRACE_MS);
       session.inflightCommandId = null;
       await persistSession();
     }
@@ -347,7 +350,7 @@ async function pollLoop(generation, owner) {
       const command = protocol.validateOperationEnvelope(response);
       if (!command) throw new BridgeError("invalid_command_response");
       failures = 0;
-      await runCommand(owner, command);
+      await runCommand(owner, command, Date.now() + command.expiresInMs);
     } catch (error) {
       if (session !== owner || generation !== pollGeneration) return;
       if (!(error instanceof BridgeError) || !error.retryable) {
@@ -369,14 +372,17 @@ function isIdleResponse(value) {
     value.protocol_version === protocol.VERSION && value.state === "idle";
 }
 
-async function runCommand(owner, command) {
+async function runCommand(owner, command, commandDeadline) {
   publishStatus("running", null);
   let result;
   let error = null;
   owner.inflightCommandId = command.commandId;
   await persistSession();
   try {
-    result = await dispatchOperation(command.operation, command.payload, owner);
+    const operationDeadline = commandDeadline - RESULT_DELIVERY_GRACE_MS;
+    if (operationDeadline <= Date.now()) throw new BridgeError("operation_timeout");
+    result = await dispatchOperation(
+      command.operation, command.payload, owner, operationDeadline);
     assertResultSize(result);
   } catch (caught) {
     error = safeError(caught);
@@ -384,7 +390,7 @@ async function runCommand(owner, command) {
   const body = error === null ?
     {command_id: command.commandId, result} :
     {command_id: command.commandId, error};
-  await postCompletion(owner, body, command.commandId);
+  await postCompletion(owner, body, command.commandId, commandDeadline);
   owner.inflightCommandId = null;
   await persistSession();
   if (command.operation === "session.close" && error === null) {
@@ -392,20 +398,28 @@ async function runCommand(owner, command) {
   }
 }
 
-async function postCompletion(owner, body, commandId) {
+async function postCompletion(owner, body, commandId, deadline) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return "expired";
     try {
       const accepted = await localRequest(owner.appOrigin, protocol.ENDPOINTS.result,
-        body, owner.token, 15000);
+        body, owner.token, Math.min(5000, remaining));
       if (!validResultAck(accepted, commandId)) throw new BridgeError("invalid_result_ack");
-      return;
+      return "accepted";
     } catch (error) {
+      if (error instanceof BridgeError && error.code === "command_completion_stale") {
+        return "stale";
+      }
       if (!(error instanceof BridgeError) || !error.retryable || attempt === 2) {
         throw new BridgeError("result_delivery_failed");
       }
-      await delay(250 * (2 ** attempt));
+      const retryDelay = Math.min(250 * (2 ** attempt), deadline - Date.now());
+      if (retryDelay <= 0) return "expired";
+      await delay(retryDelay);
     }
   }
+  return "expired";
 }
 
 function validResultAck(value, commandId) {
@@ -414,7 +428,8 @@ function validResultAck(value, commandId) {
     value.command_id === commandId;
 }
 
-async function dispatchOperation(operation, payload, owner) {
+async function dispatchOperation(operation, payload, owner, deadline) {
+  operationTimeRemaining(deadline);
   switch (operation) {
     case "session.open":
       owner.actionDelayMs = payload.action_delay_ms || owner.actionDelayMs;
@@ -422,18 +437,19 @@ async function dispatchOperation(operation, payload, owner) {
       await persistSession();
       return {opened: true};
     case "session.navigate":
-      await navigateScanTab(payload.url, payload.timeout_ms);
+      await navigateScanTab(payload.url,
+        Math.min(payload.timeout_ms, operationTimeRemaining(deadline)));
       return {loaded: true};
     case "analyzer.begin":
       owner.analyzerPhase = payload.phase;
       await persistSession();
       return {ok: true};
     case "analyzer.finish":
-      return finishAnalyzer(owner);
+      return finishAnalyzer(owner, deadline);
     case "analyzer.abort":
       if (Number.isInteger(scanTabId)) {
         try {
-          await sendScanAction(operation, payload, 65000);
+          await retryScanAction(operation, payload, deadline, true);
         } catch (error) {
           if (!(error instanceof BridgeError) || !error.retryable) throw error;
         }
@@ -448,13 +464,12 @@ async function dispatchOperation(operation, payload, owner) {
     case "league.capture":
     case "espn.authenticated_json":
     case "yahoo.scoring":
-      return sendScanAction(operation, payload,
-        ["league.capture", "espn.authenticated_json"].includes(operation) ?
-          payload.timeout_ms + 5000 : 65000);
+      return retryScanAction(operation, payload, deadline, true);
     case "projection.capture":
-      return captureProjection(payload, owner.actionDelayMs);
+      return captureProjection(payload, owner.actionDelayMs, deadline);
     case "session.wait":
-      await waitWithKeepAlive(payload.timeout_ms);
+      await waitWithKeepAlive(
+        Math.min(payload.timeout_ms, operationTimeRemaining(deadline)));
       return {ok: true};
     case "session.close":
       return {ok: true};
@@ -518,7 +533,9 @@ async function sendScanAction(action, payload, timeoutMs) {
   });
   try {
     const response = await Promise.race([
-      chrome.tabs.sendMessage(scanTabId, {kind: "fte.scan.action", action, payload}),
+      chrome.tabs.sendMessage(scanTabId, {
+        kind: "fte.scan.action", action, payload, timeout_ms: timeoutMs
+      }),
       timeout
     ]);
     if (!protocol.isRecord(response) || response.ok !== true) {
@@ -533,20 +550,46 @@ async function sendScanAction(action, payload, timeoutMs) {
   }
 }
 
-async function captureProjection(payload, sessionActionDelayMs) {
-  const deadline = Date.now() + payload.timeout_ms;
+async function captureProjection(payload, sessionActionDelayMs, deadline) {
+  if (payload.request.provider === "espn" && payload.request.horizon === "ros") {
+    const segment = await retryScanAction(
+      "espn.season_projections",
+      {...payload.request, timeout_ms: Math.min(30000, operationTimeRemaining(deadline))},
+      deadline,
+      true
+    );
+    const result = {segments: [segment]};
+    assertResultSize(result);
+    return result;
+  }
   const actionDelayMs = payload.action_delay_ms || sessionActionDelayMs;
   let changes = 0;
+  let priorContentFingerprint = null;
+  const contentChangeProviders = new Set(["fftoday", "fantasysharks"]);
   while (true) {
     const configured = await retryScanAction("projection.configure", payload.request, deadline);
     if (!protocol.isRecord(configured) ||
-        !["ready", "changed", "error"].includes(configured.action)) {
+        !["ready", "changed", "waiting", "error"].includes(configured.action)) {
       throw new BridgeError("projection_configuration_invalid");
     }
-    if (configured.action === "ready") break;
+    const fingerprint = configured.fingerprint;
+    if (contentChangeProviders.has(payload.request.provider) && configured.action !== "error" &&
+        (typeof fingerprint !== "string" || !fingerprint.length || fingerprint.length > 8192)) {
+      throw new BridgeError("projection_configuration_invalid");
+    }
+    if (contentChangeProviders.has(payload.request.provider) && configured.action === "changed" &&
+        typeof configured.require_change !== "boolean") {
+      throw new BridgeError("projection_configuration_invalid");
+    }
+    if (configured.action === "ready" && priorContentFingerprint !== fingerprint) break;
     if (configured.action === "error") throw new BridgeError("projection_configuration_failed");
-    changes += 1;
-    if (changes > 12) throw new BridgeError("projection_configuration_unstable");
+    if (configured.action === "changed") {
+      if (contentChangeProviders.has(payload.request.provider)) {
+        priorContentFingerprint = configured.require_change ? fingerprint : null;
+      }
+      changes += 1;
+      if (changes > 12) throw new BridgeError("projection_configuration_unstable");
+    }
     await boundedDelay(actionDelayMs, deadline);
   }
 
@@ -580,23 +623,20 @@ async function captureProjection(payload, sessionActionDelayMs) {
   }
 }
 
-async function finishAnalyzer(owner) {
+async function finishAnalyzer(owner, deadline) {
   if (!["ordinary_power", "full_playoffs"].includes(owner.analyzerPhase)) {
     throw new BridgeError("analyzer_phase_missing");
   }
-  const deadline = Date.now() + 45000;
   while (Date.now() < deadline) {
-    const body = await sendScanAction("analyzer.finish", {},
-      Math.min(65000, deadline - Date.now()));
+    const body = await retryScanAction("analyzer.finish", {}, deadline, true);
     if (body !== null && analyzerBodyMatchesPhase(body, owner.analyzerPhase)) {
-      await sendScanAction("analyzer.abort", {}, 5000);
+      await retryScanAction("analyzer.abort", {}, deadline, true);
       owner.analyzerPhase = null;
       await persistSession();
       return body;
     }
     await boundedDelay(50, deadline);
   }
-  await sendScanAction("analyzer.abort", {}, 5000).catch(() => {});
   owner.analyzerPhase = null;
   await persistSession();
   throw new BridgeError("analyzer_response_timeout");
@@ -669,12 +709,26 @@ async function stableProjection(request, deadline, rejectSerialized) {
   throw new BridgeError("projection_capture_timeout");
 }
 
-async function retryScanAction(action, payload, deadline) {
+async function retryScanAction(
+  action, payload, deadline, onlyCollectorUnavailable = false
+) {
+  let collectorUnavailableSince = null;
   while (Date.now() < deadline) {
     try {
       return await sendScanAction(action, payload, Math.min(30000, deadline - Date.now()));
     } catch (error) {
       if (!(error instanceof BridgeError) || !error.retryable) throw error;
+      if (onlyCollectorUnavailable && error.code !== "collector_unavailable") {
+        throw error;
+      }
+      if (error.code === "collector_unavailable") {
+        collectorUnavailableSince ??= Date.now();
+        if (Date.now() - collectorUnavailableSince >= COLLECTOR_RECOVERY_GRACE_MS) {
+          throw new BridgeError("collector_unavailable");
+        }
+      } else {
+        collectorUnavailableSince = null;
+      }
       await boundedDelay(200, deadline);
     }
   }
@@ -685,6 +739,12 @@ async function boundedDelay(milliseconds, deadline) {
   const remaining = deadline - Date.now();
   if (remaining <= 0) throw new BridgeError("operation_timeout");
   await delay(Math.min(milliseconds, remaining));
+}
+
+function operationTimeRemaining(deadline) {
+  const remaining = Math.floor(deadline - Date.now());
+  if (remaining <= 0) throw new BridgeError("operation_timeout");
+  return remaining;
 }
 
 function delay(milliseconds) {
@@ -728,10 +788,6 @@ async function localRequest(origin, path, body, token, timeoutMs) {
       referrerPolicy: "no-referrer",
       signal: controller.signal
     });
-    if (!response.ok) {
-      throw new BridgeError(response.status >= 500 ? "bridge_server_error" :
-        "bridge_request_rejected", response.status >= 500);
-    }
     const mediaType = (response.headers.get("Content-Type") || "").split(";", 1)[0]
       .trim().toLowerCase();
     if (mediaType !== "application/json") throw new BridgeError("bridge_response_type");
@@ -744,8 +800,18 @@ async function localRequest(origin, path, body, token, timeoutMs) {
     const text = await readBoundedResponseText(response, CONTROL_RESPONSE_LIMIT);
     if (!text) throw new BridgeError("bridge_response_json");
     try {
-      return JSON.parse(text);
+      const value = JSON.parse(text);
+      if (!response.ok) {
+        if (path === protocol.ENDPOINTS.result && response.status === 409 &&
+            isStaleCompletionResponse(value)) {
+          throw new BridgeError("command_completion_stale");
+        }
+        throw new BridgeError(response.status >= 500 ? "bridge_server_error" :
+          "bridge_request_rejected", response.status >= 500);
+      }
+      return value;
     } catch (_) {
+      if (_ instanceof BridgeError) throw _;
       throw new BridgeError("bridge_response_json");
     }
   } catch (error) {
@@ -755,6 +821,11 @@ async function localRequest(origin, path, body, token, timeoutMs) {
     clearTimeout(timer);
     activeRequests.delete(controller);
   }
+}
+
+function isStaleCompletionResponse(value) {
+  return protocol.isRecord(value) && Object.keys(value).length === 1 &&
+    value.error === "command completion is stale";
 }
 
 async function readBoundedResponseText(response, maximumBytes) {

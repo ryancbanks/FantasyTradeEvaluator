@@ -19,6 +19,7 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from ._app_support import default_data_directory
 from .app_service import LocalAppService, LocalSearchRequest
+from .desktop_file_manager import reveal_file
 from .extension_bridge import (
     COMMAND_RESULT_MAX_BYTES,
     PAIR_REQUEST_MAX_BYTES,
@@ -89,11 +90,18 @@ _DRAFT_ASSISTANT_PATH = re.compile(r"^/api/draft/assistants/([0-9a-f]{32})$")
 _DRAFT_ASSISTANT_ACTION_PATH = re.compile(
     r"^/api/draft/assistants/([0-9a-f]{32})/(players|picks|undo|espn-sync)$"
 )
-_DRAFT_MODEL_PATH = re.compile(r"^/api/draft/models/(draft_model_[0-9a-f]{64})/export$")
+_DRAFT_MODEL_TICKET_PATH = re.compile(
+    r"^/api/draft/models/(draft_model_[0-9a-f]{64})/export-ticket$"
+)
+_DRAFT_MODEL_REVEAL_PATH = re.compile(
+    r"^/api/draft/models/(draft_model_[0-9a-f]{64})/reveal$"
+)
+_DRAFT_MODEL_DOWNLOAD_PATH = re.compile(r"^/api/draft/model-download/([A-Za-z0-9_-]{32,128})$")
 _STATIC = WEB_ASSET_ROUTES
 _MAX_JSON_BYTES = 256 * 1024 * 1024
 _MAX_DRAFT_DATA_BYTES = 128 * 1024 * 1024
 _MAX_PLAYER_ID_LENGTH = 256
+_MODEL_DOWNLOAD_TTL_SECONDS = 300
 _EXTENSION_ROOT = "/api/browser-extension/v1"
 _CLIENT_ID_HEADER = "X-FTE-Client"
 _CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -119,7 +127,33 @@ class LocalAppHTTPServer(ThreadingHTTPServer):
         self._last_client_departed: float | None = None
         self._browser_connected = False
         self._lifecycle_started = False
+        self._model_downloads: dict[str, tuple[str, float]] = {}
         super().__init__(address, LocalAppRequestHandler)
+
+    def issue_model_download(self, model_id: str) -> tuple[str, Path]:
+        model_path = self.app_service.draft_lab.model_path(model_id)
+        now = monotonic()
+        with self._lifecycle_lock:
+            self._model_downloads = {
+                ticket: row for ticket, row in self._model_downloads.items()
+                if row[1] > now
+            }
+            if len(self._model_downloads) >= 32:
+                raise RuntimeError(
+                    "Too many model downloads are currently prepared; wait five minutes and try again."
+                )
+            ticket = token_urlsafe(32)
+            self._model_downloads[ticket] = model_id, now + _MODEL_DOWNLOAD_TTL_SECONDS
+        return f"/api/draft/model-download/{ticket}", model_path
+
+    def resolve_model_download(self, ticket: str) -> Path:
+        now = monotonic()
+        with self._lifecycle_lock:
+            row = self._model_downloads.get(ticket)
+            if row is None or row[1] <= now:
+                self._model_downloads.pop(ticket, None)
+                raise FileNotFoundError(ticket)
+        return self.app_service.draft_lab.model_path(row[0])
 
     @property
     def app_url(self) -> str:
@@ -261,9 +295,17 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
                 disposition='attachment; filename="FantasyTradeEvaluator-Browser-Extension.zip"',
             )
             return
+        matched = _DRAFT_MODEL_DOWNLOAD_PATH.fullmatch(path)
+        if matched:
+            model_path = self.server.resolve_model_download(matched.group(1))
+            self._bytes(
+                HTTPStatus.OK, model_path.read_bytes(), "application/json; charset=utf-8",
+                disposition=f'attachment; filename="{model_path.name}"',
+            )
+            return
         self._require_token()
         if path == "/api/health":
-            self._json(HTTPStatus.OK, {"status": "ready", "version": "0.2.0"})
+            self._json(HTTPStatus.OK, {"status": "ready", "version": "0.2.1"})
             return
         if path == "/api/activity":
             self._json(
@@ -302,16 +344,6 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
             self._json(
                 HTTPStatus.OK,
                 self.server.app_service.draft_lab.assistant_players(matched.group(1)),
-            )
-            return
-        matched = _DRAFT_MODEL_PATH.fullmatch(path)
-        if matched:
-            model_path = self.server.app_service.draft_lab.model_path(matched.group(1))
-            self._bytes(
-                HTTPStatus.OK,
-                model_path.read_bytes(),
-                "application/json; charset=utf-8",
-                disposition=f'attachment; filename="{model_path.name}"',
             )
             return
         matched = _DASHBOARD_PATH.fullmatch(path)
@@ -389,6 +421,25 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
             self._extension_post(path)
             return
         self._require_token()
+        matched = _DRAFT_MODEL_TICKET_PATH.fullmatch(path)
+        if matched:
+            self._require_empty_body()
+            download_url, model_path = self.server.issue_model_download(matched.group(1))
+            self._json(HTTPStatus.CREATED, {
+                "url": download_url,
+                "expires_in_seconds": _MODEL_DOWNLOAD_TTL_SECONDS,
+                "saved_path": str(model_path),
+            })
+            return
+        matched = _DRAFT_MODEL_REVEAL_PATH.fullmatch(path)
+        if matched:
+            self._require_empty_body()
+            model_path = self.server.app_service.draft_lab.model_path(matched.group(1))
+            self._json(HTTPStatus.OK, {
+                "opened": reveal_file(model_path),
+                "saved_path": str(model_path),
+            })
+            return
         if path == "/api/browser-extension/pairing":
             self._require_empty_body()
             self._json(

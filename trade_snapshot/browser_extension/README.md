@@ -87,7 +87,7 @@ omitted, redirects are rejected, and no URL contains a pair or session token.
   "pair_code": "one-time-code",
   "protocol_version": 1,
   "capabilities": ["the exact operation list below"],
-  "extension_version": "0.2.0"
+  "extension_version": "0.2.1"
 }
 ```
 
@@ -119,7 +119,8 @@ to the same loopback origin and is cleared on disconnect or browser restart.
   "state": "command",
   "command_id": "bounded-unique-id",
   "op": "page.provenance",
-  "payload": {}
+  "payload": {},
+  "expires_in_ms": 15000
 }
 ```
 
@@ -129,6 +130,11 @@ Success is posted to `/api/browser-extension/v1/result` as
 with `{"protocol_version":1,"state":"accepted","command_id":"..."}` and rejects
 stale IDs. A restored service worker does not replay a claimed command: it first
 completes that ID with `worker_restarted_during_command`, then resumes polling.
+The remaining lifetime is issued by the server rather than inferred from clocks in
+two processes. The worker reserves the final 10 seconds for bounded result delivery
+and keeps polling when the server's exact authenticated response says a result is
+stale because its command was already cancelled or timed out. Authentication,
+payload, protocol, and every other conflict still close the session fail-closed.
 
 `POST /api/browser-extension/v1/disconnect` uses `{}` and returns
 `{"protocol_version":1,"state":"unpaired"}`.
@@ -145,9 +151,9 @@ operation list is:
 3. `analyzer.begin` — payload phase `ordinary_power` or `full_playoffs`; records
    intent before navigation and returns `{"ok":true}`.
 4. `analyzer.finish` — payload `{}`; discards responses that do not structurally
-   match the phase from `analyzer.begin`, waits up to 45 seconds, then returns the
-   matching raw analyzer response object. The Python boundary still projects and
-   revalidates it before persistence.
+   match the phase from `analyzer.begin`, waits within the app-issued operation
+   deadline, then returns the matching raw analyzer response object. The Python
+   boundary still projects and revalidates it before persistence.
 5. `analyzer.abort` — payload `{}`; clears any buffered analyzer response and
    returns `{"ok":true}`.
 6. `analyzer.bundle` — payload `{}`; returns the unique public bundle as
@@ -164,7 +170,8 @@ operation list is:
 11. `league.capture` — bounded `expected_season`, `expected_week`, and `timeout_ms`;
     returns the packaged `{team_count,sources}` semantic projection.
 12. `espn.authenticated_json` — bounded `season`, numeric `league_id`, `timeout_ms`,
-    and `maximum_bytes`; constructs exactly the two existing ESPN URLs and returns
+    and `maximum_bytes`; reads the base league, preseason and current transaction
+    snapshots, and NFL schedule from four exact ESPN URLs, then returns
     `{league,pro_teams}`.
 13. `yahoo.scoring` — payload `{}`; reads the selected Yahoo league's reception
     scoring from its verified Settings page and returns the canonical scoring mode.
@@ -197,7 +204,7 @@ It also activates a packaged single-page guard adapted from the existing collect
 closes any child tab that still escapes. Ordinary unmarked provider tabs get no
 collector handlers, fetch/XHR patches, or click interception.
 
-The ESPN operation asks the ESPN page itself to make two exact credentialed reads.
+The ESPN operation asks the ESPN page itself to make four exact credentialed reads.
 The browser attaches its session internally; the extension never calls a cookie
 API, reads cookie values, reads `localStorage`/`sessionStorage`, or sends those
 values to the app. Likewise, provider login pages (including Google) are not in the

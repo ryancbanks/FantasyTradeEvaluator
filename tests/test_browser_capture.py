@@ -669,6 +669,15 @@ class PlaywrightAdapterTests(unittest.TestCase):
                     self.assertEqual(
                         page.evaluate(YAHOO_SCORING_SCRIPT), {"scoring": expected}
                     )
+                page.set_content("""<!doctype html><html><body>
+                <table id=settings-stat-mod-table><tbody>
+                <tr><th>Offense</th><th>League Value</th><th>Yahoo Default Value</th></tr>
+                <tr><td>Receptions<div>Yahoo Default</div></td><td><b>1</b></td>
+                <td><b>0.5</b></td></tr>
+                </tbody></table></body></html>""")
+                self.assertEqual(
+                    page.evaluate(YAHOO_SCORING_SCRIPT), {"scoring": "PPR"}
+                )
                 page.set_content("""<!doctype html><table id=settings-stat-mod-table>
                 <tr><td>Receptions</td><td>2</td><td>note</td></tr></table>""")
                 self.assertEqual(
@@ -756,6 +765,8 @@ class PlaywrightAdapterTests(unittest.TestCase):
                         "eligibility": ["WR"]},
                 "103": {"player_id": 103, "player_name": "C", "position_id": 2,
                         "team_id": "CAR", "eligibility": ["RB"]},
+                "105": {"player_id": 105, "player_name": "Known Free Agent",
+                         "position": "WR"},
             },
         }
         current = [
@@ -770,7 +781,16 @@ class PlaywrightAdapterTests(unittest.TestCase):
              "wins_current": 0, "losses_current": 1, "wins_proj": 6,
              "losses_proj": 8, "playoffs_odds": "40%", "championship_odds": "<1%"},
         ]}
-        initial = {"standings": current, "best_free_agents": [{"id": 104}]}
+        initial = {
+            "standings": current,
+            "best_free_agents": [
+                {
+                    "id": 104, "name": "Available D", "position": "RB",
+                    "fpLink": "https://example.test/private-provider-route",
+                },
+                {"id": 105, "name": "Conflicting Fallback", "position": "TE"},
+            ],
+        }
         body = """<!doctype html><script>
         const data=Object.freeze(%s);
         window.__tradeSnapshotAnalyzerV2={initQueue:[%s],error:null};
@@ -809,7 +829,9 @@ class PlaywrightAdapterTests(unittest.TestCase):
                     }""",
                     {
                         "initial": {"standings": current,
-                                    "best_free_agents": [{"id": 104}]},
+                                    "best_free_agents": [{
+                                        "id": 104, "name": "Available D", "position": "RB",
+                                    }]},
                         "projected": invalid_projected,
                     },
                 )
@@ -854,6 +876,18 @@ class PlaywrightAdapterTests(unittest.TestCase):
         self.assertEqual(bootstrap["body"]["payload"]["league"]["roster_size"], 2)
         self.assertEqual(bootstrap["body"]["payload"]["league"]["id"], "77")
         self.assertEqual(bootstrap["body"]["payload"]["league"]["team_id"], "1")
+        self.assertEqual(
+            bootstrap["body"]["payload"]["players"][-1],
+            {"player_id": "104", "name": "Available D", "position": "RB"},
+        )
+        known_free_agent = next(
+            row for row in bootstrap["body"]["payload"]["players"]
+            if row["player_id"] == "105"
+        )
+        self.assertEqual(
+            known_free_agent,
+            {"player_id": "105", "name": "Known Free Agent", "position": "WR"},
+        )
         projected_capture = next(
             row for row in captured["sources"] if row["source"] == "projected_standings"
         )
@@ -866,6 +900,7 @@ class PlaywrightAdapterTests(unittest.TestCase):
             "<1%",
         )
         self.assertNotIn("runtime-only-private-key", json.dumps(captured))
+        self.assertNotIn("private-provider-route", json.dumps(captured))
         self.assertEqual(wrong, {"error": "bootstrap_incomplete"})
         self.assertEqual(invalid, {"error": "projected_standings_incomplete"})
         self.assertEqual(
@@ -1129,6 +1164,67 @@ class PlaywrightAdapterTests(unittest.TestCase):
             ),
             (("1", "DL", "DE"), ("2", "DL", "DT"), ("3", "LB", "LB")),
         )
+
+    def test_page_position_rank_resolves_supported_display_formats(self):
+        cases = (
+            ("TE", "RB", "PPR", "Weekly PPR", "ppr-te", "TE113"),
+            ("TE", "RB", "PPR", "Weekly PPR", "ppr-te", "TE 113"),
+            ("TE", "RB", "PPR", "Weekly PPR", "ppr-te", "TE #113"),
+            ("DST", "DEF", "STD", "Weekly rankings", "dst", "D/ST 1"),
+        )
+        for page_position, source_position, source_scoring, type_text, slug, rank in cases:
+            with self.subTest(rank=rank):
+                path = f"/nfl/rankings/{slug}.php"
+                task = FantasyProsECRTask(
+                    2026,
+                    1,
+                    "weekly",
+                    "PPR",
+                    (page_position,),
+                    (),
+                    None,
+                    f"https://www.fantasypros.com{path}",
+                )
+                raw = ecr_raw(expert_count=19)
+                raw["source"].update({
+                    "position": page_position,
+                    "position_counts": {source_position: 1},
+                    "scoring": source_scoring,
+                    "type_text": type_text,
+                })
+                bind_ecr_page(raw, path, page_position)
+                raw["rankings"][0].update({
+                    "position": source_position,
+                    "position_rank": rank,
+                })
+
+                data = ecr_capture_data(raw, task)
+
+                self.assertEqual(data.rankings[0].position, page_position)
+                self.assertEqual(data.rankings[0].source_position, source_position)
+
+    def test_position_rank_does_not_hide_an_unsupported_source_position(self):
+        task = FantasyProsECRTask(
+            2026,
+            1,
+            "weekly",
+            "PPR",
+            ("TE",),
+            (),
+            None,
+            "https://www.fantasypros.com/nfl/rankings/ppr-te.php",
+        )
+        raw = ecr_raw(expert_count=19)
+        raw["source"].update(
+            {"position": "TE", "position_counts": {"FOO": 1}}
+        )
+        bind_ecr_page(raw, "/nfl/rankings/ppr-te.php", "TE")
+        raw["rankings"][0].update(
+            {"position": "FOO", "position_rank": "TE1"}
+        )
+
+        with self.assertRaisesRegex(BrowserCaptureError, "position was unsupported"):
+            ecr_capture_data(raw, task)
 
     def test_idp_page_fails_when_overlap_filter_leaves_no_selected_rows(self):
         task = FantasyProsECRTask(

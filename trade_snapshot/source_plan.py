@@ -55,11 +55,11 @@ def build_weekly_source_plan(
             )
             for horizon in ("weekly", "ros")
         )
-    # FantasyPros publishes no provable in-season ROS table. Attempt each
-    # remaining weekly page so published values are retained directly and
-    # unpublished future pages become explicit, timestamped attempt outcomes.
-    for week in weeks:
-        tasks.extend(_fantasypros_weekly_tasks(season, week, scoring, positions))
+    # Capture the current published FantasyPros projection once. Future-week
+    # pages are commonly unpublished and scheduling every position/week adds a
+    # large amount of browser work without adding usable evidence. Remaining
+    # weeks are materialized locally from verified ROS totals and the schedule.
+    tasks.extend(_fantasypros_weekly_tasks(season, as_of_week, scoring, positions))
     optional_weeks = weeks if include_future_weekly else (as_of_week,)
     for week in optional_weeks:
         tasks.extend(
@@ -99,16 +99,20 @@ def _optional_provider_tasks(
     season, week, horizon, scoring, positions, broad_consensus
 ):
     tasks = []
-    tasks.append(
-        PageCaptureTask(
-            "espn",
-            season,
-            week,
-            "visible_table",
-            _PROVIDER_PAGES["espn"],
-            projection=ProjectionTableSpec(horizon, scoring, ("ALL",)),
+    # ESPN exposes one full-season projection table, not independently
+    # verifiable weekly pages. Capture it once as ROS evidence and never
+    # duplicate that same table across nominal future weeks.
+    if horizon == "ros":
+        tasks.append(
+            PageCaptureTask(
+                "espn",
+                season,
+                week,
+                "visible_table",
+                _PROVIDER_PAGES["espn"],
+                projection=ProjectionTableSpec(horizon, scoring, ("ALL",)),
+            )
         )
-    )
     tasks.extend(
         PageCaptureTask(
             "yahoo",

@@ -1,20 +1,22 @@
 import copy
 from dataclasses import replace
-import json
 import unittest
 from unittest.mock import patch
 
 from tests.draft_fixtures import small_draft_config, small_historical_corpus
-from trade_snapshot._scenario_random import content_id
+from trade_snapshot.draft_brain import initialize_genome
 from trade_snapshot.draft_config import score_raw_stats
+from trade_snapshot.draft_features import build_baseline_brain
 from trade_snapshot.draft_history import ActualWeekStatus
 from trade_snapshot.draft_season import _prepare_scoring_context
-from trade_snapshot.draft_simulation import _new_simulation_cache
+from trade_snapshot.draft_simulation import _new_simulation_cache, simulate_snake_draft
 from trade_snapshot.draft_training import (
     EvolutionConfig,
     GenerationSummary,
     TrainingCheckpoint,
+    _evaluate_population,
     _reproduce,
+    _seat_sweep_arenas,
     run_training_batch,
     training_estimate,
     _tournament,
@@ -80,32 +82,30 @@ class DraftTrainingTests(unittest.TestCase):
         self.assertEqual(restored.checkpoint_id, checkpoint.checkpoint_id)
         self.assertEqual(restored.champion.brain_id, checkpoint.champion.brain_id)
 
-    def test_checkpoint_v2_shares_model_metadata_and_reads_v1(self):
+    def test_checkpoint_v3_shares_metadata_and_rejects_single_seat_policy(self):
         checkpoint = run_training_batch(
             small_historical_corpus(), small_draft_config(), evolution(1)
         )
         compact = checkpoint.to_record()
-        self.assertEqual(compact["schema_version"], 2)
+        self.assertEqual(compact["schema_version"], 3)
+        self.assertEqual(compact["evaluation_policy_version"], 2)
         self.assertNotIn("feature_schema", compact["population_genomes"][0])
-        legacy_content = {
-            "corpus_id": checkpoint.corpus_id,
-            "league_config": checkpoint.league_config.to_record(),
-            "evolution_config": checkpoint.evolution_config.to_record(),
-            "generation_completed": checkpoint.generation_completed,
-            "population": [row.to_record() for row in checkpoint.population],
-            "champion": checkpoint.champion.to_record(),
-            "champion_performance": checkpoint.champion_performance.to_record(),
-            "history": [row.to_record() for row in checkpoint.history],
-            "showcase": copy.deepcopy(compact["showcase"]),
-        }
-        legacy = {
-            "kind": "draft_training_checkpoint", "schema_version": 1,
-            **legacy_content,
-            "checkpoint_id": content_id("draft_checkpoint", legacy_content),
-        }
-        restored = TrainingCheckpoint.from_record(legacy)
-        self.assertEqual(restored.champion.brain_id, checkpoint.champion.brain_id)
-        self.assertLess(len(json.dumps(compact)), len(json.dumps(legacy)) * 0.9)
+        wrong_type = copy.deepcopy(compact)
+        wrong_type["evaluation_policy_version"] = 2.0
+        with self.assertRaisesRegex(ValueError, "evaluation policy is invalid"):
+            TrainingCheckpoint.from_record(wrong_type)
+        float_schema = copy.deepcopy(compact)
+        float_schema["schema_version"] = 3.0
+        with self.assertRaisesRegex(ValueError, "kind or version is invalid"):
+            TrainingCheckpoint.from_record(float_schema)
+        for old_version in (1, 2):
+            old = copy.deepcopy(compact)
+            old["schema_version"] = old_version
+            old.pop("evaluation_policy_version")
+            with self.subTest(old_version=old_version), self.assertRaisesRegex(
+                ValueError, "predates full .*seat sweeps"
+            ):
+                TrainingCheckpoint.from_record(old)
 
     def test_generation_checkpoint_resume_matches_uninterrupted_run(self):
         corpus, config, settings = small_historical_corpus(), small_draft_config(), evolution()
@@ -139,8 +139,12 @@ class DraftTrainingTests(unittest.TestCase):
     def test_work_estimate_and_cancellation_are_bounded(self):
         corpus, config, settings = small_historical_corpus(), small_draft_config(), evolution(3)
         estimate = training_estimate(corpus, config, settings)
-        self.assertEqual(estimate["total_leagues"], 6)
-        self.assertEqual(estimate["brain_appearances"], 12)
+        self.assertEqual(estimate["draft_positions_per_sweep"], 4)
+        self.assertEqual(estimate["candidate_leagues_per_season"], 4)
+        self.assertEqual(estimate["control_leagues_per_season"], 1)
+        self.assertEqual(estimate["leagues_per_season"], 5)
+        self.assertEqual(estimate["total_leagues"], 15)
+        self.assertEqual(estimate["brain_appearances"], 48)
         with self.assertRaisesRegex(InterruptedError, "cancelled"):
             run_training_batch(corpus, config, settings, should_cancel=lambda: True)
 
@@ -168,11 +172,83 @@ class DraftTrainingTests(unittest.TestCase):
         settings = replace(evolution(1), training_years=(2024, 2025))
         estimate = training_estimate(corpus, small_draft_config(), settings)
         self.assertEqual(estimate["training_season_count"], 2)
-        self.assertEqual(estimate["leagues_per_generation"], 4)
-        self.assertEqual(estimate["brain_appearances"], 8)
+        self.assertEqual(estimate["leagues_per_generation"], 10)
+        self.assertEqual(estimate["brain_appearances"], 32)
         checkpoint = run_training_batch(corpus, small_draft_config(), settings)
-        self.assertEqual(checkpoint.history[0].arena_count, 4)
-        self.assertEqual(checkpoint.champion_performance.appearances, 2)
+        self.assertEqual(checkpoint.history[0].arena_count, 10)
+        self.assertEqual(checkpoint.champion_performance.appearances, 8)
+
+    def test_full_sweep_runs_real_snake_drafts_at_every_seat_with_paired_controls(self):
+        drafts = []
+        progress = []
+
+        def capture(*args, **kwargs):
+            draft = simulate_snake_draft(*args, **kwargs)
+            drafts.append(draft)
+            return draft
+
+        with patch("trade_snapshot.draft_training.simulate_snake_draft", side_effect=capture):
+            checkpoint = run_training_batch(
+                small_historical_corpus(), small_draft_config(), evolution(1),
+                on_arena=lambda *row: progress.append(row),
+            )
+
+        controls = [draft for draft in drafts if len(set(draft.brain_ids)) == 1]
+        candidates = [draft for draft in drafts if len(set(draft.brain_ids)) != 1]
+        self.assertEqual(len(candidates), 4)
+        self.assertEqual(len(controls), 1)
+        self.assertEqual({draft.seed for draft in candidates}, {controls[0].seed})
+        self.assertEqual(
+            {draft.strategies for draft in candidates},
+            {controls[0].strategies},
+        )
+        self.assertEqual(progress, [(1, 2, 5), (1, 3, 5), (1, 4, 5), (1, 5, 5)])
+        brain_ids = set(candidates[0].brain_ids)
+        self.assertEqual(len(brain_ids), 4)
+        for brain_id in brain_ids:
+            self.assertEqual(
+                sorted(
+                    seat for draft in candidates
+                    for seat, seated_id in enumerate(draft.brain_ids)
+                    if seated_id == brain_id
+                ),
+                [0, 1, 2, 3],
+            )
+        for draft in candidates:
+            self.assertEqual(
+                [pick.drafter_number for pick in draft.picks[:8]],
+                [1, 2, 3, 4, 4, 3, 2, 1],
+            )
+        self.assertEqual(checkpoint.champion_performance.appearances, 4)
+        self.assertEqual(checkpoint.history[0].arena_count, 5)
+
+    def test_partial_cohort_borrows_opponents_without_scoring_them_twice(self):
+        planned = tuple(_seat_sweep_arenas(6, 4, 1, 1, 1))
+        scored_seats = {index: [] for index in range(6)}
+        for *_, entries in planned:
+            for seat, (index, scored) in enumerate(entries):
+                if scored:
+                    scored_seats[index].append(seat)
+        self.assertTrue(all(sorted(seats) == [0, 1, 2, 3] for seats in scored_seats.values()))
+
+        corpus, config = small_historical_corpus(), small_draft_config()
+        settings = replace(evolution(1), population_size=6)
+        baseline = build_baseline_brain(corpus, config, settings.training_years)
+        population = (baseline,) + tuple(
+            initialize_genome(
+                baseline.schema, baseline.baseline, config.config_id,
+                seed=settings.seed, genome_index=index,
+            )
+            for index in range(1, settings.population_size)
+        )
+        performances, summary, _ = _evaluate_population(
+            population, baseline,
+            (_prepare_scoring_context(corpus.seasons[0], config),),
+            (_new_simulation_cache(corpus.seasons[0], config),),
+            config, settings, 1, lambda: False, None,
+        )
+        self.assertEqual({row.appearances for row in performances}, {4})
+        self.assertEqual(summary.arena_count, 10)
 
     def test_equal_outcomes_do_not_reward_a_deterministic_draft_seat(self):
         corpus = small_historical_corpus()
@@ -201,7 +277,7 @@ class DraftTrainingTests(unittest.TestCase):
         self.assertEqual(
             checkpoint.champion_performance.mean_points_percentile, 0.5
         )
-        self.assertEqual(checkpoint.history[0].arena_count, 2)
+        self.assertEqual(checkpoint.history[0].arena_count, 5)
 
     def test_checkpoint_tampering_and_configuration_mismatch_are_rejected(self):
         corpus, config = small_historical_corpus(), small_draft_config()

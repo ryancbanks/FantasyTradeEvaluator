@@ -22,17 +22,17 @@ def read_authenticated_espn_json(
     *,
     transport: Callable | None = None,
 ) -> tuple[Mapping[str, object], Mapping[str, object]]:
-    """Read the two public endpoints with only URL-scoped profile cookies.
+    """Read the allowlisted ESPN endpoints with URL-scoped profile cookies.
 
     The request and cookie header exist only inside this call in the isolated browser
-    process.  The returned value contains the two validated JSON objects only.
+    process. The returned value contains only the two validated projected objects.
     """
 
     if type(timeout_ms) is not int or timeout_ms <= 0:
         raise BrowserCaptureError("authenticated ESPN timeout was invalid")
     if not callable(cancelled):
         raise BrowserCaptureError("authenticated ESPN cancellation check was invalid")
-    urls = frozenset(EspnFreeReadClient.urls(season, league_id))
+    urls = frozenset(EspnFreeReadClient.all_urls(season, league_id))
     open_request = transport or _open_without_redirects
     if not callable(open_request):
         raise BrowserCaptureError("authenticated ESPN transport was invalid")
@@ -45,9 +45,9 @@ def read_authenticated_espn_json(
             request.add_unredirected_header("Cookie", cookie_header)
         return open_request(request, timeout=timeout)
 
-    per_read_seconds = max(1.0, min(30.0, timeout_ms / 2000.0))
+    overall_seconds = max(1.0, min(60.0, timeout_ms / 1000.0))
     return EspnFreeReadClient(
-        timeout_seconds=per_read_seconds,
+        timeout_seconds=overall_seconds,
         maximum_bytes=maximum_bytes,
         opener=opener,
     )(season, league_id, cancelled)

@@ -69,6 +69,35 @@ def artifact_from(captured, task):
     )
 
 
+def fftoday_dimension_body(
+    *, position, position_id, season, week, horizon, table_position_id=None
+):
+    name = {
+        "QB": "Quarterback", "RB": "Running Back", "WR": "Wide Receiver",
+        "TE": "Tight End", "K": "Kicker", "DL": "Defensive Lineman",
+        "LB": "Linebacker", "DB": "Defensive Back",
+    }[position]
+    period = f"Week {week}" if horizon == "weekly" else "Regular Season"
+    header = f"{name} Projections" + (f": {season}" if horizon == "ros" else "")
+    link_position = table_position_id or position_id
+    core = f"LeagueID=107644&amp;PosID={link_position}&amp;Season={season}"
+    if horizon == "weekly":
+        core += f"&amp;GameWeek={week}"
+    return f"""<!doctype html>
+      <title>{name} Projections: {season} {period} - FFToday</title><body>
+      <div class='pageheader'>{header}</div>
+      <select name='LeagueID'><option value='107644' selected>FFToday PPR</option></select>
+      <div class='bodycontent'>{season} {period}</div>
+      <table><tr class='tablehdr'><th colspan='2'>Fantasy</th></tr>
+        <tr class='tableclmhdr'><th>Player
+          <a href='?{core}&amp;order_by=FName&amp;sort_order=ASC'><img alt=''></a>
+          <a href='?{core}&amp;order_by=FName&amp;sort_order=DESC'><img alt=''></a>
+        </th><th>FPts</th></tr>
+        <tr><td><a href='https://www.fftoday.com/stats/players/501/Example_Player'>Example Player</a></td>
+          <td>12.4</td></tr>
+      </table></body>"""
+
+
 def launch_test_browser(playwright, test_case):
     for options in (
         {"channel": "chromium", "headless": True},
@@ -156,6 +185,54 @@ class PublicProjectionScriptTests(unittest.TestCase):
             {"action": "error", "dimension": "fftoday availability"},
         )
 
+    def test_fftoday_rejects_stale_table_after_position_url_changes(self):
+        task = projection_task("fftoday", horizon="ros", position="RB")
+        url = FFTODAY_SEASON + "?LeagueID=107644&PosID=20&Season=2026"
+        page = self.open_page(url, fftoday_dimension_body(
+            position="RB", position_id="20", table_position_id="10",
+            season=2026, week=1, horizon="ros",
+        ))
+
+        configured = page.evaluate(CONFIGURE_PROJECTION_SCRIPT, request_for(task))
+        captured = page.evaluate(PROJECTION_TABLE_SCRIPT, request_for(task))
+
+        self.assertEqual(configured["action"], "waiting")
+        self.assertEqual(configured["dimension"], "fftoday content")
+        self.assertTrue(configured["fingerprint"])
+        self.assertEqual(captured["availability"], "unavailable")
+        self.assertEqual(captured["source"]["positions"], [])
+        self.assertEqual(captured["tables"], [])
+
+    def test_fftoday_navigation_keeps_marker_and_requires_new_page_fingerprint(self):
+        task = projection_task("fftoday", horizon="ros", position="RB")
+        qb_url = FFTODAY_SEASON + "?LeagueID=107644&PosID=10&Season=2026#fte-scan-v1"
+        rb_url = FFTODAY_SEASON + "?LeagueID=107644&PosID=20&Season=2026#fte-scan-v1"
+        page = self._browser.new_page()
+        origin = "/".join(FFTODAY_SEASON.split("/", 3)[:3])
+
+        def fulfill(route):
+            is_rb = "PosID=20" in route.request.url
+            route.fulfill(content_type="text/html", body=fftoday_dimension_body(
+                position="RB" if is_rb else "QB",
+                position_id="20" if is_rb else "10",
+                season=2026, week=1, horizon="ros",
+            ))
+
+        page.route(origin + "/**", fulfill)
+        page.goto(qb_url)
+        self.addCleanup(page.close)
+
+        previous = page.evaluate(CONFIGURE_PROJECTION_SCRIPT, request_for(task))
+        page.wait_for_url(rb_url)
+        page.wait_for_load_state("load")
+        current = page.evaluate(CONFIGURE_PROJECTION_SCRIPT, request_for(task))
+
+        self.assertEqual(previous["action"], "changed")
+        self.assertTrue(previous["require_change"])
+        self.assertEqual(page.url, rb_url)
+        self.assertEqual(current["action"], "ready")
+        self.assertNotEqual(previous["fingerprint"], current["fingerprint"])
+
     def test_fftoday_rejects_uncapturable_position_horizon_pairs(self):
         page = self.open_page(
             FFTODAY_WEEKLY
@@ -218,12 +295,17 @@ class PublicProjectionScriptTests(unittest.TestCase):
             "fftoday", season=2025, week=1, position="K"
         )
         url = FFTODAY_WEEKLY + "?LeagueID=107644&PosID=80&Season=2025&GameWeek=1"
-        body = """<!doctype html><body>
+        body = """<!doctype html><title>Kicker Projections: 2025 Week 1 - FF Today</title><body>
+          <div class='pageheader'>Kicker Projections</div>
+          <select name='LeagueID'><option value='107644' selected>FFToday PPR</option></select>
           <div class='bodycontent'>2025 Week 1</div>
           <table>
             <tr class='tablehdr'><th colspan='10'>2025 Week 1</th></tr>
             <tr class='tableclmhdr'>
-              <th>Chg</th><th>Player Sort First: Last:</th><th>Team</th><th>Opp</th>
+              <th>Chg</th><th>Player Sort First: Last:
+                <a href='?LeagueID=107644&amp;PosID=80&amp;Season=2025&amp;GameWeek=1&amp;order_by=FName&amp;sort_order=ASC'><img alt=''></a>
+                <a href='?LeagueID=107644&amp;PosID=80&amp;Season=2025&amp;GameWeek=1&amp;order_by=FName&amp;sort_order=DESC'><img alt=''></a>
+              </th><th>Team</th><th>Opp</th>
               <th>FG Made</th><th>FG Miss</th><th>XP Made</th><th>XP Miss</th><th>FFPts</th>
             </tr>
             <tr><td>-</td><td><a href='https://www.fftoday.com/stats/players/501/J.A._Bates'>Jake Bates</a></td>
@@ -286,10 +368,20 @@ class PublicProjectionScriptTests(unittest.TestCase):
                 )
                 headers = "".join(f"<th>{header}</th>" for header in source_headers)
                 cells = "".join(f"<td>{value}</td>" for value in values)
-                body = f"""<!doctype html><body>
+                position_name = {
+                    "QB": "Quarterback", "RB": "Running Back",
+                    "WR": "Wide Receiver", "TE": "Tight End",
+                }[position]
+                body = f"""<!doctype html>
+                  <title>{position_name} Projections: 2026 Regular Season - FFToday</title><body>
+                  <div class='pageheader'>{position_name} Projections: 2026</div>
+                  <select name='LeagueID'><option value='107644' selected>FFToday PPR</option></select>
                   <div class='bodycontent'>2026 Regular Season</div>
                   <table><tr class='tableclmhdr'>
-                    <th>Chg</th><th>Player Sort First: Last:</th><th>Tm</th><th>Bye</th>
+                    <th>Chg</th><th>Player Sort First: Last:
+                      <a href='?LeagueID=107644&amp;PosID={position_id}&amp;Season=2026&amp;order_by=FName&amp;sort_order=ASC'><img alt=''></a>
+                      <a href='?LeagueID=107644&amp;PosID={position_id}&amp;Season=2026&amp;order_by=FName&amp;sort_order=DESC'><img alt=''></a>
+                    </th><th>Tm</th><th>Bye</th>
                     {headers}<th>FPts</th>
                   </tr><tr><td>-</td>
                     <td><a href='https://www.fftoday.com/stats/players/501/A.J._Example'>A.J. Example</a></td>
@@ -377,6 +469,29 @@ class PublicProjectionScriptTests(unittest.TestCase):
             dict(row.raw_projected_stats)["scoring_opportunities"], 610.0
         )
 
+    def test_fantasysharks_filter_change_fingerprints_the_old_table(self):
+        task = projection_task("fantasysharks", position="RB")
+        body = """<!doctype html><body>
+          <select name='Segment'><option value='874'>2026 NFL Season</option>
+            <option value='883' selected>Week 1</option></select>
+          <select name='Position'>
+            <option value='1' selected>Quarterback</option>
+            <option value='2'>Running Back</option>
+          </select>
+          <select name='scoring'><option value='2' selected>Default PPR</option></select>
+          <table id='toolData'><tr><th>#</th><th>Player</th><th>Tm</th><th>Opp</th><th>Pts</th></tr>
+            <tr><td>1</td><td><a href='https://www.fantasysharks.com/apps/bert/players/playerpage.php?id=42'>Allen, Josh</a></td>
+              <td>BUF</td><td>MIA</td><td>24</td></tr></table>
+        </body>"""
+        page = self.open_page(task.url, body)
+
+        configured = page.evaluate(CONFIGURE_PROJECTION_SCRIPT, request_for(task))
+
+        self.assertEqual(configured["action"], "changed")
+        self.assertEqual(configured["dimension"], "position")
+        self.assertTrue(configured["require_change"])
+        self.assertTrue(configured["fingerprint"])
+
     def test_fftoday_pagination_accepts_only_exact_sequential_sorted_link(self):
         current = FFTODAY_SEASON + "?LeagueID=107644&PosID=10&Season=2026"
         valid = (
@@ -402,6 +517,40 @@ class PublicProjectionScriptTests(unittest.TestCase):
                     page.evaluate(ADVANCE_PROJECTION_SCRIPT, "fftoday"),
                     {"action": action},
                 )
+
+    def test_projection_advance_ignores_visible_overflow_ancestor(self):
+        body = """<!doctype html><body>
+          <div id='main-content' style='height: 20px; overflow-y: visible'>
+            <table id='toolData' style='height: 200px'><tr><td>Projection</td></tr></table>
+          </div>
+        </body>"""
+        page = self.open_page(FANTASYSHARKS, body)
+
+        self.assertGreater(
+            page.locator("#main-content").evaluate("node => node.scrollHeight"),
+            page.locator("#main-content").evaluate("node => node.clientHeight"),
+        )
+        self.assertEqual(
+            page.evaluate(ADVANCE_PROJECTION_SCRIPT, "fantasysharks"),
+            {"action": "done"},
+        )
+
+    def test_projection_advance_scrolls_real_overflow_container(self):
+        body = """<!doctype html><body>
+          <div id='projection-scroll' style='height: 20px; overflow-y: auto'>
+            <table id='toolData' style='height: 200px'><tr><td>Projection</td></tr></table>
+          </div>
+        </body>"""
+        page = self.open_page(FANTASYSHARKS, body)
+
+        self.assertEqual(
+            page.evaluate(ADVANCE_PROJECTION_SCRIPT, "fantasysharks"),
+            {"action": "scroll"},
+        )
+        self.assertGreater(
+            page.locator("#projection-scroll").evaluate("node => node.scrollTop"),
+            0,
+        )
 
 
 if __name__ == "__main__":

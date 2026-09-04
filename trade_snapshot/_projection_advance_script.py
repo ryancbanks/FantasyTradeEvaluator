@@ -22,11 +22,13 @@ ADVANCE_PROJECTION_SCRIPT = r"""
   const tables = Array.from(document.querySelectorAll(selector)).filter(visible);
   for (const table of tables) {
     for (let node = table.parentElement; node && node !== document.body; node = node.parentElement) {
-      if (node.scrollHeight > node.clientHeight + 2 &&
-          node.scrollTop + node.clientHeight < node.scrollHeight - 2) {
-        node.scrollTop = Math.min(node.scrollHeight, node.scrollTop + node.clientHeight);
-        return {action: 'scroll'};
-      }
+      const overflowY = getComputedStyle(node).overflowY;
+      if (!['auto', 'scroll', 'overlay'].includes(overflowY) ||
+          node.scrollHeight <= node.clientHeight + 2 ||
+          node.scrollTop + node.clientHeight >= node.scrollHeight - 2) continue;
+      const previousTop = node.scrollTop;
+      node.scrollTop = Math.min(node.scrollHeight, previousTop + node.clientHeight);
+      if (node.scrollTop > previousTop) return {action: 'scroll'};
     }
   }
   const root = tables[0] ? (tables[0].closest('main') || document.body) : document.body;

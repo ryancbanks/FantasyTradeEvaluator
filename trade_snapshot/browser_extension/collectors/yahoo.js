@@ -25,8 +25,9 @@
   const matches = [...tables[0].querySelectorAll('tr')].filter((row) => {
     if (!visible(row)) return false;
     const cells = [...row.querySelectorAll(':scope > th, :scope > td')];
+    const label = text(cells[0]).toUpperCase().replace(/\s+YAHOO DEFAULT$/, '');
     return cells.length >= 2 && visible(cells[0]) && visible(cells[1]) &&
-      text(cells[0]).toUpperCase() === 'RECEPTIONS';
+      label === 'RECEPTIONS';
   });
   if (!matches.length) return null;
   if (matches.length !== 1) return {error: 'receptions_ambiguous'};

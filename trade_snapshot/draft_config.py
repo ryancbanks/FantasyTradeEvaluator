@@ -56,6 +56,7 @@ _DEFAULT_SLOT_ELIGIBILITY = {
     "UTIL": tuple(sorted(CANONICAL_PLAYER_POSITIONS)),
 }
 _LINEAR_STAT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+ZERO_POINT_RULE_FIELDS = ("zero_point_out_weeks", "zero_point_ir_weeks", "zero_point_drop_weeks")
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +72,9 @@ class DraftLeagueConfig:
     playoff_team_count: int
     playoff_weeks: tuple[int, ...]
     strategy_counts: Mapping[DraftStrategy, int]
+    zero_point_out_weeks: int = 0
+    zero_point_ir_weeks: int = 0
+    zero_point_drop_weeks: int = 0
     config_id: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -99,6 +103,12 @@ class DraftLeagueConfig:
                 "playoff_weeks must contain exactly one week per bracket round"
             )
         strategies = _strategies(self.strategy_counts, self.team_count)
+        thresholds = [getattr(self, name) for name in ZERO_POINT_RULE_FIELDS]
+        for name, value in zip(ZERO_POINT_RULE_FIELDS, thresholds):
+            _integer(name, value, 0, 25)
+        enabled = [value for value in thresholds if value]
+        if enabled != sorted(set(enabled)):
+            raise ValueError("enabled zero-point absence thresholds must increase from bench to IR to drop")
         object.__setattr__(self, "starting_slots", slots)
         object.__setattr__(self, "slot_eligibility", eligibility)
         object.__setattr__(self, "position_limits", limits)
@@ -124,7 +134,7 @@ class DraftLeagueConfig:
         )
 
     def _content_record(self) -> dict[str, object]:
-        return {
+        record = {
             "name": self.name,
             "team_count": self.team_count,
             "starting_slots": list(self.starting_slots),
@@ -140,11 +150,14 @@ class DraftLeagueConfig:
                 for strategy in DraftStrategy
             },
         }
+        if any(getattr(self, name) for name in ZERO_POINT_RULE_FIELDS):
+            record.update({name: getattr(self, name) for name in ZERO_POINT_RULE_FIELDS})
+        return record
 
     def to_record(self) -> dict[str, object]:
         return {
             "kind": "draft_league_config",
-            "schema_version": 1,
+            "schema_version": 2 if any(getattr(self, name) for name in ZERO_POINT_RULE_FIELDS) else 1,
             **self._content_record(),
             "config_id": self.config_id,
         }
@@ -156,11 +169,14 @@ class DraftLeagueConfig:
             "position_limits", "scoring_weights", "regular_season_weeks",
             "playoff_team_count", "playoff_weeks", "strategy_counts",
         }
+        version = record.get("schema_version") if isinstance(record, Mapping) else None
+        if version == 2:
+            content.update(ZERO_POINT_RULE_FIELDS)
         if not isinstance(record, Mapping) or set(record) != content | {
             "kind", "schema_version", "config_id"
         }:
             raise ValueError("draft league config fields are invalid")
-        if record["kind"] != "draft_league_config" or record["schema_version"] != 1:
+        if record["kind"] != "draft_league_config" or type(version) is not int or version not in {1, 2}:
             raise ValueError("draft league config kind or schema version is invalid")
         raw_strategies = _mapping("strategy_counts", record["strategy_counts"])
         if set(raw_strategies) != {row.value for row in DraftStrategy}:
@@ -183,7 +199,10 @@ class DraftLeagueConfig:
             playoff_team_count=record["playoff_team_count"],
             playoff_weeks=tuple(_array("playoff_weeks", record["playoff_weeks"])),
             strategy_counts=strategies,
+            **{name: record.get(name, 0) for name in ZERO_POINT_RULE_FIELDS},
         )
+        if config.to_record()["schema_version"] != version:
+            raise ValueError("draft league config schema version is not canonical")
         if record["config_id"] != config.config_id:
             raise ValueError("draft league config content does not match config_id")
         return config
@@ -205,6 +224,9 @@ class DraftLeagueConfig:
                 "dst_sacks": 1.0, "dst_interceptions": 2.0,
                 "dst_fumble_recoveries": 2.0, "dst_touchdowns": 6.0,
                 "dst_safeties": 2.0, "dst_points_allowed_0": 10.0,
+                "dst_points_allowed_1_6": 7.0, "dst_points_allowed_7_13": 4.0,
+                "dst_points_allowed_14_20": 1.0, "dst_points_allowed_21_27": 0.0,
+                "dst_points_allowed_28_34": -1.0, "dst_points_allowed_35_plus": -4.0,
             },
             regular_season_weeks=tuple(range(1, 15)),
             playoff_team_count=playoff_team_count,

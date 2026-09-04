@@ -178,13 +178,16 @@ class ExtensionBridgePairingTests(unittest.TestCase):
             )
 
     def test_minimum_collector_version_uses_chrome_version_rules(self):
-        self.assertEqual(MINIMUM_EXTENSION_VERSION, "0.2.0")
-        for version in ("0.2", "0.2.0", "0.2.0.0", "1", "1.2.3"):
+        self.assertEqual(MINIMUM_EXTENSION_VERSION, "0.2.1")
+        for version in ("0.2.1", "0.2.1.0", "1", "1.2.3"):
             with self.subTest(version=version):
                 self.assertTrue(extension_version_is_supported(version))
         for version in (
             None,
             "",
+            "0.2",
+            "0.2.0",
+            "0.2.0.0",
             "0.1.9999",
             "00.2.0",
             "0.02.0",
@@ -263,6 +266,9 @@ class ExtensionBridgeCommandTests(unittest.TestCase):
         self.assertEqual(command["state"], "command")
         self.assertEqual(command["op"], "session.open")
         self.assertEqual(command["payload"], {"headed": True})
+        self.assertIsInstance(command["expires_in_ms"], int)
+        self.assertGreater(command["expires_in_ms"], 0)
+        self.assertLessEqual(command["expires_in_ms"], 2000)
         self.assertEqual(
             self.bridge.status(self.token)["command"],
             {
@@ -450,6 +456,7 @@ class ExtensionBridgeCommandTests(unittest.TestCase):
         self.assertIsInstance(timed_out.error, BridgeTimeoutError)
         with self.assertRaises(BridgeStaleCommandError):
             self.bridge.complete(self.token, command["command_id"], result=None)
+        self.assertEqual(self.bridge.state, "paired")
 
         cancellation = Event()
         cancelled = _Call(
@@ -465,6 +472,7 @@ class ExtensionBridgeCommandTests(unittest.TestCase):
         self.assertIsInstance(cancelled.error, BridgeCancelledError)
         with self.assertRaises(BridgeStaleCommandError):
             self.bridge.complete(self.token, command["command_id"], result=None)
+        self.assertEqual(self.bridge.state, "paired")
 
         disconnected = _Call(self.bridge, "league.capture", {})
         self.bridge.poll(self.token, wait_seconds=1)

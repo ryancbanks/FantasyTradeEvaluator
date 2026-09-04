@@ -21,6 +21,7 @@ from ._capture_task_policy import (
     yahoo_settings_path_matches,
 )
 from ._ecr_page import ecr_capture_data
+from .espn_projection_read import EspnSeasonProjectionClient
 from ._league_page import capture_league_sources
 from ._projection_tables import projection_capture
 from ._projection_configure import configure_projection, projection_request
@@ -41,6 +42,7 @@ from .capture_schema import (
     CaptureTask,
     ECRCaptureMethod,
     FantasyProsECRTask,
+    RankingHorizon,
     analyzer_body_matches_phase,
 )
 
@@ -222,6 +224,17 @@ class _PlaywrightSession:
             CaptureProvider.FANTASYSHARKS,
         ) or task.projection is None:
             raise BrowserCaptureError("projection table task is invalid")
+        if (
+            task.provider is CaptureProvider.ESPN
+            and task.projection.horizon is RankingHorizon.ROS
+        ):
+            raw = EspnSeasonProjectionClient(
+                timeout_seconds=min(60, max(1, timeout_ms / 1000))
+            )(task, cancelled)
+            parsed = projection_capture([raw], task)
+            return ProjectionCaptureData(
+                parsed.tables, parsed.source_period_text, parsed.segments_captured
+            )
         deadline = time.monotonic() + timeout_ms / 1000
         configure_projection(
             self._page, task, action_delay_ms, deadline, cancelled, self._wait,

@@ -8,7 +8,9 @@ window.DraftLab = (() => {
     league_presets: [], starter_corpus_installs: [],
     starter_corpus_install_state: {status: "not_installed", phase: "manifest"}
   };
-  let activeJob = null, jobLaunching = false, promotionBusy = false, assistantBusy = false;
+  let activeJob = null, jobLaunching = false, promotionBusy = false, modelDownloadBusy = false, assistantBusy = false;
+  let modelDownloadRequest = 0, modelDownloadRefreshTimer = null;
+  const MODEL_DOWNLOAD_SAFETY_MS = 5000, MODEL_DOWNLOAD_RETRY_MS = 30000;
   let pendingRecoveredJob = null;
   let assistantSyncBusy = false, assistantSyncTimer = null;
   let draftSurfaceActive = $("draftLabTab").getAttribute("aria-selected") === "true";
@@ -130,11 +132,19 @@ window.DraftLab = (() => {
       throw new Error("Playoff teams and weeks must form a complete bracket with one week per round.");
     }
     if (startingSlots.length > 16) throw new Error("Draft Lab supports up to 16 starting slots per team.");
+    const absenceThresholds = [integer("draftZeroOutWeeks"), integer("draftZeroIrWeeks"), integer("draftZeroDropWeeks")];
+    const enabledThresholds = absenceThresholds.filter(value => value > 0);
+    if (absenceThresholds.some(value => value < 0 || value > 25) || enabledThresholds.some((value, index) => index > 0 && value <= enabledThresholds[index - 1])) {
+      throw new Error("Zero-point thresholds must be 0 (disabled) or 1–25 weeks; enabled bench, modeled IR, and drop thresholds must strictly increase.");
+    }
     return {
       name: $("draftLeagueName").value.trim(),
       team_count: teamCount,
       starting_slots: startingSlots,
       bench_slots: integer("draftBenchSlots"),
+      zero_point_out_weeks: absenceThresholds[0],
+      zero_point_ir_weeks: absenceThresholds[1],
+      zero_point_drop_weeks: absenceThresholds[2],
       slot_eligibility: jsonObject("draftSlotEligibility", "Slot eligibility"),
       position_limits: jsonObject("draftPositionLimits", "Position limits"),
       scoring_weights: jsonObject("draftScoringWeights", "Scoring"),
@@ -205,15 +215,27 @@ window.DraftLab = (() => {
     }
     const summary = element(
       "p", "draft-install-coverage-summary",
-      `${Number(coverage.player_seasons || 0).toLocaleString()} player-seasons · ${Number(coverage.gap_count || 0).toLocaleString()} documented coverage gaps`
+      `${Number(coverage.player_seasons || 0).toLocaleString()} player-seasons · ${Number(coverage.projected_player_seasons || 0).toLocaleString()} with prior-season point, per-game, and detailed-stat projections · ${Number(coverage.gap_count || 0).toLocaleString()} documented coverage gaps`
+    );
+    const inputs = element(
+      "p", "draft-install-coverage-summary",
+      "Model inputs include position, ADP/rank range, projected points and points/game, projected games and raw stats, bye, experience, rookie/team-tenure flags, and live roster context. Player names, IDs, and NFL-team IDs are excluded."
     );
     const list = element("div", "draft-install-season-list");
     for (const row of seasons) {
       const item = element("span", row.status === "ready" ? "ready" : "has-gaps");
-      item.textContent = `${row.season}: ${Number(row.installed_players || 0).toLocaleString()} players · ${Number(row.gap_count || 0).toLocaleString()} gaps`;
+      item.textContent = `${row.season}: ${Number(row.installed_players || 0).toLocaleString()} players · ${Number(row.projected_players || 0).toLocaleString()} projected · ${Number(row.gap_count || 0).toLocaleString()} gaps`;
       list.append(item);
     }
-    container.append(summary, list);
+    container.append(summary, inputs, list);
+    if (coverage.availability_policy) {
+      container.append(element("p", "draft-install-coverage-summary",
+        `${Number(coverage.availability_report_count || 0).toLocaleString()} historical availability reports. ${coverage.availability_policy}`));
+    }
+    if (Number(coverage.transform_version) >= 3) {
+      container.append(element("p", "draft-install-coverage-summary",
+        "DST limitation: unclassified fumble-recovery touchdowns are retained but excluded from points; points-allowed buckets use the opponent's final score. These starter DST scores are approximate, not an exact ESPN/Yahoo scoring replica."));
+    }
     container.classList.remove("hidden");
   }
 
@@ -221,7 +243,10 @@ window.DraftLab = (() => {
     const installs = Array.isArray(catalog.starter_corpus_installs)
       ? catalog.starter_corpus_installs.filter(row => row && ["ready", "ready_with_gaps"].includes(row.status))
       : [];
-    const receipt = installs.sort((left, right) => String(right.installed_at || "").localeCompare(String(left.installed_at || "")))[0];
+    const transformVersion = Number(catalog.starter_corpus_transform_version || 0);
+    const ordered = installs.sort((left, right) => String(right.installed_at || "").localeCompare(String(left.installed_at || "")));
+    const receipt = ordered.find(row => Number(row.transform_version) === transformVersion);
+    const legacyReceipt = ordered[0];
     const state = catalog.starter_corpus_install_state || {status: "not_installed", phase: "manifest"};
     const status = $("draftInstallCorpusStatus");
     status.classList.remove("ready", "warning", "error");
@@ -230,6 +255,12 @@ window.DraftLab = (() => {
       status.textContent = `${label} · ${Number(receipt.coverage?.season_count || 0)} seasons installed on this device`;
       status.classList.add(receipt.status === "ready" ? "ready" : "warning");
       renderStarterCorpusCoverage(receipt.coverage);
+      return;
+    }
+    if (legacyReceipt) {
+      status.textContent = "Starter history update available · reinstall and retrain for current scoring and roster-management evidence. Cached source files will be reused; pre-version-3 starter models have invalid DST scores.";
+      status.classList.add("warning");
+      renderStarterCorpusCoverage(legacyReceipt.coverage);
       return;
     }
     renderStarterCorpusCoverage(null);
@@ -266,6 +297,9 @@ window.DraftLab = (() => {
     $("draftTeamCount").value = String(config.team_count);
     $("draftStarterSlots").value = config.starting_slots.join(",");
     $("draftBenchSlots").value = String(config.bench_slots);
+    $("draftZeroOutWeeks").value = String(config.zero_point_out_weeks ?? 0);
+    $("draftZeroIrWeeks").value = String(config.zero_point_ir_weeks ?? 0);
+    $("draftZeroDropWeeks").value = String(config.zero_point_drop_weeks ?? 0);
     $("draftRegularWeeks").value = config.regular_season_weeks.join(",");
     $("draftPlayoffTeams").value = String(config.playoff_team_count);
     $("draftPlayoffWeeks").value = config.playoff_weeks.join(",");
@@ -283,10 +317,13 @@ window.DraftLab = (() => {
     const checkpointUnavailable = externalWorkBusy || Boolean(activeJob) || jobLaunching || promotionBusy || !$("draftCheckpoint").value;
     $("draftResumeButton").disabled = checkpointUnavailable;
     $("draftPromoteButton").disabled = checkpointUnavailable;
+    $("draftDownloadModel").disabled = modelDownloadBusy || !$("draftDownloadModel").dataset.downloadUrl;
+    $("draftRevealModel").disabled = modelDownloadBusy || !$("draftRevealModel").dataset.modelId;
     $("assistantOpen").disabled = externalWorkBusy || assistantBusy || !$("assistantSession").value;
   }
 
   function selectCheckpoint() {
+    clearModelDownload();
     const checkpoint = catalog.checkpoints.find(
       row => row.checkpoint_job_id === $("draftCheckpoint").value
     );
@@ -338,7 +375,11 @@ window.DraftLab = (() => {
     if (selectSessionId) $("assistantSession").value = selectSessionId;
     if (selectCheckpointId) $("draftCheckpoint").value = selectCheckpointId;
     updateSavedControls();
-    $("draftCatalogSummary").textContent = `${catalog.corpora.length} corpora · ${catalog.models.length} models · ${catalog.boards.length} current boards · ${catalog.checkpoints.length} autosaves · ${catalog.assistant_sessions.length} rooms`;
+    const usableCount = rows => rows.filter(row => row.status !== "invalid").length;
+    const incompatibleCount = [
+      ...catalog.corpora, ...catalog.models, ...catalog.checkpoints, ...catalog.assistant_sessions,
+    ].filter(row => row.status === "invalid").length;
+    $("draftCatalogSummary").textContent = `${usableCount(catalog.corpora)} usable corpora · ${usableCount(catalog.models)} usable models · ${usableCount(catalog.boards)} current boards · ${usableCount(catalog.checkpoints)} usable autosaves · ${usableCount(catalog.assistant_sessions)} rooms${incompatibleCount ? ` · ${incompatibleCount} incompatible saved artifact${incompatibleCount === 1 ? "" : "s"} retained on disk` : ""}`;
     renderStarterCorpusCatalog();
     $("draftYearNotice").textContent = catalog.year_notice;
     if ($("draftCorpus").value !== previousCorpusId) syncTrainingYears();
@@ -533,7 +574,7 @@ window.DraftLab = (() => {
       const seasonLabel = `${value.training_season_count.toLocaleString()} selected season${value.training_season_count === 1 ? "" : "s"}`;
       const checkpoint = formatBytes(value.estimated_checkpoint_bytes);
       const memory = formatBytes(value.estimated_population_memory_bytes);
-      $("draftEstimate").textContent = `${value.total_leagues.toLocaleString()} simulated leagues across ${seasonLabel} · ${value.brain_appearances.toLocaleString()} brain appearances · about ${value.candidate_scores_estimate.toLocaleString()} neural scores · ${value.network_parameters.toLocaleString()} learned parameters per brain · about ${checkpoint} per autosave and ${memory} working memory. ${value.size_notice}`;
+      $("draftEstimate").textContent = `${value.total_leagues.toLocaleString()} simulated leagues across ${seasonLabel} · ${value.brain_appearances.toLocaleString()} brain-seat season evaluations · every full sweep covers all ${value.draft_positions_per_sweep.toLocaleString()} draft positions and reuses one same-seed control per cohort · about ${value.candidate_scores_estimate.toLocaleString()} neural scores · ${value.network_parameters.toLocaleString()} learned parameters per brain · about ${checkpoint} per autosave and ${memory} working memory. ${value.size_notice}`;
     } catch (error) { reportError(error); }
   }
 
@@ -599,6 +640,94 @@ window.DraftLab = (() => {
     } catch (error) { reportError(error); }
   }
 
+  function clearModelDownload() {
+    modelDownloadRequest += 1;
+    if (modelDownloadRefreshTimer) clearTimeout(modelDownloadRefreshTimer);
+    modelDownloadRefreshTimer = null;
+    const button = $("draftDownloadModel");
+    delete button.dataset.modelId;
+    delete button.dataset.downloadUrl;
+    delete button.dataset.downloadExpiresAt;
+    button.classList.add("hidden");
+    const revealButton = $("draftRevealModel");
+    delete revealButton.dataset.modelId;
+    delete revealButton.dataset.savedPath;
+    revealButton.classList.add("hidden");
+    updateSavedControls();
+  }
+
+  function scheduleModelDownloadRefresh(modelId, expiresAt) {
+    if (modelDownloadRefreshTimer) clearTimeout(modelDownloadRefreshTimer);
+    const delay = Math.max(1000, expiresAt - performance.now() - 60000);
+    modelDownloadRefreshTimer = setTimeout(() => {
+      if ($("draftDownloadModel").dataset.modelId === modelId) {
+        void prepareModelDownload(modelId, {quiet: true});
+      }
+    }, delay);
+  }
+
+  async function prepareModelDownload(modelId, {quiet = false} = {}) {
+    const button = $("draftDownloadModel");
+    const changingModel = button.dataset.modelId !== modelId;
+    if (changingModel) clearModelDownload();
+    const request = ++modelDownloadRequest;
+    modelDownloadBusy = true;
+    updateSavedControls();
+    const requestStartedAt = performance.now();
+    try {
+      const ticket = await api(
+        `/api/draft/models/${modelId}/export-ticket`, {method: "POST", body: ""}
+      );
+      const lifetime = Number(ticket.expires_in_seconds);
+      if (typeof ticket.url !== "string" || !ticket.url.startsWith("/api/draft/model-download/") ||
+          typeof ticket.saved_path !== "string" || !ticket.saved_path ||
+          !Number.isFinite(lifetime) || lifetime < 60) {
+        throw new Error("The local model download ticket was invalid.");
+      }
+      if (request !== modelDownloadRequest) return false;
+      const expiresAt = requestStartedAt + lifetime * 1000 - MODEL_DOWNLOAD_SAFETY_MS;
+      button.dataset.modelId = modelId;
+      button.dataset.downloadUrl = ticket.url;
+      button.dataset.downloadExpiresAt = String(expiresAt);
+      button.classList.remove("hidden");
+      const revealButton = $("draftRevealModel");
+      revealButton.dataset.modelId = modelId;
+      revealButton.dataset.savedPath = ticket.saved_path;
+      revealButton.classList.remove("hidden");
+      scheduleModelDownloadRefresh(modelId, expiresAt);
+      return true;
+    } catch (error) {
+      if (request === modelDownloadRequest && changingModel) {
+        modelDownloadBusy = false;
+        clearModelDownload();
+      }
+      if (quiet && request === modelDownloadRequest && button.dataset.modelId === modelId) {
+        const expiresAt = Number(button.dataset.downloadExpiresAt || 0);
+        if (expiresAt > performance.now() + 1000) {
+          if (modelDownloadRefreshTimer) clearTimeout(modelDownloadRefreshTimer);
+          modelDownloadRefreshTimer = setTimeout(
+            () => void prepareModelDownload(modelId, {quiet: true}),
+            Math.min(MODEL_DOWNLOAD_RETRY_MS, expiresAt - performance.now() - 1000),
+          );
+        }
+      }
+      if (!quiet) reportError(new Error(`The model was saved, but its portable download could not be prepared: ${error.message}`));
+      return false;
+    } finally {
+      if (request === modelDownloadRequest) modelDownloadBusy = false;
+      updateSavedControls();
+    }
+  }
+
+  function refreshModelDownloadIfNeeded() {
+    const button = $("draftDownloadModel");
+    const modelId = button.dataset.modelId;
+    const expiresAt = Number(button.dataset.downloadExpiresAt || 0);
+    if (modelId && expiresAt - performance.now() < 60000 && !modelDownloadBusy) {
+      void prepareModelDownload(modelId, {quiet: true});
+    }
+  }
+
   async function promoteCheckpoint() {
     if (externalWorkBusy || promotionBusy) return;
     clearDraftError();
@@ -612,9 +741,10 @@ window.DraftLab = (() => {
         `/api/draft/checkpoints/${checkpointId}/promote`,
         {method: "POST", body: ""}
       );
-      $("draftDownloadModel").dataset.modelId = model.model_id;
-      $("draftDownloadModel").classList.remove("hidden");
-      $("draftEstimate").textContent = `Generation ${model.generation} champion is ready as a portable model.`;
+      const downloadReady = await prepareModelDownload(model.model_id);
+      $("draftEstimate").textContent = downloadReady
+        ? `Generation ${model.generation} champion is saved locally and ready to download or reveal.`
+        : `Generation ${model.generation} champion is saved locally; download controls could not be prepared.`;
       await refreshCatalog({selectModelId: model.model_id, selectCheckpointId: checkpointId});
     } catch (error) { reportError(error); }
     finally { promotionBusy = false; updateSavedControls(); publishDraftActivity(); }
@@ -639,6 +769,52 @@ window.DraftLab = (() => {
     }
   }
 
+  function renderShowcaseRoster(draftTeam, seasonTeam) {
+    const draftedNames = draftTeam.roster.map(player => player.player_name);
+    const finalNames = seasonTeam.roster_player_names || draftedNames;
+    for (const [id, names] of [["draftRosterBody", finalNames], ["draftOriginalRosterBody", draftedNames]]) {
+      const body = $(id);
+      body.replaceChildren();
+      for (const name of names) { const row = element("tr"); cell(row, name); body.append(row); }
+      if (!names.length) emptyRow(body, 1, "No players on this roster.");
+    }
+    const movesBody = $("draftRosterMovesBody");
+    movesBody.replaceChildren();
+    const actions = {bench: "Benched", drop: "Dropped", add: "Waiver add", unfilled: "Unfilled"};
+    for (const move of seasonTeam.roster_moves || []) {
+      const row = element("tr");
+      for (const value of [move.week, actions[move.action] || move.action, move.player_name || "Open slot", move.reason, move.source || "Not recorded"]) cell(row, value);
+      movesBody.append(row);
+    }
+    if (!movesBody.children.length) emptyRow(movesBody, 5, seasonTeam.roster_moves
+      ? "No injury roster moves recorded for this team." : "This legacy showcase has no injury roster-management trace.");
+    const select = $("draftShowcaseWeek"), previousWeek = select.value;
+    select.replaceChildren();
+    for (const week of seasonTeam.weekly_results) select.add(new Option(`Week ${week.week} · ${week.stage}`, String(week.week)));
+    if ([...select.options].some(option => option.value === previousWeek)) select.value = previousWeek;
+    select.disabled = !select.options.length;
+    renderShowcaseWeek();
+  }
+
+  function renderShowcaseWeek() {
+    const teamId = `drafter-${$("draftShowcaseTeam").value}`;
+    const team = lastTrainingResult?.showcase?.season?.teams.find(row => row.team_id === teamId);
+    const week = team?.weekly_results.find(row => row.week === Number($("draftShowcaseWeek").value));
+    const body = $("draftLineupBody");
+    body.replaceChildren();
+    for (const starter of week?.lineup || []) {
+      const row = element("tr");
+      for (const value of [starter.slot, starter.player_name || "Empty slot", Number.isFinite(starter.selection_score) ? starter.selection_score.toFixed(1) : "Not recorded", Number.isFinite(starter.actual_score) ? starter.actual_score.toFixed(1) : "Not recorded"]) cell(row, value);
+      body.append(row);
+    }
+    if (!body.children.length) emptyRow(body, 4, "No lineup recorded for this week.");
+    const benched = (team?.roster_moves || []).filter(move => move.week === week?.week && move.action === "bench");
+    const method = "Highest-estimated legal lineup after excluding known byes and unavailable players. The estimate blends the preseason per-game projection with completed earlier games only; it never uses this week's or a future result. The starter history does not contain archived provider week-specific forecasts, so rank fallbacks may appear and this is not an exact matchup forecast.";
+    $("draftLineupNotice").textContent = benched.length
+      ? `${method} Unavailable players withheld this week: ${benched.map(move => move.player_name).join(", ")}. Empty slots remain unfilled when no legal replacement exists.`
+      : method;
+  }
+
   function renderShowcaseTeam() {
     const showcase = lastTrainingResult?.showcase;
     if (!showcase) return;
@@ -647,11 +823,7 @@ window.DraftLab = (() => {
     const seasonTeam = showcase.season.teams.find(team => team.team_id === `drafter-${numberValue}`);
     if (!draftTeam || !seasonTeam) return;
 
-    const rosterBody = $("draftRosterBody");
-    rosterBody.replaceChildren();
-    for (const player of draftTeam.roster) {
-      const row = element("tr"); cell(row, player.player_name); rosterBody.append(row);
-    }
+    renderShowcaseRoster(draftTeam, seasonTeam);
     const weekBody = $("draftWeekBody");
     weekBody.replaceChildren();
     for (const week of seasonTeam.weekly_results) {
@@ -661,7 +833,8 @@ window.DraftLab = (() => {
     }
     const standingsBody = $("draftStandingsBody");
     standingsBody.replaceChildren();
-    for (const standing of showcase.season.standings) {
+    const standings = [...showcase.season.standings].sort((left, right) => left.finish_rank - right.finish_rank);
+    for (const standing of standings) {
       const row = element("tr", standing.team_id === seasonTeam.team_id ? "draft-highlight-row" : "");
       for (const value of [standing.finish_rank, standing.team_name, `${standing.wins}-${standing.losses}${standing.ties ? `-${standing.ties}` : ""}`, standing.points_for.toFixed(1), standing.made_playoffs ? "Yes" : "No"]) cell(row, value);
       standingsBody.append(row);
@@ -672,7 +845,8 @@ window.DraftLab = (() => {
       const row = element("tr");
       const matchup = game.lower_team_name ? `${game.higher_team_name} vs ${game.lower_team_name}` : `${game.higher_team_name} · bye`;
       const score = game.lower_score == null ? "Bye" : `${game.higher_score.toFixed(1)}–${game.lower_score.toFixed(1)}`;
-      for (const value of [`R${game.round_number} · W${game.week}`, matchup, score, game.winner_team_id]) cell(row, value);
+      const winner = standings.find(team => team.team_id === game.winner_team_id)?.team_name || "Unknown team";
+      for (const value of [`R${game.round_number} · W${game.week}`, matchup, score, winner]) cell(row, value);
       bracketBody.append(row);
     }
   }
@@ -685,10 +859,13 @@ window.DraftLab = (() => {
     for (const team of result.showcase.draft.teams) select.add(new Option(`${team.name} · ${team.strategy}`, String(team.drafter_number)));
     select.value = String(result.showcase.selected_drafter_number);
     $("draftShowcaseTitle").textContent = `${result.showcase.season.season} · champion ${result.showcase.season.champion_team_name}`;
+    const season = result.showcase.season;
+    $("draftRosterPolicy").textContent = season.roster_management_policy
+      ? `${season.roster_management_policy} ${Number(season.availability_report_count || 0).toLocaleString()} availability reports in this season. Missing reports do not establish that a player is healthy.`
+      : "Legacy showcase: injury roster management was not recorded. Rebuild the starter corpus and retrain to evaluate the roster-aware simulator.";
     renderShowcaseTeam();
     $("draftLastBatch").classList.remove("hidden");
-    $("draftDownloadModel").classList.remove("hidden");
-    $("draftDownloadModel").dataset.modelId = result.model.model_id;
+    await prepareModelDownload(result.model.model_id);
     $("draftProgressText").textContent = `Training complete · ${result.model.league_name} · generation ${result.model.generation}`;
     $("draftAutosaveStatus").textContent = "Autosaved final champion and last-batch history";
     await refreshCatalog({selectModelId: result.model.model_id});
@@ -731,15 +908,50 @@ window.DraftLab = (() => {
     } catch (error) { reportError(error); }
   }
 
-  async function downloadModel() {
+  function downloadModel() {
     try {
-      const modelId = $("draftDownloadModel").dataset.modelId;
-      const record = await api(`/api/draft/models/${modelId}/export`);
+      const button = $("draftDownloadModel");
+      const modelId = button.dataset.modelId;
+      const downloadUrl = button.dataset.downloadUrl;
+      const expiresAt = Number(button.dataset.downloadExpiresAt || 0);
+      if (!modelId || !downloadUrl) throw new Error("Prepare a saved model before downloading it.");
+      if (expiresAt <= performance.now()) {
+        void prepareModelDownload(modelId);
+        $("draftEstimate").textContent = "Refreshing the secure download. Click Download trained model once more when it is ready.";
+        return;
+      }
       const link = element("a");
-      link.href = URL.createObjectURL(new Blob([JSON.stringify(record, null, 2)], {type: "application/json"}));
+      link.href = downloadUrl;
       link.download = `${modelId}.draftbrain.json`;
+      link.classList.add("hidden");
+      document.body.append(link);
       link.click();
-      setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+      setTimeout(() => link.remove(), 1000);
+      $("draftEstimate").textContent = `Download requested · ${link.download}. If a managed browser blocks it, choose Show saved model; the same portable file is already stored locally.`;
+    } catch (error) { reportError(error); }
+  }
+
+  async function revealModel() {
+    clearDraftError();
+    const button = $("draftRevealModel");
+    const modelId = button.dataset.modelId;
+    const savedPath = button.dataset.savedPath;
+    if (!modelId || !savedPath) {
+      reportError(new Error("Prepare a saved model before opening its location."));
+      return;
+    }
+    const copyPromise = navigator.clipboard?.writeText
+      ? navigator.clipboard.writeText(savedPath).then(() => true, () => false)
+      : Promise.resolve(false);
+    try {
+      const result = await api(
+        `/api/draft/models/${modelId}/reveal`, {method: "POST", body: ""}
+      );
+      const copied = await copyPromise;
+      const location = result.saved_path || savedPath;
+      $("draftEstimate").textContent = result.opened
+        ? `Opened the saved model in your file manager${copied ? " and copied its path" : ""}: ${location}`
+        : `The file manager could not be opened${copied ? ", but the path was copied" : ""}. Your portable model remains saved at ${location}`;
     } catch (error) { reportError(error); }
   }
 
@@ -963,7 +1175,11 @@ window.DraftLab = (() => {
     $("draftPromoteButton").addEventListener("click", promoteCheckpoint);
     $("draftCancelButton").addEventListener("click", cancelJob);
     $("draftDownloadModel").addEventListener("click", downloadModel);
+    $("draftDownloadModel").addEventListener("pointerenter", refreshModelDownloadIfNeeded);
+    $("draftDownloadModel").addEventListener("focus", refreshModelDownloadIfNeeded);
+    $("draftRevealModel").addEventListener("click", revealModel);
     $("draftShowcaseTeam").addEventListener("change", renderShowcaseTeam);
+    $("draftShowcaseWeek").addEventListener("change", renderShowcaseWeek);
     $("draftBenchmarkButton").addEventListener("click", startBenchmark);
     $("assistantSetupForm").addEventListener("submit", createAssistant);
     $("assistantOpen").addEventListener("click", openAssistant);
@@ -996,6 +1212,9 @@ window.DraftLab = (() => {
     emptyRow($("draftHistoryBody"), 6, "No completed training batch yet.");
     for (const [id, columns, message] of [
       ["draftRosterBody", 1, "Choose a completed showcase."],
+      ["draftOriginalRosterBody", 1, "Choose a completed showcase."],
+      ["draftRosterMovesBody", 5, "Choose a completed showcase."],
+      ["draftLineupBody", 4, "Choose a completed showcase."],
       ["draftWeekBody", 5, "Choose a completed showcase."],
       ["draftStandingsBody", 5, "Choose a completed showcase."],
       ["draftBracketBody", 4, "Choose a completed showcase."],

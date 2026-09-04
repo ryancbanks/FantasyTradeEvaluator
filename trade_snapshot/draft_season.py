@@ -9,9 +9,13 @@ import math
 from types import MappingProxyType
 
 from .draft_config import DraftLeagueConfig, score_raw_stats
+from .draft_availability import AvailabilityStatus, infer_zero_point_absences, prepare_availability
 from .draft_features import resolve_preseason_projection
 from .draft_history import ActualWeekStatus, HistoricalSeason, PreseasonPlayer
-from .lineup import LineupPlayer, optimize_lineup
+from .draft_roster_management import (
+    ROSTER_MANAGEMENT_POLICY, RosterMove, SeasonRosterManager,
+    optimize_roster as _optimize,
+)
 
 class SeasonStage(str, Enum):
     REGULAR = "regular"
@@ -99,6 +103,7 @@ class TeamSeasonTrace:
     regular_season_rank: int
     made_playoffs: bool
     finish_rank: int
+    roster_moves: tuple[RosterMove, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +115,8 @@ class HistoricalSeasonTrace:
     bracket_games: tuple[BracketGame, ...]
     champion_team_id: str
     champion_team_name: str
+    roster_management_policy: str = ROSTER_MANAGEMENT_POLICY
+    availability_report_count: int = 0
 
     def to_record(self) -> dict[str, object]:
         """Return a detached JSON-safe review record."""
@@ -133,8 +140,8 @@ class _PreparedScoringContext:
     config_id: str
     players: Mapping[str, PreseasonPlayer]
     actual_scores: Mapping[tuple[str, int], float]
-    preseason_scores: Mapping[str, float]
-    prior_played_averages: Mapping[tuple[str, int], float]
+    selection_scores: Mapping[int, Mapping[str, float]]
+    availability: Mapping[int, Mapping]
 
 
 def simulate_historical_season(
@@ -156,6 +163,7 @@ def simulate_historical_season(
     team_ids = tuple(f"drafter-{index}" for index in range(1, config.team_count + 1))
     names = {team_id: f"Drafter #{index}" for index, team_id in enumerate(team_ids, 1)}
     roster_by_team = dict(zip(team_ids, normalized))
+    manager = SeasonRosterManager(roster_by_team, players, config)
 
     records = {team_id: _Record() for team_id in team_ids}
     week_rows: dict[str, list[TeamWeekResult]] = {team_id: [] for team_id in team_ids}
@@ -165,12 +173,21 @@ def simulate_historical_season(
         key = (team_id, week)
         if key not in lineup_cache:
             lineup_cache[key] = _select_lineup(
-                roster_by_team[team_id], week, config, context,
+                manager.rosters[team_id], week, config, context,
             )
         return lineup_cache[key]
 
+    def prepare_week(week, active_teams):
+        priority = sorted(active_teams, key=lambda team: (
+            _winning_percentage(records[team]), records[team].points_for,
+            -team_ids.index(team),
+        ))
+        manager.prepare_week(week, priority, context.selection_scores[week],
+                             context.availability[week])
+
     schedule = _round_robin_schedule(team_ids, config.regular_season_weeks)
     for week, pairings in schedule:
+        prepare_week(week, team_ids)
         for left, right in pairings:
             if left is None or right is None:
                 team_id = right if left is None else left
@@ -206,7 +223,7 @@ def simulate_historical_season(
     regular_rank = {team_id: index for index, team_id in enumerate(regular_order, 1)}
     playoff_ids = regular_order[:config.playoff_team_count]
     bracket, champion, eliminated_round = _playoffs(
-        playoff_ids, config.playoff_weeks, names, lineup, week_rows,
+        playoff_ids, config.playoff_weeks, names, lineup, week_rows, prepare_week,
     )
     finish_order = [champion]
     finish_order.extend(sorted(
@@ -227,18 +244,35 @@ def simulate_historical_season(
     )
     teams = tuple(
         TeamSeasonTrace(
-            team_id, names[team_id], roster_by_team[team_id],
-            tuple(players[player_id].display_name for player_id in roster_by_team[team_id]),
+            team_id, names[team_id], tuple(manager.rosters[team_id]),
+            tuple(players[player_id].display_name for player_id in manager.rosters[team_id]),
             tuple(sorted(week_rows[team_id], key=lambda row: (row.week, row.stage.value))),
             records[team_id].wins, records[team_id].losses, records[team_id].ties,
             records[team_id].points_for, records[team_id].points_against,
             regular_rank[team_id], team_id in playoff_ids, finish_rank[team_id],
+            tuple(manager.moves[team_id]),
         )
         for team_id in team_ids
     )
     return HistoricalSeasonTrace(
         season.season, config.config_id, teams, standings, tuple(bracket),
-        champion, names[champion],
+        champion, names[champion], roster_management_policy=_roster_management_policy(config),
+        availability_report_count=len(season.availability_reports),
+    )
+
+
+def _roster_management_policy(config):
+    values = [config.zero_point_out_weeks, config.zero_point_ir_weeks,
+              config.zero_point_drop_weeks]
+    if not any(values):
+        return f"{ROSTER_MANAGEMENT_POLICY} Zero-point inference is disabled for this run."
+    labels = [
+        "disabled" if not value else f"{value} {'week' if value == 1 else 'weeks'}"
+        for value in values
+    ]
+    return (
+        f"{ROSTER_MANAGEMENT_POLICY} This run uses optional zero-point thresholds "
+        f"of bench {labels[0]}, modeled IR {labels[1]}, and drop {labels[2]}."
     )
 
 
@@ -280,13 +314,36 @@ def _prepare_scoring_context(
             if prior:
                 prior_averages[player.player_id, week] = math.fsum(prior) / len(prior)
 
+    availability = prepare_availability(season.availability_reports, required_weeks)
+    for player in season.players:
+        for week, report in infer_zero_point_absences(player, actual_scores, required_weeks, config).items():
+            # Explicit unavailable evidence takes precedence over the optional proxy.
+            if report.status is AvailabilityStatus.EXTENDED_ABSENCE:
+                # The user's optional long-streak rule is the only way a starter
+                # corpus can escalate ordinary IR into a modeled drop; nflverse
+                # has no trustworthy season-ending flag.
+                availability[week][player.player_id] = report
+            else:
+                availability[week].setdefault(player.player_id, report)
+    selection_scores = {
+        week: MappingProxyType({
+            player.player_id: (
+                preseason_scores[player.player_id]
+                if (player.player_id, week) not in prior_averages
+                else (preseason_scores[player.player_id] + prior_averages[player.player_id, week]) / 2
+            )
+            for player in season.players
+            if player.bye_week != week and player.player_id not in availability[week]
+        })
+        for week in required_weeks
+    }
     return _PreparedScoringContext(
         season,
         config.config_id,
         MappingProxyType(players),
         MappingProxyType(actual_scores),
-        MappingProxyType(preseason_scores),
-        MappingProxyType(prior_averages),
+        MappingProxyType(selection_scores),
+        MappingProxyType({week: MappingProxyType(rows) for week, rows in availability.items()}),
     )
 
 
@@ -350,20 +407,7 @@ def _validate_rosters(rosters, config, players):
 
 
 def _select_lineup(roster, week, config, context):
-    weights = {}
-    for player_id in roster:
-        player = context.players[player_id]
-        # Bye weeks are part of the preseason snapshot. Same-week inactive or
-        # played status is an outcome and must not influence a historical lock.
-        if player.bye_week == week:
-            continue
-        prior_average = context.prior_played_averages.get((player_id, week))
-        weights[player_id] = (
-            context.preseason_scores[player_id]
-            if prior_average is None
-            else (context.preseason_scores[player_id] + prior_average) / 2
-        )
-    optimized = _optimize(roster, config, context.players, weights)
+    optimized = _optimize(roster, config, context.players, context.selection_scores[week])
     slots = []
     actual_scores = []
     for assignment in optimized.assignments:
@@ -376,21 +420,6 @@ def _select_lineup(roster, week, config, context):
         ))
         actual_scores.append(actual)
     return tuple(slots), math.fsum(actual_scores)
-
-
-def _optimize(roster, config, players, weights):
-    candidates = []
-    for player_id in roster:
-        if player_id not in weights:
-            continue
-        player = players[player_id]
-        slot_weights = {
-            slot: weights[player_id]
-            for slot in set(config.starting_slots)
-            if set(player.eligible_positions).intersection(config.slot_eligibility[slot])
-        }
-        candidates.append(LineupPlayer(player_id, slot_weights))
-    return optimize_lineup(config.starting_slots, candidates)
 
 
 def _preseason_weekly_score(player: PreseasonPlayer, config: DraftLeagueConfig) -> float:
@@ -438,7 +467,7 @@ def _round_robin_schedule(team_ids, weeks):
     return tuple((week, rounds[index % len(rounds)]) for index, week in enumerate(weeks))
 
 
-def _playoffs(playoff_ids, weeks, names, lineup, week_rows):
+def _playoffs(playoff_ids, weeks, names, lineup, week_rows, prepare_week):
     seeds = {team_id: index for index, team_id in enumerate(playoff_ids, 1)}
     size = 1 << math.ceil(math.log2(len(playoff_ids)))
     byes = size - len(playoff_ids)
@@ -448,6 +477,7 @@ def _playoffs(playoff_ids, weeks, names, lineup, week_rows):
     game_number = 0
     for round_index, week in enumerate(weeks[:int(math.log2(size))], 1):
         active.sort()
+        prepare_week(week, [team_id for _, team_id in active])
         if round_index == 1 and byes:
             advancing = active[:byes]
             playing = active[byes:]

@@ -34,7 +34,6 @@ _TRANSACTION_REQUIRED_FIELDS = {
     "proposedDate",
     "rating",
     "scoringPeriodId",
-    "status",
     "teamId",
     "type",
 }
@@ -45,6 +44,7 @@ _TRANSACTION_OPTIONAL_FIELDS = {
     "processDate",
     "relatedTransactionId",
     "skipTransactionCounters",
+    "status",
     "subOrder",
     "teamActions",
 }
@@ -124,7 +124,7 @@ def _parse_transaction(value, *, completion_observed_at):
     )
     source_id = _source_transaction_id("transaction id", row["id"])
     source_type = _text("transaction type", row["type"])
-    status = _optional_text("transaction status", row["status"])
+    status = _optional_text("transaction status", row.get("status"))
     proposed_at = _epoch_milliseconds("proposedDate", row["proposedDate"])
     scoring_period = _integer(
         "transaction scoringPeriodId", row["scoringPeriodId"], minimum=0

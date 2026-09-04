@@ -10,6 +10,7 @@ from ._scenario_random import content_id
 
 
 ESPN_TRANSACTION_LIMIT = 1_000
+_MAXIMUM_SAFE_JSON_INTEGER = (1 << 53) - 1
 
 _SOURCE_TYPES = {
     "TRADE_ACCEPT": "trade",
@@ -420,13 +421,18 @@ def _optional_number(name, value, *, minimum=None):
 def _source_transaction_id(name, value):
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         raise ValueError(f"{name} must be a bounded ESPN source ID")
+    if isinstance(value, int) and abs(value) > _MAXIMUM_SAFE_JSON_INTEGER:
+        raise ValueError(f"{name} must be a bounded ESPN source ID")
     text = str(value)
     if (
         not 1 <= len(text) <= 128
         or not text.isascii()
         or not any(character.isalnum() for character in text)
         or any(not (character.isalnum() or character in "-_") for character in text)
-        or (text.lstrip("-").isdigit() and int(text) <= 0)
+        or (
+            (text.isdigit() or (text.startswith("-") and text[1:].isdigit()))
+            and int(text) <= 0
+        )
     ):
         raise ValueError(f"{name} must be a bounded ESPN source ID")
     return text

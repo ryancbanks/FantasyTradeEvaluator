@@ -32,6 +32,7 @@ class _EvidenceIndex:
         self.weekly_by_pair = defaultdict(list)
         self.rows_by_provider = defaultdict(list)
         self.provider_ids = {}
+        weekly_nfl_teams_by_player = defaultdict(list)
         for row in rows:
             self.rows_by_provider[row.provider].append(row)
             player_id = row.canonical_player_id
@@ -47,6 +48,8 @@ class _EvidenceIndex:
                     raise ValueError("projection evidence contains duplicate weekly evidence")
                 self.weekly[key] = row
                 self.weekly_by_pair[pair].append(row)
+                if row.nfl_team_id is not None:
+                    weekly_nfl_teams_by_player[player_id].append(row.nfl_team_id)
             elif isinstance(row, RemainingSeasonProjection):
                 if pair in self.remaining:
                     raise ValueError(
@@ -55,6 +58,10 @@ class _EvidenceIndex:
                 self.remaining[pair] = row
             else:
                 raise ValueError("projection evidence contains an unsupported row")
+        self._weekly_nfl_teams_by_player = {
+            player_id: tuple(values)
+            for player_id, values in weekly_nfl_teams_by_player.items()
+        }
 
     def provider_metadata(self, provider):
         rows = self.rows_by_provider.get(provider, ())

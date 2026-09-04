@@ -15,6 +15,11 @@ from uuid import uuid4
 from ._scenario_random import content_id
 from .draft_brain import DraftBrain
 from .draft_config import DraftLeagueConfig
+from .draft_evaluation_policy import (
+    EVALUATION_POLICY_VERSION,
+    LEGACY_EVALUATION_POLICY_NOTICE,
+    is_current_evaluation_policy,
+)
 from .draft_history import DraftPlayerBoard, HistoricalCorpus
 
 
@@ -39,6 +44,7 @@ class DraftModelArtifact:
     generation: int
     metrics: Mapping[str, float]
     created_at: str
+    evaluation_policy_version: int = EVALUATION_POLICY_VERSION
     model_id: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -55,6 +61,8 @@ class DraftModelArtifact:
             raise ValueError("trained_seasons must be unique and increasing")
         if type(self.generation) is not int or self.generation < 0:
             raise ValueError("generation must be a non-negative integer")
+        if not is_current_evaluation_policy(self.evaluation_policy_version):
+            raise ValueError(LEGACY_EVALUATION_POLICY_NOTICE)
         metrics = _metrics(self.metrics)
         _timestamp(self.created_at)
         object.__setattr__(self, "trained_seasons", seasons)
@@ -63,6 +71,7 @@ class DraftModelArtifact:
 
     def _content(self) -> dict[str, object]:
         return {
+            "evaluation_policy_version": self.evaluation_policy_version,
             "brain": self.brain.to_record(),
             "league_config": self.league_config.to_record(),
             "corpus_id": self.corpus_id,
@@ -75,22 +84,30 @@ class DraftModelArtifact:
     def to_record(self) -> dict[str, object]:
         return {
             "kind": "fantasy_draft_model",
-            "schema_version": 1,
+            "schema_version": 2,
             **self._content(),
             "model_id": self.model_id,
         }
 
     @classmethod
     def from_record(cls, record: Mapping[str, object]) -> "DraftModelArtifact":
+        if (
+            isinstance(record, Mapping)
+            and record.get("kind") == "fantasy_draft_model"
+            and _is_schema_version(record.get("schema_version"), 1)
+        ):
+            raise ValueError(LEGACY_EVALUATION_POLICY_NOTICE)
         content = {
-            "brain", "league_config", "corpus_id", "trained_seasons",
+            "evaluation_policy_version", "brain", "league_config", "corpus_id", "trained_seasons",
             "generation", "metrics", "created_at",
         }
         if not isinstance(record, Mapping) or set(record) != content | {
             "kind", "schema_version", "model_id"
         }:
             raise ValueError("draft model fields are invalid")
-        if record["kind"] != "fantasy_draft_model" or record["schema_version"] != 1:
+        if record["kind"] != "fantasy_draft_model" or not _is_schema_version(
+            record["schema_version"], 2
+        ):
             raise ValueError("draft model kind or schema version is invalid")
         if not isinstance(record["brain"], Mapping) or not isinstance(
             record["league_config"], Mapping
@@ -106,6 +123,7 @@ class DraftModelArtifact:
             record["generation"],
             record["metrics"],
             record["created_at"],
+            record["evaluation_policy_version"],
         )
         if record["model_id"] != artifact.model_id:
             raise ValueError("draft model content does not match model_id")
@@ -114,6 +132,7 @@ class DraftModelArtifact:
     def summary(self) -> dict[str, object]:
         return {
             "model_id": self.model_id,
+            "evaluation_policy_version": self.evaluation_policy_version,
             "brain_id": self.brain.brain_id,
             "league_name": self.league_config.name,
             "config_id": self.league_config.config_id,
@@ -202,7 +221,7 @@ class DraftFileStore:
         _write_json_atomic(path, artifact.to_record())
         _write_json_atomic(
             self.model_directory / f"{artifact.model_id}.draftbrain-summary.json",
-            {"kind": "draft_model_summary", "schema_version": 1, **artifact.summary()},
+            {"kind": "draft_model_summary", "schema_version": 2, **artifact.summary()},
         )
         return path
 
@@ -220,10 +239,7 @@ class DraftFileStore:
     def list_models(self) -> tuple[dict[str, object], ...]:
         return self._list(
             self.model_directory.glob("*.draftbrain-summary.json"),
-            lambda path: _asset_summary(
-                path, _read_json(path, 1024 * 1024),
-                "draft_model_summary", "model_id", _MODEL_ID,
-            ),
+            lambda path: _model_summary(path, _read_json(path, 1024 * 1024)),
         )
 
     def model_path(self, model_id: str) -> Path:
@@ -302,9 +318,8 @@ def _checkpoint_summary(job_id: str, record: Mapping[str, object]):
             )
         ):
             return None
-        return {
+        summary = {
             "kind": "draft_checkpoint_summary",
-            "schema_version": 1,
             "checkpoint_job_id": job_id,
             "checkpoint_id": record["checkpoint_id"],
             "generation_completed": record["generation_completed"],
@@ -317,20 +332,45 @@ def _checkpoint_summary(job_id: str, record: Mapping[str, object]):
             "champion_brain_id": champion["brain_id"],
             "champion_fitness": performance["fitness"],
         }
+        if any(_is_schema_version(record.get("schema_version"), version) for version in (1, 2)):
+            return {"schema_version": 1, **summary}
+        if _is_schema_version(record.get("schema_version"), 3):
+            return {
+                "schema_version": 2,
+                "evaluation_policy_version": record["evaluation_policy_version"],
+                **summary,
+            }
+        return None
     except (KeyError, TypeError):
         return None
 
 
 def _validated_checkpoint_summary(path: Path, record: Mapping[str, object]):
-    keys = {
+    content_keys = {
         "kind", "schema_version", "checkpoint_job_id", "checkpoint_id",
         "generation_completed", "generation_count", "population_size",
         "training_years", "corpus_id", "league_name", "config_id",
         "champion_brain_id", "champion_fitness",
     }
-    if set(record) != keys or record["kind"] != "draft_checkpoint_summary" or record[
-        "schema_version"
-    ] != 1:
+    if record.get("kind") != "draft_checkpoint_summary":
+        raise ValueError("draft checkpoint summary fields are invalid")
+    if _is_schema_version(record.get("schema_version"), 1):
+        if set(record) != content_keys:
+            raise ValueError("draft checkpoint summary fields are invalid")
+        result = dict(record)
+        result.update(
+            evaluation_policy_version=None,
+            status="invalid",
+            legacy=True,
+            error=LEGACY_EVALUATION_POLICY_NOTICE,
+        )
+    elif _is_schema_version(record.get("schema_version"), 2):
+        if set(record) != content_keys | {"evaluation_policy_version"}:
+            raise ValueError("draft checkpoint summary fields are invalid")
+        if not is_current_evaluation_policy(record["evaluation_policy_version"]):
+            raise ValueError("draft checkpoint summary evaluation policy is invalid")
+        result = dict(record)
+    else:
         raise ValueError("draft checkpoint summary fields are invalid")
     match = _CHECKPOINT_SUMMARY_NAME.fullmatch(path.name)
     if match is None or path.name.split(".", 1)[0] != record["checkpoint_job_id"]:
@@ -338,11 +378,44 @@ def _validated_checkpoint_summary(path: Path, record: Mapping[str, object]):
     _require_summary_asset(path)
     if not isinstance(record["training_years"], list):
         raise ValueError("draft checkpoint training years must be an array")
-    return dict(record)
+    return result
 
 
-def _asset_summary(path, record, kind, id_field, pattern):
-    if record.get("kind") != kind or record.get("schema_version") != 1:
+def _model_summary(path: Path, record: Mapping[str, object]) -> dict[str, object]:
+    content_keys = {
+        "model_id", "brain_id", "league_name", "config_id", "corpus_id",
+        "trained_seasons", "generation", "metrics", "created_at",
+    }
+    version = record.get("schema_version")
+    if _is_schema_version(version, 1):
+        if set(record) != content_keys | {"kind", "schema_version"}:
+            raise ValueError("draft model summary fields are invalid")
+        result = _asset_summary(
+            path, record, "draft_model_summary", "model_id", _MODEL_ID,
+        )
+        result.update(
+            evaluation_policy_version=None,
+            status="invalid",
+            legacy=True,
+            error=LEGACY_EVALUATION_POLICY_NOTICE,
+        )
+        return result
+    if not _is_schema_version(version, 2) or set(record) != content_keys | {
+        "kind", "schema_version", "evaluation_policy_version"
+    }:
+        raise ValueError("draft model summary fields are invalid")
+    if not is_current_evaluation_policy(record["evaluation_policy_version"]):
+        raise ValueError("draft model summary evaluation policy is invalid")
+    return _asset_summary(
+        path, record, "draft_model_summary", "model_id", _MODEL_ID,
+        schema_version=2,
+    )
+
+
+def _asset_summary(path, record, kind, id_field, pattern, *, schema_version=1):
+    if record.get("kind") != kind or not _is_schema_version(
+        record.get("schema_version"), schema_version
+    ):
         raise ValueError("draft asset summary kind or version is invalid")
     identifier = record.get(id_field)
     if not isinstance(identifier, str) or not pattern.fullmatch(identifier):
@@ -362,6 +435,10 @@ def _require_summary_asset(summary_path: Path) -> None:
     )
     if asset_path == summary_path or not asset_path.is_file():
         raise ValueError("draft summary has no matching saved asset")
+
+
+def _is_schema_version(value: object, expected: int) -> bool:
+    return type(value) is int and value == expected
 
 
 def _read_json(path: Path, maximum: int) -> Mapping[str, object]:

@@ -409,8 +409,9 @@ def _ranking_row(value: object) -> ECRRankingRow:
     if team is not None:
         team = _plain_text("team", team, maximum=8).upper()
     source_position = _position(value["position"])
-    position = _canonical_position(source_position)
+    _canonical_position(source_position)
     position_rank = _plain_text("position_rank", value["position_rank"], maximum=16).upper()
+    position = _position_rank_position(position_rank)
     ranks = {
         "rank_ecr": _number(value["rank_ecr"], "rank_ecr"),
         "rank_min": _number(value["rank_min"], "rank_min"),
@@ -503,6 +504,23 @@ def _canonical_position(value: object) -> str:
         return normalize_player_position(raw, require_supported=True)
     except ValueError:
         raise BrowserCaptureError("FantasyPros ECR position was unsupported") from None
+
+
+def _position_rank_position(value: str) -> str:
+    match = re.fullmatch(
+        r"\s*(D\s*/\s*ST|DST|DEF|[A-Z]{1,4})\s*#?\s*[1-9][0-9]*\s*",
+        value,
+        re.IGNORECASE,
+    )
+    if match is None:
+        raise BrowserCaptureError("FantasyPros ECR position rank was invalid")
+    try:
+        prefix = re.sub(r"\s+", "", match.group(1))
+        return normalize_player_position(prefix, require_supported=True)
+    except ValueError:
+        raise BrowserCaptureError(
+            "FantasyPros ECR position rank was unsupported"
+        ) from None
 
 
 def _plain_text(name: str, value: object, *, maximum: int) -> str:

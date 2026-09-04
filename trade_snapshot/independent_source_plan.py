@@ -18,7 +18,7 @@ def build_independent_weekly_source_plan(
     remaining_weeks: Iterable[int],
     scoring: str,
     player_positions: Iterable[str],
-    include_future_weekly: bool = True,
+    include_future_weekly: bool = False,
     broad_consensus: bool = True,
 ) -> CapturePlan:
     """Capture ESPN plus public CBS ROS tables without an analyzer source."""
@@ -27,9 +27,6 @@ def build_independent_weekly_source_plan(
     positions = _validate_positions(player_positions)
     tasks = []
     for week in weeks:
-        tasks.append(
-            _projection_task("espn", _ESPN_PAGE, season, week, "weekly", scoring)
-        )
         tasks.extend(
             _projection_task(
                 "yahoo", _YAHOO_PAGE, season, week, "weekly", scoring, (position,)

@@ -14,6 +14,7 @@ class IndependentSourcePlanTests(unittest.TestCase):
             remaining_weeks=(6, 4, 5),
             scoring="PPR",
             player_positions=("WR", "RB", "IDP"),
+            include_future_weekly=True,
         )
         reordered = build_independent_weekly_source_plan(
             season=2026,
@@ -21,11 +22,12 @@ class IndependentSourcePlanTests(unittest.TestCase):
             remaining_weeks=(5, 6, 4),
             scoring="PPR",
             player_positions=("DB", "LB", "RB", "WR", "DL"),
+            include_future_weekly=True,
         )
 
         self.assertEqual(first, reordered)
         self.assertEqual(first.plan_id, reordered.plan_id)
-        self.assertEqual(len(first.tasks), 57)
+        self.assertEqual(len(first.tasks), 54)
         self.assertTrue(
             all(task.kind is CaptureKind.VISIBLE_TABLE for task in first.tasks)
         )
@@ -35,6 +37,14 @@ class IndependentSourcePlanTests(unittest.TestCase):
                 for task in first.tasks
                 if task.provider is CaptureProvider.ESPN
             )
+        )
+        self.assertEqual(
+            {
+                task.projection.horizon
+                for task in first.tasks
+                if task.provider is CaptureProvider.ESPN
+            },
+            {RankingHorizon.ROS},
         )
         self.assertEqual(
             {task.provider for task in first.tasks},
@@ -58,7 +68,7 @@ class IndependentSourcePlanTests(unittest.TestCase):
             include_future_weekly=False,
         )
 
-        self.assertEqual(len(plan.tasks), 9)
+        self.assertEqual(len(plan.tasks), 8)
         self.assertEqual({task.week for task in plan.tasks}, {8})
         self.assertEqual(
             {task.projection.horizon for task in plan.tasks},
@@ -86,7 +96,7 @@ class IndependentSourcePlanTests(unittest.TestCase):
             broad_consensus=False,
         )
 
-        self.assertEqual(len(plan.tasks), 4)
+        self.assertEqual(len(plan.tasks), 3)
         self.assertEqual(
             {task.provider for task in plan.tasks},
             {CaptureProvider.ESPN, CaptureProvider.YAHOO},

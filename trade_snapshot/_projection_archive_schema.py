@@ -182,9 +182,15 @@ class ProjectionArchiveRow:
         )
         if identity_provider not in _PROVIDER_IDENTITIES.values():
             raise ValueError("projection archive identity_provider is invalid")
-        player_id = _safe_identifier(
-            "provider_player_id", self.provider_player_id, maximum=256
+        player_id = _safe_text(
+            "provider_player_id", self.provider_player_id, 256
         )
+        if not (
+            _SAFE_ID.fullmatch(player_id)
+            or provider == CaptureProvider.ESPN.value
+            and re.fullmatch(r"-[1-9][0-9]{0,19}", player_id)
+        ):
+            raise ValueError("provider_player_id contains unsafe characters")
         display_name = _safe_text("display_name", self.display_name, 200)
         position = _pattern_text("position", self.position, _POSITION)
         team = _pattern_text("nfl_team_id", self.nfl_team_id, _TEAM)

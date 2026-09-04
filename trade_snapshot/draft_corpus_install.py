@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shutil
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -244,16 +245,20 @@ def resolve_starter_manifest(
         )
     )
     for year in years:
+        assets.append(
+            CorpusAsset(
+                key=f"ffc_adp:{year}",
+                role="ffc_adp",
+                season=year,
+                filename=f"ffc_adp_{year}.json",
+                url=_FFC_URL.format(year),
+                maximum_bytes=_MAX_ASSET_BYTES["ffc_adp"],
+            )
+        )
+    source_years = sorted(set(years) | {year - 1 for year in years})
+    for year in source_years:
         assets.extend(
             (
-                CorpusAsset(
-                    key=f"ffc_adp:{year}",
-                    role="ffc_adp",
-                    season=year,
-                    filename=f"ffc_adp_{year}.json",
-                    url=_FFC_URL.format(year),
-                    maximum_bytes=_MAX_ASSET_BYTES["ffc_adp"],
-                ),
                 _github_asset(
                     releases["stats_player"],
                     f"stats_player_week_{year}.csv.gz",
@@ -270,7 +275,7 @@ def resolve_starter_manifest(
                 ),
             )
         )
-    for year in sorted(set(years) | {year - 1 for year in years}):
+    for year in source_years:
         release_assets = releases["weekly_rosters"]
         compressed = f"roster_weekly_{year}.csv.gz"
         filename = (
@@ -492,6 +497,10 @@ class DraftCorpusInstaller:
                 }
             )
             return
+        if asset.expected_sha256 is not None and self._reuse_pinned_asset(
+            asset, final_path, row, state, state_path
+        ):
+            return
         if final_path.exists():
             final_path.unlink()
         part_path = final_path.with_name(f"{final_path.name}.part")
@@ -516,7 +525,7 @@ class DraftCorpusInstaller:
             "Accept": "application/json"
             if asset.role == "ffc_adp"
             else "application/octet-stream",
-            "User-Agent": "FantasyTradeEvaluator/0.2.0 historical-corpus-installer",
+            "User-Agent": "FantasyTradeEvaluator/0.2.1 historical-corpus-installer",
         }
         if start:
             headers["Range"] = f"bytes={start}-"
@@ -581,13 +590,47 @@ class DraftCorpusInstaller:
         row.update({"status": "complete", "bytes": downloaded, "sha256": digest})
         _write_json_atomic(state_path, state)
 
+    def _reuse_pinned_asset(self, asset, final_path, row, state, state_path):
+        """Reuse a verified nflverse download from an older transform."""
+
+        for candidate in self.root.glob(f"*/downloads/{asset.filename}"):
+            if candidate == final_path or not candidate.is_file():
+                continue
+            if not _saved_asset_is_valid(candidate, asset, {}):
+                continue
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = final_path.with_name(
+                f".{final_path.name}.{uuid4().hex}.reuse"
+            )
+            try:
+                try:
+                    os.link(candidate, temporary)
+                except OSError:
+                    shutil.copy2(candidate, temporary)
+                if not _saved_asset_is_valid(temporary, asset, {}):
+                    continue
+                _replace_with_retry(temporary, final_path)
+            finally:
+                temporary.unlink(missing_ok=True)
+            digest = asset.expected_sha256
+            row.update(
+                {
+                    "status": "complete",
+                    "bytes": final_path.stat().st_size,
+                    "sha256": digest,
+                }
+            )
+            _write_json_atomic(state_path, state)
+            return True
+        return False
+
 
 def _release_assets(transport, tag):
     request = Request(
         _RELEASE_API.format(tag),
         headers={
             "Accept": "application/vnd.github+json",
-            "User-Agent": "FantasyTradeEvaluator/0.2.0 historical-corpus-installer",
+            "User-Agent": "FantasyTradeEvaluator/0.2.1 historical-corpus-installer",
         },
     )
     try:
@@ -685,12 +728,11 @@ def _validate_manifest_roles(years, assets):
     keys = {row.key for row in assets}
     expected = {"schedule"}
     for year in years:
-        expected.update(
-            {f"ffc_adp:{year}", f"player_stats:{year}", f"team_stats:{year}"}
-        )
-    expected.update(
-        f"roster:{year}" for year in set(years) | {year - 1 for year in years}
-    )
+        expected.add(f"ffc_adp:{year}")
+    source_years = set(years) | {year - 1 for year in years}
+    expected.update(f"player_stats:{year}" for year in source_years)
+    expected.update(f"team_stats:{year}" for year in source_years)
+    expected.update(f"roster:{year}" for year in source_years)
     if keys != expected:
         raise ValueError(
             "corpus install manifest does not contain the required source set"

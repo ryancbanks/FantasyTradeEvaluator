@@ -18,7 +18,7 @@ from datetime import date, datetime, time, timezone
 from pathlib import Path
 
 STARTER_CORPUS_YEARS = (2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025)
-STARTER_TRANSFORM_VERSION = 1
+STARTER_TRANSFORM_VERSION = 4
 FANTASY_POSITIONS = frozenset({"QB", "RB", "WR", "TE", "K"})
 _TEAM_ALIASES = {
     "ARZ": "ARI",

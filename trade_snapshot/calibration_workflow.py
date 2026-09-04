@@ -170,6 +170,7 @@ def prepare_weekly_calibration_session(
         player_nfl_team_ids=evidence.player_nfl_team_ids,
         nfl_schedule=evidence.nfl_schedule,
         ensemble_config=evidence.ensemble_config,
+        ros_matchup_allocation=evidence.ros_matchup_allocation,
     )
     return prepare_calibration_session(
         features=prepared.features,

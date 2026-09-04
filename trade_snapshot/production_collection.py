@@ -95,6 +95,10 @@ from .public_player_data import (
     PublicPlayerDataSnapshot,
     collect_public_player_data,
 )
+from .ros_matchup_allocation import (
+    build_ros_matchup_allocation,
+    neutral_ros_matchup_allocation,
+)
 from .calibration_workflow import CalibrationNotExact
 from .source_plan import build_weekly_source_plan
 from .waiver_pool import required_waiver_positions
@@ -494,6 +498,9 @@ class ProductionWeeklyCollectionWorkflow:
             first_remaining_week=request.week,
             attempt_clock=self._now,
             unavailable_providers=unavailable_providers,
+            task_progress=lambda current, total, task: _emit_source_progress(
+                progress, current, total, task
+            ),
         )
         validation.stage = "projection and ECR artifact verification"
         projections, ecr = _source_artifacts(
@@ -545,6 +552,23 @@ class ProductionWeeklyCollectionWorkflow:
         public_player_data = self._collect_public_player_data(
             request, root, cancelled, progress
         )
+        if public_player_data is None:
+            ros_matchup_allocation = neutral_ros_matchup_allocation(
+                season=request.season,
+                as_of_week=request.week,
+                scoring=request.scoring,
+                scoring_profile_id=host.scoring_profile.scoring_profile_id,
+            )
+        else:
+            ros_matchup_allocation = build_ros_matchup_allocation(
+                season=request.season,
+                as_of_week=request.week,
+                scoring=request.scoring,
+                scoring_profile_id=host.scoring_profile.scoring_profile_id,
+                current_stats=public_player_data.current_stats,
+                previous_stats=public_player_data.previous_stats,
+                source_data_id=public_player_data.data_id,
+            )
 
         validation.stage = "cross-source identity and weekly evidence assembly"
         _emit(progress, WeeklyCollectionStage.NORMALIZING, .7,
@@ -566,6 +590,7 @@ class ProductionWeeklyCollectionWorkflow:
                 previous_identities=previous,
                 ensemble_config=ensemble_config,
                 broad_consensus=request.use_broad_consensus,
+                ros_matchup_allocation=ros_matchup_allocation,
             )
             if not isinstance(independent, IndependentWeeklyEngine):
                 raise ValueError(
@@ -646,6 +671,7 @@ class ProductionWeeklyCollectionWorkflow:
             ensemble_config=ensemble_config,
             broad_consensus=request.use_broad_consensus,
             projection_source_attempts=projection_attempts,
+            ros_matchup_allocation=ros_matchup_allocation,
         )
         if not isinstance(assembled, AssembledWeeklyEvidence):
             raise ValueError("assembler must return AssembledWeeklyEvidence")
@@ -981,16 +1007,33 @@ def _collect_remaining_sources(
     first_remaining_week,
     attempt_clock,
     unavailable_providers=None,
+    task_progress=None,
 ):
     artifacts = []
     attempts = []
     provider_failures = dict(unavailable_providers or {})
+    unproven_fantasypros_tasks = _unproven_fantasypros_weeks(
+        plan, first_remaining_week
+    )
+    fantasypros_unpublished_cutoff = None
+    if task_progress is not None and not callable(task_progress):
+        raise ValueError("task_progress must be callable")
     optional_providers = {
         task.provider.value for task in plan.tasks if _optional_projection_task(task)
     }
     if not set(provider_failures) <= optional_providers:
         raise ValueError("only optional projection providers may be unavailable")
-    for task in plan.tasks:
+    total_tasks = len(plan.tasks)
+    for current_task, task in enumerate(plan.tasks, start=1):
+        if task_progress is not None:
+            task_progress(current_task, total_tasks, task)
+        if (
+            fantasypros_unpublished_cutoff is not None
+            and _future_fantasypros_weekly_task(task, first_remaining_week)
+            and task.week > fantasypros_unpublished_cutoff
+        ):
+            attempts.append(_not_published_attempt(task, attempt_clock))
+            continue
         provider_failure = provider_failures.get(task.provider.value)
         if provider_failure is not None:
             if not _optional_projection_task(task):
@@ -1020,12 +1063,16 @@ def _collect_remaining_sources(
         except ProjectionNotPublished:
             if not _skippable_unpublished_task(task, first_remaining_week):
                 raise
-            attempts.append(_projection_attempt(
-                task,
-                ProjectionAttemptStatus.NOT_PUBLISHED,
-                ProjectionAttemptReason.SOURCE_NOT_PUBLISHED,
-                attempted_at=attempt_clock(),
-            ))
+            attempts.append(_not_published_attempt(task, attempt_clock))
+            if _future_fantasypros_weekly_task(task, first_remaining_week):
+                unproven = unproven_fantasypros_tasks[task.week]
+                unproven.remove(task.task_id)
+                if not unproven:
+                    fantasypros_unpublished_cutoff = (
+                        task.week
+                        if fantasypros_unpublished_cutoff is None
+                        else min(fantasypros_unpublished_cutoff, task.week)
+                    )
             continue
         except (BrowserCaptureCancelled, BrowserCaptureDependencyError):
             raise
@@ -1064,6 +1111,42 @@ def _collect_remaining_sources(
                 artifact=artifact,
             ))
     return tuple(artifacts), tuple(attempts)
+
+
+def _emit_source_progress(callback, current, total, task):
+    provider = task.provider.value
+    provider_name = {
+        "fantasypros": "FantasyPros",
+        "espn": "ESPN",
+        "yahoo": "Yahoo",
+        "cbs": "CBS",
+        "fftoday": "FFToday",
+        "fantasysharks": "FantasySharks",
+    }.get(provider, provider)
+    stage = {
+        "fantasypros": WeeklyCollectionStage.COLLECTING_FANTASYPROS,
+        "espn": WeeklyCollectionStage.COLLECTING_ESPN,
+        "yahoo": WeeklyCollectionStage.COLLECTING_YAHOO,
+    }.get(provider, WeeklyCollectionStage.COLLECTING_PUBLIC)
+    projection = getattr(task, "projection", None)
+    if projection is None:
+        horizon = getattr(task, "horizon", None)
+        positions = getattr(task, "position_scope", ())
+        detail = f"{getattr(horizon, 'value', 'weekly').upper()} ECR"
+    else:
+        positions = projection.position_scope
+        detail = (
+            "rest of season"
+            if projection.horizon.value == "ros"
+            else f"Week {task.week}"
+        )
+    position_text = "/".join(positions)
+    message = (
+        f"Source {current} of {total}: {provider_name} {detail}"
+        + (f" · {position_text}" if position_text else "")
+    )
+    fraction = .4 + .24 * ((current - 1) / max(total, 1))
+    _emit(callback, stage, fraction, message)
 
 
 def _source_artifacts(
@@ -1156,15 +1239,36 @@ def _optional_projection_task(task):
     return _projection_task(task) and task.provider.value != "fantasypros"
 
 
+def _future_fantasypros_weekly_task(task, first_remaining_week):
+    return (
+        _projection_task(task)
+        and task.provider.value == "fantasypros"
+        and task.projection.horizon.value == "weekly"
+        and task.week > first_remaining_week
+    )
+
+
+def _unproven_fantasypros_weeks(plan, first_remaining_week):
+    tasks_by_week = {}
+    for task in plan.tasks:
+        if _future_fantasypros_weekly_task(task, first_remaining_week):
+            tasks_by_week.setdefault(task.week, set()).add(task.task_id)
+    return tasks_by_week
+
+
 def _skippable_unpublished_task(task, first_remaining_week):
     return (
         _optional_projection_task(task)
-        or (
-            _projection_task(task)
-            and task.provider.value == "fantasypros"
-            and task.projection.horizon.value == "weekly"
-            and task.week > first_remaining_week
-        )
+        or _future_fantasypros_weekly_task(task, first_remaining_week)
+    )
+
+
+def _not_published_attempt(task, attempt_clock):
+    return _projection_attempt(
+        task,
+        ProjectionAttemptStatus.NOT_PUBLISHED,
+        ProjectionAttemptReason.SOURCE_NOT_PUBLISHED,
+        attempted_at=attempt_clock(),
     )
 
 
