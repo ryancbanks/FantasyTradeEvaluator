@@ -78,6 +78,8 @@ from .weekly_collection import (
     WeeklyCollectionProgress,
     WeeklyCollectionRequest,
     WeeklyCollectionStage,
+    WeeklyHistoryAttempt,
+    WeeklyHistoryReason,
 )
 from .weekly_refresh import (
     CalibrationRequired,
@@ -265,10 +267,25 @@ class ProductionWeeklyCollectionWorkflow:
                 collector, request, host_id
             )
         captured_at = self._now()
-        activity = self._activity_adapter(
-            league_payload,
-            captured_at=captured_at,
-        )
+        try:
+            activity = self._activity_adapter(
+                league_payload,
+                captured_at=captured_at,
+            )
+        except ValueError:
+            activity = None
+            history_attempt = WeeklyHistoryAttempt.unavailable(
+                WeeklyHistoryReason.ACTIVITY_SCHEMA_UNSUPPORTED,
+                captured_at,
+            )
+        except Exception:
+            activity = None
+            history_attempt = WeeklyHistoryAttempt.unavailable(
+                WeeklyHistoryReason.ACTIVITY_UNAVAILABLE,
+                captured_at,
+            )
+        else:
+            history_attempt = None
         host = self._host_adapter(
             league_payload,
             pro_team_payload,
@@ -397,16 +414,35 @@ class ProductionWeeklyCollectionWorkflow:
         bundle = getattr(result, "bundle", None)
         if not isinstance(bundle, EngineBundle):
             raise ValueError("refresher must return a weekly refresh result")
-        history_capture, history_binding = self._history_adapter(
-            activity,
-            assembled,
-            bundle,
-            bundle_captured_at=self._now(),
-        )
+        if activity is None:
+            history_capture = history_binding = None
+        else:
+            try:
+                history_capture, history_binding = self._history_adapter(
+                    activity,
+                    assembled,
+                    bundle,
+                    bundle_captured_at=self._now(),
+                )
+            except ValueError:
+                history_capture = history_binding = None
+                history_attempt = _failed_history_attempt(
+                    activity,
+                    captured_at,
+                    WeeklyHistoryReason.CANONICALIZATION_FAILED,
+                )
+            except Exception:
+                history_capture = history_binding = None
+                history_attempt = _failed_history_attempt(
+                    activity,
+                    captured_at,
+                    WeeklyHistoryReason.HISTORY_PROCESSING_UNAVAILABLE,
+                )
         publication = WeeklyCollectionPublication(
             bundle,
             history_capture,
             history_binding,
+            history_attempt,
         )
         save_identity_registry(assembled.identities, root / _IDENTITY_FILE)
         return publication
@@ -779,6 +815,23 @@ def _primary_team(assembled, metadata):
 
 def _previous_identities(path):
     return load_identity_registry(path) if path.exists() else None
+
+
+def _failed_history_attempt(activity, attempted_at, reason):
+    return WeeklyHistoryAttempt(
+        status="unavailable",
+        reason_code=reason,
+        attempted_at=attempted_at,
+        source_provider="espn",
+        returned_transaction_count=getattr(
+            activity, "returned_transaction_count", None
+        ),
+        normalized_transaction_count=None,
+        transaction_limit=getattr(activity, "transaction_limit", None),
+        transactions_complete=getattr(
+            activity, "transactions_complete", None
+        ),
+    )
 
 
 def _refresh_progress(callback, value):

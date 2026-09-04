@@ -357,6 +357,22 @@ function renderBundleDataReadiness(bundle) {
   panel.classList.remove("hidden");
 }
 
+function bundleCapability(bundle, key) {
+  const capability = bundle?.data_readiness?.capabilities?.[key];
+  return capability && typeof capability === "object" ? capability : null;
+}
+
+function bundleCapabilityIsUsable(bundle, key) {
+  const capability = bundleCapability(bundle, key);
+  return Boolean(capability) && capability.status !== "not_ready";
+}
+
+function bundleCapabilityBlockMessage(bundle, key, fallback) {
+  const capability = bundleCapability(bundle, key);
+  const missing = Array.isArray(capability?.missing) ? capability.missing.filter(Boolean) : [];
+  return missing.length ? `${fallback}: ${missing.join(" ")}` : fallback;
+}
+
 function renderBundle() {
   const bundle = currentBundle();
   renderBundleDataReadiness(bundle);
@@ -395,7 +411,16 @@ function renderBundle() {
   }
   $("surrogateSearchConsentRow").classList.toggle("hidden", !surrogate);
   $("acceptSurrogateSearch").checked = false;
+  const tradeSearchReady = bundleCapabilityIsUsable(bundle, "trade_search");
   $("estimateButton").disabled = Boolean(activeCollection);
+  $("estimateButton").title = "Count the candidate space without running player-value or playoff calculations.";
+  if (!tradeSearchReady) {
+    $("estimate").textContent = bundleCapabilityBlockMessage(
+      bundle,
+      "trade_search",
+      "Trade search is unavailable for this weekly bundle"
+    );
+  }
   syncCounterparties();
   ThreeWayUi.syncFormatControls(bundle);
   updateSearchStartButton();
@@ -448,8 +473,16 @@ function syncCounterparties() {
   populatePackageFilters();
 }
 
-function requestPayload() {
-  if (!$("bundleSelect").value) throw new Error("Choose a ready weekly bundle first.");
+function requestPayload({requireTradeSearchReady = true} = {}) {
+  const bundle = currentBundle();
+  if (!bundle) throw new Error("Choose a ready weekly bundle first.");
+  if (requireTradeSearchReady && !bundleCapabilityIsUsable(bundle, "trade_search")) {
+    throw new Error(bundleCapabilityBlockMessage(
+      bundle,
+      "trade_search",
+      "Trade search is unavailable for this weekly bundle"
+    ));
+  }
   const format = tradeFormat();
   const partnerSlots = ThreeWayUi.selectedPartnerSlots();
   if (format === "three_team" && (partnerSlots.length !== 2 || new Set(partnerSlots).size !== 2)) {
@@ -481,12 +514,12 @@ function requestPayload() {
 }
 
 function searchConfigurationSignature(payload = null) {
-  try { return JSON.stringify(payload || requestPayload()); }
+  try { return JSON.stringify(payload || requestPayload({requireTradeSearchReady: false})); }
   catch (_) { return null; }
 }
 
 function updateSearchStartButton() {
-  const bundleReady = Boolean(currentBundle());
+  const bundleReady = bundleCapabilityIsUsable(currentBundle(), "trade_search");
   const estimateCurrent = !isThreeTeam() || (
     threeTeamEstimateSignature !== null &&
     threeTeamEstimateSignature === searchConfigurationSignature()
@@ -496,7 +529,16 @@ function updateSearchStartButton() {
 
 function invalidateSearchEstimate() {
   threeTeamEstimateSignature = null;
-  if (isThreeTeam() && currentBundle()) {
+  if (!bundleCapabilityIsUsable(currentBundle(), "trade_search")) {
+    const bundle = currentBundle();
+    if (bundle) {
+      $("estimate").textContent = bundleCapabilityBlockMessage(
+        bundle,
+        "trade_search",
+        "Trade search is unavailable for this weekly bundle"
+      );
+    }
+  } else if (isThreeTeam() && currentBundle()) {
     $("estimate").textContent = "Count this specific three-team search before starting it.";
   }
   updateSearchStartButton();
@@ -545,7 +587,13 @@ async function pollCollection() {
       const selectedBundle = job.bundle_id;
       activeCollection = null;
       setCollectionRunning(false);
-      if (job.status === "complete") await refreshBundles(selectedBundle);
+      if (job.status === "complete") {
+        await refreshBundles(selectedBundle);
+        const historyNote = historyCollectionNote(job.history_attempt);
+        if (historyNote) {
+          $("collectionProgressText").textContent = `Weekly model ready. ${historyNote}`;
+        }
+      }
       else if (job.status === "failed") showError(job.error || "No new weekly bundle was published.");
       else $("collectionProgressText").textContent = "Collection stopped safely. No incomplete week was published.";
       return;
@@ -554,6 +602,22 @@ async function pollCollection() {
   }
   activeCollection = null;
   setCollectionRunning(false);
+}
+
+function historyCollectionNote(attempt) {
+  if (!attempt || typeof attempt !== "object") return "";
+  if (attempt.status === "captured") {
+    return "League activity was saved for GM and timing history.";
+  }
+  const messages = {
+    activity_schema_unsupported: "League activity needs a collector update; every core trade feature remains available.",
+    activity_unavailable: "League activity was temporarily unavailable; every core trade feature remains available.",
+    canonicalization_failed: "League activity could not be matched safely; every core trade feature remains available.",
+    history_processing_unavailable: "League activity could not be processed locally; every core trade feature remains available.",
+    store_unavailable: "League activity could not be saved locally; every core trade feature remains available.",
+    not_provided: "No league-activity capture was included; every core trade feature remains available."
+  };
+  return messages[attempt.reason_code] || "League activity is unavailable; every core trade feature remains available.";
 }
 
 function renderCollectionProgress(job) {
@@ -611,7 +675,7 @@ async function cancelCollection() {
 async function estimate() {
   clearError();
   try {
-    const payload = requestPayload();
+    const payload = requestPayload({requireTradeSearchReady: false});
     const signature = searchConfigurationSignature(payload);
     const value = await api("/api/searches/estimate", {method: "POST", body: JSON.stringify(payload)});
     const candidateCount = ThreeWayUi.exactCandidateCount(value);
@@ -622,14 +686,21 @@ async function estimate() {
     const caution = candidateCount > 10000000n
       ? " This is a very large run; tighten a size or imbalance filter first."
       : "";
+    const searchReadiness = value?.data_readiness;
+    const blocked = searchReadiness?.status === "not_ready";
+    const blockedNote = blocked
+      ? ` Search cannot start: ${Array.isArray(searchReadiness.missing) && searchReadiness.missing.length
+        ? searchReadiness.missing.join(" ")
+        : "required bundle evidence is missing."}`
+      : "";
     if (payload.trade_format === "three_team") {
       const adjustmentPolicy = value.free_agent_allocation_policy
         ? ` Automatic roster adjustment policy: ${value.free_agent_allocation_policy}`
         : "";
-      $("estimate").textContent = `${compactNumber(candidateCount)} combinations counted exactly for this three-team agreement.${caution}${adjustmentPolicy}`;
+      $("estimate").textContent = `${compactNumber(candidateCount)} combinations counted exactly for this three-team agreement.${caution}${adjustmentPolicy}${blockedNote}`;
       threeTeamEstimateSignature = signature;
     } else {
-      $("estimate").textContent = `${compactNumber(candidateCount)} combinations counted exactly across ${value.pair_count} team matchups.${caution}`;
+      $("estimate").textContent = `${compactNumber(candidateCount)} combinations counted exactly across ${value.pair_count} team matchups.${caution}${blockedNote}`;
     }
     updateSearchStartButton();
   } catch (error) {

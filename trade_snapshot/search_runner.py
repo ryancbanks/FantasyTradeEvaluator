@@ -83,6 +83,35 @@ class TradeSearchProgress:
 class TradeSearchOutcome:
     progress: TradeSearchProgress
     results: tuple[QualifiedSearchResult, ...]
+    run_definition: SearchRunDefinition
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.progress, TradeSearchProgress):
+            raise ValueError("progress must be a TradeSearchProgress")
+        if not isinstance(self.run_definition, SearchRunDefinition):
+            raise ValueError("run_definition must be a SearchRunDefinition")
+        rows = tuple(self.results)
+        if any(not isinstance(row, QualifiedSearchResult) for row in rows):
+            raise ValueError("results must contain QualifiedSearchResult values")
+        if (
+            self.progress.run_id != self.run_definition.run_id
+            or self.progress.total_candidate_count
+            != self.run_definition.total_candidate_count
+        ):
+            raise ValueError("search outcome does not match its run definition")
+        if len(rows) != self.progress.power_qualified_count:
+            raise ValueError("search outcome result count does not match progress")
+        indexes = tuple(row.candidate_index for row in rows)
+        if (
+            len(set(indexes)) != len(indexes)
+            or any(index >= self.progress.next_candidate_index for index in indexes)
+            or sum(row.primary_playoff_before is not None for row in rows)
+            != self.progress.playoff_evaluated_count
+            or sum(_is_mutual_gain(row) for row in rows)
+            != self.progress.mutual_playoff_gain_count
+        ):
+            raise ValueError("search outcome results do not reconcile to progress")
+        object.__setattr__(self, "results", rows)
 
     @property
     def mutual_playoff_gains(self) -> tuple[QualifiedSearchResult, ...]:
@@ -231,7 +260,9 @@ class ResumableTradeSearch:
             progress = self._progress(final_state, cancelled=cancelled)
             if on_progress is not None:
                 on_progress(progress)
-            return TradeSearchOutcome(progress, final_state.qualified_results)
+            return TradeSearchOutcome(
+                progress, final_state.qualified_results, self.run_definition
+            )
 
     def _power_qualifies(self, result: TradePowerEvaluation) -> bool:
         threshold = self.settings.minimum_displayed_power_delta

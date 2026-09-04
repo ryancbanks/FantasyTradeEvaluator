@@ -467,6 +467,106 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
         self.assertLess(progress[-1].fraction, .99)
         self.assertTrue(any("Found 2 teams" in row.message for row in progress))
 
+    def test_activity_schema_failure_degrades_history_without_blocking_bundle(self):
+        workflow = _workflow(collector=_Collector())
+
+        def fail_activity(*_args, **_kwargs):
+            raise ValueError("unsupported optional activity schema")
+
+        workflow._activity_adapter = fail_activity
+        workflow._history_adapter = lambda *_args, **_kwargs: self.fail(
+            "history normalization must not run without activity"
+        )
+        with TemporaryDirectory() as directory:
+            result = workflow(
+                _request(),
+                data_directory=Path(directory),
+                progress=lambda _: None,
+                cancelled=lambda: False,
+            )
+
+        self.assertIsInstance(result, WeeklyCollectionPublication)
+        self.assertIsNone(result.history_capture)
+        self.assertIsNone(result.history_binding)
+        self.assertEqual(result.history_attempt.status.value, "unavailable")
+        self.assertEqual(
+            result.history_attempt.reason_code.value,
+            "activity_schema_unsupported",
+        )
+
+    def test_activity_runtime_failure_is_not_mislabeled_as_a_schema_change(self):
+        workflow = _workflow(collector=_Collector())
+
+        def fail_activity(*_args, **_kwargs):
+            raise RuntimeError("private provider response was temporarily unavailable")
+
+        workflow._activity_adapter = fail_activity
+        workflow._history_adapter = lambda *_args, **_kwargs: self.fail(
+            "history normalization must not run without activity"
+        )
+        with TemporaryDirectory() as directory:
+            result = workflow(
+                _request(),
+                data_directory=Path(directory),
+                progress=lambda _: None,
+                cancelled=lambda: False,
+            )
+
+        self.assertIsInstance(result, WeeklyCollectionPublication)
+        self.assertIsNone(result.history_capture)
+        self.assertEqual(result.history_attempt.status.value, "unavailable")
+        self.assertEqual(
+            result.history_attempt.reason_code.value,
+            "activity_unavailable",
+        )
+
+    def test_history_normalization_failure_degrades_only_history(self):
+        workflow = _workflow(collector=_Collector())
+
+        def fail_history(*_args, **_kwargs):
+            raise ValueError("history identity mismatch")
+
+        workflow._history_adapter = fail_history
+        with TemporaryDirectory() as directory:
+            result = workflow(
+                _request(),
+                data_directory=Path(directory),
+                progress=lambda _: None,
+                cancelled=lambda: False,
+            )
+
+        self.assertIsInstance(result, WeeklyCollectionPublication)
+        self.assertIsNone(result.history_capture)
+        self.assertIsNone(result.history_binding)
+        self.assertEqual(result.history_attempt.status.value, "unavailable")
+        self.assertEqual(
+            result.history_attempt.reason_code.value,
+            "canonicalization_failed",
+        )
+
+    def test_history_runtime_failure_is_not_mislabeled_as_bad_identity_data(self):
+        workflow = _workflow(collector=_Collector())
+
+        def fail_history(*_args, **_kwargs):
+            raise RuntimeError("temporary local processing failure")
+
+        workflow._history_adapter = fail_history
+        with TemporaryDirectory() as directory:
+            result = workflow(
+                _request(),
+                data_directory=Path(directory),
+                progress=lambda _: None,
+                cancelled=lambda: False,
+            )
+
+        self.assertIsInstance(result, WeeklyCollectionPublication)
+        self.assertIsNone(result.history_capture)
+        self.assertEqual(result.history_attempt.status.value, "unavailable")
+        self.assertEqual(
+            result.history_attempt.reason_code.value,
+            "history_processing_unavailable",
+        )
+
     def test_legacy_team_count_is_only_a_mismatch_guard(self):
         collector = _Collector()
         workflow = _workflow(collector=collector)

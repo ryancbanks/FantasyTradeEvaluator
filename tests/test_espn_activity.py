@@ -1,4 +1,5 @@
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 import unittest
@@ -6,6 +7,8 @@ import unittest
 from trade_snapshot.espn_activity import (
     ESPN_TRANSACTION_LIMIT,
     EspnActivityKind,
+    EspnActivitySkipCount,
+    EspnActivitySkipReason,
     EspnTransactionAssetKind,
     espn_activity_capture,
 )
@@ -177,6 +180,15 @@ class EspnActivityCaptureTests(unittest.TestCase):
         self.assertEqual(capture.returned_transaction_count, 9)
         self.assertEqual(capture.transaction_limit, ESPN_TRANSACTION_LIMIT)
         self.assertEqual(
+            {row.reason: row.count for row in capture.skipped_transactions},
+            {
+                EspnActivitySkipReason.NOT_EXECUTED: 3,
+                EspnActivitySkipReason.PENDING: 1,
+                EspnActivitySkipReason.TRADE_WITHOUT_BILATERAL_ASSETS: 1,
+                EspnActivitySkipReason.UNSUPPORTED_ACTIVITY_KIND: 1,
+            },
+        )
+        self.assertEqual(
             [row.kind for row in capture.transactions],
             [
                 EspnActivityKind.TRADE,
@@ -301,6 +313,35 @@ class EspnActivityCaptureTests(unittest.TestCase):
         self.assertEqual(by_id[free_agent["id"]].kind, EspnActivityKind.FREE_AGENT)
         self.assertEqual(by_id[waiver["id"]].kind, EspnActivityKind.WAIVER)
         self.assertEqual(by_id[accepted_trade["id"]].kind, EspnActivityKind.TRADE)
+        accepted = by_id[accepted_trade["id"]]
+        self.assertEqual(
+            accepted.accepted_at,
+            datetime.fromtimestamp(accepted_trade["acceptedDate"] / 1000, timezone.utc),
+        )
+        self.assertEqual(
+            accepted.processed_at,
+            datetime.fromtimestamp(accepted_trade["processDate"] / 1000, timezone.utc),
+        )
+        self.assertEqual(
+            accepted.expires_at,
+            datetime.fromtimestamp(accepted_trade["expirationDate"] / 1000, timezone.utc),
+        )
+        self.assertEqual(accepted.completion_observed_at, NOW)
+        self.assertNotEqual(accepted.accepted_at, accepted.proposed_at)
+        self.assertNotEqual(accepted.processed_at, accepted.proposed_at)
+        self.assertIsNone(by_id[free_agent["id"]].accepted_at)
+        self.assertIsNone(by_id[free_agent["id"]].processed_at)
+        self.assertIsNone(by_id[free_agent["id"]].expires_at)
+        self.assertEqual(by_id[free_agent["id"]].completion_observed_at, NOW)
+        without_process = deepcopy(accepted_trade)
+        without_process.pop("processDate")
+        self.assertNotEqual(
+            capture.capture_id,
+            espn_activity_capture(
+                league_payload([free_agent, waiver, without_process]),
+                captured_at=NOW,
+            ).capture_id,
+        )
         player_items = [
             row
             for event in by_id.values()
@@ -341,6 +382,11 @@ class EspnActivityCaptureTests(unittest.TestCase):
                     "TRADE_ACCEPT",
                     [item(0, 1, 2, item_type="DRAFT", overall_pick=5)],
                 ),
+                transaction(
+                    5,
+                    "TRADE_ACCEPT",
+                    [item(101, 1, 2), item(202, 2, 1), item(303, 0, 1)],
+                ),
             ]
         )
 
@@ -358,6 +404,91 @@ class EspnActivityCaptureTests(unittest.TestCase):
             EspnTransactionAssetKind.UNSUPPORTED_NON_PLAYER,
         )
         self.assertEqual(draft_asset.source_player_id, "0")
+
+    def test_reports_one_stable_reason_for_every_omitted_source_row(self):
+        first = 1_788_800_300_000
+        last = 1_788_800_600_000
+        payload = league_payload(
+            [
+                transaction(1, "WAIVER", [item(303, 0, 1)], date=first + 100_000),
+                transaction(
+                    2,
+                    "TRADE_ACCEPT",
+                    [item(101, 1, 2), item(202, 2, 1)],
+                    pending=True,
+                    date=first,
+                ),
+                transaction(
+                    3,
+                    "WAIVER",
+                    [item(404, 0, 1)],
+                    status="CANCELED",
+                    date=first + 50_000,
+                ),
+                transaction(
+                    4,
+                    "ROSTER",
+                    [item(101, 1, 1)],
+                    date=first + 150_000,
+                ),
+                transaction(
+                    5,
+                    "FREEAGENT",
+                    [item(101, 1, 1)],
+                    date=first + 200_000,
+                ),
+                transaction(
+                    6,
+                    "TRADE_UPHOLD",
+                    [item(505, 0, 1)],
+                    date=last,
+                ),
+            ]
+        )
+
+        capture = espn_activity_capture(payload, captured_at=NOW)
+
+        self.assertEqual(capture.returned_transaction_count, 6)
+        self.assertEqual(len(capture.transactions), 1)
+        self.assertEqual(
+            sum(row.count for row in capture.skipped_transactions), 5
+        )
+        self.assertEqual(
+            {row.reason.value: row.count for row in capture.skipped_transactions},
+            {
+                "no_ownership_changes": 1,
+                "not_executed": 1,
+                "pending": 1,
+                "trade_without_bilateral_assets": 1,
+                "unsupported_activity_kind": 1,
+            },
+        )
+        self.assertEqual(
+            capture.earliest_returned_proposed_at,
+            datetime.fromtimestamp(first / 1000, timezone.utc),
+        )
+        self.assertEqual(
+            capture.latest_returned_proposed_at,
+            datetime.fromtimestamp(last / 1000, timezone.utc),
+        )
+        reordered = deepcopy(payload)
+        reordered["transactions"].reverse()
+        reordered["teams"].reverse()
+        self.assertEqual(
+            capture.capture_id,
+            espn_activity_capture(reordered, captured_at=NOW).capture_id,
+        )
+
+        with self.assertRaisesRegex(ValueError, "skip counts"):
+            replace(capture, skipped_transactions=())
+        with self.assertRaisesRegex(ValueError, "duplicate skip reason"):
+            replace(
+                capture,
+                skipped_transactions=(
+                    EspnActivitySkipCount(EspnActivitySkipReason.PENDING, 2),
+                    EspnActivitySkipCount(EspnActivitySkipReason.PENDING, 3),
+                ),
+            )
 
     def test_mixed_player_and_draft_pick_trade_retains_the_unsupported_asset(self):
         payload = league_payload(
@@ -417,15 +548,54 @@ class EspnActivityCaptureTests(unittest.TestCase):
         )
 
         self.assertFalse(left.transactions_complete)
+        self.assertEqual(left.returned_transaction_count, 2)
+        self.assertEqual(len(left.transactions), 2)
+        self.assertEqual(left.skipped_transactions, ())
         self.assertEqual(
             [row.source_transaction_id for row in left.transactions], ["1", "2"]
         )
         self.assertEqual(left.capture_id, right.capture_id)
 
+        filtered_at_cap = espn_activity_capture(
+            league_payload(
+                [
+                    transaction(
+                        3,
+                        "WAIVER",
+                        [item(303, 0, 1)],
+                        status="CANCELED",
+                    ),
+                    transaction(
+                        4,
+                        "TRADE_ACCEPT",
+                        [item(101, 1, 2), item(202, 2, 1)],
+                        pending=True,
+                    ),
+                ]
+            ),
+            captured_at=NOW,
+            transaction_limit=2,
+        )
+        self.assertFalse(filtered_at_cap.transactions_complete)
+        self.assertEqual(filtered_at_cap.transactions, ())
+        self.assertEqual(
+            sum(row.count for row in filtered_at_cap.skipped_transactions), 2
+        )
+
         complete = espn_activity_capture(
             league_payload(transactions[:1]), captured_at=NOW, transaction_limit=2
         )
         self.assertTrue(complete.transactions_complete)
+
+    def test_rejects_source_action_times_after_the_completion_observation(self):
+        after_capture = int(NOW.timestamp() * 1000) + 1
+        for field in ("acceptedDate", "processDate"):
+            row = transaction(1, "WAIVER", [item(303, 0, 1)])
+            row[field] = after_capture
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError, "cannot follow captured_at"
+            ):
+                espn_activity_capture(league_payload([row]), captured_at=NOW)
 
     def test_rejects_schema_drift_duplicate_ids_and_invalid_roster_ownership(self):
         valid = transaction(1, "WAIVER", [item(303, 0, 1)])

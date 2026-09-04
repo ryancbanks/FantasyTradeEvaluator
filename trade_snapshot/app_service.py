@@ -20,7 +20,10 @@ from ._app_support import (
     workbook_sources,
 )
 from .dashboard import build_league_dashboard
-from .data_readiness import build_data_readiness_snapshot
+from .data_readiness import (
+    build_bundle_data_readiness,
+    build_data_readiness_snapshot,
+)
 from .engine_bundle import (
     EngineBundle,
     UnsupportedEngineBundleSchema,
@@ -28,7 +31,8 @@ from .engine_bundle import (
     save_engine_bundle,
 )
 from .gm_insights import build_gm_insights
-from .league_history import LeagueHistoryStore
+from .history_readiness import build_history_data_readiness
+from .league_history import LeagueHistoryStore, LeagueHistoryStoreError
 from .league_search import LeagueSearchOutcome, LeagueSearchProgress, ResumableLeagueTradeSearch
 from .player_outlook import build_player_outlook
 from .roster_adjustment import (
@@ -65,9 +69,11 @@ from .weekly_collection import (
     WeeklyCollectionJobs,
     WeeklyCollectionRequest,
     WeeklyCollectionWorkflow,
+    load_weekly_history_attempt,
 )
 from .workbook_model import (
     TradeWorkbookContext,
+    TwoTeamExportProvenance,
     team_outlook_rows,
     workbook_trade_rows,
 )
@@ -261,21 +267,19 @@ class LocalAppService:
         self._dashboard_futures: dict[str, Future[dict[str, object]]] = {}
         self._player_outlook_cache: OrderedDict[str, dict[str, object]] = OrderedDict()
         self._player_outlook_futures: dict[str, Future[dict[str, object]]] = {}
-        self._gm_insights_cache: OrderedDict[
-            tuple[str, str | None], dict[str, object]
-        ] = OrderedDict()
+        self._gm_insights_cache: OrderedDict[tuple[object, ...], dict[str, object]] = (
+            OrderedDict()
+        )
         self._gm_insights_futures: dict[
-            tuple[str, str | None], Future[dict[str, object]]
+            tuple[object, ...], Future[dict[str, object]]
         ] = {}
         self._trade_timing_cache: OrderedDict[
-            tuple[str, str | None, str], dict[str, object]
+            tuple[object, ...], dict[str, object]
         ] = OrderedDict()
         self._trade_timing_futures: dict[
-            tuple[str, str | None, str], Future[dict[str, object]]
+            tuple[object, ...], Future[dict[str, object]]
         ] = {}
-        self._history_store = LeagueHistoryStore(
-            self.data_directory / LEAGUE_HISTORY_FILENAME
-        )
+        self._history_path = self.data_directory / LEAGUE_HISTORY_FILENAME
         self._collections = WeeklyCollectionJobs(
             self.data_directory,
             self.bundle_directory,
@@ -335,6 +339,11 @@ class LocalAppService:
 
         try:
             bundle = load_engine_bundle(self._bundle_path(bundle_id))
+            _require_bundle_capability(
+                bundle,
+                "team_outlook_and_exports",
+                "league dashboard",
+            )
             source_config = bundle.scenario_config
             dashboard_config = (
                 source_config
@@ -353,11 +362,14 @@ class LocalAppService:
                 bundle.eligibilities,
                 dashboard_config,
             )
-            dashboard = build_league_dashboard(
+            dashboard = dict(build_league_dashboard(
                 bundle,
                 baseline.season_projection,
                 baseline.scenarios,
-            )
+            ))
+            dashboard["data_readiness"] = build_bundle_data_readiness(bundle)[
+                "capabilities"
+            ]["team_outlook_and_exports"]
         except BaseException as error:
             future.set_exception(error)
             raise
@@ -389,9 +401,11 @@ class LocalAppService:
             return future.result()
 
         try:
-            outlook = build_player_outlook(
-                load_engine_bundle(self._bundle_path(bundle_id))
-            )
+            bundle = load_engine_bundle(self._bundle_path(bundle_id))
+            outlook = dict(build_player_outlook(bundle))
+            outlook["data_readiness"] = build_bundle_data_readiness(bundle)[
+                "capabilities"
+            ]["player_lab"]
         except BaseException as error:
             future.set_exception(error)
             raise
@@ -412,9 +426,15 @@ class LocalAppService:
         """Return evidence-backed team tendencies for one bound league history."""
 
         bundle = load_engine_bundle(self._bundle_path(bundle_id))
-        history = self._history_store.snapshot_for_bundle(bundle_id)
+        history, history_store_status, history_attempt = self._history_snapshot(bundle)
         revision = None if history is None else history.history_revision
-        cache_key = bundle_id, revision
+        cache_key = (
+            bundle_id,
+            revision,
+            history_store_status,
+            self._history_attempt_revision(history_attempt),
+            self._loadable_history_engine_revision(history),
+        )
         with self._lock:
             cached = self._gm_insights_cache.get(cache_key)
             if cached is not None:
@@ -430,12 +450,18 @@ class LocalAppService:
             return future.result()
 
         try:
-            insights = build_gm_insights(
+            insights = dict(build_gm_insights(
                 bundle,
                 history,
                 bundle_loader=lambda source_id: load_engine_bundle(
                     self._bundle_path(source_id)
                 ),
+            ))
+            insights["data_readiness"] = build_history_data_readiness(
+                bundle,
+                history,
+                store_status=history_store_status,
+                collection_attempt=history_attempt,
             )
         except BaseException as error:
             future.set_exception(error)
@@ -459,9 +485,15 @@ class LocalAppService:
         """Return one coalesced, history-aware trade-timing preview."""
 
         bundle = load_engine_bundle(self._bundle_path(bundle_id))
-        history = self._history_store.snapshot_for_bundle(bundle_id)
+        history, history_store_status, history_attempt = self._history_snapshot(bundle)
         revision = None if history is None else history.history_revision
-        cache_key = bundle_id, revision, primary_team_id
+        cache_key = (
+            bundle_id,
+            revision,
+            history_store_status,
+            self._history_attempt_revision(history_attempt),
+            primary_team_id,
+        )
         with self._lock:
             cached = self._trade_timing_cache.get(cache_key)
             if cached is not None:
@@ -477,7 +509,13 @@ class LocalAppService:
             return future.result()
 
         try:
-            timing = build_trade_timing(bundle, history, primary_team_id)
+            timing = dict(build_trade_timing(bundle, history, primary_team_id))
+            timing["data_readiness"] = build_history_data_readiness(
+                bundle,
+                history,
+                store_status=history_store_status,
+                collection_attempt=history_attempt,
+            )
         except BaseException as error:
             future.set_exception(error)
             raise
@@ -557,6 +595,53 @@ class LocalAppService:
             "message": " ".join(message_parts),
         }
 
+    def _history_snapshot(self, bundle: EngineBundle):
+        """Load an optional sidecar without making core bundle use depend on it."""
+
+        try:
+            attempt = load_weekly_history_attempt(
+                self.data_directory,
+                bundle.bundle_id,
+            )
+        except (OSError, ValueError):
+            attempt = None
+        try:
+            history = LeagueHistoryStore(self._history_path).snapshot_for_bundle(
+                bundle.bundle_id
+            )
+        except (LeagueHistoryStoreError, OSError):
+            return None, "unavailable", attempt
+        if history is not None and (
+            history.league_key != bundle.source_manifest.league_binding_id
+            or history.season != bundle.state.season
+            or history.bundle_id != bundle.bundle_id
+        ):
+            return None, "unavailable", attempt
+        return history, "available", attempt
+
+    @staticmethod
+    def _history_attempt_revision(attempt) -> str | None:
+        if attempt is None:
+            return None
+        return content_id("history-attempt", attempt.to_record())
+
+    def _loadable_history_engine_revision(self, history) -> str | None:
+        """Invalidate GM caches when a formerly missing prior engine appears."""
+
+        if history is None:
+            return None
+        available = tuple(
+            sorted(
+                binding.bundle_id
+                for binding in history.bundle_bindings
+                if BUNDLE_ID_PATTERN.fullmatch(binding.bundle_id)
+                and (
+                    self.bundle_directory / f"{binding.bundle_id}.json"
+                ).is_file()
+            )
+        )
+        return content_id("history-engine-set", {"bundle_ids": list(available)})
+
     def start_weekly_collection(
         self, request: WeeklyCollectionRequest
     ) -> dict[str, object]:
@@ -579,6 +664,7 @@ class LocalAppService:
             raise ValueError("request must be a LocalSearchRequest")
         bundle = load_engine_bundle(self._bundle_path(request.bundle_id))
         _require_surrogate_consent(bundle, request)
+        _require_bundle_capability(bundle, "trade_search", "trade search")
         _search_scope(bundle, request)
         with self._lock:
             if self._collections.is_running:
@@ -595,6 +681,9 @@ class LocalAppService:
             raise ValueError("request must be a LocalSearchRequest")
         bundle = load_engine_bundle(self._bundle_path(request.bundle_id))
         _require_surrogate_consent(bundle, request)
+        readiness = build_bundle_data_readiness(bundle)["capabilities"][
+            "trade_search"
+        ]
         by_team, primary, selected = _search_scope(bundle, request)
         eligible_positions = {
             player_id: player.eligible_positions
@@ -620,6 +709,7 @@ class LocalAppService:
                     *request.counterparty_team_ids,
                 ],
                 "free_agent_allocation_policy": MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY,
+                "data_readiness": readiness,
             }
         pairs = tuple(
             {
@@ -640,6 +730,7 @@ class LocalAppService:
             "candidate_count": count,
             "candidate_count_text": str(count),
             "pairs": pairs,
+            "data_readiness": readiness,
         }
 
     def job(self, job_id: str) -> dict[str, object]:
@@ -667,14 +758,35 @@ class LocalAppService:
             request, outcome, baseline = job.request, job.outcome, job.baseline
         bundle = load_engine_bundle(self._bundle_path(request.bundle_id))
         if request.trade_format == "three_team":
-            return three_way_search_result_record(
+            result = three_way_search_result_record(
                 outcome,
                 bundle,
                 baseline.season_projection,
                 limit,
                 free_agent_allocation_policy=MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY,
             )
-        return search_result_record(outcome, bundle, baseline.season_projection, limit)
+        else:
+            result = search_result_record(
+                outcome, bundle, baseline.season_projection, limit
+            )
+        search_run_ids = (
+            [outcome.progress.run_id]
+            if request.trade_format == "three_team"
+            else [row.search.progress.run_id for row in outcome.pairs]
+        )
+        return {
+            **result,
+            "bundle_id": request.bundle_id,
+            "request_id": request.request_id,
+            "search_run_id": (
+                search_run_ids[0] if len(search_run_ids) == 1 else None
+            ),
+            "search_run_ids": search_run_ids,
+            "search_request": request.to_record(),
+            "data_readiness": build_bundle_data_readiness(bundle)["capabilities"][
+                "trade_search"
+            ],
+        }
 
     def export_job(self, job_id: str) -> dict[str, object]:
         with self._lock:
@@ -699,23 +811,16 @@ class LocalAppService:
                 self.export_directory / filename,
                 _workbook_context(bundle, baseline, request),
                 ThreeWayExportProvenance.from_records(
+                    bundle_id=bundle.bundle_id,
+                    waiver_pool_id=bundle.waiver_pool.waiver_pool_id,
                     request_id=request.request_id,
-                    search_run_id=outcome.progress.run_id,
-                    participant_team_ids=(
-                        request.primary_team_id,
-                        *request.counterparty_team_ids,
-                    ),
+                    request_record=request.to_record(),
+                    search_run_definition=outcome.run_definition,
                     participant_team_names=tuple(
                         team_names[team_id]
-                        for team_id in (
-                            request.primary_team_id,
-                            *request.counterparty_team_ids,
-                        )
+                        for team_id in outcome.run_definition.participant_team_ids
                     ),
-                    total_candidate_count=outcome.progress.total_candidate_count,
-                    seed=request.seed,
-                    trade_constraint_record=request.constraints.to_record(),
-                    power_settings_record=request.settings.to_record(),
+                    completed_candidate_count=outcome.progress.next_candidate_index,
                     free_agent_allocation_policy=MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY,
                 ),
                 rows,
@@ -732,6 +837,13 @@ class LocalAppService:
         path = export_trade_workbook(
             self.export_directory / filename,
             _workbook_context(bundle, baseline, request),
+            TwoTeamExportProvenance.from_outcome(
+                bundle_id=bundle.bundle_id,
+                waiver_pool_id=bundle.waiver_pool.waiver_pool_id,
+                request_id=request.request_id,
+                request_record=request.to_record(),
+                outcome=outcome,
+            ),
             rows,
             team_outlook_rows(bundle.state, baseline.season_projection),
         )
@@ -750,6 +862,7 @@ class LocalAppService:
             self._set_job(job, status="running")
             bundle = load_engine_bundle(self._bundle_path(job.request.bundle_id))
             _require_surrogate_consent(bundle, job.request)
+            _require_bundle_capability(bundle, "trade_search", "trade search")
             config = CorrelatedScenarioConfig(
                 job.request.scenario_count,
                 job.request.seed,
@@ -901,9 +1014,11 @@ class LocalAppService:
         return {
             "job_id": job.job_id,
             "request_id": job.request.request_id,
+            "bundle_id": job.request.bundle_id,
             "status": job.status,
             "error": job.error,
             "trade_format": job.request.trade_format,
+            "search_request": job.request.to_record(),
             "progress": progress_record,
         }
 
@@ -916,6 +1031,8 @@ def _workbook_context(
     methodology = bundle.methodology_evidence
     team_names = {row.team_id: row.name for row in bundle.state.teams}
     return TradeWorkbookContext(
+        bundle_id=bundle.bundle_id,
+        waiver_pool_id=bundle.waiver_pool.waiver_pool_id,
         snapshot_id=bundle.state.snapshot_id,
         scoring_profile_id=bundle.scoring_profile.scoring_profile_id,
         nfl_schedule_id=bundle.nfl_schedule.schedule_id,
@@ -928,7 +1045,11 @@ def _workbook_context(
         minimum_power_delta=request.settings.minimum_displayed_power_delta,
         scenario_count=request.scenario_count,
         power_engine_mode=bundle.methodology_mode,
-        calibration_status=bundle.strength_model.calibration.status.value,
+        calibration_status=(
+            "holdout_validated"
+            if bundle.methodology_mode == "holdout_validated"
+            else "surrogate"
+        ),
         methodology_evidence_kind=(
             "blind_holdout_attestation"
             if bundle.methodology_mode == "holdout_validated"
@@ -977,6 +1098,29 @@ def _require_surrogate_consent(
             "This weekly engine is a SURROGATE approximation. Explicitly accept "
             "surrogate power before counting or running trades."
         )
+
+
+def _require_bundle_capability(
+    bundle: EngineBundle,
+    capability_name: str,
+    feature_name: str,
+) -> None:
+    capability = build_bundle_data_readiness(bundle)["capabilities"].get(
+        capability_name
+    )
+    if not isinstance(capability, Mapping):
+        raise ValueError(f"{feature_name} readiness is unavailable")
+    if capability.get("status") != "not_ready":
+        return
+    missing = capability.get("missing")
+    details = (
+        "; ".join(str(value) for value in missing)
+        if isinstance(missing, list) and missing
+        else "required bundle evidence"
+    )
+    raise ValueError(
+        f"{feature_name} is not ready for this weekly bundle: {details}"
+    )
 
 
 def _payload_filter(

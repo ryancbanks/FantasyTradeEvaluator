@@ -6,28 +6,71 @@ import json
 from math import isfinite
 from numbers import Real
 
-from .three_way_search_records import ThreeWayQualifiedResult
+from ._scenario_random import canonical_json, content_id
+from .three_way_search_records import (
+    ThreeWayQualifiedResult,
+    ThreeWaySearchRunDefinition,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class ThreeWayExportProvenance:
     """Canonical request and run evidence carried into a three-way workbook."""
 
+    bundle_id: str
+    waiver_pool_id: str
     request_id: str
+    request_json: str
     search_run_id: str
+    search_run_json: str
     participant_team_ids: tuple[str, str, str]
     participant_team_names: tuple[str, str, str]
     total_candidate_count: int
+    completed_candidate_count: int
     seed: int
     trade_constraints_json: str
     power_settings_json: str
     free_agent_allocation_policy: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "request_id", _text("request_id", self.request_id))
-        object.__setattr__(
-            self, "search_run_id", _text("search_run_id", self.search_run_id)
+        for name in (
+            "bundle_id",
+            "waiver_pool_id",
+            "request_id",
+            "search_run_id",
+        ):
+            object.__setattr__(self, name, _text(name, getattr(self, name)))
+        request_json = _canonical_json_object("request_json", self.request_json)
+        search_run_json = _canonical_json_object(
+            "search_run_json", self.search_run_json
         )
+        request = json.loads(request_json)
+        if (
+            set(request)
+            != {
+                "allow_surrogate_power",
+                "bundle_id",
+                "counterparty_team_ids",
+                "primary_team_id",
+                "scenario_count",
+                "seed",
+                "settings",
+                "trade_constraints",
+                "trade_format",
+            }
+            or request["trade_format"] != "three_team"
+            or request["bundle_id"] != self.bundle_id
+            or content_id("app-search", request) != self.request_id
+        ):
+            raise ValueError("request identity does not match export provenance")
+        try:
+            run = ThreeWaySearchRunDefinition.from_record(
+                json.loads(search_run_json)
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("search run provenance is invalid") from None
+        if run.run_id != self.search_run_id:
+            raise ValueError("search run identity does not match export provenance")
         team_ids = _texts(
             "participant_team_ids", self.participant_team_ids, required=True, unique=True
         )
@@ -39,12 +82,10 @@ class ThreeWayExportProvenance:
         )
         if len(team_ids) != 3 or len(team_names) != 3:
             raise ValueError("export provenance requires exactly three participant teams")
-        if (
-            isinstance(self.total_candidate_count, bool)
-            or not isinstance(self.total_candidate_count, int)
-            or self.total_candidate_count < 0
-        ):
-            raise ValueError("total_candidate_count must be a non-negative integer")
+        for name in ("total_candidate_count", "completed_candidate_count"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
             raise ValueError("seed must be an integer")
         for name in ("trade_constraints_json", "power_settings_json"):
@@ -54,6 +95,24 @@ class ThreeWayExportProvenance:
         policy = self.free_agent_allocation_policy
         if policy is not None:
             policy = _text("free_agent_allocation_policy", policy)
+        run_inputs = json.loads(search_run_json)["trade_constraint_record"]
+        if (
+            (request["primary_team_id"], *request["counterparty_team_ids"])
+            != team_ids
+            or run.participant_team_ids != team_ids
+            or run.total_candidate_count != self.total_candidate_count
+            or self.completed_candidate_count != self.total_candidate_count
+            or request["seed"] != self.seed
+            or request["trade_constraints"]
+            != json.loads(self.trade_constraints_json)
+            or request["settings"] != json.loads(self.power_settings_json)
+            or run_inputs.get("trade_constraints")
+            != request["trade_constraints"]
+            or run_inputs.get("settings") != request["settings"]
+        ):
+            raise ValueError("request and completed search run do not reconcile")
+        object.__setattr__(self, "request_json", request_json)
+        object.__setattr__(self, "search_run_json", search_run_json)
         object.__setattr__(self, "participant_team_ids", team_ids)
         object.__setattr__(self, "participant_team_names", team_names)
         object.__setattr__(self, "free_agent_allocation_policy", policy)
@@ -62,26 +121,50 @@ class ThreeWayExportProvenance:
     def from_records(
         cls,
         *,
+        bundle_id: str,
+        waiver_pool_id: str,
         request_id: str,
-        search_run_id: str,
-        participant_team_ids: Iterable[str],
+        request_record: Mapping[str, object],
+        search_run_definition: ThreeWaySearchRunDefinition,
         participant_team_names: Iterable[str],
-        total_candidate_count: int,
-        seed: int,
-        trade_constraint_record: Mapping[str, object],
-        power_settings_record: Mapping[str, object],
+        completed_candidate_count: int,
         free_agent_allocation_policy: str | None = None,
     ) -> "ThreeWayExportProvenance":
+        if not isinstance(request_record, Mapping):
+            raise ValueError("request_record must be a mapping")
+        if not isinstance(search_run_definition, ThreeWaySearchRunDefinition):
+            raise ValueError(
+                "search_run_definition must be a ThreeWaySearchRunDefinition"
+            )
+        request = dict(request_record)
+        run = search_run_definition
         return cls(
+            bundle_id,
+            waiver_pool_id,
             request_id,
-            search_run_id,
-            tuple(participant_team_ids),
+            canonical_json(request),
+            run.run_id,
+            canonical_json(run.to_record()),
+            run.participant_team_ids,
             tuple(participant_team_names),
-            total_candidate_count,
-            seed,
-            _json_record("trade_constraint_record", trade_constraint_record),
-            _json_record("power_settings_record", power_settings_record),
+            run.total_candidate_count,
+            completed_candidate_count,
+            request.get("seed"),
+            _json_record(
+                "trade_constraint_record", request.get("trade_constraints")
+            ),
+            _json_record("power_settings_record", request.get("settings")),
             free_agent_allocation_policy,
+        )
+
+    @property
+    def request_record(self) -> dict[str, object]:
+        return json.loads(self.request_json)
+
+    @property
+    def search_run_definition(self) -> ThreeWaySearchRunDefinition:
+        return ThreeWaySearchRunDefinition.from_record(
+            json.loads(self.search_run_json)
         )
 
     @property

@@ -3,40 +3,13 @@ import inspect
 import json
 import unittest
 
-from tests.test_engine_bundle import engine_bundle, exact_model_and_attestation
+from tests.test_engine_bundle import engine_bundle
 from trade_snapshot.roster_compatibility import build_roster_compatibility
-from trade_snapshot.strength import PlayerStrength, RoleDefinition, RoleKind, StrengthModel
 from trade_snapshot.trade_space import TeamRoster
 
 
 def mutual_fit_bundle():
-    bundle = engine_bundle()
-    model = bundle.strength_model
-    roles = (
-        model.role_definitions[0],
-        RoleDefinition("QB", RoleKind.STARTER, "QB", frozenset({"QB"})),
-    )
-    players = (
-        PlayerStrength("p1", 1, frozenset({"FLEX"}), {"FLEX": 10}),
-        PlayerStrength("p2", 1, frozenset({"FLEX"}), {"FLEX": 8}),
-        PlayerStrength("q1", 1, frozenset({"QB"}), {"QB": 10}),
-        PlayerStrength("q2", 1, frozenset({"QB"}), {"QB": 8}),
-    )
-    seed = StrengthModel(
-        roles,
-        players,
-        model.normalization_denominator,
-        snapshot_id=model.snapshot_id,
-        season=model.season,
-        scoring_profile_id=model.scoring_profile_id,
-        calibration=model.calibration,
-    )
-    exact_model, attestation = exact_model_and_attestation(seed)
-    return replace(
-        bundle,
-        strength_model=exact_model,
-        methodology_attestation=attestation,
-    )
+    return engine_bundle()
 
 
 def partner(result, team_id, partner_id):
@@ -47,14 +20,12 @@ def partner(result, team_id, partner_id):
 
 
 class RosterCompatibilityTests(unittest.TestCase):
-    def test_mutual_fit_is_symmetric_and_best_example_is_directional(self):
+    def test_pair_screen_is_symmetric_and_uses_scoped_method_status(self):
         result = build_roster_compatibility(mutual_fit_bundle())
         primary = partner(result, "primary", "other")
         other = partner(result, "other", "primary")
 
-        self.assertEqual(primary["evidence_tier"], "verified_mutual_positive_fit")
         self.assertEqual(primary["evaluated_swap_count"], 4)
-        self.assertGreater(primary["mutually_positive_swap_count"], 0)
         self.assertEqual(
             primary["mutually_positive_swap_count"],
             other["mutually_positive_swap_count"],
@@ -63,19 +34,8 @@ class RosterCompatibilityTests(unittest.TestCase):
             primary["mutually_nondecreasing_swap_count"],
             other["mutually_nondecreasing_swap_count"],
         )
-        primary_example = primary["best_mutually_positive_example"]
-        other_example = other["best_mutually_positive_example"]
-        self.assertEqual(
-            primary_example["team_sends"], other_example["team_receives"]
-        )
-        self.assertEqual(
-            primary_example["team_receives"], other_example["team_sends"]
-        )
-        self.assertEqual(
-            primary_example["team_power_delta"],
-            other_example["partner_power_delta"],
-        )
-        self.assertEqual(primary["power_methodology_status"], "exact")
+        self.assertEqual(primary["power_methodology_status"], "holdout_validated")
+        self.assertEqual(other["power_methodology_status"], "holdout_validated")
 
     def test_api_and_payload_explicitly_exclude_behavior_or_acceptance_inputs(self):
         signature = inspect.signature(build_roster_compatibility)

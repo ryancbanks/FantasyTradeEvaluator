@@ -48,4 +48,13 @@ _HOST_SETTLEMENT_POLICY_LIMITATION = (
     "balanced head-to-head policy are a declared reconstruction; current-rank "
     "comparison with FantasyPros is diagnostic, not proof for future tied scenarios."
 )
-
+_BOUNDED_WAIVER_POOL_LIMITATION = (
+    "Automatic roster repair is limited to the bundle's bounded waiver pool. "
+    "Trades that require an outside free agent are infeasible locally, and a "
+    "multi-team repair can exhaust the retained pool."
+)
+_HOST_TRADE_LEGALITY_LIMITATION = (
+    "The host trade deadline, transaction-processing policy, player locks, "
+    "undroppable list, and pending transactions are not yet captured. Results "
+    "are analytical roster scenarios, not confirmation that the host will accept them."
+)

@@ -9,9 +9,12 @@ import sys
 from tempfile import TemporaryDirectory
 import unittest
 
+from trade_snapshot._league_history_schema import V1_INDEXES, V1_TABLES
+from trade_snapshot._scenario_random import canonical_json
 from trade_snapshot.league_history import (
     LEAGUE_HISTORY_APPLICATION_ID,
     LEAGUE_HISTORY_SCHEMA_VERSION,
+    HistoryAcquisitionOutcome,
     HistoryBundleBinding,
     HistoryRosterPlayer,
     HistoryTeam,
@@ -91,6 +94,81 @@ def capture(
         transactions=tuple(transactions if transactions is not None else (trade(),)),
         rosters=tuple(roster_rows if roster_rows is not None else rosters()),
     )
+
+
+def write_v1_store(path, row, binding):
+    transaction_row = row.transactions[0]
+    capture_body = canonical_json(
+        {
+            "rosters": [item.to_record() for item in row.rosters],
+            "teams": [item.to_record() for item in row.teams],
+            "transactions": [transaction_row.to_record()],
+        }
+    )
+    with closing(sqlite3.connect(path)) as database, database:
+        for statement in V1_TABLES:
+            database.execute(statement)
+        for statement in V1_INDEXES:
+            database.execute(statement)
+        database.execute(
+            "INSERT INTO history_capture VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                row.capture_id,
+                row.league_key,
+                row.season,
+                _canonical_time(row.captured_at),
+                _canonical_time(row.coverage_start),
+                _canonical_time(row.coverage_end),
+                1,
+                1,
+                1,
+                capture_body,
+            ),
+        )
+        database.execute(
+            "INSERT INTO transaction_event VALUES (?,?,?,?,?,?,?)",
+            (
+                row.league_key,
+                row.season,
+                transaction_row.transaction_id,
+                _canonical_time(transaction_row.recorded_at),
+                transaction_row.timestamp_basis.value,
+                transaction_row.kind.value,
+                canonical_json(transaction_row.to_record()),
+            ),
+        )
+        database.execute(
+            "INSERT INTO capture_transaction VALUES (?,?,?,?)",
+            (
+                row.capture_id,
+                row.league_key,
+                row.season,
+                transaction_row.transaction_id,
+            ),
+        )
+        database.execute(
+            "INSERT INTO bundle_binding VALUES (?,?,?,?,?)",
+            (
+                binding.bundle_id,
+                binding.league_key,
+                binding.season,
+                _canonical_time(binding.captured_at),
+                canonical_json(
+                    {
+                        "bundle_id": binding.bundle_id,
+                        "captured_at": _canonical_time(binding.captured_at),
+                        "league_key": binding.league_key,
+                        "season": binding.season,
+                    }
+                ),
+            ),
+        )
+        database.execute(f"PRAGMA application_id = {LEAGUE_HISTORY_APPLICATION_ID}")
+        database.execute("PRAGMA user_version = 1")
+
+
+def _canonical_time(value):
+    return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 class HistoryRecordTests(unittest.TestCase):
@@ -192,6 +270,16 @@ class HistoryRecordTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "lineup_complete"):
             replace(capture(key), roster_complete=False, lineup_complete=True)
 
+    def test_v2_capture_round_trip_authenticates_acquisition_provenance(self):
+        row = capture(make_league_key("espn", "77"))
+        record = row.to_record()
+
+        self.assertEqual(LeagueHistoryCapture.from_record(record), row)
+        changed = json.loads(json.dumps(record))
+        changed["acquisition_evidence"]["provider"] = "other"
+        with self.assertRaisesRegex(ValueError, "capture_id"):
+            LeagueHistoryCapture.from_record(changed)
+
 
 class LeagueHistoryStoreTests(unittest.TestCase):
     def setUp(self):
@@ -237,7 +325,13 @@ class LeagueHistoryStoreTests(unittest.TestCase):
         self.assertEqual(len(snapshot.captures), 1)
         self.assertEqual(len(snapshot.transactions), 1)
 
-    def test_new_capture_or_binding_changes_revision_and_all_bindings_are_exposed(self):
+        self.store.bind_bundle(self.key, 2026, BUNDLE_2, NOW)
+        self.assertEqual(
+            self.store.snapshot_for_bundle(BUNDLE_1).bundle_bindings,
+            (snapshot.requested_binding,),
+        )
+
+    def test_each_bundle_snapshot_is_bounded_to_its_own_capture_time(self):
         first = capture(self.key, captured_at=NOW - timedelta(hours=1))
         first_binding = HistoryBundleBinding(
             self.key, 2026, BUNDLE_1, NOW - timedelta(hours=1)
@@ -262,17 +356,24 @@ class LeagueHistoryStoreTests(unittest.TestCase):
         second_binding = HistoryBundleBinding(self.key, 2026, BUNDLE_2, NOW)
         self.store.ingest(second, bundle=second_binding)
 
-        snapshot = self.store.snapshot_for_bundle(BUNDLE_1)
-        self.assertNotEqual(snapshot.history_revision, old_revision)
-        self.assertEqual(snapshot.bundle_bindings, (first_binding, second_binding))
+        old_snapshot = self.store.snapshot_for_bundle(BUNDLE_1)
+        self.assertEqual(old_snapshot.history_revision, old_revision)
+        self.assertEqual(old_snapshot.bundle_bindings, (first_binding,))
         self.assertEqual(
-            tuple(row.transaction_id for row in snapshot.transactions),
+            tuple(row.transaction_id for row in old_snapshot.transactions),
+            ("trade-1",),
+        )
+        self.assertEqual(old_snapshot.evidence_as_of, first_binding.captured_at)
+
+        current_snapshot = self.store.snapshot_for_bundle(BUNDLE_2)
+        self.assertEqual(
+            current_snapshot.bundle_bindings, (first_binding, second_binding)
+        )
+        self.assertEqual(
+            tuple(row.transaction_id for row in current_snapshot.transactions),
             ("trade-1", "free-agent-1"),
         )
-        self.assertEqual(
-            self.store.revision_for_bundle(BUNDLE_1),
-            self.store.revision_for_bundle(BUNDLE_2),
-        )
+        self.assertNotEqual(old_snapshot.history_revision, current_snapshot.history_revision)
 
     def test_conflicting_transaction_rolls_back_entire_capture(self):
         original = capture(self.key)
@@ -334,6 +435,9 @@ class LeagueHistoryStoreTests(unittest.TestCase):
             trade(),
             timestamp_basis=HistoryTimestampBasis.ESPN_PROPOSED_DATE,
             bid_amount=7.5,
+            accepted_at=NOW - timedelta(days=2, minutes=-1),
+            processed_at=NOW - timedelta(days=2, minutes=-2),
+            expires_at=NOW + timedelta(days=1),
         )
         row = capture(self.key, transactions=(event,))
         self.store.ingest(row, bundle=HistoryBundleBinding(self.key, 2026, BUNDLE_1, NOW))
@@ -341,6 +445,9 @@ class LeagueHistoryStoreTests(unittest.TestCase):
         self.assertEqual(restored.recorded_at, event.recorded_at)
         self.assertEqual(restored.timestamp_basis, HistoryTimestampBasis.ESPN_PROPOSED_DATE)
         self.assertEqual(restored.bid_amount, 7.5)
+        self.assertEqual(restored.accepted_at, event.accepted_at)
+        self.assertEqual(restored.processed_at, event.processed_at)
+        self.assertEqual(restored.expires_at, event.expires_at)
 
     def test_database_stores_no_raw_league_id_and_preserves_partial_coverage(self):
         row = capture(
@@ -369,6 +476,72 @@ class LeagueHistoryStoreTests(unittest.TestCase):
                 LEAGUE_HISTORY_APPLICATION_ID,
             )
         self.assertIn(self.store.journal_mode, {"wal", "delete", "truncate", "persist", "memory", "off"})
+
+    def test_schema_v1_database_is_migrated_without_losing_history(self):
+        legacy_path = Path(self.temporary.name) / "legacy.sqlite3"
+        row = replace(capture(self.key), identity_schema_version=1)
+        binding = HistoryBundleBinding(self.key, 2026, BUNDLE_1, NOW)
+        write_v1_store(legacy_path, row, binding)
+
+        migrated = LeagueHistoryStore(legacy_path)
+        snapshot = migrated.snapshot_for_bundle(BUNDLE_1)
+
+        self.assertEqual(snapshot.captures[0].capture_id, row.capture_id)
+        self.assertEqual(snapshot.transactions, row.transactions)
+        self.assertIsNone(snapshot.requested_binding.history_capture_id)
+        self.assertEqual(
+            snapshot.captures[0].acquisition_evidence.outcome,
+            HistoryAcquisitionOutcome.LEGACY_UNKNOWN,
+        )
+        with closing(sqlite3.connect(legacy_path)) as database:
+            self.assertEqual(
+                database.execute("PRAGMA user_version").fetchone()[0], 2
+            )
+
+    def test_failed_v1_migration_rolls_back_without_modifying_source_store(self):
+        legacy_path = Path(self.temporary.name) / "corrupt-legacy.sqlite3"
+        row = replace(capture(self.key), identity_schema_version=1)
+        binding = HistoryBundleBinding(self.key, 2026, BUNDLE_1, NOW)
+        write_v1_store(legacy_path, row, binding)
+        with closing(sqlite3.connect(legacy_path)) as database, database:
+            database.execute(
+                "UPDATE history_capture SET capture_json='{}'"
+            )
+
+        with self.assertRaises(LeagueHistoryStoreError):
+            LeagueHistoryStore(legacy_path)
+
+        with closing(sqlite3.connect(legacy_path)) as database:
+            self.assertEqual(database.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(
+                database.execute("SELECT COUNT(*) FROM history_capture").fetchone()[0],
+                1,
+            )
+
+    def test_exact_binding_must_match_capture_identity_and_roster(self):
+        row = replace(capture(self.key), host_snapshot_id="snapshot-1")
+        binding = HistoryBundleBinding(
+            self.key,
+            2026,
+            BUNDLE_1,
+            NOW,
+            "snapshot-1",
+            NOW,
+            row.capture_id,
+            row.roster_ownership_id,
+        )
+
+        self.store.ingest(row, bundle=binding)
+        restored = self.store.snapshot_for_bundle(BUNDLE_1)
+        self.assertEqual(restored.requested_binding, binding)
+        self.assertEqual(
+            restored.captures[0].roster_ownership_id,
+            row.roster_ownership_id,
+        )
+
+        wrong = replace(binding, roster_ownership_id="history-roster_" + "f" * 64)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            self.store.ingest(row, bundle=wrong)
 
     def test_future_or_unversioned_nonempty_database_is_rejected(self):
         future = Path(self.temporary.name) / "future.sqlite3"
@@ -455,13 +628,24 @@ class LeagueHistoryStoreTests(unittest.TestCase):
             captured_at=NOW + timedelta(days=1),
             transactions=(resolved,),
         )
-        self.store.ingest(second)
-
-        snapshot = self.store.snapshot_for_bundle(BUNDLE_1)
-        self.assertEqual(snapshot.captures[0].capture_id, first_id)
-        self.assertIsNone(
-            snapshot.captures[0].transactions[0].assets[0].canonical_player_id
+        self.store.ingest(
+            second,
+            bundle=HistoryBundleBinding(
+                self.key, 2026, BUNDLE_2, NOW + timedelta(days=1)
+            ),
         )
+
+        old_snapshot = self.store.snapshot_for_bundle(BUNDLE_1)
+        self.assertEqual(len(old_snapshot.captures), 1)
+        self.assertEqual(old_snapshot.captures[0].capture_id, first_id)
+        self.assertIsNone(
+            old_snapshot.captures[0].transactions[0].assets[0].canonical_player_id
+        )
+        self.assertIsNone(
+            old_snapshot.transactions[0].assets[0].canonical_player_id
+        )
+
+        snapshot = self.store.snapshot_for_bundle(BUNDLE_2)
         self.assertEqual(
             snapshot.captures[1].transactions[0].assets[0].canonical_player_id,
             "player-a",
@@ -471,7 +655,7 @@ class LeagueHistoryStoreTests(unittest.TestCase):
             "player-a",
         )
         self.assertEqual(
-            LeagueHistoryStore(self.path).snapshot_for_bundle(BUNDLE_1),
+            LeagueHistoryStore(self.path).snapshot_for_bundle(BUNDLE_2),
             snapshot,
         )
 
@@ -492,8 +676,55 @@ class LeagueHistoryStoreTests(unittest.TestCase):
         ):
             self.store.ingest(third)
         self.assertEqual(
-            len(self.store.snapshot_for_bundle(BUNDLE_1).captures), 2
+            len(self.store.snapshot_for_bundle(BUNDLE_2).captures), 2
         )
+
+    def test_source_action_time_enrichment_preserves_as_of_history(self):
+        first = capture(self.key)
+        self.store.ingest(
+            first,
+            bundle=HistoryBundleBinding(self.key, 2026, BUNDLE_1, NOW),
+        )
+        enriched_event = replace(
+            trade(),
+            accepted_at=NOW - timedelta(days=2, minutes=-1),
+            processed_at=NOW - timedelta(days=2, minutes=-2),
+            expires_at=NOW + timedelta(days=1),
+        )
+        second = capture(
+            self.key,
+            captured_at=NOW + timedelta(days=1),
+            transactions=(enriched_event,),
+        )
+        self.store.ingest(
+            second,
+            bundle=HistoryBundleBinding(
+                self.key, 2026, BUNDLE_2, NOW + timedelta(days=1)
+            ),
+        )
+
+        self.assertIsNone(
+            self.store.snapshot_for_bundle(BUNDLE_1).transactions[0].accepted_at
+        )
+        current = self.store.snapshot_for_bundle(BUNDLE_2).transactions[0]
+        self.assertEqual(current.accepted_at, enriched_event.accepted_at)
+        self.assertEqual(current.processed_at, enriched_event.processed_at)
+        self.assertEqual(current.expires_at, enriched_event.expires_at)
+
+        conflicting = replace(
+            enriched_event,
+            accepted_at=enriched_event.accepted_at + timedelta(seconds=1),
+        )
+        with self.assertRaisesRegex(
+            LeagueHistoryConflictError, "conflicting source action timestamps"
+        ):
+            self.store.ingest(
+                capture(
+                    self.key,
+                    captured_at=NOW + timedelta(days=2),
+                    transactions=(conflicting,),
+                )
+            )
 
     def test_unsupported_asset_kind_round_trips_without_becoming_a_player(self):
         asset = HistoryTransactionAsset(

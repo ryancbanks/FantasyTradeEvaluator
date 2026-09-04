@@ -520,7 +520,9 @@ class ThreeWayStoreTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     store.results(0)
             outcome = ThreeWaySearchOutcome(
-                progress=runner_progress(definition, state), database_path=path
+                progress=runner_progress(definition, state),
+                database_path=path,
+                run_definition=definition,
             )
             rows = outcome.results()
             with self.assertRaises(ValueError):
@@ -576,7 +578,9 @@ class ThreeWayStoreTests(unittest.TestCase):
                         )
                     )
             with self.assertRaises(ThreeWaySearchRunMismatchError):
-                ThreeWaySearchOutcome(runner_progress(other), path).results()
+                ThreeWaySearchOutcome(
+                    runner_progress(other), path, other
+                ).results()
 
     def test_missing_run_row_cannot_rebind_stale_results(self):
         definition = run_definition()
@@ -590,7 +594,9 @@ class ThreeWayStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ThreeWaySearchStoreError, "missing"):
                 ThreeWaySearchStore(path, definition)
             with self.assertRaisesRegex(ThreeWaySearchStoreError, "missing"):
-                ThreeWaySearchOutcome(runner_progress(definition), path).results()
+                ThreeWaySearchOutcome(
+                    runner_progress(definition), path, definition
+                ).results()
 
     def test_wrong_version_one_table_layout_is_rejected(self):
         with TemporaryDirectory() as directory:
@@ -625,7 +631,9 @@ class ThreeWayStoreTests(unittest.TestCase):
                 )
                 database.commit()
             with self.assertRaisesRegex(ThreeWaySearchStoreError, "invalid"):
-                ThreeWaySearchOutcome(runner_progress(definition), path).results(1)
+                ThreeWaySearchOutcome(
+                    runner_progress(definition), path, definition
+                ).results(1)
 
     def test_run_mismatch_and_corrupt_result_fail_closed(self):
         with TemporaryDirectory() as directory:
@@ -650,7 +658,9 @@ class ThreeWayStoreTests(unittest.TestCase):
                 with self.assertRaisesRegex(ThreeWaySearchStoreError, "invalid"):
                     store.resume()
             with self.assertRaisesRegex(ThreeWaySearchStoreError, "invalid"):
-                ThreeWaySearchOutcome(runner_progress(definition), path).results()
+                ThreeWaySearchOutcome(
+                    runner_progress(definition), path, definition
+                ).results()
 
     def test_tampered_adjustment_conflict_fails_closed(self):
         with TemporaryDirectory() as directory:
@@ -669,7 +679,9 @@ class ThreeWayStoreTests(unittest.TestCase):
                 )
                 database.commit()
             with self.assertRaisesRegex(ThreeWaySearchStoreError, "invalid"):
-                ThreeWaySearchOutcome(runner_progress(definition), path).results()
+                ThreeWaySearchOutcome(
+                    runner_progress(definition), path, definition
+                ).results()
 
 
 def runner_progress(definition, state=None):

@@ -169,10 +169,16 @@ class GeneralManagerInsightsTests(unittest.TestCase):
             )
             self.assertNotIn("proposal_guidance", row)
 
-    def test_complete_single_trade_is_exact_but_tendency_label_is_withheld(self):
+    def test_complete_single_trade_is_holdout_validated_but_tendency_is_withheld(self):
         source = engine_bundle()
         requested = current_bundle(source)
-        snapshot = history(source, requested, (trade(),))
+        source_event = replace(
+            trade(),
+            accepted_at=TRADE_AT + timedelta(minutes=5),
+            processed_at=TRADE_AT + timedelta(minutes=10),
+            expires_at=TRADE_AT + timedelta(days=1),
+        )
+        snapshot = history(source, requested, (source_event,))
         loader = {source.bundle_id: source}.__getitem__
 
         first = build_gm_insights(requested, snapshot, bundle_loader=loader)
@@ -180,7 +186,17 @@ class GeneralManagerInsightsTests(unittest.TestCase):
         primary = team(first, "primary")
 
         self.assertEqual(first, second)
+        self.assertEqual(first["schema_version"], 2)
         self.assertEqual(first["status"], "ready")
+        self.assertEqual(first["evidence"]["analysis_as_of"], first["analysis_as_of"])
+        self.assertTrue(first["evidence"]["evidence_id"].startswith("gm-report-evidence_"))
+        self.assertEqual(len(first["evidence"]["historical_model_evidence_ids"]), 1)
+        self.assertEqual(len(first["evidence"]["current_model_evidence_ids"]), 1)
+        self.assertTrue(
+            first["evidence"]["historical_valuation_evidence_id"].startswith(
+                "historical-valuation-evidence_"
+            )
+        )
         self.assertEqual(first["coverage"]["valuations"]["valued_trades"], 1)
         self.assertEqual(
             first["coverage"]["valuations"]["current_revalued_trades"], 1
@@ -189,13 +205,16 @@ class GeneralManagerInsightsTests(unittest.TestCase):
             first["coverage"]["valuations"]["foresight_eligible_trades"], 0
         )
         self.assertEqual(primary["trade_value"]["status"], "insufficient_sample")
-        self.assertEqual(primary["trade_value"]["methodology_counts"], {"exact": 1})
+        self.assertEqual(
+            primary["trade_value"]["methodology_counts"],
+            {"holdout_validated": 1},
+        )
         self.assertIsNone(primary["trade_value"]["plain_language_alias"])
         metric = primary["trade_value"]["relative_power_edge"]
         self.assertEqual(metric["sample"]["raw_n"], 1)
         self.assertEqual(metric["confidence"]["status"], "uncertain")
         self.assertIn(
-            "At least three exact at-time valued trades",
+            "At least three blind-holdout-validated at-time valued trades",
             " ".join(metric["confidence"]["reasons"]),
         )
         self.assertNotIn("acceptance_probability", json.dumps(first, sort_keys=True))
@@ -229,9 +248,35 @@ class GeneralManagerInsightsTests(unittest.TestCase):
             "negative_of_team_contemporaneous_relative_power_edge",
         )
         event = primary["evidence"][0]["valuation"]
+        timestamps = primary["evidence"][0]["source_timestamps"]
+        self.assertEqual(timestamps["proposed_at"], primary["evidence"][0]["source_event_at"])
+        self.assertIsNotNone(timestamps["accepted_at"])
+        self.assertIsNotNone(timestamps["processed_at"])
+        self.assertIsNotNone(timestamps["expires_at"])
+        self.assertTrue(timestamps["completion_observed_by_is_upper_bound"])
         self.assertIsNotNone(event["at_time"])
         self.assertIsNotNone(event["current_revaluation"])
-        self.assertEqual(event["comparison"]["status"], "comparable_raw")
+        self.assertTrue(
+            event["at_time"]["playoff_evidence"]["impact_id"].startswith(
+                "impact_"
+            )
+        )
+        self.assertEqual(
+            event["at_time"]["playoff_evidence"]["scenario_count"],
+            event["at_time"]["playoff_scenario_count"],
+        )
+        comparison_ids = event["comparison"]["evidence_ids"]
+        self.assertEqual(
+            comparison_ids["at_time_model_evidence_id"],
+            event["at_time"]["model_evidence"]["evidence_id"],
+        )
+        self.assertEqual(
+            comparison_ids["current_model_evidence_id"],
+            event["current_revaluation"]["model_evidence"]["evidence_id"],
+        )
+        self.assertEqual(
+            event["comparison"]["status"], "health_ineligible_raw_only"
+        )
         self.assertFalse(event["comparison"]["foresight_eligible"])
         self.assertIn(
             "source_health_capture_missing",
@@ -384,7 +429,10 @@ class GeneralManagerInsightsTests(unittest.TestCase):
         self.assertEqual(
             primary["trade_value"]["relative_power_edge"]["sample"]["raw_n"], 3
         )
-        self.assertEqual(primary["trade_value"]["methodology_counts"], {"exact": 3})
+        self.assertEqual(
+            primary["trade_value"]["methodology_counts"],
+            {"holdout_validated": 3},
+        )
         self.assertEqual(
             report,
             build_gm_insights(
@@ -461,7 +509,7 @@ class GeneralManagerInsightsTests(unittest.TestCase):
             drift["relative_power_edge_drift"]["evidence"]["coverage_complete"]
         )
 
-    def test_value_alias_and_value_guidance_require_three_exact_valuations(self):
+    def test_value_alias_requires_three_holdout_validated_valuations(self):
         pooled = {
             "interval_80": (0.8, 1.2),
             "interval_90": (0.7, 1.3),
@@ -494,7 +542,9 @@ class GeneralManagerInsightsTests(unittest.TestCase):
         )
 
         self.assertIsNone(inferred["alias"])
-        self.assertIn("exact at-time", " ".join(inferred["reasons"]))
+        self.assertIn(
+            "blind-holdout-validated at-time", " ".join(inferred["reasons"])
+        )
         self.assertTrue(
             any(
                 "does not establish a stingy, generous, or even tendency"
@@ -510,7 +560,7 @@ class GeneralManagerInsightsTests(unittest.TestCase):
             )
         )
 
-    def test_approximate_rows_cannot_dominate_exact_value_signal(self):
+    def test_approximate_rows_cannot_dominate_holdout_validated_value_signal(self):
         def valued_row(methodology_status, edge):
             own = SimpleNamespace(
                 team_id="primary",
@@ -530,19 +580,21 @@ class GeneralManagerInsightsTests(unittest.TestCase):
             )
             return valuation, own
 
-        exact = tuple(valued_row("exact", 2.0) for _ in range(3))
+        validated = tuple(
+            valued_row("holdout_validated", 2.0) for _ in range(3)
+        )
         approximate = tuple(
             valued_row("surrogate", -20.0) for _ in range(20)
         )
 
         summary = _trade_value_summary(
-            (*exact, *approximate),
+            (*validated, *approximate),
             (2.0, -2.0) * 3,
             {"primary": 1.0, "other": -1.0},
             True,
         )
 
-        self.assertEqual(summary["exact_valued_trades"], 3)
+        self.assertEqual(summary["holdout_validated_valued_trades"], 3)
         self.assertEqual(
             summary["relative_power_edge"]["sample"]["raw_n"], 3
         )
@@ -551,7 +603,8 @@ class GeneralManagerInsightsTests(unittest.TestCase):
             summary["all_methodologies_relative_power_edge_mean"], 0
         )
         self.assertEqual(
-            summary["methodology_counts"], {"exact": 3, "surrogate": 20}
+            summary["methodology_counts"],
+            {"holdout_validated": 3, "surrogate": 20},
         )
 
     def test_offseason_trade_stays_raw_but_not_in_completed_week_rates(self):
@@ -599,6 +652,42 @@ class GeneralManagerInsightsTests(unittest.TestCase):
         self.assertEqual(
             team(report, "primary")["roster_construction"]["status"],
             "current_bundle_only",
+        )
+
+    def test_newer_incomplete_capture_does_not_mask_fresh_roster_and_lineup_evidence(self):
+        bundle = engine_bundle()
+        binding = HistoryBundleBinding(
+            LEAGUE_KEY, 2026, bundle.bundle_id, REQUEST_AT
+        )
+        complete = capture(
+            (trade(),),
+            captured_at=REQUEST_AT - timedelta(minutes=10),
+            injury_status="ACTIVE",
+        )
+        incomplete = capture(
+            (trade(),),
+            captured_at=REQUEST_AT,
+            complete=False,
+        )
+        snapshot = LeagueHistorySnapshot(binding, (binding,), (complete, incomplete))
+
+        report = build_gm_insights(bundle, snapshot)
+
+        self.assertEqual(report["status"], "partial")
+        self.assertEqual(report["coverage"]["transactions"]["status"], "partial")
+        self.assertEqual(report["coverage"]["rosters"]["status"], "complete")
+        self.assertEqual(
+            report["coverage"]["rosters"]["current_evidence_capture_id"],
+            complete.capture_id,
+        )
+        self.assertEqual(report["coverage"]["lineups"]["status"], "complete_at_capture_times")
+        self.assertEqual(
+            report["coverage"]["lineups"]["current_evidence_capture_id"],
+            complete.capture_id,
+        )
+        self.assertEqual(
+            report["current_trade_feasibility"]["current_health_screen_status"],
+            "complete_and_fresh",
         )
 
     def test_retention_waits_until_transaction_is_first_observed(self):

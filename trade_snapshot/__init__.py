@@ -260,6 +260,7 @@ from .waiver_pool import (
 )
 from .workbook_model import (
     TradeWorkbookContext,
+    TwoTeamExportProvenance,
     WorkbookSource,
     WorkbookTeamOutlook,
     WorkbookTradeRow,
@@ -419,6 +420,7 @@ __all__ = (
     "TRADE_FILTER_EXPRESSION_SEMANTICS_VERSION",
     "TRADE_FILTER_SEMANTICS_VERSION",
     "TradeWorkbookContext",
+    "TwoTeamExportProvenance",
     "TradeSearchOutcome",
     "TradeSearchProgress",
     "TradeSearchSettings",

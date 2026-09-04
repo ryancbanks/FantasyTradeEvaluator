@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
 import unittest
@@ -16,6 +17,7 @@ from trade_snapshot.league_history import HistoryBundleBinding, LeagueHistorySna
 from trade_snapshot.roster_compatibility import RosterSwap, screened_roster_swaps
 from trade_snapshot.season_trajectory import RecordTriggerScenarios
 from trade_snapshot.trade_impact import prepare_season_baseline
+from trade_snapshot.scenario_config import CorrelatedScenarioConfig
 from trade_snapshot._trade_timing_market import market_pattern, market_summary
 from trade_snapshot._trade_timing_selection import build_recommendation, dominates
 from trade_snapshot.trade_timing import (
@@ -89,11 +91,23 @@ class TradeTimingTests(unittest.TestCase):
         second = build_trade_timing(bundle, None, "primary", scenario_limit=3)
 
         self.assertEqual(first, second)
-        self.assertEqual(first["schema_version"], 1)
+        self.assertEqual(first["schema_version"], 2)
         self.assertEqual(first["primary_team_id"], "primary")
         self.assertEqual(first["scenario_sampling"]["scenario_count"], 3)
         self.assertFalse(first["methodology"]["manager_acceptance_modeled"])
         self.assertFalse(first["trade_deadline"]["future_windows_are_legality_verified"])
+        self.assertFalse(first["trade_legality"]["host_legality_verified"])
+        self.assertEqual(first["evidence"]["analysis_as_of"], first["analysis_as_of"])
+        self.assertTrue(
+            first["evidence"]["evidence_id"].startswith("trade-timing-evidence_")
+        )
+        self.assertIn(
+            "history_not_collected", first["history_coverage"]["incomplete_dimensions"]
+        )
+        self.assertEqual(
+            first["projection_lineage"]["projection_source_manifest_id"],
+            bundle.projection_source_manifest.manifest_id,
+        )
         partner = first["partner_plans"][0]
         self.assertEqual(
             partner["candidate_screen"]["minimum_displayed_power_delta_each_team"],
@@ -102,19 +116,24 @@ class TradeTimingTests(unittest.TestCase):
         self.assertFalse(
             partner["completed_deal_timing"]["manager_acceptance_modeled"]
         )
+        self.assertTrue(
+            partner["completed_deal_timing"]["evidence"]["evidence_id"].startswith(
+                "gm-timing-evidence_"
+            )
+        )
         json.dumps(first, allow_nan=False, sort_keys=True)
 
     def test_roster_screen_honors_displayed_power_floor_and_limit(self):
         bundle = engine_bundle()
 
         all_swaps = screened_roster_swaps(
-            bundle, "primary", "other", minimum_displayed_power_delta=-5
+            bundle, "primary", "other", minimum_displayed_power_delta=-100
         )
         limited = screened_roster_swaps(
             bundle,
             "primary",
             "other",
-            minimum_displayed_power_delta=-5,
+            minimum_displayed_power_delta=-100,
             limit=2,
         )
 
@@ -122,8 +141,8 @@ class TradeTimingTests(unittest.TestCase):
         self.assertEqual(limited, all_swaps[:2])
         self.assertTrue(
             all(
-                row.primary_display_power_delta >= -5
-                and row.counterparty_display_power_delta >= -5
+                row.primary_display_power_delta >= -100
+                and row.counterparty_display_power_delta >= -100
                 for row in all_swaps
             )
         )
@@ -142,7 +161,7 @@ class TradeTimingTests(unittest.TestCase):
     def test_current_window_never_assigns_probability_to_unknown_legality(self):
         bundle = engine_bundle()
         swap = screened_roster_swaps(
-            bundle, "primary", "other", minimum_displayed_power_delta=-5, limit=1
+            bundle, "primary", "other", minimum_displayed_power_delta=-100, limit=1
         )[0]
         first_week = bundle.state.first_remaining_week
 
@@ -184,7 +203,7 @@ class TradeTimingTests(unittest.TestCase):
     def test_exact_two_scenario_step_gain_survives_float_rounding(self):
         bundle = engine_bundle()
         swap = screened_roster_swaps(
-            bundle, "primary", "other", minimum_displayed_power_delta=-5, limit=1
+            bundle, "primary", "other", minimum_displayed_power_delta=-100, limit=1
         )[0]
         first_week = bundle.state.first_remaining_week
         exact_two_steps = 3 / 100 - 1 / 100
@@ -213,13 +232,28 @@ class TradeTimingTests(unittest.TestCase):
     def test_projection_shape_is_explicitly_not_market_price(self):
         bundle = engine_bundle()
         swap = screened_roster_swaps(
-            bundle, "primary", "other", minimum_displayed_power_delta=-5, limit=1
+            bundle, "primary", "other", minimum_displayed_power_delta=-100, limit=1
         )[0]
 
         pattern = market_pattern(bundle, swap, bundle.state.first_remaining_week)
 
         self.assertTrue(pattern["not_market_price_or_future_ecr"])
         self.assertIn("projected", pattern["summary"].casefold())
+        lineage = pattern["primary_receives"]["projection_lineage"][0]
+        self.assertTrue(
+            lineage["source_binding"]["projection_input_id"].startswith(
+                "projection-input_"
+            )
+        )
+        self.assertTrue(
+            lineage["source_binding"]["source_artifact_id"].startswith(
+                "captable_"
+            )
+        )
+        self.assertEqual(lineage["source_binding"]["source_horizon"], "weekly")
+        self.assertEqual(
+            lineage["source_binding"]["source_scoring_format"], "PPR"
+        )
 
     def test_projection_shape_surfaces_each_partner_high_low_signal(self):
         buy_high = market_summary([], ["partner_buys_projected_high"])
@@ -259,9 +293,14 @@ class TradeTimingTests(unittest.TestCase):
             (swap,),
             (window,),
             {("b", 1): trigger},
+            evidence_index=SimpleNamespace(
+                provider_record=lambda *_args: {"provider": "source"}
+            ),
         )
 
-        future = next(row for row in options if row["effective_week"] == 2)
+        future = next(
+            row for row in options.options if row["effective_week"] == 2
+        )
         self.assertEqual(future["scenario_count"], 2)
         self.assertEqual(future["conditional_trigger_scenario_count"], 2)
         self.assertEqual(
@@ -272,11 +311,23 @@ class TradeTimingTests(unittest.TestCase):
             future["delay_comparison_scope"],
             "execute_now_vs_wait_within_same_pre_trade_trigger_scenarios",
         )
+        self.assertTrue(future["scenario_evidence"]["impact_id"].startswith("impact_"))
+        self.assertTrue(
+            future["scenario_evidence"]["before_scenario_run_id"].startswith(
+                "conditioned-scenario-run_"
+            )
+        )
+        self.assertTrue(
+            future["scenario_evidence"]["after_scenario_run_id"].startswith(
+                "delayed-scenario-run_"
+            )
+        )
+        self.assertIsNotNone(future["scenario_evidence"]["draw_space_id"])
 
     def test_conditional_guard_rejects_an_unconditionally_positive_future(self):
         bundle = engine_bundle()
         swap = screened_roster_swaps(
-            bundle, "primary", "other", minimum_displayed_power_delta=-5, limit=1
+            bundle, "primary", "other", minimum_displayed_power_delta=-100, limit=1
         )[0]
         first_week = bundle.state.first_remaining_week
         future_week = first_week + 1
@@ -317,9 +368,11 @@ class TradeTimingTests(unittest.TestCase):
             (window,),
             {("other", first_week): trigger},
         )
-        recommendation = build_recommendation(options, first_week)
+        recommendation = build_recommendation(options.options, first_week)
         future = next(
-            row for row in options if row["effective_week"] == future_week
+            row
+            for row in options.options
+            if row["effective_week"] == future_week
         )
 
         self.assertEqual(delayed_baseline.change.selected_indexes, indexes)
@@ -392,6 +445,67 @@ class TradeTimingTests(unittest.TestCase):
 
         self.assertEqual(injuries, ())
         self.assertEqual(status, "partial_or_unrecognized_statuses")
+
+    def test_bounded_timing_run_preserves_player_score_floor(self):
+        bundle = engine_bundle()
+        floor = -1.25
+        config = CorrelatedScenarioConfig(
+            bundle.scenario_config.scenario_count,
+            bundle.scenario_config.seed,
+            bundle.scenario_config.loadings,
+            floor,
+        )
+        bundle = replace(bundle, scenario_config=config)
+
+        report = build_trade_timing(bundle, None, "primary", scenario_limit=3)
+
+        self.assertEqual(report["evidence"]["player_score_floor"], floor)
+        self.assertNotEqual(
+            report["evidence"]["scenario_config_id"], config.config_id
+        )
+
+    def test_one_infeasible_candidate_does_not_fail_the_partner_endpoint(self):
+        bundle = engine_bundle()
+        swaps = screened_roster_swaps(
+            bundle,
+            "primary",
+            "other",
+            minimum_displayed_power_delta=-100,
+            limit=2,
+        )
+
+        class DelayedChange:
+            def project(self, _week):
+                return _impact(1_000, 0.01, 0.01)
+
+            def project_conditioned_many(self, _weeks, _indexes):
+                return {}
+
+        class DelayedBaseline:
+            calls = 0
+
+            def roster_change(self, _rosters, _team_ids):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ValueError("candidate cannot be materialized")
+                return DelayedChange()
+
+        result = _evaluate_shortlist(
+            bundle,
+            DelayedBaseline(),
+            "primary",
+            "other",
+            swaps,
+            (),
+            {},
+        )
+
+        self.assertEqual(len(result.options), 1)
+        self.assertEqual(len(result.skipped_options), 1)
+        self.assertEqual(
+            result.skipped_options[0]["reason_code"],
+            "candidate_roster_change_infeasible",
+        )
 
 
 if __name__ == "__main__":

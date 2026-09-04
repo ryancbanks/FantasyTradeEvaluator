@@ -7,6 +7,7 @@ from math import fsum, isfinite
 from numbers import Real
 from types import MappingProxyType
 
+from ._workbook_provenance import TwoTeamExportProvenance
 from .data_readiness import DataReadinessSnapshot
 from .league_search import LeagueSearchOutcome
 from .league_state import LeagueState
@@ -29,6 +30,8 @@ class WorkbookSource:
 
 @dataclass(frozen=True, slots=True)
 class TradeWorkbookContext:
+    bundle_id: str
+    waiver_pool_id: str
     snapshot_id: str
     scoring_profile_id: str
     nfl_schedule_id: str
@@ -59,6 +62,8 @@ class TradeWorkbookContext:
 
     def __post_init__(self) -> None:
         for name in (
+            "bundle_id",
+            "waiver_pool_id",
             "snapshot_id",
             "scoring_profile_id",
             "nfl_schedule_id",
@@ -107,7 +112,8 @@ class TradeWorkbookContext:
             )
         attested = self.power_engine_mode == "holdout_validated"
         if (
-            self.calibration_status != ("exact" if attested else "surrogate")
+            self.calibration_status
+            != ("holdout_validated" if attested else "surrogate")
             or self.methodology_evidence_kind
             != (
                 "blind_holdout_attestation"
@@ -162,6 +168,7 @@ class WorkbookTradeRow:
     counterparty_playoff_after: float
     candidate_index: int
     power_methodology_status: str
+    search_run_id: str
     primary_added_player_ids: tuple[str, ...] = ()
     primary_added_player_names: tuple[str, ...] = ()
     primary_dropped_player_ids: tuple[str, ...] = ()
@@ -172,7 +179,11 @@ class WorkbookTradeRow:
     counterparty_dropped_player_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        for name in ("counterparty_team_id", "counterparty_team_name"):
+        for name in (
+            "counterparty_team_id",
+            "counterparty_team_name",
+            "search_run_id",
+        ):
             object.__setattr__(self, name, _text(name, getattr(self, name)))
         for id_name, display_name in (
             ("outgoing_player_ids", "outgoing_player_names"),
@@ -311,8 +322,16 @@ def workbook_trade_rows(
     ):
         raise ValueError("methodology_evidence has an invalid type")
     rows = tuple(
-        _trade_row(row, teams, players, methodology_evidence)
-        for row in outcome.qualified_trades
+        _trade_row(
+            pair.counterparty_team_id,
+            result,
+            teams,
+            players,
+            methodology_evidence,
+            pair.search.progress.run_id,
+        )
+        for pair in outcome.pairs
+        for result in pair.search.results
     )
     return tuple(
         sorted(
@@ -382,8 +401,14 @@ def team_outlook_rows(
     return tuple(sorted(rows, key=lambda row: (row.mean_rank, row.team_name.casefold())))
 
 
-def _trade_row(value, team_names, player_names, methodology_evidence):
-    result = value.result
+def _trade_row(
+    counterparty_team_id,
+    result,
+    team_names,
+    player_names,
+    methodology_evidence,
+    search_run_id,
+):
     odds = (
         result.primary_playoff_before,
         result.primary_playoff_after,
@@ -407,7 +432,7 @@ def _trade_row(value, team_names, player_names, methodology_evidence):
         ),
     )
     try:
-        team_name = team_names[value.counterparty_team_id]
+        team_name = team_names[counterparty_team_id]
         outgoing_names = tuple(player_names[player_id] for player_id in outgoing)
         incoming_names = tuple(player_names[player_id] for player_id in incoming)
         adjustment_names = {
@@ -424,7 +449,7 @@ def _trade_row(value, team_names, player_names, methodology_evidence):
     except KeyError as error:
         raise ValueError(f"missing display name for ID {error.args[0]!r}") from None
     return WorkbookTradeRow(
-        value.counterparty_team_id,
+        counterparty_team_id,
         team_name,
         outgoing,
         outgoing_names,
@@ -438,6 +463,7 @@ def _trade_row(value, team_names, player_names, methodology_evidence):
         odds[3] / 100,
         result.candidate_index,
         power_status,
+        search_run_id,
         primary_added_player_ids=result.primary_added_player_ids,
         primary_added_player_names=adjustment_names["primary_added_player_names"],
         primary_dropped_player_ids=result.primary_dropped_player_ids,

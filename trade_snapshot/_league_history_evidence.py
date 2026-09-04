@@ -16,8 +16,8 @@ def merge_transaction_versions(
     """Allow only keyed ``None -> canonical player`` evidence enrichment.
 
     Provider timestamps and asset movements are immutable. A later capture may
-    add a canonical player mapping for the same privacy-safe source asset key;
-    it may never replace one canonical mapping with another.
+    add a previously unavailable source action timestamp or canonical player
+    mapping; it may never replace conflicting evidence.
     """
 
     # Keep this module importable while ``league_history`` attaches its SQLite
@@ -39,8 +39,17 @@ def merge_transaction_versions(
     ):
         raise ValueError("history contains conflicting immutable transactions")
 
-    assets = []
+    optional_times = {}
     changed = False
+    for name in ("accepted_at", "processed_at", "expires_at"):
+        old = getattr(previous, name)
+        new = getattr(current, name)
+        if old is not None and new is not None and old != new:
+            raise ValueError("history contains conflicting source action timestamps")
+        optional_times[name] = old or new
+        changed = changed or optional_times[name] != old
+
+    assets = []
     for old, new in zip(previous.assets, current.assets):
         if (
             old.asset_index != new.asset_index
@@ -69,7 +78,11 @@ def merge_transaction_versions(
         )
         changed = changed or merged != old
         assets.append(merged)
-    return previous if not changed else replace(previous, assets=tuple(assets))
+    return previous if not changed else replace(
+        previous,
+        assets=tuple(assets),
+        **optional_times,
+    )
 
 
 def captured_transaction_evidence(captures):

@@ -91,6 +91,17 @@ class PairedSeasonProjection:
         ):
             if not isinstance(getattr(self, name), str) or not getattr(self, name).strip():
                 raise ValueError(f"{name} must be a non-empty string")
+        for projection, run_id in (
+            (self.before, self.before_scenario_run_id),
+            (self.after, self.after_scenario_run_id),
+        ):
+            if (
+                projection.scenario_run_id is not None
+                and projection.scenario_run_id != run_id
+            ):
+                raise ValueError(
+                    "paired projection does not match its scenario run ID"
+                )
         object.__setattr__(self, "changes", changes)
         object.__setattr__(
             self,
@@ -148,6 +159,10 @@ class PreparedSeasonBaseline:
             raise ValueError("season projection does not match league state")
         if season_projection.scenario_count != scenarios.config.scenario_count:
             raise ValueError("season projection and scenario count disagree")
+        if season_projection.scenario_run_id != scenarios.run_id:
+            raise ValueError(
+                "season projection does not match the prepared scenario run"
+            )
         if (
             season_projection.score_decimal_places != score_decimal_places
             or season_projection.random_seed != tiebreak_random_seed

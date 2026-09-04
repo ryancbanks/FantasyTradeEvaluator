@@ -78,6 +78,9 @@ class LocalServerTests(unittest.TestCase):
         dashboard = json.loads(raw)
         self.assertEqual(status, 200)
         self.assertEqual(dashboard["bundle_id"], bundle.bundle_id)
+        self.assertEqual(
+            dashboard["data_readiness"]["status"], "ready_with_limitations"
+        )
         self.assertEqual(dashboard["championship_model"]["status"], "modeled_estimate")
         self.assertEqual(len(dashboard["teams"]), 2)
         self.assertAlmostEqual(
@@ -92,6 +95,9 @@ class LocalServerTests(unittest.TestCase):
         player_outlook = json.loads(raw)
         self.assertEqual(status, 200)
         self.assertEqual(player_outlook["bundle_id"], bundle.bundle_id)
+        self.assertEqual(
+            player_outlook["data_readiness"]["status"], "ready_with_limitations"
+        )
         self.assertEqual(
             len(player_outlook["players"]),
             len({row.canonical_player_id for row in bundle.projections}),
@@ -197,6 +203,8 @@ class LocalServerTests(unittest.TestCase):
             self.assertIn(label, body)
         self.assertIn(b"bundle.data_readiness", body)
         self.assertIn(b"renderBundleDataReadiness", body)
+        self.assertIn(b"bundleCapabilityIsUsable", body)
+        self.assertIn(b'Trade search is unavailable for this weekly bundle', body)
         self.assertIn(b"Exact championship simulation", body)
         self.assertIn(b"FantasyPros comparison benchmark", body)
         self.assertIn(b"Comparison only", body)

@@ -329,6 +329,15 @@ def build_bundle_data_readiness(bundle: EngineBundle) -> dict[str, object]:
         "capabilities": capabilities,
         "missing_data_plan": [
             {
+                "data": "host_trade_legality",
+                "strategy": (
+                    "Capture a timestamped host transaction-policy sidecar once per "
+                    "refresh, including the deadline/window, processing rules, player "
+                    "locks, undroppable flags, and pending transactions. Bind it to the "
+                    "league, season, host snapshot, and analysis time."
+                ),
+            },
+            {
                 "data": "exact_projection_scoring_compatibility",
                 "strategy": (
                     "Retain complete provider stat components and recompute points with "
@@ -367,4 +376,3 @@ def build_bundle_data_readiness(bundle: EngineBundle) -> dict[str, object]:
             },
         ],
     }
-

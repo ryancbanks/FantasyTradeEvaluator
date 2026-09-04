@@ -2,8 +2,10 @@
 
 from ._data_readiness_policy import (
     _AVAILABILITY_LIMITATION,
+    _BOUNDED_WAIVER_POOL_LIMITATION,
     _CHAMPIONSHIP_PROXY_LIMITATION,
     _FANTASYPROS_BENCHMARK_POLICY,
+    _HOST_TRADE_LEGALITY_LIMITATION,
     _ROS_ALLOCATION_LIMITATION,
     _SCORING_LIMITATION,
 )
@@ -52,6 +54,24 @@ def _capability_decisions(
         EcrPeriod.WEEKLY,
         EcrPeriod.REST_OF_SEASON,
     }
+    ecr_player_ids = {
+        snapshot.period: {
+            ranking.canonical_player_id for ranking in snapshot.rankings
+        }
+        for snapshot in bundle.ecr_snapshots
+    }
+    ecr_player_coverage = {
+        period.value: {
+            "ranked_player_count": len(ecr_player_ids.get(period, set()) & player_ids),
+            "unranked_player_count": len(player_ids - ecr_player_ids.get(period, set())),
+            "calculation_player_count": len(player_ids),
+            "complete": player_ids.issubset(ecr_player_ids.get(period, set())),
+        }
+        for period in EcrPeriod
+    }
+    full_ecr_player_coverage = all(
+        row["complete"] for row in ecr_player_coverage.values()
+    )
     formula_identity_matches = (
         bundle.strength_formula.scoring_profile_id
         == bundle.scoring_profile.scoring_profile_id
@@ -69,11 +89,28 @@ def _capability_decisions(
         for name in weights
     )
     required_ecr_periods = set()
+    required_numeric_ecr_periods = set()
     if any(name.startswith("ecr_weekly_") for name in required_features):
         required_ecr_periods.add(EcrPeriod.WEEKLY)
+    if any(
+        name.startswith("ecr_weekly_") and name != "ecr_weekly_available"
+        for name in required_features
+    ):
+        required_numeric_ecr_periods.add(EcrPeriod.WEEKLY)
     if any(name.startswith("ecr_ros_") for name in required_features):
         required_ecr_periods.add(EcrPeriod.REST_OF_SEASON)
-    required_ecr_complete = required_ecr_periods.issubset(ecr_periods)
+    if any(
+        name.startswith("ecr_ros_") and name != "ecr_ros_available"
+        for name in required_features
+    ):
+        required_numeric_ecr_periods.add(EcrPeriod.REST_OF_SEASON)
+    required_ecr_complete = (
+        required_ecr_periods.issubset(ecr_periods)
+        and all(
+            ecr_player_coverage[period.value]["complete"]
+            for period in required_numeric_ecr_periods
+        )
+    )
     availability = projection_availability_requirements(
         required_features,
         tuple(row.provider for row in bundle.ensemble_config.provider_weights),
@@ -222,6 +259,25 @@ def _capability_decisions(
         (ecr_pair_complete, "weekly and rest-of-season ECR evidence"),
         (roster_identity_complete, "complete ownership and eligibility evidence"),
     )
+    incomplete_ecr_periods = tuple(
+        period
+        for period in EcrPeriod
+        if ecr_player_coverage[period.value]["unranked_player_count"]
+    )
+    ecr_coverage_limitations = (
+        [
+            "FantasyPros ECR does not rank every calculation player ("
+            + "; ".join(
+                f"{period.value.replace('_', ' ')}: "
+                f"{ecr_player_coverage[period.value]['unranked_player_count']} "
+                "unranked"
+                for period in incomplete_ecr_periods
+            )
+            + "). Missing Player Lab ranks are shown as unavailable."
+        ]
+        if incomplete_ecr_periods
+        else []
+    )
     benchmark_complete = (
         {row.team_id for row in bundle.fantasypros_benchmark.teams} == team_ids
         and bundle.fantasypros_benchmark.snapshot_id == state.snapshot_id
@@ -262,11 +318,21 @@ def _capability_decisions(
             ],
             "evidence": {
                 **common_evidence,
-                "weekly_and_ros_ecr_complete": ecr_pair_complete,
+                "weekly_and_ros_ecr_snapshots_present": ecr_pair_complete,
+                "weekly_and_ros_ecr_complete": (
+                    ecr_pair_complete and full_ecr_player_coverage
+                ),
                 "required_ecr_periods": sorted(
                     row.value for row in required_ecr_periods
                 ),
+                "required_numeric_ecr_periods": sorted(
+                    row.value for row in required_numeric_ecr_periods
+                ),
                 "required_ecr_evidence_complete": required_ecr_complete,
+                "ecr_player_coverage": {
+                    period: dict(coverage)
+                    for period, coverage in ecr_player_coverage.items()
+                },
                 "formula_identity_matches": formula_identity_matches,
                 "required_projection_features": sorted(required_features),
                 "required_current_providers": sorted(availability.current_providers),
@@ -341,8 +407,16 @@ def _capability_decisions(
                 "expected_standings_ready": not expected_standings_missing,
                 "playoff_model_ready": not playoff_missing,
                 "waiver_pool_complete": waiver_pool_complete,
+                "waiver_pool_id": bundle.waiver_pool.waiver_pool_id,
+                "waiver_player_count": len(bundle.waiver_pool.players),
+                "waiver_minimum_pool_size": bundle.waiver_pool.minimum_pool_size,
+                "waiver_selection_algorithm": bundle.waiver_pool.selection_algorithm,
             },
-            "limitations": list(simulation_limitations),
+            "limitations": [
+                *simulation_limitations,
+                _BOUNDED_WAIVER_POOL_LIMITATION,
+                _HOST_TRADE_LEGALITY_LIMITATION,
+            ],
             "missing": trade_missing,
         },
         "player_lab": {
@@ -358,7 +432,14 @@ def _capability_decisions(
             "evidence": {
                 **common_evidence,
                 "provider_projection_evidence_retained": bool(bundle.projection_evidence),
-                "weekly_and_ros_ecr_complete": ecr_pair_complete,
+                "weekly_and_ros_ecr_snapshots_present": ecr_pair_complete,
+                "weekly_and_ros_ecr_complete": (
+                    ecr_pair_complete and full_ecr_player_coverage
+                ),
+                "ecr_player_coverage": {
+                    period: dict(coverage)
+                    for period, coverage in ecr_player_coverage.items()
+                },
                 "provider_status_observation_count": provider_status_coverage[
                     "observation_count"
                 ],
@@ -374,6 +455,7 @@ def _capability_decisions(
                     else []
                 ),
                 _AVAILABILITY_LIMITATION,
+                *ecr_coverage_limitations,
                 *(
                     [
                         limitation
@@ -472,4 +554,3 @@ def _schedule_evidence_complete(bundle):
     except (KeyError, ValueError):
         return False
     return True
-

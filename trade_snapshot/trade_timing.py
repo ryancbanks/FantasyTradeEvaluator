@@ -1,6 +1,5 @@
 """Forward-looking trade windows grounded in local league simulations."""
 
-from dataclasses import replace
 import json
 from math import ceil
 
@@ -10,32 +9,39 @@ from ._league_history_health import (
     latest_physical_injury_ids,
 )
 from ._record_trend import record_slope_direction
-from ._trade_timing_market import market_pattern
+from ._trade_timing_evaluation import (
+    TimingShortlistEvaluation,
+    _option_record,
+    evaluate_shortlist as _evaluate_shortlist,
+    minimum_playoff_gain as _minimum_playoff_gain,
+)
+from ._trade_timing_evidence import (
+    analysis_as_of as _analysis_as_of,
+    history_coverage as _history_coverage,
+    iso_utc as _iso,
+    timing_evidence as _timing_evidence,
+)
+from ._trade_timing_market import prepare_market_evidence, projection_lineage_summary
 from ._trade_timing_selection import build_recommendation, partner_plan_key
 from .delayed_trade_impact import prepare_delayed_baseline
 from .engine_bundle import EngineBundle
 from .gm_timing_profile import build_completed_deal_timing_profiles
 from .league_history import LeagueHistorySnapshot
-from .roster_compatibility import RosterSwap, screened_roster_swaps
+from .roster_compatibility import screened_roster_swaps
 from .scenario_config import CorrelatedScenarioConfig
 from .season_trajectory import (
     build_loss_and_downward_scenario_index,
     build_season_trajectory,
 )
 from .trade_impact import prepare_season_baseline
-from .trade_space import TeamRoster
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _DEFAULT_SCENARIO_LIMIT = 1_000
 _POWER_FLOOR = -5.0
 _SHORTLIST_PER_PARTNER = 3
-_WATCH_WINDOWS_PER_PARTNER = 2
 _MIN_CONDITIONAL_SCENARIOS = 100
 _MIN_CONDITIONAL_SCENARIO_FRACTION = 0.05
-_MIN_PLAYOFF_GAIN = 0.0025
-_MIN_PLAYOFF_GAIN_SCENARIO_STEPS = 2
-_PLAYOFF_GAIN_EPSILON = 1e-12
 
 
 def build_trade_timing(
@@ -76,6 +82,7 @@ def build_trade_timing(
     trajectory_by_team = {row["team_id"]: row for row in trajectory["teams"]}
     timing_profiles = build_completed_deal_timing_profiles(bundle.state, history)
     injuries, injury_status = _current_injuries(history)
+    market_evidence = prepare_market_evidence(bundle)
     primary_week = bundle.state.first_remaining_week
     plans = []
     for partner_id in sorted(
@@ -104,6 +111,7 @@ def build_trade_timing(
             all_swaps[:_SHORTLIST_PER_PARTNER],
             vulnerable_windows,
             trigger_index,
+            evidence_index=market_evidence,
         )
         completed_timing = _completed_timing_record(timing_profiles[partner_id])
         plans.append(
@@ -127,6 +135,18 @@ def build_trade_timing(
                     "simulated_shortlist_count": min(
                         len(all_swaps), _SHORTLIST_PER_PARTNER
                     ),
+                    "successfully_simulated_option_count": len(evaluated.options),
+                    "skipped_infeasible_option_count": len(
+                        evaluated.skipped_options
+                    ),
+                    "simulation_coverage_status": (
+                        "complete"
+                        if not evaluated.skipped_options
+                        else "partial_candidate_failures"
+                    ),
+                    "skipped_infeasible_options": list(
+                        evaluated.skipped_options
+                    ),
                     "shortlist_is_exhaustive": len(all_swaps)
                     <= _SHORTLIST_PER_PARTNER,
                     "current_physical_injuries_verified": injury_status
@@ -135,11 +155,12 @@ def build_trade_timing(
                     "current_health_screen_status": injury_status,
                 },
                 "recommendation": build_recommendation(
-                    evaluated,
+                    evaluated.options,
                     primary_week,
                     shortlist_is_exhaustive=len(all_swaps)
                     <= _SHORTLIST_PER_PARTNER,
                     alternative_limit=_SHORTLIST_PER_PARTNER,
+                    skipped_option_count=len(evaluated.skipped_options),
                 ),
             }
         )
@@ -151,6 +172,7 @@ def build_trade_timing(
         "schema_version": _SCHEMA_VERSION,
         "bundle_id": bundle.bundle_id,
         "history_revision": None if history is None else history.history_revision,
+        "analysis_as_of": _iso(_analysis_as_of(bundle, history)),
         "status": "ready",
         "primary_team_id": primary_team_id,
         "primary_team_name": names[primary_team_id],
@@ -167,6 +189,13 @@ def build_trade_timing(
             "excluded_physical_injury_count": len(injuries),
             "verification_required": injury_status != "complete_and_fresh",
         },
+        "history_coverage": _history_coverage(history, timing_profiles),
+        "evidence": _timing_evidence(
+            bundle,
+            history,
+            baseline,
+        ),
+        "projection_lineage": projection_lineage_summary(bundle),
         "trade_deadline": {
             "status": "not_captured",
             "current_window_is_legality_verified": False,
@@ -175,6 +204,15 @@ def build_trade_timing(
                 "Every proposal requires confirming that the league still permits "
                 "trades. Future weeks remain conditional watch plans."
             ),
+        },
+        "trade_legality": {
+            "status": "manual_verification_required",
+            "trade_deadline_status": "not_captured",
+            "transaction_processing_rules_status": "not_captured",
+            "player_lock_status": "not_captured",
+            "undroppable_player_status": "not_captured",
+            "candidate_player_tradeability_status": "not_captured",
+            "host_legality_verified": False,
         },
         "methodology": {
             "manager_acceptance_modeled": False,
@@ -215,6 +253,7 @@ def build_trade_timing(
                 "The automatic preview simulates only the three strongest power-screened 1-for-1 swaps per opponent, not the full configurable trade space.",
                 "Only explicitly captured current physical injuries can be excluded when current health coverage is incomplete.",
                 "Monte Carlo playoff changes are resolution-limited point estimates and do not establish statistical certainty.",
+                "Completed transaction history is descriptive only and is not used to fill missing legality, deadline, or health evidence.",
             ],
         },
         "trajectory_methodology": trajectory["methodology"],
@@ -223,162 +262,6 @@ def build_trade_timing(
     }
     json.dumps(result, allow_nan=False, sort_keys=True)
     return result
-
-
-def _evaluate_shortlist(
-    bundle,
-    delayed_baseline,
-    primary_id,
-    partner_id,
-    swaps,
-    windows,
-    trigger_index,
-):
-    first_week = bundle.state.first_remaining_week
-    conditioned_windows = [
-        row
-        for row in windows
-        if row["conditional_trade_simulation_status"] == "ready"
-    ][:_WATCH_WINDOWS_PER_PARTNER]
-    options = []
-    for swap in swaps:
-        after_rosters = _after_swap(bundle.rosters, primary_id, partner_id, swap)
-        delayed = delayed_baseline.roster_change(
-            after_rosters, (primary_id, partner_id)
-        )
-        immediate = _option_record(
-            bundle,
-            swap,
-            delayed.project(first_week),
-            primary_id,
-            partner_id,
-            first_week,
-            first_week,
-            None,
-        )
-        options.append(immediate)
-        for window in conditioned_windows:
-            trigger = trigger_index[(partner_id, window["result_week"])]
-            conditioned = delayed.project_conditioned_many(
-                (first_week, window["effective_week"]),
-                trigger.scenario_indexes,
-            )
-            conditional_now = conditioned[first_week]
-            future_impact = conditioned[window["effective_week"]]
-            row = _option_record(
-                bundle,
-                swap,
-                future_impact,
-                primary_id,
-                partner_id,
-                window["effective_week"],
-                first_week,
-                window,
-            )
-            row["delay_cost_primary"] = (
-                conditional_now.for_team(primary_id).playoff_probability_delta
-                - row["primary_playoff_probability_delta"]
-            )
-            row["delay_cost_partner"] = (
-                conditional_now.for_team(partner_id).playoff_probability_delta
-                - row["partner_playoff_probability_delta"]
-            )
-            row["delay_comparison_scope"] = (
-                "execute_now_vs_wait_within_same_pre_trade_trigger_scenarios"
-            )
-            options.append(row)
-    return options
-
-
-def _option_record(
-    bundle,
-    swap,
-    impact,
-    primary_id,
-    partner_id,
-    effective_week,
-    first_week,
-    window,
-):
-    primary = impact.for_team(primary_id)
-    partner = impact.for_team(partner_id)
-    is_now = effective_week == first_week
-    scenario_count = impact.before.scenario_count
-    minimum_gain = _minimum_playoff_gain(scenario_count)
-    point_estimate_gain = (
-        primary.playoff_probability_delta > 0
-        and partner.playoff_probability_delta > 0
-    )
-    material_gain = (
-        primary.playoff_probability_delta >= minimum_gain - _PLAYOFF_GAIN_EPSILON
-        and partner.playoff_probability_delta >= minimum_gain - _PLAYOFF_GAIN_EPSILON
-    )
-    trigger = (
-        {
-            "kind": "current_window_after_verification",
-            "label": (
-                f"If league trades are still open, propose before Week "
-                f"{effective_week} locks"
-            ),
-            "probability": None,
-            "probability_status": "unmodeled_trade_legality",
-        }
-        if is_now
-        else {
-            "kind": "loss_and_downward_slope",
-            "label": (
-                f"Planning only—if {_team_name(bundle, partner_id)} loses Week "
-                f"{window['result_week']} and its record slope is downward, propose "
-                f"before Week {effective_week} locks, after verifying the trade deadline"
-            ),
-            "probability": window["trigger_probability"],
-            "probability_status": "modeled_outcome_trigger_only",
-        }
-    )
-    return {
-        "effective_week": effective_week,
-        "timing_status": (
-            "current_window_verification_required"
-            if is_now
-            else "conditional_watch_deadline_unverified"
-        ),
-        "impact_scope": (
-            "all_shared_scenarios"
-            if is_now
-            else "partner_loss_and_downward_slope_trigger_scenarios"
-        ),
-        "trigger_selected_from_pre_trade_baseline": not is_now,
-        "trigger": trigger,
-        "primary_sends": [
-            _player_record(bundle, swap.primary_player_id)
-        ],
-        "primary_receives": [
-            _player_record(bundle, swap.counterparty_player_id)
-        ],
-        "primary_power_delta": swap.primary_power_delta,
-        "partner_power_delta": swap.counterparty_power_delta,
-        "primary_display_power_delta": swap.primary_display_power_delta,
-        "partner_display_power_delta": swap.counterparty_display_power_delta,
-        "primary_playoff_probability_delta": primary.playoff_probability_delta,
-        "partner_playoff_probability_delta": partner.playoff_probability_delta,
-        "primary_expected_wins_delta": primary.expected_wins_delta,
-        "partner_expected_wins_delta": partner.expected_wins_delta,
-        "mutual_playoff_point_estimate_gain": point_estimate_gain,
-        "mutual_playoff_gain": material_gain,
-        "minimum_playoff_probability_gain_each_team": minimum_gain,
-        "playoff_gain_evidence": "paired_monte_carlo_point_estimate",
-        "playoff_gain_confidence_certified": False,
-        "pressure_percentile": None if window is None else window["pressure_percentile"],
-        "market_pattern": market_pattern(bundle, swap, effective_week),
-        "scenario_count": scenario_count,
-        "conditional_trigger_scenario_count": (
-            None if window is None else window["trigger_scenario_count"]
-        ),
-        "delay_cost_primary": 0.0,
-        "delay_cost_partner": 0.0,
-        "delay_comparison_scope": None,
-        "reasons": _option_reasons(window, is_now, minimum_gain),
-    }
 
 
 def _vulnerable_windows(projected, first_week, partner_id, trigger_index):
@@ -444,6 +327,9 @@ def _completed_timing_record(profile):
     return {
         "status": timing.get("status", profile["status"]),
         "profile_status": profile["status"],
+        "analysis_as_of": profile["analysis_as_of"],
+        "evidence": profile["evidence"],
+        "coverage": profile["coverage"],
         "unavailable_reason": timing.get("reason")
         or (
             None
@@ -469,63 +355,6 @@ def _completed_timing_record(profile):
         "proxy_status": "not_personalized_without_week_aligned_health_evidence",
         "trade_deadline_status": "not_captured",
     }
-
-
-def _after_swap(rosters, primary_id, partner_id, swap):
-    result = []
-    for roster in rosters:
-        if roster.team_id == primary_id:
-            player_ids = tuple(
-                swap.counterparty_player_id
-                if player_id == swap.primary_player_id
-                else player_id
-                for player_id in roster.player_ids
-            )
-        elif roster.team_id == partner_id:
-            player_ids = tuple(
-                swap.primary_player_id
-                if player_id == swap.counterparty_player_id
-                else player_id
-                for player_id in roster.player_ids
-            )
-        else:
-            result.append(roster)
-            continue
-        result.append(replace(roster, player_ids=player_ids))
-    return tuple(result)
-
-
-def _option_reasons(window, is_now, minimum_gain):
-    materiality = (
-        f"Both teams clear the {minimum_gain:.2%} per-team Monte Carlo "
-        "materiality floor; this is still a point estimate, not certainty."
-    )
-    if is_now:
-        return [
-            "Both teams' delayed-impact result is measured against the same scenario draws.",
-            materiality,
-            "Verify that trades remain open and current player health before proposing.",
-        ]
-    return [
-        "This is a conditional schedule-pressure watch point, not a prediction of manager acceptance.",
-        "Trade impact is recalculated only inside the pre-trade paths where the named loss/downturn trigger occurs.",
-        materiality,
-        (
-            f"The partner's simulated pressure percentile is "
-            f"{window['pressure_percentile']:.1%}."
-            if window["pressure_percentile"] is not None
-            else "The partner's pressure percentile is unavailable for this week."
-        ),
-    ]
-
-
-def _minimum_playoff_gain(scenario_count):
-    if type(scenario_count) is not int or scenario_count < 1:
-        raise ValueError("scenario_count must be a positive integer")
-    return max(
-        _MIN_PLAYOFF_GAIN,
-        _MIN_PLAYOFF_GAIN_SCENARIO_STEPS / scenario_count,
-    )
 
 
 def _current_injuries(history):
@@ -565,16 +394,13 @@ def _bounded_config(bundle, scenario_limit):
     return (
         source
         if source.scenario_count <= scenario_limit
-        else CorrelatedScenarioConfig(scenario_limit, source.seed, source.loadings)
+        else CorrelatedScenarioConfig(
+            scenario_limit,
+            source.seed,
+            source.loadings,
+            source.player_score_floor,
+        )
     )
-
-
-def _player_record(bundle, player_id):
-    return {"player_id": player_id, "player_name": bundle.player_names[player_id]}
-
-
-def _team_name(bundle, team_id):
-    return next(row.name for row in bundle.state.teams if row.team_id == team_id)
 
 
 def _validate_inputs(bundle, history, primary_team_id, scenario_limit):
@@ -593,15 +419,24 @@ def _validate_inputs(bundle, history, primary_team_id, scenario_limit):
 
 
 def _season_complete(bundle, history, primary_team_id, names):
+    profiles = build_completed_deal_timing_profiles(bundle.state, history)
     return {
         "schema_version": _SCHEMA_VERSION,
         "bundle_id": bundle.bundle_id,
         "history_revision": None if history is None else history.history_revision,
+        "analysis_as_of": _iso(_analysis_as_of(bundle, history)),
         "status": "season_complete",
         "primary_team_id": primary_team_id,
         "primary_team_name": names[primary_team_id],
         "scenario_sampling": None,
+        "history_coverage": _history_coverage(history, profiles),
+        "evidence": _timing_evidence(bundle, history),
+        "projection_lineage": projection_lineage_summary(bundle),
         "trade_deadline": {"status": "season_complete"},
+        "trade_legality": {
+            "status": "season_complete",
+            "host_legality_verified": False,
+        },
         "methodology": {"manager_acceptance_modeled": False},
         "primary_trajectory": None,
         "partner_plans": [],

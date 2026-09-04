@@ -8,7 +8,7 @@ keeps current ECR and current rosters out of historical conclusions.
 
 from collections import Counter
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from math import isfinite
 from types import MappingProxyType
@@ -21,6 +21,13 @@ from ._league_history_health import (
     NON_PHYSICAL_UNAVAILABLE_STATUSES,
     PHYSICAL_INJURY_STATUSES,
 )
+from ._gm_model_evidence import (
+    GmModelEvidence,
+    POWER_RESULT_STATUSES,
+    build_gm_model_evidence,
+    model_comparability_reasons,
+)
+from ._scenario_random import content_id
 from .engine_bundle import EngineBundle
 from .league_history import (
     HISTORY_CAPTURE_BINDING_TOLERANCE,
@@ -68,6 +75,56 @@ class HistoricalTeamOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class HistoricalPlayoffEvidence:
+    """Content-addressed paired-simulation evidence for a playoff delta."""
+
+    scenario_count: int
+    scenario_config_id: str
+    player_score_floor: float | None
+    projection_set_id: str
+    impact_id: str
+    before_scenario_run_id: str
+    after_scenario_run_id: str
+    draw_space_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.scenario_count) is not int or self.scenario_count < 1:
+            raise ValueError("scenario_count must be a positive integer")
+        for name in (
+            "scenario_config_id",
+            "projection_set_id",
+            "impact_id",
+            "before_scenario_run_id",
+            "after_scenario_run_id",
+            "draw_space_id",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be non-empty text")
+        floor = self.player_score_floor
+        if floor is not None and (
+            isinstance(floor, bool)
+            or not isinstance(floor, (int, float))
+            or not isfinite(float(floor))
+        ):
+            raise ValueError("player_score_floor must be finite numeric data or null")
+        if floor is not None:
+            object.__setattr__(self, "player_score_floor", float(floor))
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "scenario_count": self.scenario_count,
+            "scenario_config_id": self.scenario_config_id,
+            "player_score_floor": self.player_score_floor,
+            "projection_set_id": self.projection_set_id,
+            "impact_id": self.impact_id,
+            "before_scenario_run_id": self.before_scenario_run_id,
+            "after_scenario_run_id": self.after_scenario_run_id,
+            "draw_space_id": self.draw_space_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CurrentTeamRevaluation:
     """The same historical team/package scored by the selected current model."""
 
@@ -100,6 +157,8 @@ class CurrentTradeRevaluation:
     bundle_id: str
     bundle_captured_at: datetime
     methodology_status: str
+    model_evidence: GmModelEvidence
+    model_comparability_reasons: tuple[str, ...]
     foresight_eligible: bool
     foresight_ineligibility_reasons: tuple[str, ...]
     outcomes: tuple[CurrentTeamRevaluation, ...]
@@ -109,13 +168,18 @@ class CurrentTradeRevaluation:
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f"{name} must be a non-empty string")
         captured_at = _aware("bundle_captured_at", self.bundle_captured_at)
-        if self.methodology_status not in {
-            "exact",
-            "extrapolated",
-            "surrogate",
-            "surrogate_extrapolated",
-        }:
+        if self.methodology_status not in POWER_RESULT_STATUSES:
             raise ValueError("methodology_status is invalid")
+        if not isinstance(self.model_evidence, GmModelEvidence):
+            raise ValueError("model_evidence must be GmModelEvidence")
+        if (
+            self.model_evidence.bundle_id != self.bundle_id
+            or self.model_evidence.methodology_status != self.methodology_status
+        ):
+            raise ValueError("model_evidence does not match current revaluation")
+        model_reasons = tuple(sorted(set(self.model_comparability_reasons)))
+        if any(not isinstance(reason, str) or not reason for reason in model_reasons):
+            raise ValueError("model comparability reasons must be non-empty strings")
         if not isinstance(self.foresight_eligible, bool):
             raise ValueError("foresight_eligible must be a boolean")
         reasons = tuple(sorted(set(self.foresight_ineligibility_reasons)))
@@ -124,6 +188,10 @@ class CurrentTradeRevaluation:
         if self.foresight_eligible == bool(reasons):
             raise ValueError(
                 "foresight eligibility must be true exactly when no reasons exist"
+            )
+        if not set(model_reasons).issubset(reasons):
+            raise ValueError(
+                "model comparability reasons must also be foresight reasons"
             )
         outcomes = tuple(self.outcomes)
         if any(not isinstance(row, CurrentTeamRevaluation) for row in outcomes):
@@ -135,6 +203,7 @@ class CurrentTradeRevaluation:
         if abs(sum(row.relative_power_edge_drift for row in outcomes)) > 1e-9:
             raise ValueError("relative power edge drifts must sum to zero")
         object.__setattr__(self, "bundle_captured_at", captured_at)
+        object.__setattr__(self, "model_comparability_reasons", model_reasons)
         object.__setattr__(self, "foresight_ineligibility_reasons", reasons)
         object.__setattr__(
             self, "outcomes", tuple(sorted(outcomes, key=lambda row: row.team_id))
@@ -145,11 +214,13 @@ class CurrentTradeRevaluation:
 class HistoricalTradeValuation:
     transaction_id: str
     proposal_at: datetime
+    analysis_as_of: datetime
     source_bundle_id: str
     source_bundle_captured_at: datetime
     valuation_lag_hours: float
     methodology_status: str
-    playoff_scenario_count: int | None
+    source_model_evidence: GmModelEvidence
+    playoff_evidence: HistoricalPlayoffEvidence | None
     playoff_unavailable_reason: str | None
     outcomes: tuple[HistoricalTeamOutcome, ...]
     current_revaluation: CurrentTradeRevaluation | None
@@ -160,29 +231,39 @@ class HistoricalTradeValuation:
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f"{name} must be a non-empty string")
         proposal_at = _aware("proposal_at", self.proposal_at)
+        analysis_as_of = _aware("analysis_as_of", self.analysis_as_of)
         source_at = _aware(
             "source_bundle_captured_at", self.source_bundle_captured_at
         )
+        if analysis_as_of < proposal_at:
+            raise ValueError("analysis_as_of cannot predate the transaction")
         if not 0 < self.valuation_lag_hours <= _MAX_VALUATION_LAG.total_seconds() / 3600:
             raise ValueError("valuation_lag_hours is outside the contemporaneous window")
         expected_lag = (proposal_at - source_at).total_seconds() / 3600
         if abs(expected_lag - self.valuation_lag_hours) > 1e-9:
             raise ValueError("valuation_lag_hours does not match its evidence timestamps")
-        if self.methodology_status not in {
-            "exact", "extrapolated", "surrogate", "surrogate_extrapolated"
-        }:
+        if self.methodology_status not in POWER_RESULT_STATUSES:
             raise ValueError("methodology_status is invalid")
-        if self.playoff_scenario_count is not None and (
-            type(self.playoff_scenario_count) is not int
-            or self.playoff_scenario_count < 1
+        if not isinstance(self.source_model_evidence, GmModelEvidence):
+            raise ValueError("source_model_evidence must be GmModelEvidence")
+        if (
+            self.source_model_evidence.bundle_id != self.source_bundle_id
+            or self.source_model_evidence.methodology_status
+            != self.methodology_status
         ):
-            raise ValueError("playoff_scenario_count must be positive or null")
+            raise ValueError("source_model_evidence does not match valuation")
+        if self.playoff_evidence is not None and not isinstance(
+            self.playoff_evidence, HistoricalPlayoffEvidence
+        ):
+            raise ValueError(
+                "playoff_evidence must be HistoricalPlayoffEvidence or null"
+            )
         playoff_reason = self.playoff_unavailable_reason
         if playoff_reason is not None and (
             not isinstance(playoff_reason, str) or not playoff_reason
         ):
             raise ValueError("playoff_unavailable_reason must be non-empty or null")
-        if (self.playoff_scenario_count is None) != (playoff_reason is not None):
+        if (self.playoff_evidence is None) != (playoff_reason is not None):
             raise ValueError(
                 "playoff availability must match its unavailable reason"
             )
@@ -194,7 +275,7 @@ class HistoricalTradeValuation:
         playoff_values_available = all(
             row.playoff_probability_delta is not None for row in outcomes
         )
-        if playoff_values_available != (self.playoff_scenario_count is not None):
+        if playoff_values_available != (self.playoff_evidence is not None):
             raise ValueError(
                 "playoff outcome availability must match the scenario evidence"
             )
@@ -221,9 +302,18 @@ class HistoricalTradeValuation:
         elif not isinstance(reason, str) or not reason:
             raise ValueError("current revaluation unavailable reason must be non-empty")
         object.__setattr__(self, "proposal_at", proposal_at)
+        object.__setattr__(self, "analysis_as_of", analysis_as_of)
         object.__setattr__(self, "source_bundle_captured_at", source_at)
         object.__setattr__(
             self, "outcomes", tuple(sorted(outcomes, key=lambda row: row.team_id))
+        )
+
+    @property
+    def playoff_scenario_count(self) -> int | None:
+        return (
+            None
+            if self.playoff_evidence is None
+            else self.playoff_evidence.scenario_count
         )
 
 
@@ -232,6 +322,9 @@ class HistoricalValuationResult:
     valuations: tuple[HistoricalTradeValuation, ...]
     unvalued_reasons: Mapping[str, int]
     unvalued_transactions: Mapping[str, str]
+    analysis_as_of: datetime
+    history_revision: str
+    evidence_id: str = field(init=False)
 
     def __post_init__(self) -> None:
         rows = tuple(self.valuations)
@@ -264,10 +357,47 @@ class HistoricalValuationResult:
             raise ValueError("a transaction cannot be both valued and unvalued")
         if Counter(unvalued.values()) != Counter(reasons):
             raise ValueError("unvalued transaction reasons do not match reason counts")
+        analysis_as_of = _aware("analysis_as_of", self.analysis_as_of)
+        if any(row.analysis_as_of != analysis_as_of for row in rows):
+            raise ValueError("valuation analysis cutoffs are inconsistent")
+        if not isinstance(self.history_revision, str) or not self.history_revision:
+            raise ValueError("history_revision must be non-empty text")
         object.__setattr__(self, "valuations", rows)
         object.__setattr__(self, "unvalued_reasons", MappingProxyType(reasons))
         object.__setattr__(
             self, "unvalued_transactions", MappingProxyType(unvalued)
+        )
+        object.__setattr__(self, "analysis_as_of", analysis_as_of)
+        object.__setattr__(
+            self,
+            "evidence_id",
+            content_id(
+                "historical-valuation-evidence",
+                {
+                    "analysis_as_of": analysis_as_of.isoformat(),
+                    "history_revision": self.history_revision,
+                    "valued_trades": [
+                        {
+                            "transaction_id": row.transaction_id,
+                            "source_model_evidence_id": (
+                                row.source_model_evidence.evidence_id
+                            ),
+                            "playoff_impact_id": (
+                                None
+                                if row.playoff_evidence is None
+                                else row.playoff_evidence.impact_id
+                            ),
+                            "current_model_evidence_id": (
+                                None
+                                if row.current_revaluation is None
+                                else row.current_revaluation.model_evidence.evidence_id
+                            ),
+                        }
+                        for row in rows
+                    ],
+                    "unvalued_transactions": unvalued,
+                },
+            ),
         )
 
 
@@ -361,6 +491,7 @@ def value_historical_trades(
                 binding.captured_at,
                 bundle,
                 transactions,
+                analysis_as_of=cutoff,
                 current_bundle=current_bundle,
                 current_bundle_captured_at=history.bundle_captured_at,
                 history_captures=captures,
@@ -372,7 +503,11 @@ def value_historical_trades(
         valuations.append(valuation)
 
     return HistoricalValuationResult(
-        tuple(valuations), reasons, unvalued_transactions
+        valuations=tuple(valuations),
+        unvalued_reasons=reasons,
+        unvalued_transactions=unvalued_transactions,
+        analysis_as_of=cutoff,
+        history_revision=history.history_revision,
     )
 
 
@@ -408,6 +543,7 @@ def _value_one(
     bundle,
     transactions,
     *,
+    analysis_as_of,
     current_bundle,
     current_bundle_captured_at,
     history_captures,
@@ -434,12 +570,12 @@ def _value_one(
         incoming_player_ids=outgoing[second],
     )
     power_deltas, relative = _power_values(result, first, second)
-    methodology_status = bundle.methodology_evidence.power_result_status(
+    source_model_evidence = build_gm_model_evidence(
+        bundle,
         outgoing_count=len(outgoing[first]),
         incoming_count=len(outgoing[second]),
-        has_roster_adjustment=False,
     )
-    playoff, scenario_count, playoff_unavailable = (
+    playoff, playoff_evidence, playoff_unavailable = (
         _playoff_deltas(bundle, owners, exempt, trade, participants)
         if playoff_context_known
         else ({}, None, "intervening_league_move_order_is_ambiguous")
@@ -455,6 +591,7 @@ def _value_one(
     )
     current, current_unavailable = _current_revaluation(
         source_bundle=bundle,
+        source_model_evidence=source_model_evidence,
         current_bundle=current_bundle,
         current_bundle_captured_at=current_bundle_captured_at,
         source_bundle_captured_at=binding_at,
@@ -470,11 +607,13 @@ def _value_one(
     return HistoricalTradeValuation(
         transaction_id=trade.transaction_id,
         proposal_at=trade.recorded_at,
+        analysis_as_of=analysis_as_of,
         source_bundle_id=bundle.bundle_id,
         source_bundle_captured_at=binding_at,
         valuation_lag_hours=(trade.recorded_at - binding_at).total_seconds() / 3600,
-        methodology_status=methodology_status,
-        playoff_scenario_count=scenario_count,
+        methodology_status=source_model_evidence.methodology_status,
+        source_model_evidence=source_model_evidence,
+        playoff_evidence=playoff_evidence,
         playoff_unavailable_reason=playoff_unavailable,
         outcomes=at_time_outcomes,
         current_revaluation=current,
@@ -485,6 +624,7 @@ def _value_one(
 def _current_revaluation(
     *,
     source_bundle,
+    source_model_evidence,
     current_bundle,
     current_bundle_captured_at,
     source_bundle_captured_at,
@@ -520,25 +660,17 @@ def _current_revaluation(
     except ValueError:
         return None, "current_model_cannot_score_historical_roster_context"
     power_deltas, relative = _power_values(result, first, second)
-    current_methodology = current_bundle.methodology_evidence.power_result_status(
+    current_model_evidence = build_gm_model_evidence(
+        current_bundle,
         outgoing_count=len(outgoing[first]),
         incoming_count=len(outgoing[second]),
-        has_roster_adjustment=False,
     )
     at_time = {row.team_id: row for row in at_time_outcomes}
     eligibility_reasons = []
-    source_methodology = source_bundle.methodology_evidence.power_result_status(
-        outgoing_count=len(outgoing[first]),
-        incoming_count=len(outgoing[second]),
-        has_roster_adjustment=False,
+    comparison_reasons = model_comparability_reasons(
+        source_model_evidence, current_model_evidence
     )
-    if source_methodology != "exact" or current_methodology != "exact":
-        eligibility_reasons.append("power_methodology_is_not_exact_at_both_times")
-    if (
-        source_bundle.strength_model.role_definitions
-        != current_bundle.strength_model.role_definitions
-    ):
-        eligibility_reasons.append("strength_role_definition_changed")
+    eligibility_reasons.extend(comparison_reasons)
     eligibility_reasons.extend(
         _health_eligibility_reasons(
             history_captures,
@@ -551,7 +683,9 @@ def _current_revaluation(
         CurrentTradeRevaluation(
             bundle_id=current_bundle.bundle_id,
             bundle_captured_at=current_bundle_captured_at,
-            methodology_status=current_methodology,
+            methodology_status=current_model_evidence.methodology_status,
+            model_evidence=current_model_evidence,
+            model_comparability_reasons=comparison_reasons,
             foresight_eligible=not eligibility_reasons,
             foresight_ineligibility_reasons=tuple(eligibility_reasons),
             outcomes=tuple(
@@ -753,15 +887,19 @@ def _playoff_deltas(bundle, owners, exempt, trade, participants):
         config = bundle.scenario_config
         if config.scenario_count > _MAX_PLAYOFF_SCENARIOS:
             config = CorrelatedScenarioConfig(
-                _MAX_PLAYOFF_SCENARIOS, config.seed, config.loadings
+                _MAX_PLAYOFF_SCENARIOS,
+                config.seed,
+                config.loadings,
+                config.player_score_floor,
             )
-        paired = prepare_season_baseline(
+        baseline = prepare_season_baseline(
             bundle.state,
             before,
             bundle.projections,
             bundle.eligibilities,
             config,
-        ).project(after)
+        )
+        paired = baseline.project(after)
     except ValueError:
         return {}, None, "playoff_simulation_inputs_are_incomplete"
     return (
@@ -769,7 +907,16 @@ def _playoff_deltas(bundle, owners, exempt, trade, participants):
             team_id: paired.for_team(team_id).playoff_probability_delta
             for team_id in participants
         },
-        paired.before.scenario_count,
+        HistoricalPlayoffEvidence(
+            scenario_count=paired.before.scenario_count,
+            scenario_config_id=baseline.scenarios.config.config_id,
+            player_score_floor=baseline.scenarios.config.player_score_floor,
+            projection_set_id=baseline.scenarios.projection_set_id,
+            impact_id=paired.impact_id,
+            before_scenario_run_id=paired.before_scenario_run_id,
+            after_scenario_run_id=paired.after_scenario_run_id,
+            draw_space_id=paired.draw_space_id,
+        ),
         None,
     )
 
@@ -802,6 +949,7 @@ __all__ = (
     "CurrentTeamRevaluation",
     "CurrentTradeRevaluation",
     "HistoricalTeamOutcome",
+    "HistoricalPlayoffEvidence",
     "HistoricalTradeValuation",
     "HistoricalValuationResult",
     "PHYSICAL_INJURY_STATUSES",

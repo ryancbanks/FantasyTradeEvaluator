@@ -1,6 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -22,11 +22,15 @@ from trade_snapshot.league_history import (
     HistoryTeamRoster,
     LeagueHistoryCapture,
     LeagueHistoryStore,
-    make_league_key,
 )
+from trade_snapshot.league_state import Tiebreaker
 from trade_snapshot.three_way_search import ThreeWaySearchOutcome
 from trade_snapshot.trade_impact import prepare_season_baseline
-from trade_snapshot.weekly_collection import LEAGUE_HISTORY_FILENAME
+from trade_snapshot.weekly_collection import (
+    LEAGUE_HISTORY_FILENAME,
+    WeeklyHistoryAttempt,
+    WeeklyHistoryReason,
+)
 
 
 def payload(bundle_id):
@@ -156,10 +160,40 @@ class LocalAppServiceTests(unittest.TestCase):
         self.assertEqual(first["primary_team_id"], "primary")
         self.assertFalse(first["methodology"]["manager_acceptance_modeled"])
 
+    def test_not_ready_bundle_can_be_inspected_but_cannot_run_season_features(self):
+        bundle = engine_bundle()
+        playoff_rules = replace(
+            bundle.state.playoff_rules,
+            tiebreaker_order=(
+                Tiebreaker.DIVISION_RECORD,
+                Tiebreaker.RANDOM_DRAW,
+            ),
+        )
+        bundle = replace(
+            bundle,
+            state=replace(bundle.state, playoff_rules=playoff_rules),
+        )
+        request = LocalSearchRequest.from_payload(payload(bundle.bundle_id))
+
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            estimate = service.estimate_search(request)
+            with self.assertRaisesRegex(ValueError, "trade search is not ready"):
+                service.start_search(request)
+            with self.assertRaisesRegex(ValueError, "league dashboard is not ready"):
+                service.league_dashboard(bundle.bundle_id)
+
+        self.assertEqual(estimate["data_readiness"]["status"], "not_ready")
+        self.assertIn(
+            "ready expected-standings evidence",
+            estimate["data_readiness"]["missing"],
+        )
+
     def test_gm_insights_supports_old_bundles_and_refreshes_for_new_history(self):
         bundle = engine_bundle()
-        captured_at = datetime(2026, 9, 1, tzinfo=timezone.utc)
-        league_key = make_league_key("espn", "test-private-league")
+        captured_at = bundle.source_manifest.host_captured_at
+        league_key = bundle.source_manifest.league_binding_id
         names = {team.team_id: team.name for team in bundle.state.teams}
         capture = LeagueHistoryCapture(
             league_key=league_key,
@@ -182,12 +216,17 @@ class LocalAppServiceTests(unittest.TestCase):
                 )
                 for roster in bundle.rosters
             ),
+            host_snapshot_id=bundle.source_manifest.host_snapshot_id,
         )
         binding = HistoryBundleBinding(
             league_key,
             bundle.state.season,
             bundle.bundle_id,
             captured_at,
+            bundle.source_manifest.host_snapshot_id,
+            bundle.source_manifest.host_captured_at,
+            capture.capture_id,
+            capture.roster_ownership_id,
         )
 
         with TemporaryDirectory() as directory:
@@ -195,9 +234,16 @@ class LocalAppServiceTests(unittest.TestCase):
             service.import_bundle(bundle.to_record())
             old_bundle_result = service.gm_insights(bundle.bundle_id)
             old_timing = service.trade_timing(bundle.bundle_id, "primary")
-            LeagueHistoryStore(
+            history_store = LeagueHistoryStore(
                 Path(directory) / LEAGUE_HISTORY_FILENAME
-            ).ingest(capture, bundle=binding)
+            )
+            history_store.bind_bundle(
+                league_key,
+                bundle.state.season,
+                "engine_" + "9" * 64,
+                captured_at - timedelta(days=7),
+            )
+            history_store.ingest(capture, bundle=binding)
             captured_result = service.gm_insights(bundle.bundle_id)
             captured_timing = service.trade_timing(bundle.bundle_id, "primary")
 
@@ -208,6 +254,66 @@ class LocalAppServiceTests(unittest.TestCase):
         self.assertIsNone(old_timing["history_revision"])
         self.assertIsNotNone(captured_timing["history_revision"])
         self.assertIsNot(old_timing, captured_timing)
+
+    def test_unreadable_optional_history_does_not_block_current_bundle_features(self):
+        bundle = engine_bundle()
+        with TemporaryDirectory() as directory:
+            history_path = Path(directory) / LEAGUE_HISTORY_FILENAME
+            history_path.write_bytes(b"not a sqlite database")
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+
+            insights = service.gm_insights(bundle.bundle_id)
+            timing = service.trade_timing(bundle.bundle_id, "primary")
+
+        self.assertEqual(insights["status"], "not_collected")
+        self.assertEqual(insights["data_readiness"]["store_status"], "unavailable")
+        self.assertEqual(
+            insights["data_readiness"]["capabilities"][
+                "current_roster_compatibility"
+            ]["status"],
+            "ready_with_holdout_validated_scope",
+        )
+        self.assertEqual(timing["data_readiness"]["store_status"], "unavailable")
+        self.assertEqual(
+            timing["data_readiness"]["capabilities"]["completed_deal_activity"][
+                "status"
+            ],
+            "not_ready",
+        )
+
+    def test_history_collection_failure_reason_reaches_gm_and_timing_views(self):
+        bundle = engine_bundle()
+        attempt = WeeklyHistoryAttempt.unavailable(
+            WeeklyHistoryReason.ACTIVITY_UNAVAILABLE,
+            bundle.source_manifest.host_captured_at,
+        )
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            attempt_directory = Path(directory) / "history-attempts"
+            attempt_directory.mkdir()
+            (attempt_directory / f"{bundle.bundle_id}.json").write_text(
+                json.dumps(
+                    {
+                        "bundle_id": bundle.bundle_id,
+                        "history_attempt": attempt.to_record(),
+                        "schema_version": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            insights = service.gm_insights(bundle.bundle_id)
+            timing = service.trade_timing(bundle.bundle_id, "primary")
+
+        for result in (insights, timing):
+            readiness = result["data_readiness"]
+            self.assertEqual(readiness["collection_attempt"], attempt.to_record())
+            self.assertIn(
+                "history_collection_activity_unavailable",
+                readiness["capabilities"]["completed_deal_activity"]["missing"],
+            )
 
     def test_player_outlook_is_available_without_a_search_and_cached(self):
         bundle = engine_bundle()
@@ -223,6 +329,7 @@ class LocalAppServiceTests(unittest.TestCase):
 
         self.assertIs(first, second)
         self.assertEqual(first["bundle_id"], bundle.bundle_id)
+        self.assertEqual(first["data_readiness"]["status"], "ready_with_limitations")
         self.assertEqual(
             len(first["players"]),
             len({row.canonical_player_id for row in bundle.projections}),
@@ -313,6 +420,7 @@ class LocalAppServiceTests(unittest.TestCase):
 
         self.assertIs(first, second)
         self.assertEqual(first["bundle_id"], bundle.bundle_id)
+        self.assertEqual(first["data_readiness"]["status"], "ready_with_limitations")
         self.assertEqual(first["scenario_count"], bundle.scenario_config.scenario_count)
         self.assertEqual(len(first["teams"]), len(bundle.state.teams))
         self.assertEqual(first["championship_model"]["status"], "modeled_estimate")
@@ -439,9 +547,24 @@ class LocalAppServiceTests(unittest.TestCase):
             service = LocalAppService(directory)
             with patch.object(
                 service, "_bundle_path", return_value=Path(directory) / "bundle.json"
-            ), patch("trade_snapshot.app_service.load_engine_bundle", return_value=bundle):
+            ), patch(
+                "trade_snapshot.app_service.load_engine_bundle", return_value=bundle
+            ), patch(
+                "trade_snapshot.app_service.build_bundle_data_readiness",
+                return_value={
+                    "capabilities": {
+                        "trade_search": {
+                            "status": "ready_with_limitations",
+                            "missing": [],
+                        }
+                    }
+                },
+            ):
                 estimate = service.estimate_search(request)
                 started = service.start_search(request)
+                self.assertEqual(started["bundle_id"], request.bundle_id)
+                self.assertEqual(started["request_id"], request.request_id)
+                self.assertEqual(started["search_request"], request.to_record())
                 finished = wait_for_job(service, started["job_id"])
                 self.assertEqual(finished["status"], "complete", finished)
                 preview = service.job_results(started["job_id"])
@@ -579,9 +702,24 @@ class LocalAppServiceTests(unittest.TestCase):
             {"holdout_validated"},
         )
         self.assertEqual(
-            {row["power_methodology_status"] for row in preview["rows"]},
-            {"holdout_validated"},
+            {row["search_run_id"] for row in preview["rows"]},
+            set(preview["search_run_ids"]),
         )
+        for row in preview["rows"]:
+            self.assertTrue(row["candidate_index"].isdigit())
+            self.assertEqual(row["other_team_id"], "other")
+            self.assertEqual(len(row["give_player_ids"]), len(row["give"]))
+            self.assertEqual(
+                len(row["receive_player_ids"]), len(row["receive"])
+            )
+            self.assertAlmostEqual(
+                row["your_playoff_after"] - row["your_playoff_before"],
+                row["your_playoff_delta"],
+            )
+            self.assertAlmostEqual(
+                row["their_playoff_after"] - row["their_playoff_before"],
+                row["their_playoff_delta"],
+            )
         self.assertEqual(len(preview["team_outlook"]), 2)
         self.assertEqual(
             {row["team_name"] for row in preview["team_outlook"]},
@@ -607,6 +745,15 @@ class LocalAppServiceTests(unittest.TestCase):
         self.assertIn("Championship-Proxy Limitation", export_strings)
         self.assertIn("As-of-Time Limitation", export_strings)
         self.assertIn("Host league snapshot (espn)", export_strings)
+        self.assertIn("Engine Bundle ID", export_strings)
+        self.assertIn(bundle.bundle_id, export_strings)
+        self.assertIn("Waiver Pool ID", export_strings)
+        self.assertIn(bundle.waiver_pool.waiver_pool_id, export_strings)
+        self.assertIn("Search Request ID", export_strings)
+        self.assertIn(request.request_id, export_strings)
+        self.assertIn("Trade Constraints (Canonical JSON)", export_strings)
+        self.assertIn("require_no_drops", export_strings)
+        self.assertIn("Pair Search Definitions", export_strings)
         self.assertIn("Opaque league binding (workspace)", export_strings)
         self.assertIn(bundle.source_manifest.league_binding_id, export_strings)
         self.assertIn(bundle.source_manifest.host_snapshot_id, export_strings)
@@ -922,7 +1069,19 @@ class LocalAppServiceTests(unittest.TestCase):
             service = LocalAppService(directory)
             with patch.object(
                 service, "_bundle_path", return_value=Path(directory) / "bundle.json"
-            ), patch("trade_snapshot.app_service.load_engine_bundle", return_value=bundle):
+            ), patch(
+                "trade_snapshot.app_service.load_engine_bundle", return_value=bundle
+            ), patch(
+                "trade_snapshot.app_service.build_bundle_data_readiness",
+                return_value={
+                    "capabilities": {
+                        "trade_search": {
+                            "status": "ready_with_limitations",
+                            "missing": [],
+                        }
+                    }
+                },
+            ):
                 two_team_estimate = service.estimate_search(two_team)
                 three_team_estimate = service.estimate_search(three_team)
                 with self.assertRaisesRegex(ValueError, "selected other team"):

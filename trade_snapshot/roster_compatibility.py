@@ -220,8 +220,8 @@ def _scope_record():
             "relative_surplus_at_or_above_league_percentile": _SURPLUS_PERCENTILE_MIN,
         },
         "partner_ranking_order": [
-            "verified mutual-positive 1-for-1 fit under exact power methodology",
-            "modeled mutual-positive 1-for-1 fit under non-exact power methodology",
+            "mutual-positive 1-for-1 fit in a blind-holdout-validated package shape",
+            "modeled mutual-positive 1-for-1 fit outside blind-holdout validation",
             "reciprocal relative positional fit",
             "one-way relative positional fit",
             "limited evidence",
@@ -473,7 +473,10 @@ def _directed_partner_record(pair, team_id, partner_id, team_names, player_names
         example = None
     tier = (
         "verified_mutual_positive_fit"
-        if pair.mutually_positive_count and pair.power_methodology_status == "exact"
+        if (
+            pair.mutually_positive_count
+            and pair.power_methodology_status == "holdout_validated"
+        )
         else "modeled_mutual_positive_fit"
         if pair.mutually_positive_count
         else "reciprocal_positional_fit"

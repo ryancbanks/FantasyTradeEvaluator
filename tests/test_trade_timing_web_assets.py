@@ -42,6 +42,8 @@ class TradeTimingWebAssetTests(unittest.TestCase):
         self.assertIn("replacement?.focus", script)
         self.assertIn("80% Wilson interval", script)
         self.assertIn("comparison sample gate is not met", script)
+        self.assertIn("activity_schema_unsupported", script)
+        self.assertIn("forward-looking data only", script)
         self.assertIn("primary_display_power_delta", script)
         self.assertNotIn("Actionable now", script)
         self.assertIn('role: "img"', script)
@@ -54,9 +56,13 @@ class TradeTimingWebAssetTests(unittest.TestCase):
         self.assertIn("TradeTimingUi.setBundle", script)
         self.assertIn("apiRequest: api", script)
         self.assertIn("TradeTimingUi.setPrimaryTeam", script)
+        self.assertIn("historyCollectionNote(job.history_attempt)", script)
+        self.assertIn("every core trade feature remains available", script)
 
         gm_script = asset("gm_insights_ui.js")
         self.assertIn("TradeTimingUi?.setPartnerTeam", gm_script)
+        self.assertIn("activity_schema_unsupported", gm_script)
+        self.assertIn("scan again after the collector is updated", gm_script)
 
     def test_styles_include_responsive_and_reduced_motion_layouts(self):
         stylesheet = asset("trade_timing.css")

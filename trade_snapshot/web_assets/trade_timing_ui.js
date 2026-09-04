@@ -7,6 +7,14 @@ window.TradeTimingUi = (() => {
   });
   const numberFormatter = new Intl.NumberFormat(undefined, {maximumFractionDigits: 2});
   const SVG_NS = "http://www.w3.org/2000/svg";
+  const HISTORY_ATTEMPT_NOTES = Object.freeze({
+    activity_schema_unsupported: "ESPN's activity format was not recognized during this scan; timing uses current forward-looking data only.",
+    activity_unavailable: "ESPN activity could not be read during this scan; timing uses current forward-looking data only.",
+    canonicalization_failed: "Captured activity could not be matched safely to this league snapshot; behavioral timing is withheld.",
+    history_processing_unavailable: "League activity could not be processed locally during this scan; forward-looking timing still runs.",
+    store_unavailable: "Captured activity could not be saved to the local history database; forward-looking timing still runs.",
+    not_provided: "This bundle was imported without an activity-capture attempt; forward-looking timing still runs."
+  });
   let requestRevision = 0;
   let activeController = null;
   let activeBundle = null;
@@ -751,6 +759,18 @@ window.TradeTimingUi = (() => {
     );
     for (const limitation of array(timing.methodology?.limitations).map(plainText).filter(Boolean)) {
       list.append(node("li", "", limitation));
+    }
+    const readiness = timing.data_readiness || {};
+    const activityStatus = plainText(
+      readiness.capabilities?.completed_deal_activity?.status
+    );
+    const attemptNote = HISTORY_ATTEMPT_NOTES[readiness.collection_attempt?.reason_code];
+    if (attemptNote) {
+      list.append(node("li", "", attemptNote));
+    } else if (readiness.store_status === "unavailable") {
+      list.append(node("li", "", "The local history store is unavailable. Forward-looking simulation still runs, but completed-deal behavior is withheld."));
+    } else if (activityStatus && activityStatus !== "ready") {
+      list.append(node("li", "", `Completed-deal data is ${humanize(activityStatus)}. Forward-looking simulation remains separate from that missing history.`));
     }
     container.append(list);
     const summary = plainText(timing.methodology?.summary || timing.methodology?.interpretation);

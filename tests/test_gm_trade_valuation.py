@@ -1,9 +1,24 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
-from tests.test_engine_bundle import engine_bundle, exact_model_and_attestation
-from trade_snapshot.gm_trade_valuation import value_historical_trades
+from tests.source_fixtures import (
+    fantasypros_league_benchmark,
+    projection_source_manifest,
+)
+from tests.test_engine_bundle import (
+    engine_bundle,
+    nfl_schedule_for,
+    rebuild_bundle_inputs,
+)
+from trade_snapshot.feature_engineering import build_strength_features
+from trade_snapshot._gm_model_evidence import (
+    build_gm_model_evidence,
+    model_comparability_reasons,
+)
+from trade_snapshot.gm_trade_valuation import _playoff_deltas, value_historical_trades
 from trade_snapshot.league_history import (
     HistoryBundleBinding,
     HistoryRosterPlayer,
@@ -19,7 +34,8 @@ from trade_snapshot.league_history import (
     make_league_key,
 )
 from trade_snapshot.league_state import FantasyMatchup, LeagueTeam, TeamStanding
-from trade_snapshot.strength import StrengthModel
+from trade_snapshot.projections import RemainingSeasonProjection
+from trade_snapshot.scenario_config import CorrelatedScenarioConfig
 from trade_snapshot.trade_space import TeamRoster
 
 
@@ -37,59 +53,22 @@ def current_bundle(source=None, suffix="current"):
 
 
 def drifted_current_bundle(source):
-    model = source.strength_model
-    core_players = tuple(
-        replace(player, residual_score=4.0)
-        if player.player_id == "q1"
-        else player
-        for player in model.players.values()
-        if player.player_id not in {"w1", "w2"}
+    evidence = tuple(
+        replace(row, projected_fantasy_points=4.0)
+        if isinstance(row, RemainingSeasonProjection)
+        and row.canonical_player_id == "q1"
+        else row
+        for row in source.projection_evidence
     )
-    seed = StrengthModel(
-        model.role_definitions,
-        core_players,
-        model.normalization_denominator,
-        snapshot_id=model.snapshot_id,
-        season=model.season,
-        scoring_profile_id=model.scoring_profile_id,
-        calibration=model.calibration,
-    )
-    current_model, attestation = exact_model_and_attestation(seed)
+    rebuilt = rebuild_bundle_inputs(source, projection_evidence=evidence)
     names = dict(source.player_names)
     names["q1"] = "Q1 current-value test"
-    return replace(
-        source,
-        strength_model=current_model,
-        methodology_attestation=attestation,
-        player_names=names,
-    )
+    return replace(rebuilt, player_names=names)
 
 
 def four_team_bundle():
     source = engine_bundle()
     cloned_from = {"r1": "p1", "r2": "p2", "s1": "q1", "s2": "q2"}
-    core_players = [
-        player
-        for player in source.strength_model.players.values()
-        if player.player_id not in {"w1", "w2"}
-    ]
-    core_players.extend(
-        replace(
-            source.strength_model.players[template_id],
-            player_id=player_id,
-        )
-        for player_id, template_id in cloned_from.items()
-    )
-    seed = StrengthModel(
-        source.strength_model.role_definitions,
-        core_players,
-        source.strength_model.normalization_denominator,
-        snapshot_id=source.strength_model.snapshot_id,
-        season=source.strength_model.season,
-        scoring_profile_id=source.strength_model.scoring_profile_id,
-        calibration=source.strength_model.calibration,
-    )
-    strength_model, attestation = exact_model_and_attestation(seed)
     projection_by_player = {
         row.canonical_player_id: row for row in source.projections
     }
@@ -99,9 +78,6 @@ def four_team_bundle():
         row.canonical_player_id: row for row in source.eligibilities
     }
     evidence = list(source.projection_evidence)
-    evidence_by_player = {
-        row.canonical_player_id: row for row in source.projection_evidence
-    }
     for player_id, template_id in cloned_from.items():
         template = projection_by_player[template_id]
         projections.append(
@@ -111,11 +87,12 @@ def four_team_bundle():
                 provider_observations=tuple(
                     replace(
                         observation,
-                        provider_player_id=f"source-{player_id}",
+                        provider_player_id=f"fantasypros-{player_id}",
                     )
                     for observation in template.provider_observations
                 ),
                 nfl_team_id=f"NFL-{player_id}",
+                nfl_game_id=f"G1-{player_id}",
                 opponent_team_id=f"OPP-{player_id}",
             )
         )
@@ -125,15 +102,20 @@ def four_team_bundle():
                 canonical_player_id=player_id,
             )
         )
-        evidence.append(
-            replace(
-                evidence_by_player[template_id],
-                canonical_player_id=player_id,
-                provider_player_id=f"fp-{player_id}",
-                nfl_team_id=f"NFL-{player_id}",
-                opponent_team_id=f"OPP-{player_id}",
-            )
-        )
+        for source_row in source.projection_evidence:
+            if source_row.canonical_player_id != template_id:
+                continue
+            changes = {
+                "canonical_player_id": player_id,
+                "provider_player_id": f"fantasypros-{player_id}",
+            }
+            if not isinstance(source_row, RemainingSeasonProjection):
+                changes.update(
+                    nfl_team_id=f"NFL-{player_id}",
+                    nfl_game_id=f"G1-{player_id}",
+                    opponent_team_id=f"OPP-{player_id}",
+                )
+            evidence.append(replace(source_row, **changes))
     state = replace(
         source.state,
         teams=(
@@ -151,16 +133,43 @@ def four_team_bundle():
             FantasyMatchup(1, "third", "fourth"),
         ),
     )
+    rosters = (
+        *source.rosters,
+        TeamRoster("third", ("r1", "r2"), 2, 2),
+        TeamRoster("fourth", ("s1", "s2"), 2, 2),
+    )
+    features = build_strength_features(
+        source.ecr_snapshots,
+        tuple(projections),
+        tuple(eligibilities),
+        provider_names=tuple(
+            row.provider for row in source.ensemble_config.provider_weights
+        ),
+        projection_evidence=tuple(evidence),
+        remaining_week_scopes={
+            row.canonical_player_id: tuple(range(1, 19))
+            for row in projections
+        },
+    )
+    formula = source.strength_formula
+    strength_model = formula.build_model(features, rosters)
+    attestation = replace(
+        source.methodology_attestation,
+        strength_model_id=strength_model.model_id,
+    )
     return replace(
         source,
         state=state,
-        rosters=(
-            *source.rosters,
-            TeamRoster("third", ("r1", "r2"), 2, 2),
-            TeamRoster("fourth", ("s1", "s2"), 2, 2),
-        ),
+        rosters=rosters,
         projections=tuple(projections),
         eligibilities=tuple(eligibilities),
+        nfl_schedule=nfl_schedule_for(tuple(projections)),
+        projection_source_manifest=projection_source_manifest(tuple(evidence)),
+        fantasypros_benchmark=fantasypros_league_benchmark(
+            captured_at=source.source_manifest.host_captured_at,
+            team_ids=("primary", "other", "third", "fourth"),
+        ),
+        strength_formula=formula,
         strength_model=strength_model,
         projection_evidence=tuple(evidence),
         player_names={
@@ -280,8 +289,27 @@ class HistoricalTradeValuationTests(unittest.TestCase):
         self.assertEqual(valuation.source_bundle_id, source.bundle_id)
         self.assertEqual(valuation.source_bundle_captured_at, SOURCE_AT)
         self.assertEqual(valuation.valuation_lag_hours, 6)
-        self.assertEqual(valuation.methodology_status, "exact")
+        self.assertEqual(valuation.methodology_status, "holdout_validated")
+        self.assertEqual(valuation.analysis_as_of, REQUEST_AT)
+        self.assertEqual(
+            valuation.source_model_evidence.projection_source_manifest_id,
+            source.projection_source_manifest.manifest_id,
+        )
         self.assertEqual(valuation.playoff_scenario_count, 5)
+        self.assertEqual(valuation.playoff_evidence.scenario_count, 5)
+        self.assertEqual(
+            valuation.playoff_evidence.player_score_floor,
+            source.scenario_config.player_score_floor,
+        )
+        self.assertTrue(valuation.playoff_evidence.impact_id.startswith("impact_"))
+        self.assertTrue(
+            valuation.playoff_evidence.projection_set_id.startswith("sproj_")
+        )
+        self.assertTrue(
+            result.evidence_id.startswith("historical-valuation-evidence_")
+        )
+        self.assertEqual(result.analysis_as_of, REQUEST_AT)
+        self.assertEqual(result.history_revision, snapshot.history_revision)
         self.assertIsNone(valuation.playoff_unavailable_reason)
         self.assertEqual([row.team_id for row in valuation.outcomes], ["other", "primary"])
         self.assertAlmostEqual(
@@ -463,7 +491,7 @@ class HistoricalTradeValuationTests(unittest.TestCase):
         self.assertEqual(result.unvalued_reasons, {})
         self.assertEqual(len(result.valuations), 1)
         valuation = result.valuations[0]
-        self.assertEqual(valuation.methodology_status, "exact")
+        self.assertEqual(valuation.methodology_status, "holdout_validated")
         self.assertIsNone(valuation.playoff_scenario_count)
         self.assertEqual(
             valuation.playoff_unavailable_reason,
@@ -619,6 +647,178 @@ class HistoricalTradeValuationTests(unittest.TestCase):
         self.assertEqual(
             valuation.current_revaluation.foresight_ineligibility_reasons, ()
         )
+        self.assertEqual(
+            valuation.current_revaluation.model_comparability_reasons, ()
+        )
+
+    def test_foresight_comparison_checks_every_model_and_source_dimension(self):
+        evidence = build_gm_model_evidence(
+            engine_bundle(), outgoing_count=1, incoming_count=1
+        )
+        cases = (
+            (
+                replace(evidence, scoring_profile_id="scoring_changed"),
+                "scoring_profile_changed",
+            ),
+            (
+                replace(evidence, formula_id="formula_changed"),
+                "strength_formula_changed",
+            ),
+            (
+                replace(
+                    evidence,
+                    methodology_fingerprint_id="fingerprint_changed",
+                ),
+                "methodology_fingerprint_changed",
+            ),
+            (
+                replace(
+                    evidence,
+                    methodology_mode="surrogate",
+                    methodology_status="surrogate",
+                ),
+                "methodology_mode_changed",
+            ),
+            (
+                replace(evidence, methodology_status="extrapolated"),
+                "power_shape_not_blind_holdout_validated_at_both_times",
+            ),
+            (
+                replace(
+                    evidence,
+                    power_feature_names=("different_feature",),
+                    source_contract_id="feature_contract_changed",
+                ),
+                "power_feature_set_changed",
+            ),
+            (
+                replace(
+                    evidence,
+                    source_providers=("different_provider",),
+                    source_contract_id="provider_contract_changed",
+                ),
+                "power_input_provider_set_changed",
+            ),
+            (
+                replace(
+                    evidence,
+                    scoring_bases=("different_scoring_basis",),
+                    source_contract_id="scoring_contract_changed",
+                ),
+                "power_input_scoring_basis_changed",
+            ),
+            (
+                replace(
+                    evidence,
+                    horizons=("different_horizon",),
+                    source_contract_id="horizon_contract_changed",
+                ),
+                "power_input_horizon_changed",
+            ),
+            (
+                replace(evidence, source_contract_id="source_semantics_changed"),
+                "power_input_source_semantics_changed",
+            ),
+        )
+
+        for current, expected in cases:
+            with self.subTest(reason=expected):
+                reasons = model_comparability_reasons(evidence, current)
+                self.assertIn(expected, reasons)
+
+    def test_changed_projection_scoring_basis_keeps_raw_drift_but_blocks_foresight(self):
+        source = engine_bundle()
+        requested = current_bundle(source)
+        requested = replace(
+            requested,
+            projection_source_manifest=projection_source_manifest(
+                requested.projection_evidence,
+                source_scoring_format="HALF",
+            ),
+        )
+        requested_binding = HistoryBundleBinding(
+            LEAGUE_KEY, 2026, requested.bundle_id, REQUEST_AT
+        )
+        source_binding = HistoryBundleBinding(
+            LEAGUE_KEY, 2026, source.bundle_id, SOURCE_AT
+        )
+        snapshot = LeagueHistorySnapshot(
+            requested_binding,
+            (source_binding, requested_binding),
+            (
+                capture(
+                    (),
+                    SOURCE_AT - timedelta(minutes=1),
+                    injury_status="ACTIVE",
+                ),
+                capture((trade(),), injury_status="ACTIVE"),
+            ),
+        )
+
+        valuation = value_historical_trades(
+            snapshot,
+            as_of=REQUEST_AT,
+            bundle_loader={source.bundle_id: source}.__getitem__,
+            current_bundle=requested,
+        ).valuations[0]
+
+        self.assertIsNotNone(valuation.current_revaluation)
+        self.assertFalse(valuation.current_revaluation.foresight_eligible)
+        self.assertIn(
+            "power_input_scoring_basis_changed",
+            valuation.current_revaluation.model_comparability_reasons,
+        )
+
+    def test_historical_playoff_cap_preserves_player_score_floor(self):
+        source = engine_bundle()
+        config = CorrelatedScenarioConfig(
+            2_001,
+            source.scenario_config.seed,
+            source.scenario_config.loadings,
+            -2.5,
+        )
+        source = replace(source, scenario_config=config)
+        owners = {row.team_id: list(row.player_ids) for row in source.rosters}
+        exempt = {
+            row.team_id: set(row.capacity_exempt_player_ids)
+            for row in source.rosters
+        }
+        change = SimpleNamespace(playoff_probability_delta=0.0)
+        paired = SimpleNamespace(
+            before=SimpleNamespace(scenario_count=2_000),
+            for_team=lambda _team_id: change,
+            impact_id="impact_test",
+            before_scenario_run_id="srun_before",
+            after_scenario_run_id="srun_after",
+            draw_space_id="sdraw_test",
+        )
+        captured_configs = []
+
+        def prepare(*args):
+            captured_configs.append(args[-1])
+            return SimpleNamespace(
+                scenarios=SimpleNamespace(
+                    config=args[-1], projection_set_id="sproj_test"
+                ),
+                project=lambda _rosters: paired,
+            )
+
+        with patch(
+            "trade_snapshot.gm_trade_valuation.prepare_season_baseline",
+            side_effect=prepare,
+        ):
+            _, evidence, reason = _playoff_deltas(
+                source,
+                owners,
+                exempt,
+                trade(),
+                ("other", "primary"),
+            )
+
+        self.assertEqual(evidence.scenario_count, 2_000)
+        self.assertIsNone(reason)
+        self.assertEqual(captured_configs[0].player_score_floor, -2.5)
+        self.assertEqual(evidence.player_score_floor, -2.5)
 
     def test_injury_observation_excludes_foresight_but_keeps_raw_revaluation(self):
         source = engine_bundle()

@@ -128,10 +128,19 @@ class PreparedThreeWayTrade:
 class ThreeWaySearchOutcome:
     progress: ThreeWaySearchProgress
     database_path: Path
+    run_definition: ThreeWaySearchRunDefinition
 
     def __post_init__(self) -> None:
         if not isinstance(self.progress, ThreeWaySearchProgress):
             raise ValueError("progress must be ThreeWaySearchProgress")
+        if not isinstance(self.run_definition, ThreeWaySearchRunDefinition):
+            raise ValueError("run_definition must be ThreeWaySearchRunDefinition")
+        if (
+            self.progress.run_id != self.run_definition.run_id
+            or self.progress.total_candidate_count
+            != self.run_definition.total_candidate_count
+        ):
+            raise ValueError("search outcome does not match its run definition")
         object.__setattr__(self, "database_path", Path(self.database_path).resolve())
 
     def results(
@@ -249,7 +258,7 @@ class ResumableThreeWayTradeSearch:
             )
             if on_progress is not None:
                 on_progress(progress)
-        return ThreeWaySearchOutcome(progress, path)
+        return ThreeWaySearchOutcome(progress, path, self.run_definition)
 
     def _power_qualifies(self, result: ThreeWayPowerEvaluation) -> bool:
         threshold = self.settings.minimum_displayed_power_delta

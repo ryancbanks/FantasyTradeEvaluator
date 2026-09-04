@@ -51,6 +51,7 @@ def export_three_way_trade_workbook(
         raise ValueError("trade_rows must contain ThreeWayWorkbookRow values")
     if any(not isinstance(row, WorkbookTeamOutlook) for row in outlook):
         raise ValueError("team_outlook must contain WorkbookTeamOutlook values")
+    _validate_export_binding(context, provenance, trades)
     target = Path(output_path)
     if target.suffix.casefold() != ".xlsx":
         raise ValueError("output_path must end in .xlsx")
@@ -338,8 +339,12 @@ def _details_sheet(
     )
     details = (
         ("Trade Format", "three_team"),
+        ("Engine Bundle ID", context.bundle_id),
+        ("Waiver Pool ID", context.waiver_pool_id),
         ("Request ID", provenance.request_id),
+        ("Search Request (Canonical JSON)", provenance.request_json),
         ("Search Run ID", provenance.search_run_id),
+        ("Search Run Definition (Canonical JSON)", provenance.search_run_json),
         *(
             (
                 f"Participant Team {index}",
@@ -381,7 +386,7 @@ def _details_sheet(
             ),
         ),
         ("Three-Way Power Method", three_way_notice),
-        ("Calibration Status", context.calibration_status),
+        ("Calibration Evidence Status", context.calibration_status),
         ("Methodology Evidence Type", context.methodology_evidence_kind),
         ("Methodology Evidence Record ID", context.methodology_record_id),
         ("Strength Formula ID", context.formula_id),
@@ -447,6 +452,48 @@ def _details_sheet(
     sheet.set_column(0, 0, 40)
     sheet.set_column(1, 1, 90)
     sheet.set_column(2, 2, 21)
+
+
+def _validate_export_binding(context, provenance, trades):
+    if context.data_readiness.trade_search_status == "not_ready":
+        raise ValueError("cannot export a search whose data readiness is not_ready")
+    if (
+        context.bundle_id != provenance.bundle_id
+        or context.waiver_pool_id != provenance.waiver_pool_id
+    ):
+        raise ValueError("workbook context does not match bundle provenance")
+    request = provenance.request_record
+    run = provenance.search_run_definition
+    run_inputs = run.trade_constraint_record
+    if (
+        context.primary_team_id != request["primary_team_id"]
+        or context.primary_team_name != provenance.participant_team_names[0]
+        or context.scenario_count != request["scenario_count"]
+        or context.minimum_power_delta
+        != request["settings"]["minimum_displayed_power_delta"]
+    ):
+        raise ValueError("workbook context does not match the search request")
+    if (
+        context.snapshot_id != run.snapshot_id
+        or context.strength_model_id != run.strength_model_id
+        or context.scenario_run_id != run_inputs.get("scenario_run_id")
+    ):
+        raise ValueError("workbook context does not match the search run")
+    candidate_indexes = set()
+    participant_ids = set(provenance.participant_team_ids)
+    for row in trades:
+        if (
+            row.candidate_index >= provenance.total_candidate_count
+            or row.candidate_index in candidate_indexes
+            or {impact.team_id for impact in row.team_impacts} != participant_ids
+            or any(
+                transfer.source_team_id not in participant_ids
+                or transfer.destination_team_id not in participant_ids
+                for transfer in row.transfers
+            )
+        ):
+            raise ValueError("three-team trade row does not match its search run")
+        candidate_indexes.add(row.candidate_index)
 
 
 def _cell(column: int, row: int) -> str:

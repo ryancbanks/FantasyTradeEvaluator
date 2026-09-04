@@ -5,14 +5,13 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
-import re
 import sqlite3
 
 from ._scenario_random import canonical_json
+from ._league_history_acquisition import HistoryAcquisitionEvidence
 from ._league_history_evidence import merge_transaction_versions
+from ._league_history_schema import prepare_schema, require_schema
 from .league_history import (
-    LEAGUE_HISTORY_APPLICATION_ID,
-    LEAGUE_HISTORY_SCHEMA_VERSION,
     HistoryBundleBinding,
     HistoryTeam,
     HistoryTeamRoster,
@@ -63,6 +62,15 @@ class LeagueHistoryStore:
                 capture.season,
             ):
                 raise ValueError("bundle binding does not match history capture")
+            if bundle.history_capture_id is not None and (
+                bundle.history_capture_id != capture.capture_id
+                or bundle.host_snapshot_id != capture.host_snapshot_id
+                or bundle.host_captured_at != capture.captured_at
+                or bundle.roster_ownership_id != capture.roster_ownership_id
+            ):
+                raise ValueError(
+                    "exact bundle binding does not match history capture evidence"
+                )
         try:
             with closing(self._connection()) as connection, connection:
                 self._require_schema(connection)
@@ -106,6 +114,8 @@ class LeagueHistoryStore:
             ) from None
 
     def snapshot_for_bundle(self, bundle_id: str) -> LeagueHistorySnapshot | None:
+        """Return a repeatable snapshot that cannot observe later captures."""
+
         bundle_id = _bundle_id(bundle_id)
         try:
             with closing(self._connection()) as connection:
@@ -121,14 +131,23 @@ class LeagueHistoryStore:
                     _binding_from_row(row)
                     for row in connection.execute(
                         _SELECT_LEAGUE_BINDINGS_SQL,
-                        (requested.league_key, requested.season),
+                        (
+                            requested.league_key,
+                            requested.season,
+                            _timestamp(requested.captured_at),
+                            requested.bundle_id,
+                        ),
                     )
                 )
                 captures = tuple(
                     self._capture_from_row(connection, row)
                     for row in connection.execute(
                         _SELECT_CAPTURES_SQL,
-                        (requested.league_key, requested.season),
+                        (
+                            requested.league_key,
+                            requested.season,
+                            _timestamp(requested.captured_at),
+                        ),
                     )
                 )
                 return LeagueHistorySnapshot(requested, bindings, captures)
@@ -161,69 +180,11 @@ class LeagueHistoryStore:
 
     @classmethod
     def _prepare_schema(cls, connection: sqlite3.Connection) -> None:
-        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
-        if version > LEAGUE_HISTORY_SCHEMA_VERSION:
-            raise LeagueHistoryStoreError(
-                "league history store uses a newer database schema"
-            )
-        if version == 0:
-            if application_id not in (0, LEAGUE_HISTORY_APPLICATION_ID):
-                raise LeagueHistoryStoreError(
-                    "unversioned database belongs to another application"
-                )
-            existing = connection.execute(
-                "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
-            ).fetchall()
-            if existing:
-                raise LeagueHistoryStoreError(
-                    "unversioned database is not an empty league history store"
-                )
-            with connection:
-                for statement in _CREATE_TABLES:
-                    connection.execute(statement)
-                for statement in _CREATE_INDEXES:
-                    connection.execute(statement)
-                connection.execute(
-                    f"PRAGMA application_id = {LEAGUE_HISTORY_APPLICATION_ID}"
-                )
-                connection.execute(
-                    f"PRAGMA user_version = {LEAGUE_HISTORY_SCHEMA_VERSION}"
-                )
-        elif version != LEAGUE_HISTORY_SCHEMA_VERSION:
-            raise LeagueHistoryStoreError(
-                "league history store schema cannot be migrated"
-            )
-        cls._require_schema(connection)
+        prepare_schema(connection, LeagueHistoryStoreError)
 
     @staticmethod
     def _require_schema(connection: sqlite3.Connection) -> None:
-        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
-        if (
-            version != LEAGUE_HISTORY_SCHEMA_VERSION
-            or application_id != LEAGUE_HISTORY_APPLICATION_ID
-        ):
-            raise LeagueHistoryStoreError(
-                "league history store schema identity is invalid"
-            )
-        rows = connection.execute(
-            "SELECT type, name, sql FROM sqlite_master "
-            "WHERE name NOT LIKE 'sqlite_%'"
-        ).fetchall()
-        actual = {
-            (row["type"], row["name"]): _normalized_sql(row["sql"])
-            for row in rows
-            if row["sql"] is not None
-        }
-        expected = {
-            **{("table", _schema_name(sql)): _normalized_sql(sql) for sql in _CREATE_TABLES},
-            **{("index", _schema_name(sql)): _normalized_sql(sql) for sql in _CREATE_INDEXES},
-        }
-        if actual != expected:
-            raise LeagueHistoryStoreError(
-                "league history store table schema is invalid"
-            )
+        require_schema(connection, LeagueHistoryStoreError)
 
     @staticmethod
     def _insert_capture(
@@ -244,6 +205,10 @@ class LeagueHistoryStore:
             )
         body = canonical_json(
             {
+                "acquisition_evidence": capture.acquisition_evidence.to_record(),
+                "host_snapshot_id": capture.host_snapshot_id,
+                "identity_schema_version": capture.identity_schema_version,
+                "roster_ownership_id": capture.roster_ownership_id,
                 "teams": [row.to_record() for row in capture.teams],
                 "transactions": [
                     row.to_record() for row in capture.transactions
@@ -261,6 +226,10 @@ class LeagueHistoryStore:
             int(capture.transaction_history_complete),
             int(capture.roster_complete),
             int(capture.lineup_complete),
+            capture.host_snapshot_id,
+            capture.identity_schema_version,
+            capture.roster_ownership_id,
+            canonical_json(capture.acquisition_evidence.to_record()),
             body,
         )
         connection.execute(_INSERT_CAPTURE_SQL, values)
@@ -386,9 +355,22 @@ class LeagueHistoryStore:
             body = _strict_json_loads(row["capture_json"])
             if not isinstance(body, dict):
                 raise ValueError("stored capture body must be an object")
-            if set(body) == {"teams", "rosters", "transactions"}:
+            if "transactions" in body:
                 continue
-            body = _record(body, {"teams", "rosters"}, "stored capture body")
+            body = dict(
+                _record(
+                    body,
+                    {
+                        "acquisition_evidence",
+                        "host_snapshot_id",
+                        "identity_schema_version",
+                        "roster_ownership_id",
+                        "rosters",
+                        "teams",
+                    },
+                    "stored capture body",
+                )
+            )
             # Validate the legacy row against its content ID before enriching
             # only the storage representation.
             LeagueHistoryStore._capture_from_row(connection, row)
@@ -398,13 +380,8 @@ class LeagueHistoryStore:
                     _SELECT_CAPTURE_TRANSACTIONS_SQL, (row["capture_id"],)
                 )
             )
-            encoded = canonical_json(
-                {
-                    "teams": body["teams"],
-                    "transactions": [item.to_record() for item in transactions],
-                    "rosters": body["rosters"],
-                }
-            )
+            body["transactions"] = [item.to_record() for item in transactions]
+            encoded = canonical_json(body)
             connection.execute(
                 "UPDATE history_capture SET capture_json=? WHERE capture_id=?",
                 (encoded, row["capture_id"]),
@@ -422,6 +399,14 @@ class LeagueHistoryStore:
                 binding.league_key,
                 binding.season,
                 _timestamp(binding.captured_at),
+                binding.host_snapshot_id,
+                (
+                    None
+                    if binding.host_captured_at is None
+                    else _timestamp(binding.host_captured_at)
+                ),
+                binding.history_capture_id,
+                binding.roster_ownership_id,
                 encoded,
             ),
         )
@@ -434,6 +419,14 @@ class LeagueHistoryStore:
             binding.league_key,
             binding.season,
             _timestamp(binding.captured_at),
+            binding.host_snapshot_id,
+            (
+                None
+                if binding.host_captured_at is None
+                else _timestamp(binding.host_captured_at)
+            ),
+            binding.history_capture_id,
+            binding.roster_ownership_id,
             encoded,
         )
         if saved is None or _binding_columns(saved) != expected:
@@ -454,12 +447,20 @@ class LeagueHistoryStore:
                 _SELECT_CAPTURE_TRANSACTIONS_SQL, (row["capture_id"],)
             )
         )
-        if set(body) == {"teams", "rosters"}:
+        common_fields = {
+            "acquisition_evidence",
+            "host_snapshot_id",
+            "identity_schema_version",
+            "roster_ownership_id",
+            "rosters",
+            "teams",
+        }
+        if set(body) == common_fields:
             transactions = global_transactions
         else:
             body = _record(
                 body,
-                {"teams", "rosters", "transactions"},
+                common_fields | {"transactions"},
                 "stored capture body",
             )
             transactions = tuple(
@@ -481,6 +482,17 @@ class LeagueHistoryStore:
                 merge_transaction_versions(
                     transaction, current_by_id[transaction.transaction_id]
                 )
+        acquisition = HistoryAcquisitionEvidence.from_record(
+            body["acquisition_evidence"]
+        )
+        if (
+            row["host_snapshot_id"] != body["host_snapshot_id"]
+            or row["identity_schema_version"] != body["identity_schema_version"]
+            or row["roster_ownership_id"] != body["roster_ownership_id"]
+            or row["acquisition_json"]
+            != canonical_json(acquisition.to_record())
+        ):
+            raise ValueError("stored capture provenance columns conflict with its record")
         capture = LeagueHistoryCapture(
             league_key=row["league_key"],
             season=row["season"],
@@ -507,9 +519,14 @@ class LeagueHistoryStore:
                 HistoryTeamRoster.from_record(item)
                 for item in _array("history rosters", body["rosters"])
             ),
+            host_snapshot_id=body["host_snapshot_id"],
+            acquisition_evidence=acquisition,
+            identity_schema_version=body["identity_schema_version"],
         )
         if capture.capture_id != row["capture_id"]:
             raise ValueError("stored capture does not match capture_id")
+        if capture.roster_ownership_id != row["roster_ownership_id"]:
+            raise ValueError("stored capture roster ownership is invalid")
         return capture
 
 
@@ -520,6 +537,14 @@ def _binding_from_row(row: sqlite3.Row) -> HistoryBundleBinding:
         binding.league_key,
         binding.season,
         _timestamp(binding.captured_at),
+        binding.host_snapshot_id,
+        (
+            None
+            if binding.host_captured_at is None
+            else _timestamp(binding.host_captured_at)
+        ),
+        binding.history_capture_id,
+        binding.roster_ownership_id,
         row["binding_json"],
     )
     if _binding_columns(row) != expected:
@@ -560,6 +585,10 @@ def _capture_columns(row: sqlite3.Row) -> tuple[object, ...]:
             "transactions_complete",
             "roster_complete",
             "lineup_complete",
+            "host_snapshot_id",
+            "identity_schema_version",
+            "roster_ownership_id",
+            "acquisition_json",
             "capture_json",
         )
     )
@@ -588,6 +617,10 @@ def _binding_columns(row: sqlite3.Row) -> tuple[object, ...]:
             "league_key",
             "season",
             "captured_at",
+            "host_snapshot_id",
+            "host_captured_at",
+            "history_capture_id",
+            "roster_ownership_id",
             "binding_json",
         )
     )
@@ -629,52 +662,8 @@ def _path(value: object) -> Path:
     return Path(path).resolve()
 
 
-def _schema_name(statement: str) -> str:
-    match = re.match(r"CREATE (?:TABLE|INDEX) ([a-z_]+)", statement)
-    if match is None:
-        raise AssertionError("schema statement does not have a canonical name")
-    return match.group(1)
-
-
-def _normalized_sql(value: object) -> str:
-    return "" if not isinstance(value, str) else "".join(value.split()).casefold()
-
-
-_CREATE_TABLES = (
-    "CREATE TABLE history_capture ("
-    "capture_id TEXT PRIMARY KEY,league_key TEXT NOT NULL,"
-    "season INTEGER NOT NULL CHECK(season>0),captured_at TEXT NOT NULL,"
-    "coverage_start TEXT NOT NULL,coverage_end TEXT NOT NULL,"
-    "transactions_complete INTEGER NOT NULL CHECK(transactions_complete IN (0,1)),"
-    "roster_complete INTEGER NOT NULL CHECK(roster_complete IN (0,1)),"
-    "lineup_complete INTEGER NOT NULL CHECK(lineup_complete IN (0,1)),"
-    "capture_json TEXT NOT NULL,UNIQUE(league_key,season,captured_at),"
-    "UNIQUE(capture_id,league_key,season))",
-    "CREATE TABLE transaction_event ("
-    "league_key TEXT NOT NULL,season INTEGER NOT NULL CHECK(season>0),"
-    "transaction_id TEXT NOT NULL,recorded_at TEXT NOT NULL,"
-    "timestamp_basis TEXT NOT NULL,kind TEXT NOT NULL,transaction_json TEXT NOT NULL,"
-    "PRIMARY KEY(league_key,season,transaction_id))",
-    "CREATE TABLE capture_transaction ("
-    "capture_id TEXT NOT NULL,league_key TEXT NOT NULL,season INTEGER NOT NULL,"
-    "transaction_id TEXT NOT NULL,PRIMARY KEY(capture_id,transaction_id),"
-    "FOREIGN KEY(capture_id,league_key,season) REFERENCES "
-    "history_capture(capture_id,league_key,season),"
-    "FOREIGN KEY(league_key,season,transaction_id) REFERENCES "
-    "transaction_event(league_key,season,transaction_id))",
-    "CREATE TABLE bundle_binding ("
-    "bundle_id TEXT PRIMARY KEY,league_key TEXT NOT NULL,"
-    "season INTEGER NOT NULL CHECK(season>0),captured_at TEXT NOT NULL,"
-    "binding_json TEXT NOT NULL)",
-)
-_CREATE_INDEXES = (
-    "CREATE INDEX history_capture_league_season_time ON "
-    "history_capture(league_key,season,captured_at)",
-    "CREATE INDEX bundle_binding_league_season_time ON "
-    "bundle_binding(league_key,season,captured_at)",
-)
 _INSERT_CAPTURE_SQL = (
-    "INSERT OR IGNORE INTO history_capture VALUES (?,?,?,?,?,?,?,?,?,?)"
+    "INSERT OR IGNORE INTO history_capture VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 _INSERT_TRANSACTION_SQL = (
     "INSERT OR IGNORE INTO transaction_event VALUES (?,?,?,?,?,?,?)"
@@ -682,14 +671,16 @@ _INSERT_TRANSACTION_SQL = (
 _INSERT_CAPTURE_TRANSACTION_SQL = (
     "INSERT OR IGNORE INTO capture_transaction VALUES (?,?,?,?)"
 )
-_INSERT_BINDING_SQL = "INSERT OR IGNORE INTO bundle_binding VALUES (?,?,?,?,?)"
+_INSERT_BINDING_SQL = "INSERT OR IGNORE INTO bundle_binding VALUES (?,?,?,?,?,?,?,?,?)"
 _SELECT_BINDING_SQL = "SELECT * FROM bundle_binding WHERE bundle_id=?"
 _SELECT_LEAGUE_BINDINGS_SQL = (
     "SELECT * FROM bundle_binding WHERE league_key=? AND season=? "
+    "AND (captured_at<? OR bundle_id=?) "
     "ORDER BY captured_at,bundle_id"
 )
 _SELECT_CAPTURES_SQL = (
     "SELECT * FROM history_capture WHERE league_key=? AND season=? "
+    "AND captured_at<=? "
     "ORDER BY captured_at,capture_id"
 )
 _SELECT_CAPTURE_TRANSACTIONS_SQL = (

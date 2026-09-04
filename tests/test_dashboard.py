@@ -270,6 +270,27 @@ class LeagueDashboardTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     build_league_dashboard(bundle, projection, baseline.scenarios)
 
+    def test_rejects_scenarios_with_a_different_player_score_floor(self):
+        bundle, _ = dashboard_inputs()
+        detached_config = replace(bundle.scenario_config, player_score_floor=0.0)
+        detached_baseline = prepare_season_baseline(
+            bundle.state,
+            bundle.rosters,
+            bundle.projections,
+            bundle.eligibilities,
+            detached_config,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "prepared scenarios do not match the engine bundle",
+        ):
+            build_league_dashboard(
+                bundle,
+                detached_baseline.season_projection,
+                detached_baseline.scenarios,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

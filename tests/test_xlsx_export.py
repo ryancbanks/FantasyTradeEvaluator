@@ -5,9 +5,12 @@ from tempfile import TemporaryDirectory
 import unittest
 from zipfile import ZipFile
 
+from trade_snapshot._scenario_random import content_id
 from trade_snapshot.data_readiness import DataReadinessSnapshot
+from trade_snapshot.search_store import SearchRunDefinition
 from trade_snapshot.workbook_model import (
     TradeWorkbookContext,
+    TwoTeamExportProvenance,
     WorkbookSource,
     WorkbookTeamOutlook,
     WorkbookTradeRow,
@@ -74,6 +77,8 @@ def readiness():
 
 def context():
     return TradeWorkbookContext(
+        bundle_id="engine_" + "a" * 64,
+        waiver_pool_id="waiver-pool_" + "b" * 64,
         snapshot_id="snapshot-1",
         scoring_profile_id="scoring-profile-1",
         nfl_schedule_id="nfl-schedule-1",
@@ -86,7 +91,7 @@ def context():
         minimum_power_delta=-5,
         scenario_count=10_000,
         power_engine_mode="holdout_validated",
-        calibration_status="exact",
+        calibration_status="holdout_validated",
         methodology_evidence_kind="blind_holdout_attestation",
         methodology_record_id="attestation-1",
         formula_id="formula-1",
@@ -108,6 +113,80 @@ def context():
     )
 
 
+def request_record():
+    constraints = {
+        "balanced_only": False,
+        "excluded_size_pairs": [],
+        "incoming_filter": {
+            "player_ids": ["p2"],
+            "player_mode": "include",
+            "position_mode": None,
+            "positions": [],
+        },
+        "locked_player_ids": [],
+        "max_imbalance": 1,
+        "max_incoming": 2,
+        "max_outgoing": 2,
+        "max_total_players": 4,
+        "min_incoming": 1,
+        "min_outgoing": 1,
+        "package_filter_semantics_version": 1,
+        "require_no_drops": True,
+    }
+    return {
+        "allow_surrogate_power": False,
+        "bundle_id": "engine_" + "a" * 64,
+        "counterparty_team_ids": ["other"],
+        "primary_team_id": "primary",
+        "scenario_count": 10_000,
+        "seed": 47,
+        "settings": {
+            "checkpoint_interval": 1000,
+            "minimum_displayed_power_delta": -5.0,
+        },
+        "trade_constraints": constraints,
+    }
+
+
+def search_run():
+    request = request_record()
+    return SearchRunDefinition(
+        snapshot_id="snapshot-1",
+        strength_model_id="model-1",
+        primary_team_id="primary",
+        counterparty_team_id="other",
+        trade_constraint_record={
+            "algorithm": "local-power-paired-playoffs-v2",
+            "candidate_order": {
+                "counterparty_capacity_exempt_player_ids": [],
+                "counterparty_player_ids": ["p2", "p3"],
+                "primary_capacity_exempt_player_ids": [],
+                "primary_player_ids": ["p1"],
+            },
+            "roster_adjustment_id": "radj-test",
+            "scenario_run_id": "scenario-1",
+            "season_projection_options": {
+                "score_decimal_places": 6,
+                "tiebreak_random_seed": 47,
+            },
+            "settings": request["settings"],
+            "trade_constraints": request["trade_constraints"],
+        },
+        total_candidate_count=2,
+    )
+
+
+def provenance():
+    request = request_record()
+    return TwoTeamExportProvenance.from_records(
+        bundle_id=request["bundle_id"],
+        waiver_pool_id="waiver-pool_" + "b" * 64,
+        request_id=content_id("app-search", request),
+        request_record=request,
+        search_runs=(search_run(),),
+    )
+
+
 def trade(*, mutual=True, candidate_index=0):
     return WorkbookTradeRow(
         counterparty_team_id="other",
@@ -126,6 +205,7 @@ def trade(*, mutual=True, candidate_index=0):
         power_methodology_status=(
             "holdout_validated" if mutual else "extrapolated"
         ),
+        search_run_id=search_run().run_id,
     )
 
 
@@ -165,7 +245,11 @@ class ExcelExportTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             target = Path(directory) / "trade-results.xlsx"
             result = export_trade_workbook(
-                target, context(), (trade(), trade(mutual=False, candidate_index=1)), outlook()
+                target,
+                context(),
+                provenance(),
+                (trade(), trade(mutual=False, candidate_index=1)),
+                outlook(),
             )
             self.assertEqual(result, target.resolve())
             self.assertTrue(target.is_file())
@@ -188,6 +272,10 @@ class ExcelExportTests(unittest.TestCase):
         self.assertIn("Power Method Evidence", shared)
         self.assertIn("Blind-Validated FantasyPros-Power Scope", shared)
         self.assertIn("Host-Settlement-Policy Limitation", shared)
+        self.assertIn("Bounded-Waiver-Pool Limitation", shared)
+        self.assertIn("bounded waiver pool", shared)
+        self.assertIn("Host-Trade-Legality Limitation", shared)
+        self.assertIn("host trade deadline", shared.lower())
         self.assertIn("Expected PF", shared)
         self.assertIn("Rank Probabilities", shared)
         self.assertIn("1: 20.0%; 2: 80.0%", shared)
@@ -208,6 +296,14 @@ class ExcelExportTests(unittest.TestCase):
         self.assertIn("Source Capture Window (Seconds)", shared)
         self.assertIn("FantasyPros Comparison Team Coverage", shared)
         self.assertIn("Scenario Player-Score Floor", shared)
+        self.assertIn("Engine Bundle ID", shared)
+        self.assertIn("Waiver Pool ID", shared)
+        self.assertIn("Search Request ID", shared)
+        self.assertIn("Trade Constraints (Canonical JSON)", shared)
+        self.assertIn("Pair Search Definitions", shared)
+        self.assertIn("require_no_drops", shared)
+        self.assertIn("incoming_filter", shared)
+        self.assertIn(search_run().run_id, shared)
         self.assertIn("UNBOUNDED", shared)
         self.assertIn("never blended into local playoff odds", shared)
         self.assertIn("Marginal-Uncertainty Limitation", shared)
@@ -221,16 +317,19 @@ class ExcelExportTests(unittest.TestCase):
         self.assertIn("scoring-profile-1", shared)
         self.assertIn("nfl-schedule-1", shared)
         self.assertIn("ensemble-config-1", shared)
-        self.assertIn("exact", shared)
+        self.assertIn("Calibration Evidence Status", shared)
+        self.assertIn("holdout_validated", shared)
         self.assertIn("extrapolated", shared)
         self.assertFalse(any(name.startswith("xl/externalLinks") for name in names))
 
     def test_overwrites_instead_of_appending_duplicate_rows(self):
         with TemporaryDirectory() as directory:
             target = Path(directory) / "trade-results.xlsx"
-            export_trade_workbook(target, context(), (trade(),), outlook())
+            export_trade_workbook(
+                target, context(), provenance(), (trade(),), outlook()
+            )
             first_size = target.stat().st_size
-            export_trade_workbook(target, context(), (), outlook())
+            export_trade_workbook(target, context(), provenance(), (), outlook())
             second_size = target.stat().st_size
 
         self.assertNotEqual(first_size, second_size)
@@ -244,7 +343,11 @@ class ExcelExportTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             target = Path(directory) / "surrogate-results.xlsx"
             export_trade_workbook(
-                target, surrogate_context(), (row, extrapolated), outlook()
+                target,
+                surrogate_context(),
+                provenance(),
+                (row, extrapolated),
+                outlook(),
             )
             with ZipFile(target) as archive:
                 shared = archive.read("xl/sharedStrings.xml").decode("utf-8")
@@ -258,9 +361,73 @@ class ExcelExportTests(unittest.TestCase):
     def test_requires_xlsx_suffix_and_valid_probability(self):
         with TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "end in .xlsx"):
-                export_trade_workbook(Path(directory) / "results.csv", context(), (), outlook())
+                export_trade_workbook(
+                    Path(directory) / "results.csv",
+                    context(),
+                    provenance(),
+                    (),
+                    outlook(),
+                )
         with self.assertRaisesRegex(ValueError, "between 0 and 1"):
             WorkbookTeamOutlook("t", "Team", 0, 0, 0, 1, 1, 0, 1, 1.1)
+
+    def test_rejects_unbound_rows_context_and_not_ready_exports(self):
+        with TemporaryDirectory() as directory:
+            target = Path(directory) / "results.xlsx"
+            with self.assertRaisesRegex(ValueError, "trade row"):
+                export_trade_workbook(
+                    target,
+                    context(),
+                    provenance(),
+                    (replace(trade(), search_run_id="different-run"),),
+                    outlook(),
+                )
+            for changed_context in (
+                replace(context(), bundle_id="engine_" + "c" * 64),
+                replace(
+                    context(),
+                    waiver_pool_id="waiver-pool_" + "d" * 64,
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "bundle provenance"):
+                    export_trade_workbook(
+                        target,
+                        changed_context,
+                        provenance(),
+                        (),
+                        outlook(),
+                    )
+            with self.assertRaisesRegex(ValueError, "pair search run"):
+                export_trade_workbook(
+                    target,
+                    replace(context(), scenario_run_id="different-scenarios"),
+                    provenance(),
+                    (),
+                    outlook(),
+                )
+            blocked = replace(
+                context(),
+                data_readiness=replace(
+                    readiness(), trade_search_status="not_ready"
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "not_ready"):
+                export_trade_workbook(
+                    target, blocked, provenance(), (), outlook()
+                )
+
+    def test_request_identity_commits_filters_and_no_drop_policy(self):
+        request = request_record()
+        original_id = content_id("app-search", request)
+        request["trade_constraints"]["require_no_drops"] = False
+        with self.assertRaisesRegex(ValueError, "request identity"):
+            TwoTeamExportProvenance.from_records(
+                bundle_id=request["bundle_id"],
+                waiver_pool_id="waiver-pool_" + "b" * 64,
+                request_id=original_id,
+                request_record=request,
+                search_runs=(search_run(),),
+            )
 
     def test_seed_distribution_reconciles_to_playoff_probability(self):
         with self.assertRaisesRegex(ValueError, "wrong probability total"):

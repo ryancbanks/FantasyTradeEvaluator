@@ -45,7 +45,7 @@ window.GmInsightsFormat = (() => {
     transaction_history_is_incomplete: "The captured transaction ledger is incomplete, so historical value is withheld",
     intervening_league_move_order_is_ambiguous: "Another team moved players during an overlapping execution window",
     playoff_simulation_inputs_are_incomplete: "The historical league-wide playoff inputs were incomplete",
-    power_methodology_is_not_exact_at_both_times: "The same exact power method was not available at both dates",
+    power_methodology_is_not_exact_at_both_times: "A comparable holdout-validated power method was not available at both dates",
     strength_role_definition_changed: "The lineup-role method changed between the two dates",
     source_health_capture_missing: "No health snapshot was captured close enough to the trade",
     current_health_capture_missing: "No health snapshot was captured close enough to the current model",

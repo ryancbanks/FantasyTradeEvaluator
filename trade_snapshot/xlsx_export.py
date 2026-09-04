@@ -6,8 +6,13 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
+from ._data_readiness_policy import (
+    _BOUNDED_WAIVER_POOL_LIMITATION,
+    _HOST_TRADE_LEGALITY_LIMITATION,
+)
 from .workbook_model import (
     TradeWorkbookContext,
+    TwoTeamExportProvenance,
     WorkbookTeamOutlook,
     WorkbookTradeRow,
 )
@@ -39,12 +44,14 @@ TRADE_HEADERS = (
     "Other Team ID",
     "Candidate Index",
     "Power Method Evidence",
+    "Search Run ID",
 )
 
 
 def export_trade_workbook(
     output_path: str | os.PathLike[str],
     context: TradeWorkbookContext,
+    provenance: TwoTeamExportProvenance,
     trade_rows: Iterable[WorkbookTradeRow],
     team_outlook: Iterable[WorkbookTeamOutlook],
 ) -> Path:
@@ -52,12 +59,15 @@ def export_trade_workbook(
 
     if not isinstance(context, TradeWorkbookContext):
         raise ValueError("context must be a TradeWorkbookContext")
+    if not isinstance(provenance, TwoTeamExportProvenance):
+        raise ValueError("provenance must be a TwoTeamExportProvenance")
     trades = tuple(trade_rows)
     outlook = tuple(team_outlook)
     if any(not isinstance(row, WorkbookTradeRow) for row in trades):
         raise ValueError("trade_rows must contain WorkbookTradeRow values")
     if any(not isinstance(row, WorkbookTeamOutlook) for row in outlook):
         raise ValueError("team_outlook must contain WorkbookTeamOutlook values")
+    _validate_export_binding(context, provenance, trades)
     if len(trades) > MAX_EXCEL_DATA_ROWS:
         raise ValueError(
             f"Excel export supports at most {MAX_EXCEL_DATA_ROWS:,} qualified trades"
@@ -68,14 +78,14 @@ def export_trade_workbook(
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.stem}.{uuid4().hex}.tmp.xlsx")
     try:
-        _write_workbook(temporary, context, trades, outlook)
+        _write_workbook(temporary, context, provenance, trades, outlook)
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
     return target.resolve()
 
 
-def _write_workbook(path, context, trades, outlook):
+def _write_workbook(path, context, provenance, trades, outlook):
     try:
         import xlsxwriter
     except ImportError:
@@ -122,7 +132,14 @@ def _write_workbook(path, context, trades, outlook):
             formats,
             table_name="TeamOutlookTable",
         )
-        _details_sheet(workbook, context, len(trades), len(mutual), formats)
+        _details_sheet(
+            workbook,
+            context,
+            provenance,
+            len(trades),
+            len(mutual),
+            formats,
+        )
     finally:
         workbook.close()
 
@@ -240,6 +257,7 @@ def _write_trade_row(sheet, row_number, row, formats):
     sheet.write(row_number, 20, row.counterparty_team_id)
     sheet.write_number(row_number, 21, row.candidate_index, formats["integer"])
     sheet.write(row_number, 22, row.power_methodology_status, formats["text"])
+    sheet.write(row_number, 23, row.search_run_id, formats["text"])
 
 
 def _trade_conditional_formats(sheet, first, last, formats):
@@ -252,10 +270,11 @@ def _trade_conditional_formats(sheet, first, last, formats):
 
 
 def _trade_widths(sheet):
-    widths = (20, 30, 30, 24, 24, 24, 24, 9, 10, 11, 13, 13, 17, 17, 15, 18, 18, 16, 13, 19, 16, 13, 22)
+    widths = (20, 30, 30, 24, 24, 24, 24, 9, 10, 11, 13, 13, 17, 17, 15, 18, 18, 16, 13, 19, 16, 13, 22, 26)
     for column, width in enumerate(widths):
         sheet.set_column(column, column, width)
     sheet.set_column(20, 21, None, None, {"hidden": True})
+    sheet.set_column(23, 23, None, None, {"hidden": True})
     sheet.set_default_row(18)
 
 
@@ -467,6 +486,8 @@ def data_readiness_detail_rows(context):
             "Host-Settlement-Policy Limitation",
             readiness.host_settlement_policy_limitation,
         ),
+        ("Bounded-Waiver-Pool Limitation", _BOUNDED_WAIVER_POOL_LIMITATION),
+        ("Host-Trade-Legality Limitation", _HOST_TRADE_LEGALITY_LIMITATION),
     )
     if readiness.custom_scoring_limitation:
         rows = (
@@ -498,13 +519,34 @@ def data_readiness_detail_rows(context):
     return rows
 
 
-def _details_sheet(workbook, context, trade_count, mutual_count, formats):
+def _details_sheet(
+    workbook, context, provenance, trade_count, mutual_count, formats
+):
     sheet = workbook.add_worksheet("Run Details")
     sheet.hide_gridlines(2)
     sheet.set_row(0, 30)
-    sheet.merge_range("A1:C1", "Calculation Provenance", formats["title"])
+    sheet.merge_range("A1:D1", "Calculation Provenance", formats["title"])
     attested = context.power_engine_mode == "holdout_validated"
     details = (
+        ("Engine Bundle ID", provenance.bundle_id),
+        ("Waiver Pool ID", provenance.waiver_pool_id),
+        ("Search Request ID", provenance.request_id),
+        ("Search Request (Canonical JSON)", provenance.request_json),
+        ("Trade Constraints (Canonical JSON)", provenance.trade_constraints_json),
+        ("Power Settings (Canonical JSON)", provenance.search_settings_json),
+        ("Require No Drops", "YES" if provenance.require_no_drops else "NO"),
+        ("Scenario Seed", provenance.scenario_seed),
+        ("Requested Counterparty Scope", provenance.requested_counterparty_display),
+        (
+            "Resolved Counterparty Team IDs",
+            ", ".join(provenance.resolved_counterparty_team_ids),
+        ),
+        (
+            "Roster Adjustment IDs",
+            ", ".join(provenance.roster_adjustment_ids),
+        ),
+        ("Pair Search Runs", len(provenance.search_runs)),
+        ("Total Search Candidates", provenance.total_candidate_count),
         ("Snapshot ID", context.snapshot_id),
         ("Scoring Profile ID", context.scoring_profile_id),
         ("NFL Schedule ID", context.nfl_schedule_id),
@@ -523,7 +565,7 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
                 else "SURROGATE / APPROXIMATE"
             ),
         ),
-        ("Calibration Status", context.calibration_status),
+        ("Calibration Evidence Status", context.calibration_status),
         ("Methodology Evidence Type", context.methodology_evidence_kind),
         ("Methodology Evidence Record ID", context.methodology_record_id),
         ("Strength Formula ID", context.formula_id),
@@ -584,13 +626,23 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
         elif label.endswith(" Limitation"):
             value_format = formats["warning"]
             sheet.set_row(row, 60)
-        elif label.endswith(" Policy"):
+        elif label.endswith(" Policy") or label.endswith("(Canonical JSON)"):
             value_format = formats["wrapped_text"]
             sheet.set_row(row, 45)
         elif label == "Power Engine Mode" and not attested:
             value_format = formats["warning"]
         sheet.write(row, 1, value, value_format)
-    source_row = 4 + len(details)
+    run_row = 4 + len(details)
+    sheet.write(run_row, 0, "Pair Search Definitions", formats["section"])
+    sheet.write_row(
+        run_row + 1,
+        0,
+        ("Counterparty Team ID", "Search Run ID", "Candidates", "Definition JSON"),
+        formats["header"],
+    )
+    for offset, run in enumerate(provenance.search_run_rows, start=run_row + 2):
+        sheet.write_row(offset, 0, run)
+    source_row = run_row + len(provenance.search_runs) + 3
     sheet.write(source_row, 0, "Weekly Sources", formats["section"])
     sheet.write_row(source_row + 1, 0, ("Source", "Evidence ID", "Captured UTC"), formats["header"])
     for offset, source in enumerate(context.sources, start=source_row + 2):
@@ -601,6 +653,46 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
     sheet.set_column(0, 0, 40)
     sheet.set_column(1, 1, 82)
     sheet.set_column(2, 2, 21)
+    sheet.set_column(3, 3, 90)
+
+
+def _validate_export_binding(context, provenance, trades):
+    request = provenance.request_record
+    if context.data_readiness.trade_search_status == "not_ready":
+        raise ValueError("cannot export a search whose data readiness is not_ready")
+    if (
+        provenance.bundle_id != context.bundle_id
+        or provenance.waiver_pool_id != context.waiver_pool_id
+    ):
+        raise ValueError("workbook context does not match bundle provenance")
+    if (
+        request["primary_team_id"] != context.primary_team_id
+        or request["scenario_count"] != context.scenario_count
+        or request["settings"]["minimum_displayed_power_delta"]
+        != context.minimum_power_delta
+    ):
+        raise ValueError("workbook context does not match the search request")
+    by_run = {row.run_id: row for row in provenance.search_runs}
+    for run in provenance.search_runs:
+        definition = run.trade_constraint_record
+        if (
+            run.snapshot_id != context.snapshot_id
+            or run.strength_model_id != context.strength_model_id
+            or definition["scenario_run_id"] != context.scenario_run_id
+        ):
+            raise ValueError("workbook context does not match a pair search run")
+    row_keys = set()
+    for row in trades:
+        run = by_run.get(row.search_run_id)
+        key = (row.search_run_id, row.candidate_index)
+        if (
+            run is None
+            or run.counterparty_team_id != row.counterparty_team_id
+            or row.candidate_index >= run.total_candidate_count
+            or key in row_keys
+        ):
+            raise ValueError("trade row does not match its pair search run")
+        row_keys.add(key)
 
 
 def _utc_timestamp(value):

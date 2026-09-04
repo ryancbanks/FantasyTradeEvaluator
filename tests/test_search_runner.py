@@ -239,6 +239,11 @@ class ResumableTradeSearchTests(unittest.TestCase):
         self.assertFalse(first.progress.cancelled)
         self.assertEqual(len(first.results), 4)
         self.assertEqual(first, second)
+        self.assertEqual(first.run_definition.run_id, first.progress.run_id)
+        self.assertEqual(
+            first.run_definition.total_candidate_count,
+            first.progress.total_candidate_count,
+        )
         self.assertEqual(progress_updates[-1], first.progress)
         self.assertTrue(
             all(row.primary_playoff_before is not None for row in first.results)

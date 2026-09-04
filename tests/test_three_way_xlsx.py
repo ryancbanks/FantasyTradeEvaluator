@@ -6,7 +6,9 @@ import unittest
 from unittest.mock import patch
 from zipfile import ZipFile
 
+from trade_snapshot._scenario_random import content_id
 from trade_snapshot.data_readiness import DataReadinessSnapshot
+from trade_snapshot.three_way_search_records import ThreeWaySearchRunDefinition
 from trade_snapshot.three_way_workbook import (
     ThreeWayExportProvenance,
     ThreeWayWorkbookRow,
@@ -80,6 +82,8 @@ def readiness():
 
 def context():
     return TradeWorkbookContext(
+        bundle_id="engine_" + "a" * 64,
+        waiver_pool_id="waiver-pool_" + "b" * 64,
         snapshot_id="snapshot-3way",
         scoring_profile_id="scoring-profile-3way",
         nfl_schedule_id="nfl-schedule-3way",
@@ -92,7 +96,7 @@ def context():
         minimum_power_delta=-5,
         scenario_count=10_000,
         power_engine_mode="holdout_validated",
-        calibration_status="exact",
+        calibration_status="holdout_validated",
         methodology_evidence_kind="blind_holdout_attestation",
         methodology_record_id="attestation-3way",
         formula_id="formula-3way",
@@ -115,28 +119,58 @@ def context():
 
 
 def provenance(*, adjustments=True):
-    return ThreeWayExportProvenance.from_records(
-        request_id="app-search-request-3way",
-        search_run_id="three-way-search-run-v1-test",
+    constraints = {
+        "balanced_only": False,
+        "incoming_filter": {
+            "player_ids": ["C-received"],
+            "player_mode": "include",
+            "position_mode": None,
+            "positions": [],
+        },
+        "max_imbalance": 1,
+        "require_no_drops": not adjustments,
+    }
+    settings = {
+        "checkpoint_interval": 1000,
+        "minimum_displayed_power_delta": -5.0,
+    }
+    request = {
+        "allow_surrogate_power": False,
+        "bundle_id": context().bundle_id,
+        "counterparty_team_ids": ["B", "C"],
+        "primary_team_id": "A",
+        "scenario_count": context().scenario_count,
+        "seed": -9_007_199_254_740_991,
+        "settings": settings,
+        "trade_constraints": constraints,
+        "trade_format": "three_team",
+    }
+    run = ThreeWaySearchRunDefinition(
+        snapshot_id=context().snapshot_id,
+        strength_model_id=context().strength_model_id,
         participant_team_ids=("A", "B", "C"),
-        participant_team_names=("Alpha", "Bravo", "Charlie"),
-        total_candidate_count=1 << 70,
-        seed=-9_007_199_254_740_991,
         trade_constraint_record={
-            "balanced_only": False,
-            "incoming_filter": {
-                "player_ids": ["C-received"],
-                "player_mode": "include",
-                "position_mode": None,
-                "positions": [],
+            "algorithm": "local-three-way-power-paired-playoffs-v1",
+            "candidate_order": {"test": True},
+            "roster_adjustment_id": "adjustment-1" if adjustments else None,
+            "scenario_run_id": context().scenario_run_id,
+            "season_projection_options": {
+                "score_decimal_places": 6,
+                "tiebreak_random_seed": request["seed"],
             },
-            "max_imbalance": 1,
-            "require_no_drops": not adjustments,
+            "settings": settings,
+            "trade_constraints": constraints,
         },
-        power_settings_record={
-            "checkpoint_interval": 1000,
-            "minimum_displayed_power_delta": -5.0,
-        },
+        total_candidate_count=1 << 70,
+    )
+    return ThreeWayExportProvenance.from_records(
+        bundle_id=context().bundle_id,
+        waiver_pool_id=context().waiver_pool_id,
+        request_id=content_id("app-search", request),
+        request_record=request,
+        search_run_definition=run,
+        participant_team_names=("Alpha", "Bravo", "Charlie"),
+        completed_candidate_count=run.total_candidate_count,
         free_agent_allocation_policy=(
             "Scarce replacements use ascending team-ID order."
             if adjustments
@@ -314,8 +348,16 @@ class ThreeWayExcelExportTests(unittest.TestCase):
         self.assertIn("scoring-profile-3way", shared)
         self.assertIn("nfl-schedule-3way", shared)
         self.assertIn("ensemble-config-3way", shared)
-        self.assertIn("app-search-request-3way", shared)
-        self.assertIn("three-way-search-run-v1-test", shared)
+        self.assertIn(provenance().request_id, shared)
+        self.assertIn(provenance().search_run_id, shared)
+        self.assertIn("Search Request (Canonical JSON)", shared)
+        self.assertIn("Search Run Definition (Canonical JSON)", shared)
+        self.assertIn("Engine Bundle ID", shared)
+        self.assertIn(context().bundle_id, shared)
+        self.assertIn("Waiver Pool ID", shared)
+        self.assertIn(context().waiver_pool_id, shared)
+        self.assertIn("Calibration Evidence Status", shared)
+        self.assertIn("holdout_validated", shared)
         self.assertIn("Alpha (A)", shared)
         self.assertIn(str(1 << 70), shared)
         self.assertIn(str(-9_007_199_254_740_991), shared)
@@ -412,6 +454,52 @@ class ThreeWayExcelExportTests(unittest.TestCase):
                         (trade(), trade(candidate_index=8)),
                         outlook(),
                     )
+
+    def test_rejects_mismatched_incomplete_and_duplicate_run_evidence(self):
+        with TemporaryDirectory() as directory:
+            target = Path(directory) / "results.xlsx"
+            with self.assertRaisesRegex(ValueError, "bundle provenance"):
+                export_three_way_trade_workbook(
+                    target,
+                    replace(context(), bundle_id="engine_" + "c" * 64),
+                    provenance(),
+                    (),
+                    outlook(),
+                )
+            with self.assertRaisesRegex(ValueError, "search run"):
+                export_three_way_trade_workbook(
+                    target,
+                    replace(context(), scenario_run_id="different-scenarios"),
+                    provenance(),
+                    (),
+                    outlook(),
+                )
+            with self.assertRaisesRegex(ValueError, "trade row"):
+                export_three_way_trade_workbook(
+                    target,
+                    context(),
+                    provenance(),
+                    (trade(candidate_index=7), trade(candidate_index=7)),
+                    outlook(),
+                )
+            with self.assertRaisesRegex(ValueError, "trade row"):
+                export_three_way_trade_workbook(
+                    target,
+                    context(),
+                    provenance(),
+                    (trade(candidate_index=1 << 70),),
+                    outlook(),
+                )
+            blocked = replace(
+                context(),
+                data_readiness=replace(
+                    readiness(), trade_search_status="not_ready"
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "not_ready"):
+                export_three_way_trade_workbook(
+                    target, blocked, provenance(), (), outlook()
+                )
 
 
 if __name__ == "__main__":

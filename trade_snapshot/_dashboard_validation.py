@@ -21,6 +21,7 @@ def validate_dashboard_inputs(bundle, projection, scenarios) -> None:
         projection.snapshot_id != state.snapshot_id
         or projection.scoring_profile_id != state.scoring_profile_id
         or projection.scenario_count != scenarios.config.scenario_count
+        or projection.scenario_run_id != scenarios.run_id
     ):
         raise ValueError("baseline projection does not match the engine bundle")
     if (
@@ -30,6 +31,10 @@ def validate_dashboard_inputs(bundle, projection, scenarios) -> None:
         or scenarios.eligibilities != bundle.eligibilities
         or scenarios.config.seed != bundle.scenario_config.seed
         or scenarios.config.loadings != bundle.scenario_config.loadings
+        or (
+            scenarios.config.player_score_floor
+            != bundle.scenario_config.player_score_floor
+        )
         or scenarios.config.scenario_count > bundle.scenario_config.scenario_count
     ):
         raise ValueError("prepared scenarios do not match the engine bundle")

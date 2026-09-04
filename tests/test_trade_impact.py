@@ -188,6 +188,19 @@ class PairedSeasonProjectionTests(unittest.TestCase):
                 baseline.tiebreak_random_seed,
             )
 
+        detached = replace(
+            baseline.season_projection,
+            scenario_run_id="different-scenario-run",
+        )
+        with self.assertRaisesRegex(ValueError, "prepared scenario run"):
+            PreparedSeasonBaseline(
+                baseline.state,
+                baseline.scenarios,
+                detached,
+                baseline.score_decimal_places,
+                baseline.tiebreak_random_seed,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

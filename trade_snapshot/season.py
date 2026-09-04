@@ -85,6 +85,7 @@ class SeasonProjection:
     score_decimal_places: int
     random_seed: int
     teams: tuple[TeamSeasonProjection, ...]
+    scenario_run_id: str | None = None
 
 
 def project_remaining_season(
@@ -109,6 +110,11 @@ def project_remaining_season(
     """
 
     _validate_options(score_decimal_places, random_seed)
+    scenario_run_id = getattr(scenarios, "run_id", None)
+    if scenario_run_id is not None and (
+        not isinstance(scenario_run_id, str) or not scenario_run_id.strip()
+    ):
+        raise ValueError("scenario run_id must be non-empty text when provided")
     uses_matchup_history = validate_tiebreaker_inputs(state)
     team_ids = tuple(team.team_id for team in state.teams)
     standings = {standing.team_id: standing for standing in state.standings}
@@ -211,6 +217,7 @@ def project_remaining_season(
         score_decimal_places=score_decimal_places,
         random_seed=random_seed,
         teams=projections,
+        scenario_run_id=scenario_run_id,
     )
 
 

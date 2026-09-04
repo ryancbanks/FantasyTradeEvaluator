@@ -211,6 +211,31 @@ class BundleDataReadinessTests(unittest.TestCase):
             report["capabilities"]["fantasypros_style_power"]["status"],
             "ready_with_holdout_validated_scope",
         )
+        trade_evidence = report["capabilities"]["trade_search"]["evidence"]
+        self.assertEqual(
+            trade_evidence["waiver_pool_id"],
+            bundle.waiver_pool.waiver_pool_id,
+        )
+        self.assertEqual(
+            trade_evidence["waiver_player_count"],
+            len(bundle.waiver_pool.players),
+        )
+        self.assertTrue(
+            any(
+                "bounded waiver pool" in limitation
+                for limitation in report["capabilities"]["trade_search"][
+                    "limitations"
+                ]
+            )
+        )
+        self.assertTrue(
+            any(
+                "host trade deadline" in limitation.lower()
+                for limitation in report["capabilities"]["trade_search"][
+                    "limitations"
+                ]
+            )
+        )
         self.assertEqual(
             report["capabilities"]["fantasypros_style_power"][
                 "holdout_validated_scope"
@@ -239,6 +264,7 @@ class BundleDataReadinessTests(unittest.TestCase):
         self.assertEqual(
             {row["data"] for row in report["missing_data_plan"]},
             {
+                "host_trade_legality",
                 "exact_projection_scoring_compatibility",
                 "player_week_availability",
                 "postseason_schedule_and_bracket",
@@ -262,6 +288,74 @@ class BundleDataReadinessTests(unittest.TestCase):
             "not_ready"
             if summary["data_readiness"]["status"] == "not_ready"
             else "ready",
+        )
+
+    def test_discloses_player_level_ecr_gaps_without_disabling_player_lab(self):
+        bundle = engine_bundle()
+        snapshots = []
+        for snapshot in bundle.ecr_snapshots:
+            rankings = tuple(
+                row for row in snapshot.rankings
+                if row.canonical_player_id != "p1"
+            )
+            panel = snapshot.expert_panels[0]
+            source_details = replace(
+                panel.provenance.source_details,
+                source_player_count=len(rankings),
+                source_position_counts={"FLEX": len(rankings)},
+            )
+            snapshots.append(
+                replace(
+                    snapshot,
+                    rankings=rankings,
+                    expert_panels=(
+                        replace(
+                            panel,
+                            provenance=replace(
+                                panel.provenance,
+                                source_details=source_details,
+                            ),
+                        ),
+                    ),
+                )
+            )
+        partial = replace(bundle, ecr_snapshots=tuple(snapshots))
+
+        report = build_bundle_data_readiness(partial)
+        player_lab = report["capabilities"]["player_lab"]
+
+        self.assertEqual(player_lab["status"], "ready_with_limitations")
+        self.assertTrue(
+            player_lab["evidence"]["weekly_and_ros_ecr_snapshots_present"]
+        )
+        self.assertFalse(player_lab["evidence"]["weekly_and_ros_ecr_complete"])
+        self.assertEqual(
+            player_lab["evidence"]["ecr_player_coverage"],
+            {
+                "weekly": {
+                    "ranked_player_count": len(bundle.strength_model.players) - 1,
+                    "unranked_player_count": 1,
+                    "calculation_player_count": len(bundle.strength_model.players),
+                    "complete": False,
+                },
+                "rest_of_season": {
+                    "ranked_player_count": len(bundle.strength_model.players) - 1,
+                    "unranked_player_count": 1,
+                    "calculation_player_count": len(bundle.strength_model.players),
+                    "complete": False,
+                },
+            },
+        )
+        self.assertTrue(
+            any(
+                "Missing Player Lab ranks" in limitation
+                for limitation in player_lab["limitations"]
+            )
+        )
+        self.assertTrue(
+            report["capabilities"]["fantasypros_style_power"]["evidence"][
+                "required_ecr_evidence_complete"
+            ]
         )
 
     def test_tiebreaker_requirements_gate_every_season_consumer(self):

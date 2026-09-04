@@ -79,7 +79,17 @@ class SeasonTrajectoryTests(unittest.TestCase):
         alpha = next(row for row in result["teams"] if row["team_id"] == "a")
         week4 = alpha["projected"][0]
 
+        self.assertEqual(result["schema_version"], 2)
         self.assertEqual(result["history_status"], "complete")
+        self.assertTrue(result["history_coverage"]["completed_matchups_usable"])
+        self.assertTrue(
+            result["scenario_evidence"]["scenario_set_id"].startswith(
+                "trajectory-scenario-set_"
+            )
+        )
+        self.assertEqual(
+            result["scenario_evidence"]["first_scenario_id"], "scenario-0"
+        )
         self.assertEqual(alpha["current_direction"], "downward")
         self.assertEqual(
             [row["outcome"] for row in alpha["observed"]],
@@ -106,6 +116,8 @@ class SeasonTrajectoryTests(unittest.TestCase):
         result = build_season_trajectory(state, _scenarios())
 
         self.assertEqual(result["history_status"], "unavailable_or_inconsistent")
+        self.assertFalse(result["history_coverage"]["completed_matchups_usable"])
+        self.assertEqual(result["history_coverage"]["observed_trajectory_status"], "withheld")
         self.assertTrue(all(not row["observed"] for row in result["teams"]))
         self.assertTrue(all(row["current_direction"] == "unavailable" for row in result["teams"]))
 

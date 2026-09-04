@@ -8,6 +8,14 @@ window.GmInsightsUi = (() => {
   ]);
   const EVIDENCE_PAGE_SIZE = 10;
   const HISTORY_EMPTY = "Historical league activity has not been collected for this weekly model.";
+  const HISTORY_ATTEMPT_NOTES = Object.freeze({
+    activity_schema_unsupported: "ESPN's activity format was not recognized during this scan. Current roster analysis is still available; scan again after the collector is updated.",
+    activity_unavailable: "ESPN activity could not be read during this scan. Current roster analysis is still available; try the weekly scan again.",
+    canonicalization_failed: "The activity rows could not be matched safely to this league snapshot, so history-based conclusions are withheld.",
+    history_processing_unavailable: "League activity could not be processed locally during this scan. Current roster analysis remains available.",
+    store_unavailable: "Activity was captured, but the local history database could not save it. Current roster analysis remains available.",
+    not_provided: "This bundle was imported without an activity-capture attempt, so history-based conclusions are unavailable."
+  });
   let requestRevision = 0;
   let activeController = null;
   let activeBundleId = null;
@@ -194,7 +202,7 @@ window.GmInsightsUi = (() => {
     if (Number.isFinite(fit.mutually_positive_swap_count)) {
       parts.push(`${F.integerFormatter.format(fit.mutually_positive_swap_count)} mutual-positive 1-for-1s`);
     }
-    parts.push(fit.power_methodology_status === "exact" ? "exact power method" : "modeled power method");
+    parts.push(fit.power_methodology_status === "holdout_validated" ? "holdout-validated power method" : "modeled power method");
     return parts.join(" · ");
   }
 
@@ -322,7 +330,7 @@ window.GmInsightsUi = (() => {
     text.append(node("p", "gm-insights-profile-scope", "This is a current-season team-slot profile; ownership continuity is not assumed."));
     const badges = node("div", "gm-insights-profile-badges");
     const method = team.roster_compatibility?.power_methodology_status;
-    if (method) badges.append(statusBadge(method === "exact" ? "Exact current power method" : "Modeled current power method"));
+    if (method) badges.append(statusBadge(method === "holdout_validated" ? "Holdout-validated current power method" : "Modeled current power method"));
     if (historyAvailable(team)) badges.append(confidenceBadge(team.summary || F.teamMetrics(team).tradeLikelihood));
     else badges.append(statusBadge("History not collected", "is-unavailable"));
     const sample = profileSampleText(team);
@@ -432,7 +440,7 @@ window.GmInsightsUi = (() => {
     const intro = node("div", "gm-insights-compatibility-intro");
     intro.append(
       node("p", "", "Partners are ranked from current roster and position evidence only—past manager behavior is not an input."),
-      statusBadge(compatibility?.power_methodology_status === "exact" ? "Exact current power screen" : "Modeled current power screen")
+      statusBadge(compatibility?.power_methodology_status === "holdout_validated" ? "Holdout-validated current power screen" : "Modeled current power screen")
     );
     container.append(intro);
     if (!partners.length) {
@@ -452,7 +460,7 @@ window.GmInsightsUi = (() => {
       );
       const badges = node("div", "gm-insights-profile-badges");
       badges.append(statusBadge(F.fitLabel(fit)));
-      badges.append(statusBadge(fit.power_methodology_status === "exact" ? "Exact" : "Modeled"));
+      badges.append(statusBadge(fit.power_methodology_status === "holdout_validated" ? "Holdout validated" : "Modeled"));
       if (fit.partner_team_id === primaryTeamId) badges.append(statusBadge("Your team", "is-moderate"));
       header.append(title, badges);
       const [receiving, offering] = positionSummary(fit, team.team_name, fit.partner_team_name);
@@ -681,9 +689,20 @@ window.GmInsightsUi = (() => {
     const limitations = Array.isArray(insights.methodology?.limitations)
       ? insights.methodology.limitations.filter(value => typeof value === "string").join(" ")
       : F.plainText(insights.methodology?.limitations);
+    const readiness = insights.data_readiness || {};
+    const activity = readiness.capabilities?.completed_deal_activity || {};
+    const attemptReason = readiness.collection_attempt?.reason_code;
+    const historyDataNote = HISTORY_ATTEMPT_NOTES[attemptReason] || (readiness.store_status === "unavailable"
+      ? "The local history store could not be read; current roster compatibility remains available, while history-based conclusions are withheld."
+      : activity.status === "not_ready"
+        ? "No bundle-bound transaction capture is available yet; current roster compatibility remains available."
+        : activity.status === "partial"
+          ? "Transaction history is partial or stale, so normalized behavioral conclusions are withheld."
+          : "The transaction ledger is complete and fresh for this weekly model; individual historical valuations still pass their own ordering and prior-engine gates.");
     $("gmInsightsMethodNote").textContent = [
       "The three decision questions above remain independent: current roster fit uses no behavior, completed-deal accessibility is not offer acceptance, and counterparty value opportunity is only the reversed at-time relative edge.",
       "Historical profiles describe completed activity for a team slot, not rejected offers, intent, or a private person.",
+      historyDataNote,
       limitations
     ].filter(Boolean).join(" ");
   }
