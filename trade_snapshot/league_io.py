@@ -30,7 +30,7 @@ _TOP_KEYS = {
     "playoff_rules",
 }
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 def league_state_to_record(state: LeagueState) -> dict[str, object]:
@@ -79,6 +79,7 @@ def league_state_to_record(state: LeagueState) -> dict[str, object]:
             for row in state.completed_matchups
         ],
         "roster_rules": {
+            "reserve_slot_counts": dict(state.roster_rules.reserve_slot_counts),
             "roster_cap": state.roster_rules.roster_cap,
             "starting_lineup_slots": list(state.roster_rules.starting_lineup_slots),
         },
@@ -124,7 +125,7 @@ def league_state_from_record(record: Mapping[str, object]) -> LeagueState:
     roster = _object(
         "roster_rules",
         record["roster_rules"],
-        {"roster_cap", "starting_lineup_slots"},
+        {"reserve_slot_counts", "roster_cap", "starting_lineup_slots"},
     )
     playoff = _object(
         "playoff_rules",
@@ -160,7 +161,11 @@ def league_state_from_record(record: Mapping[str, object]) -> LeagueState:
         standings=tuple(TeamStanding(**row) for row in standings),
         remaining_matchups=tuple(FantasyMatchup(**row) for row in remaining),
         completed_matchups=tuple(CompletedFantasyMatchup(**row) for row in completed),
-        roster_rules=RosterRules(roster["roster_cap"], tuple(slots)),
+        roster_rules=RosterRules(
+            roster["roster_cap"],
+            tuple(slots),
+            _mapping("reserve_slot_counts", roster["reserve_slot_counts"]),
+        ),
         playoff_rules=PlayoffRules(
             qualifier_count=playoff["qualifier_count"],
             regular_season_end_week=playoff["regular_season_end_week"],
@@ -186,6 +191,12 @@ def _object(name, value, keys):
     if not isinstance(value, Mapping) or set(value) != keys:
         raise ValueError(f"{name} fields are invalid")
     return value
+
+
+def _mapping(name, value):
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a JSON object")
+    return dict(value)
 
 
 def _array(name, value):

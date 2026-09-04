@@ -33,21 +33,36 @@ window.TradeFilterUi = (() => {
     return `${side === "outgoing" ? "Positions you give" : "Positions you receive"} in rule ${ruleNumber}`;
   }
 
+  function rosterCapacitySummary(team) {
+    const parts = [];
+    if (Number.isInteger(team.active_count) && Number.isInteger(team.active_capacity)) {
+      parts.push(`${team.active_count}/${team.active_capacity} active`);
+    }
+    for (const [kind, capacity] of Object.entries(team.reserve_capacity || {}).sort()) {
+      const occupied = team.reserve_occupancy?.[kind] || 0;
+      const label = kind === "ROOKIE_RESERVE" ? "Rookie Reserve" : kind;
+      parts.push(`${label} ${occupied}/${capacity}`);
+    }
+    return parts.join(" · ");
+  }
+
   function renderPlayerChoices(side, clause, teams) {
     const container = control(clause, "player-choices");
     const selected = new Set(checkedValues(container));
     container.replaceChildren();
     for (const team of teams) {
-      if (teams.length > 1) {
-        const heading = document.createElement("div");
-        heading.className = "filter-team-label";
-        heading.textContent = team.name;
-        container.append(heading);
-      }
+      const heading = document.createElement("div");
+      const capacity = rosterCapacitySummary(team);
+      heading.className = "filter-team-label";
+      heading.textContent = capacity ? `${team.name} · ${capacity}` : team.name;
+      container.append(heading);
       for (const player of team.players) {
+        const rosterStatus = player.roster_status === "ACTIVE"
+          ? ""
+          : ` · ${player.roster_status === "ROOKIE_RESERVE" ? "Rookie Reserve" : player.roster_status}`;
         const label = document.createElement("label");
         label.className = "filter-choice";
-        label.dataset.search = `${player.name} ${team.name} ${player.positions.join(" ")}`.toLowerCase();
+        label.dataset.search = `${player.name} ${team.name} ${player.positions.join(" ")} ${player.roster_status}`.toLowerCase();
         const checkbox = document.createElement("input");
         checkbox.type = "checkbox";
         checkbox.value = player.player_id;
@@ -56,8 +71,8 @@ window.TradeFilterUi = (() => {
         checkbox.checked = selected.has(player.player_id);
         const text = document.createElement("span");
         text.textContent = player.positions.length
-          ? `${player.name} · ${player.positions.join("/")}`
-          : player.name;
+          ? `${player.name} · ${player.positions.join("/")}${rosterStatus}`
+          : `${player.name}${rosterStatus}`;
         label.append(checkbox, text);
         container.append(label);
       }

@@ -173,9 +173,9 @@ class ProductionWeeklyCollectionWorkflow:
                 "Connect the Fantasy Trade Evaluator browser extension, then collect "
                 "the week again. No weekly bundle was published."
             ) from None
-        except BrowserCaptureError:
+        except BrowserCaptureError as error:
             raise WeeklyCollectionError(
-                "A signed-in source page could not be captured. No weekly bundle was published."
+                f"{str(error).rstrip('.')}. No weekly bundle was published."
             ) from None
         except CalibrationRequired:
             raise WeeklyCollectionError(

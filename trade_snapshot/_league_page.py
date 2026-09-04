@@ -8,6 +8,21 @@ from ._capture_runtime import LeagueCaptureData
 from ._league_script import LEAGUE_SOURCE_SCRIPT
 
 
+_CAPTURE_FAILURES = {
+    "signed_out": "FantasyPros requires a signed-in league",
+    "provenance": "FantasyPros redirected away from the Trade Analyzer",
+    "bootstrap": "FantasyPros Trade Analyzer page data did not finish loading",
+    "bootstrap_incomplete": "FantasyPros loaded, but its league roster data was incomplete",
+    "analyzer_init_incomplete": (
+        "FantasyPros loaded, but the Trade Analyzer initialization response was not captured"
+    ),
+    "projected_standings_incomplete": (
+        "FantasyPros loaded, but projected standings were unavailable for this league"
+    ),
+    "task_dimensions": "The FantasyPros collection season or week was invalid",
+}
+
+
 def capture_league_sources(page, task, timeout_ms, cancelled, require_page):
     if task.kind.value != "league_source" or task.provider.value != "fantasypros":
         raise BrowserCaptureError("FantasyPros league-source task is invalid")
@@ -38,8 +53,8 @@ def league_capture_data(raw, task):
         raise BrowserCaptureError("FantasyPros league-source task is invalid")
     if not isinstance(raw, Mapping) or set(raw) != {"team_count", "sources"}:
         detail = raw.get("error") if isinstance(raw, Mapping) else None
-        if detail == "signed_out":
-            raise BrowserCaptureError("FantasyPros league capture requires a signed-in league")
+        if isinstance(detail, str) and detail in _CAPTURE_FAILURES:
+            raise BrowserCaptureError(_CAPTURE_FAILURES[detail])
         raise BrowserCaptureError("FantasyPros league sources were incomplete")
     rows = raw["sources"]
     if not isinstance(rows, list) or len(rows) != len(REQUIRED_LEAGUE_SOURCES) or any(

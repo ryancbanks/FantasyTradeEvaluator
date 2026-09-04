@@ -10,7 +10,6 @@ from pathlib import Path
 from .search import PreparedTradePair, TradePowerEvaluation
 from .search_store import (
     QualifiedSearchResult,
-    SearchResumeState,
     SearchRunDefinition,
     SearchStore,
 )
@@ -18,7 +17,7 @@ from .trade_impact import PreparedSeasonBaseline
 from .trade_space import TeamRoster, TradeSpace
 
 
-SEARCH_ALGORITHM = "local-power-paired-playoffs-v2"
+SEARCH_ALGORITHM = "local-power-paired-playoffs-v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,14 +144,20 @@ class ResumableTradeSearch:
             trade_constraint_record={
                 "algorithm": SEARCH_ALGORITHM,
                 "candidate_order": {
-                    "counterparty_capacity_exempt_player_ids": sorted(
-                        trade_space.counterparty.capacity_exempt_player_ids
-                    ),
                     "counterparty_player_ids": list(trade_space.counterparty.player_ids),
-                    "primary_capacity_exempt_player_ids": sorted(
-                        trade_space.primary.capacity_exempt_player_ids
+                    "counterparty_reserve_slot_by_player": dict(
+                        trade_space.counterparty.reserve_slot_by_player
+                    ),
+                    "counterparty_reserve_slot_counts": dict(
+                        trade_space.counterparty.reserve_slot_counts
                     ),
                     "primary_player_ids": list(trade_space.primary.player_ids),
+                    "primary_reserve_slot_by_player": dict(
+                        trade_space.primary.reserve_slot_by_player
+                    ),
+                    "primary_reserve_slot_counts": dict(
+                        trade_space.primary.reserve_slot_counts
+                    ),
                 },
                 "scenario_run_id": season_baseline.scenarios.run_id,
                 "roster_adjustment_id": (
@@ -184,7 +189,14 @@ class ResumableTradeSearch:
         with SearchStore(database_path, self.run_definition) as store:
             state = store.resume()
             next_index = state.next_candidate_index
-            saved_results = list(state.qualified_results)
+            power_qualified_count = len(state.qualified_results)
+            playoff_evaluated_count = sum(
+                row.primary_playoff_before is not None
+                for row in state.qualified_results
+            )
+            mutual_playoff_gain_count = sum(
+                _is_mutual_gain(row) for row in state.qualified_results
+            )
             cancelled = False
             for index, candidate in enumerate(
                 islice(iter(self.trade_space), next_index, None), next_index
@@ -200,7 +212,11 @@ class ResumableTradeSearch:
                 if qualified:
                     saved = self._simulate_candidate(power)
                     store.upsert_qualified_result(saved, next_candidate_index=next_index)
-                    saved_results.append(saved)
+                    power_qualified_count += 1
+                    playoff_evaluated_count += int(
+                        saved.primary_playoff_before is not None
+                    )
+                    mutual_playoff_gain_count += int(_is_mutual_gain(saved))
                 elif next_index % self.settings.checkpoint_interval == 0:
                     store.checkpoint(next_index)
                 if on_progress is not None and (
@@ -209,7 +225,11 @@ class ResumableTradeSearch:
                 ):
                     on_progress(
                         self._progress_values(
-                            next_index, tuple(saved_results), cancelled=False
+                            next_index,
+                            power_qualified_count=power_qualified_count,
+                            playoff_evaluated_count=playoff_evaluated_count,
+                            mutual_playoff_gain_count=mutual_playoff_gain_count,
+                            cancelled=False,
                         )
                     )
             else:
@@ -218,7 +238,15 @@ class ResumableTradeSearch:
             final_state = store.resume()
             if final_state.next_candidate_index != next_index:
                 raise AssertionError("search checkpoint did not advance to the expected index")
-            progress = self._progress(final_state, cancelled=cancelled)
+            if len(final_state.qualified_results) != power_qualified_count:
+                raise AssertionError("search result count did not match progress accounting")
+            progress = self._progress_values(
+                final_state.next_candidate_index,
+                power_qualified_count=power_qualified_count,
+                playoff_evaluated_count=playoff_evaluated_count,
+                mutual_playoff_gain_count=mutual_playoff_gain_count,
+                cancelled=cancelled,
+            )
             if on_progress is not None:
                 on_progress(progress)
             return TradeSearchOutcome(progress, final_state.qualified_results)
@@ -262,29 +290,22 @@ class ResumableTradeSearch:
             counterparty_playoff_after=counterparty.after.playoff_probability * 100,
         )
 
-    def _progress(
-        self, state: SearchResumeState, *, cancelled: bool
-    ) -> TradeSearchProgress:
-        return self._progress_values(
-            state.next_candidate_index,
-            state.qualified_results,
-            cancelled=cancelled,
-        )
-
     def _progress_values(
         self,
         next_candidate_index: int,
-        results: tuple[QualifiedSearchResult, ...],
         *,
+        power_qualified_count: int,
+        playoff_evaluated_count: int,
+        mutual_playoff_gain_count: int,
         cancelled: bool,
     ) -> TradeSearchProgress:
         return TradeSearchProgress(
             run_id=self.run_definition.run_id,
             next_candidate_index=next_candidate_index,
             total_candidate_count=self.run_definition.total_candidate_count,
-            power_qualified_count=len(results),
-            playoff_evaluated_count=sum(row.primary_playoff_before is not None for row in results),
-            mutual_playoff_gain_count=sum(_is_mutual_gain(row) for row in results),
+            power_qualified_count=power_qualified_count,
+            playoff_evaluated_count=playoff_evaluated_count,
+            mutual_playoff_gain_count=mutual_playoff_gain_count,
             cancelled=cancelled,
         )
 
@@ -324,7 +345,8 @@ def _same_roster(left: TeamRoster, right: TeamRoster) -> bool:
         and frozenset(left.player_ids) == frozenset(right.player_ids)
         and left.current_size == right.current_size
         and left.roster_cap == right.roster_cap
-        and left.capacity_exempt_player_ids == right.capacity_exempt_player_ids
+        and left.reserve_slot_by_player == right.reserve_slot_by_player
+        and left.reserve_slot_counts == right.reserve_slot_counts
     )
 
 

@@ -2,6 +2,8 @@
 
 The installed application collects each provider once per weekly snapshot and performs all trade enumeration and season simulation locally. It never makes one upstream request per candidate trade. FantasyPros analyzer observations are collected only for the small initial/revalidation methodology experiment.
 
+Each season-scoped league workspace saves only normalized provider identifiers, scoring mode, the user's selected team, archive state, and associations to immutable weekly bundles. Workspaces are stored in a paginated local SQLite catalog with no fixed league-count ceiling in the application. Collection intermediates and the reusable strength formula are isolated under that league's local workspace, preventing two leagues from overwriting one another. Existing portable bundles remain valid and initially appear as unassigned until the user attaches them to a workspace.
+
 ## Supported acquisition paths
 
 ### FantasyPros
@@ -46,6 +48,7 @@ rolling window.
 ## Privacy and freshness
 
 - Browser profiles, cookies, and OAuth tokens remain under the normal browser's control. The extension has no cookie permission and never returns browser storage or credentials to the app. None is exported to Excel or copied into calibration artifacts.
+- League-workspace metadata stays in the local catalog and is not inserted into portable weekly bundles or workbooks. Archiving hides a workspace without deleting its bundles or collection evidence.
 - A capture timestamp records when the app observed a row. A provider publication time is stored separately only when the provider supplies one.
 - Snapshot readiness requires the exact content-addressed scoring profile and an explicit row from every configured provider for every computation-domain player and remaining week. The full verified profile is persisted in the portable engine bundle; ID-only legacy bundles fail closed instead of reconstructing settings from a scoring label.
 - Weekly materialization uses the separately verified NFL schedule for game context and byes. Source points and raw projected stats are left unchanged; schedule enrichment never invents a player projection.

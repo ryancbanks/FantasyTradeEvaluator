@@ -67,7 +67,7 @@ LEAGUE_SOURCE_SCHEMA_FINGERPRINT = schema_fingerprint(
             "max_nodes": 250000,
             "max_string_length": 100000,
         },
-        "policy_version": "trade-analyzer-bootstrap-passive-init-v6-configurable-host-id",
+        "policy_version": "trade-analyzer-bootstrap-passive-init-v8-active-vs-reserve-slots",
     },
 )
 
@@ -354,12 +354,22 @@ def _projected_standings(value: object) -> None:
     }
     _rows(value, fields, fields, "projected standings")
     for row in value:
-        for name in fields - {"teamId", "teamName"}:
+        for name in fields - {
+            "teamId", "teamName", "playoffs_odds", "championship_odds"
+        }:
             number = row[name]
             if isinstance(number, bool) or not isinstance(number, (int, float)) or not isfinite(number):
                 raise ValueError(f"projected standings {name} must be finite numeric data")
         for name in ("playoffs_odds", "championship_odds"):
-            if not 0 <= row[name] <= 100:
+            number = row[name]
+            if isinstance(number, str) and number in {"<1%", ">99%"}:
+                continue
+            if (
+                isinstance(number, bool)
+                or not isinstance(number, (int, float))
+                or not isfinite(number)
+                or not 0 <= number <= 100
+            ):
                 raise ValueError(f"projected standings {name} must be a percentage")
 
 

@@ -2,7 +2,6 @@
 
 from collections.abc import Iterable, Mapping
 from itertools import combinations
-from math import comb
 
 from .trade_filter_compiler import (
     CompiledTradeFilter,
@@ -28,7 +27,7 @@ class TradePackagePool:
         available_player_ids: tuple[PlayerId, ...],
         package_filter: TradePackageExpression | None,
         eligible_positions_by_player: Mapping[PlayerId, Iterable[str]] | None,
-        capacity_exempt_player_ids: frozenset[PlayerId],
+        reserve_slot_by_player: Mapping[PlayerId, str],
     ) -> None:
         self._available_ids = available_player_ids
         self._legacy_pool = (
@@ -36,7 +35,7 @@ class TradePackagePool:
                 available_player_ids,
                 package_filter,
                 eligible_positions_by_player,
-                capacity_exempt_player_ids,
+                reserve_slot_by_player,
             )
             if isinstance(package_filter, TradePackageFilter)
             else None
@@ -50,93 +49,83 @@ class TradePackagePool:
             if isinstance(package_filter, TradeFilterExpression)
             else None
         )
-        self._capacity_exempt_ids = capacity_exempt_player_ids
-        self._compiled_package_cache: dict[
-            tuple[int, int], _ReplayablePackages
-        ] = {}
+        self._reserve_slot_by_player = dict(reserve_slot_by_player)
+        self._compiled_package_cache: dict[int, _ReplayablePackages] = {}
 
-    def count(self, package_size: int, *, minimum_active: int = 0) -> int:
-        """Return an exact count without constructing package combinations."""
+    def count_by_reserve_signature(
+        self,
+        package_size: int,
+        reserve_kinds: tuple[str, ...],
+    ) -> dict[tuple[int, ...], int]:
+        """Count matching packages grouped by their typed reserve occupants."""
 
         _nonnegative_int("package_size", package_size)
-        _nonnegative_int("minimum_active", minimum_active)
-        if package_size > len(self._available_ids) or minimum_active > package_size:
-            return 0
+        if len(set(reserve_kinds)) != len(reserve_kinds):
+            raise ValueError("reserve_kinds cannot contain duplicates")
+        if package_size > len(self._available_ids):
+            return {}
         if self._legacy_pool is not None:
-            return self._legacy_pool.count(
-                package_size, minimum_active=minimum_active
+            return self._legacy_pool.count_by_reserve_signature(
+                package_size, reserve_kinds
             )
-        if self._compiled_filter is None:
-            return _count_by_active(
-                self._available_ids,
-                self._capacity_exempt_ids,
-                package_size,
-                minimum_active,
-            )
-        states = {(0, 0, 0): 1}
+        kind_index = {kind: index for index, kind in enumerate(reserve_kinds)}
+        states = {(0, (0,) * len(reserve_kinds), 0): 1}
         for player_id in self._available_ids:
             updated = dict(states)
-            active_increment = int(player_id not in self._capacity_exempt_ids)
-            evidence = self._compiled_filter.evidence_by_player[player_id]
-            for (chosen, active, mask), count in states.items():
+            reserve_kind = self._reserve_slot_by_player.get(player_id)
+            evidence = (
+                0
+                if self._compiled_filter is None
+                else self._compiled_filter.evidence_by_player[player_id]
+            )
+            for (chosen, signature, mask), count in states.items():
                 if chosen >= package_size:
                     continue
+                incremented = list(signature)
+                if reserve_kind is not None:
+                    incremented[kind_index[reserve_kind]] += 1
                 key = (
                     chosen + 1,
-                    min(minimum_active, active + active_increment),
+                    tuple(incremented),
                     mask | evidence,
                 )
                 updated[key] = updated.get(key, 0) + count
             states = updated
-        return sum(
-            count
-            for (chosen, active, mask), count in states.items()
-            if chosen == package_size
-            and active == minimum_active
-            and self._compiled_filter.matches(mask)
-        )
+        result: dict[tuple[int, ...], int] = {}
+        for (chosen, signature, mask), count in states.items():
+            if chosen != package_size:
+                continue
+            if self._compiled_filter is not None and not self._compiled_filter.matches(mask):
+                continue
+            result[signature] = result.get(signature, 0) + count
+        return result
 
-    def iter_packages(
-        self, package_size: int, *, minimum_active: int = 0
-    ) -> Iterable[tuple[PlayerId, ...]]:
+    def iter_packages(self, package_size: int) -> Iterable[tuple[PlayerId, ...]]:
         """Yield matching packages in deterministic roster-combination order."""
 
         _nonnegative_int("package_size", package_size)
-        _nonnegative_int("minimum_active", minimum_active)
-        if package_size > len(self._available_ids) or minimum_active > package_size:
+        if package_size > len(self._available_ids):
             return
         if self._legacy_pool is not None:
-            yield from self._legacy_pool.iter_packages(
-                package_size, minimum_active=minimum_active
-            )
+            yield from self._legacy_pool.iter_packages(package_size)
             return
         if self._compiled_filter is not None:
-            key = (package_size, minimum_active)
-            packages = self._compiled_package_cache.get(key)
+            packages = self._compiled_package_cache.get(package_size)
             if packages is None:
                 packages = _ReplayablePackages(
-                    self._iter_compiled_packages(package_size, minimum_active)
+                    self._iter_compiled_packages(package_size)
                 )
-                self._compiled_package_cache[key] = packages
+                self._compiled_package_cache[package_size] = packages
             yield from packages
             return
-        for package in combinations(self._available_ids, package_size):
-            if sum(
-                player_id not in self._capacity_exempt_ids for player_id in package
-            ) < minimum_active:
-                continue
-            yield package
+        yield from combinations(self._available_ids, package_size)
 
     def _iter_compiled_packages(
-        self, package_size: int, minimum_active: int
+        self, package_size: int
     ) -> Iterable[tuple[PlayerId, ...]]:
         if self._compiled_filter is None:
             raise AssertionError("a compiled package scan requires an expression")
         for package in combinations(self._available_ids, package_size):
-            if sum(
-                player_id not in self._capacity_exempt_ids for player_id in package
-            ) < minimum_active:
-                continue
             evidence = self._compiled_filter.evidence_for(package)
             if self._compiled_filter.matches(evidence):
                 yield package
@@ -177,7 +166,7 @@ class _LegacyTradePackagePool:
         available_player_ids: tuple[PlayerId, ...],
         rule: TradePackageFilter,
         eligible_positions_by_player: Mapping[PlayerId, Iterable[str]] | None,
-        capacity_exempt_player_ids: frozenset[PlayerId],
+        reserve_slot_by_player: Mapping[PlayerId, str],
     ) -> None:
         allowed, required, possible = _apply_player_rule(
             available_player_ids, rule
@@ -211,7 +200,7 @@ class _LegacyTradePackagePool:
         self._optional_ids = tuple(
             player_id for player_id in allowed if player_id not in required_set
         )
-        self._capacity_exempt_ids = capacity_exempt_player_ids
+        self._reserve_slot_by_player = dict(reserve_slot_by_player)
         self._position_masks = masks
         self._target_position_mask = (
             sum(position_bits.values())
@@ -221,43 +210,59 @@ class _LegacyTradePackagePool:
         self._required_position_mask = _coverage(required_ids, masks)
         self._possible = possible
 
-    def count(self, package_size: int, *, minimum_active: int) -> int:
+    def count_by_reserve_signature(
+        self,
+        package_size: int,
+        reserve_kinds: tuple[str, ...],
+    ) -> dict[tuple[int, ...], int]:
         optional_count = package_size - len(self._required_ids)
         if (
             not self._possible
             or optional_count < 0
             or optional_count > len(self._optional_ids)
-            or minimum_active > package_size
         ):
-            return 0
-        required_active = sum(
-            player_id not in self._capacity_exempt_ids
-            for player_id in self._required_ids
-        )
-        needed_active = max(0, minimum_active - required_active)
-        missing_positions = (
-            self._target_position_mask & ~self._required_position_mask
-        )
-        if not missing_positions:
-            return _count_by_active(
-                self._optional_ids,
-                self._capacity_exempt_ids,
-                optional_count,
-                needed_active,
-            )
-        return self._count_with_position_coverage(
-            optional_count, needed_active, missing_positions
-        )
+            return {}
+        kind_index = {kind: index for index, kind in enumerate(reserve_kinds)}
+        required_signature = [0] * len(reserve_kinds)
+        for player_id in self._required_ids:
+            kind = self._reserve_slot_by_player.get(player_id)
+            if kind is not None:
+                required_signature[kind_index[kind]] += 1
+        states = {
+            (0, tuple(required_signature), self._required_position_mask): 1
+        }
+        for player_id in self._optional_ids:
+            updated = dict(states)
+            reserve_kind = self._reserve_slot_by_player.get(player_id)
+            coverage_increment = self._position_masks[player_id]
+            for (chosen, signature, coverage), count in states.items():
+                if chosen >= optional_count:
+                    continue
+                incremented = list(signature)
+                if reserve_kind is not None:
+                    incremented[kind_index[reserve_kind]] += 1
+                key = (
+                    chosen + 1,
+                    tuple(incremented),
+                    coverage | coverage_increment,
+                )
+                updated[key] = updated.get(key, 0) + count
+            states = updated
+        result: dict[tuple[int, ...], int] = {}
+        for (chosen, signature, coverage), count in states.items():
+            if chosen != optional_count:
+                continue
+            if coverage & self._target_position_mask != self._target_position_mask:
+                continue
+            result[signature] = result.get(signature, 0) + count
+        return result
 
-    def iter_packages(
-        self, package_size: int, *, minimum_active: int
-    ) -> Iterable[tuple[PlayerId, ...]]:
+    def iter_packages(self, package_size: int) -> Iterable[tuple[PlayerId, ...]]:
         optional_count = package_size - len(self._required_ids)
         if (
             not self._possible
             or optional_count < 0
             or optional_count > len(self._optional_ids)
-            or minimum_active > package_size
         ):
             return
         for optional in combinations(self._optional_ids, optional_count):
@@ -265,10 +270,6 @@ class _LegacyTradePackagePool:
             package = tuple(
                 player_id for player_id in self._allowed_ids if player_id in selected
             )
-            if sum(
-                player_id not in self._capacity_exempt_ids for player_id in package
-            ) < minimum_active:
-                continue
             if (
                 _coverage(package, self._position_masks)
                 & self._target_position_mask
@@ -276,30 +277,6 @@ class _LegacyTradePackagePool:
             ):
                 continue
             yield package
-
-    def _count_with_position_coverage(
-        self,
-        optional_count: int,
-        needed_active: int,
-        missing_positions: int,
-    ) -> int:
-        states = {(0, 0, 0): 1}
-        for player_id in self._optional_ids:
-            updated = dict(states)
-            active_increment = int(player_id not in self._capacity_exempt_ids)
-            coverage_increment = self._position_masks[player_id] & missing_positions
-            for (chosen, active, coverage), count in states.items():
-                if chosen >= optional_count:
-                    continue
-                key = (
-                    chosen + 1,
-                    min(needed_active, active + active_increment),
-                    coverage | coverage_increment,
-                )
-                updated[key] = updated.get(key, 0) + count
-            states = updated
-        return states.get((optional_count, needed_active, missing_positions), 0)
-
 
 def _apply_player_rule(
     available_player_ids: tuple[PlayerId, ...], rule: TradePackageFilter
@@ -344,25 +321,6 @@ def _apply_position_rule(
             if not positions[player_id].intersection(rule.positions)
         ]
     return allowed, positions, required.issubset(allowed)
-
-
-def _count_by_active(
-    player_ids: tuple[PlayerId, ...],
-    capacity_exempt_player_ids: frozenset[PlayerId],
-    package_size: int,
-    minimum_active: int,
-) -> int:
-    exempt_count = sum(
-        player_id in capacity_exempt_player_ids for player_id in player_ids
-    )
-    active_count = len(player_ids) - exempt_count
-    lower = max(0, package_size - exempt_count, minimum_active)
-    upper = min(package_size, active_count)
-    return sum(
-        comb(active_count, active)
-        * comb(exempt_count, package_size - active)
-        for active in range(lower, upper + 1)
-    )
 
 
 def _coverage(

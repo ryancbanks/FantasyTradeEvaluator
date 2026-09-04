@@ -3,6 +3,10 @@
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   min-width: 320px;

@@ -33,6 +33,7 @@ from trade_snapshot.espn_free_read import (
 from trade_snapshot._espn_browser_read import read_authenticated_espn_json
 from trade_snapshot.browser_capture import (
     BrowserCaptureCancelled,
+    BrowserCaptureError,
     BrowserCaptureOptions,
     YahooScoringError,
 )
@@ -225,6 +226,24 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
                 cancelled=lambda: False,
             )
         self.assertEqual(len(collector.calls), 1)
+
+    def test_sanitized_capture_failure_is_preserved_for_troubleshooting(self):
+        class FailingCollector(_Collector):
+            def collect(self, *_args, **_kwargs):
+                raise BrowserCaptureError(
+                    "FantasyPros loaded, but its analyzer initialization was not captured"
+                )
+
+        workflow = _workflow(collector=FailingCollector())
+        with TemporaryDirectory() as directory, self.assertRaisesRegex(
+            WeeklyCollectionError,
+            "FantasyPros loaded, but its analyzer initialization was not captured.*"
+            "No weekly bundle was published",
+        ):
+            workflow(
+                _request(), data_directory=Path(directory),
+                progress=lambda _: None, cancelled=lambda: False,
+            )
 
     def test_discovered_team_count_must_match_espn(self):
         collector = _Collector()
@@ -438,8 +457,26 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
 
 
 class ProductionCalibrationTests(unittest.TestCase):
+    def test_wait_state_listener_failure_cannot_break_gate_transitions(self):
+        gate = InteractiveSignInGate()
+        task = PageCaptureTask(
+            "fantasypros", 2026, 1, "league_source",
+            "https://www.fantasypros.com/nfl/myplaybook/trade-analyzer.php",
+        )
+
+        def broken_listener(_waiting):
+            raise RuntimeError("telemetry failed")
+
+        gate.subscribe_wait_state(broken_listener)
+        self.assertFalse(gate.is_ready(task))
+        self.assertEqual(gate.status()["pending_provider"], "fantasypros")
+        self.assertEqual(gate.confirm(), "fantasypros")
+        self.assertTrue(gate.is_ready(task))
+
     def test_gate_reports_pending_confirms_exact_provider_and_resets(self):
         gate = InteractiveSignInGate()
+        wait_states = []
+        unsubscribe = gate.subscribe_wait_state(wait_states.append)
         fp = PageCaptureTask(
             "fantasypros", 2026, 1, "league_source",
             "https://www.fantasypros.com/nfl/myplaybook/trade-analyzer.php",
@@ -451,13 +488,20 @@ class ProductionCalibrationTests(unittest.TestCase):
         )
         self.assertFalse(gate.is_ready(fp))
         self.assertEqual(gate.status()["pending_provider"], "fantasypros")
+        self.assertEqual(wait_states, [True])
         with self.assertRaisesRegex(ValueError, "does not match"):
             gate.confirm("espn")
         self.assertEqual(gate.confirm("fantasypros"), "fantasypros")
+        self.assertEqual(wait_states, [True, False])
         self.assertTrue(gate.is_ready(fp))
         self.assertFalse(gate.is_ready(espn))
         self.assertEqual(gate.status()["pending_provider"], "espn")
         gate.reset()
+        self.assertEqual(wait_states, [True, False, True, False])
+        unsubscribe()
+        self.assertFalse(gate.is_ready(fp))
+        gate.reset()
+        self.assertEqual(wait_states, [True, False, True, False])
         self.assertEqual(gate.status(), {
             "pending_provider": None, "confirmed_providers": [],
         })

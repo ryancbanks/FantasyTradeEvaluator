@@ -11,6 +11,7 @@ from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
 from .engine_bundle import EngineBundle, save_engine_bundle
+from .operation_timing import OperationTiming
 
 
 class WeeklyCollectionStage(str, Enum):
@@ -146,6 +147,9 @@ class _CollectionJob:
     error: str | None = None
     bundle_id: str | None = None
     cancel: Event = field(default_factory=Event)
+    data_directory: Path | None = None
+    on_published: Callable[[EngineBundle], None] | None = None
+    timing: OperationTiming = field(default_factory=OperationTiming)
 
 
 class WeeklyCollectionJobs:
@@ -156,10 +160,15 @@ class WeeklyCollectionJobs:
         data_directory: str | Path,
         bundle_directory: str | Path,
         workflow: WeeklyCollectionWorkflow | None,
+        *,
+        timing_factory: Callable[[], OperationTiming] = OperationTiming,
     ) -> None:
+        if not callable(timing_factory):
+            raise ValueError("timing_factory must be callable")
         self._data_directory = Path(data_directory).resolve()
         self._bundle_directory = Path(bundle_directory).resolve()
         self._workflow = workflow
+        self._timing_factory = timing_factory
         self._lock = RLock()
         self._jobs: dict[str, _CollectionJob] = {}
 
@@ -172,7 +181,13 @@ class WeeklyCollectionJobs:
         with self._lock:
             return any(job.status in {"queued", "running"} for job in self._jobs.values())
 
-    def start(self, request: WeeklyCollectionRequest) -> dict[str, object]:
+    def start(
+        self,
+        request: WeeklyCollectionRequest,
+        *,
+        data_directory: str | Path | None = None,
+        on_published: Callable[[EngineBundle], None] | None = None,
+    ) -> dict[str, object]:
         if not isinstance(request, WeeklyCollectionRequest):
             raise ValueError("request must be a WeeklyCollectionRequest")
         if self._workflow is None:
@@ -180,10 +195,28 @@ class WeeklyCollectionJobs:
                 "Weekly collection is not available in this build. "
                 "Import a complete weekly bundle instead."
             )
+        workspace = (
+            self._data_directory
+            if data_directory is None
+            else Path(data_directory).resolve()
+        )
+        if workspace != self._data_directory and self._data_directory not in workspace.parents:
+            raise ValueError("collection data_directory must stay inside application data")
+        if on_published is not None and not callable(on_published):
+            raise ValueError("on_published must be callable")
         with self._lock:
             if self.is_running:
                 raise RuntimeError("another weekly collection is already running")
-            job = _CollectionJob(uuid4().hex, request)
+            timing = self._timing_factory()
+            if not isinstance(timing, OperationTiming):
+                raise TypeError("timing_factory must return an OperationTiming")
+            job = _CollectionJob(
+                uuid4().hex,
+                request,
+                data_directory=workspace,
+                on_published=on_published,
+                timing=timing,
+            )
             self._jobs[job.job_id] = job
             Thread(target=self._run, args=(job,), name="weekly-collection", daemon=True).start()
             return self._record(job)
@@ -217,10 +250,13 @@ class WeeklyCollectionJobs:
             job = self._require(job_id)
             if job.status in {"queued", "running"}:
                 job.cancel.set()
+                job.timing.request_cancel()
             return self._record(job)
 
     def _run(self, job: _CollectionJob) -> None:
+        unsubscribe_wait_state: Callable[[], None] | None = None
         try:
+            job.timing.start(WeeklyCollectionStage.PREPARING.value)
             self._update(
                 job,
                 status="running",
@@ -230,20 +266,24 @@ class WeeklyCollectionJobs:
                     "Preparing the connected browser extension",
                 ),
             )
+            unsubscribe_wait_state = self._subscribe_sign_in_timing(job)
             if job.cancel.is_set():
+                job.timing.cancel()
                 self._update(job, status="cancelled")
                 return
             bundle = self._workflow(
                 job.request,
-                data_directory=self._data_directory,
+                data_directory=job.data_directory or self._data_directory,
                 progress=lambda value: self._progress(job, value),
                 cancelled=job.cancel.is_set,
             )
             if not isinstance(bundle, EngineBundle):
                 raise TypeError("weekly collection workflow did not return an EngineBundle")
             if job.cancel.is_set():
+                job.timing.cancel()
                 self._update(job, status="cancelled")
                 return
+            job.timing.begin_phase(WeeklyCollectionStage.PUBLISHING.value)
             self._update(
                 job,
                 progress=WeeklyCollectionProgress(
@@ -256,10 +296,25 @@ class WeeklyCollectionJobs:
                 bundle,
                 self._bundle_directory / f"{bundle.bundle_id}.json",
             )
+            self._update(job, bundle_id=bundle.bundle_id)
+            if job.on_published is not None:
+                try:
+                    job.on_published(bundle)
+                except Exception:
+                    job.timing.fail()
+                    self._update(
+                        job,
+                        status="failed",
+                        error=(
+                            "The weekly engine was saved under Unassigned imports because "
+                            "its league workspace could not be updated."
+                        ),
+                    )
+                    return
+            job.timing.finish()
             self._update(
                 job,
                 status="complete",
-                bundle_id=bundle.bundle_id,
                 progress=WeeklyCollectionProgress(
                     WeeklyCollectionStage.READY,
                     1,
@@ -273,6 +328,9 @@ class WeeklyCollectionJobs:
                 job,
                 "Weekly collection stopped unexpectedly. No new weekly bundle was published.",
             )
+        finally:
+            if unsubscribe_wait_state is not None:
+                unsubscribe_wait_state()
 
     def _progress(self, job: _CollectionJob, value: WeeklyCollectionProgress) -> None:
         if job.cancel.is_set():
@@ -290,12 +348,16 @@ class WeeklyCollectionJobs:
                 raise ValueError("collection progress cannot move backwards")
             if value.fraction >= 0.99:
                 raise ValueError("workflow progress must leave room for atomic publishing")
+            if previous is None or value.stage != previous.stage:
+                job.timing.begin_phase(value.stage.value)
             job.progress = value
 
     def _finish_error(self, job: _CollectionJob, message: str) -> None:
         if job.cancel.is_set():
+            job.timing.cancel()
             self._update(job, status="cancelled", error=None)
         else:
+            job.timing.fail()
             visible = message.strip() if isinstance(message, str) else ""
             self._update(
                 job,
@@ -310,6 +372,36 @@ class WeeklyCollectionJobs:
         with self._lock:
             for name, value in changes.items():
                 setattr(job, name, value)
+
+    def _subscribe_sign_in_timing(
+        self, job: _CollectionJob
+    ) -> Callable[[], None] | None:
+        gate = getattr(self._workflow, "sign_in_gate", None)
+        subscribe = getattr(gate, "subscribe_wait_state", None)
+        if not callable(subscribe):
+            return None
+
+        def waiting_changed(waiting: bool) -> None:
+            if not isinstance(waiting, bool):
+                raise ValueError("sign-in wait state must be a boolean")
+            if job.timing.snapshot()["status"] != "running":
+                return
+            try:
+                if waiting:
+                    job.timing.pause()
+                else:
+                    job.timing.resume()
+            except RuntimeError:
+                # Terminalization can win a race with an already-dispatched
+                # gate notification. Such a stale notification is harmless.
+                if job.timing.snapshot()["status"] != "running":
+                    return
+                raise
+
+        unsubscribe = subscribe(waiting_changed)
+        if not callable(unsubscribe):
+            raise TypeError("sign-in wait subscription must be removable")
+        return unsubscribe
 
     def _require(self, job_id: str) -> _CollectionJob:
         try:
@@ -350,6 +442,7 @@ class WeeklyCollectionJobs:
                 "fraction": progress.fraction,
                 "message": progress.message,
             },
+            "operation": job.timing.snapshot(),
         }
 
 

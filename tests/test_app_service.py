@@ -58,6 +58,25 @@ def wait_for_job(service, job_id):
 
 
 class LocalAppServiceTests(unittest.TestCase):
+    def test_search_jobs_keep_only_recent_in_memory_previews(self):
+        bundle = engine_bundle()
+        request = LocalSearchRequest.from_payload(payload(bundle.bundle_id))
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            first = service.start_search(request)
+            self.assertEqual(wait_for_job(service, first["job_id"])["status"], "complete")
+            self.assertTrue(service.job_results(first["job_id"])["rows"])
+
+            second = service.start_search(request)
+            self.assertEqual(wait_for_job(service, second["job_id"])["status"], "complete")
+            third = service.start_search(request)
+            self.assertEqual(wait_for_job(service, third["job_id"])["status"], "complete")
+            with self.assertRaisesRegex(KeyError, "unknown search job"):
+                service.job(first["job_id"])
+            self.assertTrue(service.job_results(second["job_id"])["rows"])
+            self.assertTrue(service.job_results(third["job_id"])["rows"])
+
     def test_three_team_service_counts_runs_and_presents_every_participant(self):
         space, prepared, baseline, _ = three_way_components()
         bundle = SimpleNamespace(
@@ -196,6 +215,16 @@ class LocalAppServiceTests(unittest.TestCase):
 
         self.assertEqual(summary["status"], "ready")
         self.assertEqual(summary["positions"], ["RB"])
+        self.assertTrue(
+            all(team["active_count"] == team["active_capacity"] == 2 for team in summary["teams"])
+        )
+        self.assertTrue(
+            all(
+                player["roster_status"] == "ACTIVE"
+                for team in summary["teams"]
+                for player in team["players"]
+            )
+        )
         self.assertEqual(
             {
                 player["name"]

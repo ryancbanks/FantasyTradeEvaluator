@@ -1,5 +1,6 @@
 """Cross-row completeness checks for provider-neutral host league evidence."""
 
+from collections import Counter
 from math import fsum, isclose
 
 from .league_state import (
@@ -54,8 +55,17 @@ def _validate_source_references(snapshot) -> None:
 def _validate_rosters(snapshot, rosters, players) -> None:
     owners: dict[str, str] = {}
     for team_id, roster in rosters.items():
+        occupancy = Counter(roster.reserve_slot_by_player.values())
+        unknown = set(occupancy).difference(snapshot.roster_rules.reserve_slot_counts)
+        if unknown:
+            raise ValueError("source roster uses an unconfigured reserve slot")
+        if any(
+            count > snapshot.roster_rules.reserve_slot_counts[kind]
+            for kind, count in occupancy.items()
+        ):
+            raise ValueError("source roster exceeds a verified reserve-slot capacity")
         active_size = len(roster.source_player_ids) - len(
-            roster.capacity_exempt_source_player_ids
+            roster.reserve_slot_by_player
         )
         if active_size > snapshot.roster_rules.roster_cap:
             raise ValueError("source roster exceeds the verified roster cap")

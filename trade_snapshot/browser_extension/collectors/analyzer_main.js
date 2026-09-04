@@ -34,13 +34,26 @@
     return result.team2id.length === 1 && result.team1gets.length && result.team2gets.length
       ? result : null;
   })();
-  const isEndpoint = (value) => {
+  const endpointKind = (value, method) => {
     try {
       const url = new URL(value, document.baseURI);
-      return url.protocol === 'https:' && url.hostname === 'api.fantasypros.com' &&
-        (url.port === '' || url.port === '443') &&
-        url.pathname === '/v2/ajax/myplaybook.php' && !url.username && !url.password;
-    } catch (_) { return false; }
+      if (url.protocol !== 'https:' || !['', '443'].includes(url.port) ||
+          url.username || url.password) return null;
+      const verb = String(method).toUpperCase();
+      if (verb === 'GET' && url.hostname === 'mpbnfl.fantasypros.com' &&
+          url.pathname === '/api/tradeAnalyzer') return 'current';
+      if (verb === 'POST' && url.hostname === 'api.fantasypros.com' &&
+          url.pathname === '/v2/ajax/myplaybook.php') return 'legacy';
+      return null;
+    } catch (_) { return null; }
+  };
+  const retainedEndpoint = (requestUrl, responseUrl, method) => {
+    const requestKind = endpointKind(requestUrl, method);
+    if (!requestKind || endpointKind(responseUrl, method) !== requestKind) return null;
+    try {
+      return new URL(requestUrl, document.baseURI).href ===
+        new URL(responseUrl, document.baseURI).href ? requestKind : null;
+    } catch (_) { return null; }
   };
   const normalizeKey = (value) => String(value).toLowerCase().replace(/[^a-z0-9]/g, '');
   const aliases = {
@@ -72,10 +85,13 @@
     } catch (_) { return null; }
     return result;
   };
-  const matches = (params) => {
+  const matches = (params, endpoint) => {
     if (!expected || !params) return false;
+    if (['team1drops', 'team2drops'].some((name) =>
+        (params.get(name) || []).some((value) => String(value).trim()))) return false;
     const action = (params.get('action') || []).map((item) => item.toLowerCase());
-    if (!action.includes('tradeanalyzer')) return false;
+    if (endpoint === 'legacy' && !action.includes('tradeanalyzer')) return false;
+    if (endpoint === 'current' && !currentDimensions(params)) return false;
     return Object.entries(aliases).every(([field, names]) => {
       const candidate = names.flatMap((name) => params.get(name) || []);
       const actual = ids(candidate.join(','));
@@ -83,17 +99,29 @@
         actual.every((value, index) => value === expected[field][index]);
     });
   };
-  const matchesInit = (params) => {
+  const identifier = (value) => /^[1-9]\d{0,19}$/.test(String(value));
+  const currentDimensions = (params) => {
+    const key = params.get('key') || [];
+    const team = params.get('team1id') || [];
+    const period = (params.get('period') || []).map((item) => item.toLowerCase());
+    return key.length === 1 && key[0].length > 0 && key[0].length <= 2048 &&
+      team.length === 1 && identifier(team[0]) && period.length === 1 &&
+      ['ros', 'dyn', 'pre'].includes(period[0]);
+  };
+  const matchesInit = (params, endpoint) => {
     if (!params) return false;
     const actions = (params.get('action') || []).map((item) => item.toLowerCase());
     const init = (params.get('init') || []).map((item) => item.toLowerCase());
-    return actions.includes('tradeanalyzer') && init.includes('y');
+    return (endpoint !== 'current' || currentDimensions(params)) &&
+      (endpoint === 'current' || actions.includes('tradeanalyzer')) && init.includes('y');
   };
-  const retain = (url, status, method, requestBody, body) => {
+  const retain = (requestUrl, responseUrl, status, method, requestBody, redirected, body) => {
     if (!state.active) return;
-    const params = parameters(url, requestBody);
-    if (!isEndpoint(url) || status !== 200 || String(method).toUpperCase() !== 'POST') return;
-    const trade = matches(params), initial = matchesInit(params);
+    if (redirected) return;
+    const endpoint = retainedEndpoint(requestUrl, responseUrl, method);
+    const params = parameters(responseUrl, requestBody);
+    if (!endpoint || status !== 200) return;
+    const trade = matches(params, endpoint), initial = matchesInit(params, endpoint);
     if (!trade && !initial) return;
     if (body === null || typeof body !== 'object' || Array.isArray(body)) return;
     let portable;
@@ -121,8 +149,9 @@
       } catch (_) {}
       const response = await originalFetch.apply(this, args);
       Promise.all([requestBody, response.clone().json()]).then(
-        ([raw, body]) => retain(response.url, response.status,
-          init.method || (request && request.method) || 'GET', raw, body), () => {}
+        ([raw, body]) => retain(request ? request.url : args[0], response.url, response.status,
+          init.method || (request && request.method) || 'GET', raw, response.redirected, body),
+        () => {}
       );
       return response;
     };
@@ -131,13 +160,15 @@
   const originalSend = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.open = function(method, url, ...rest) {
     this.__tradeSnapshotMethod = method;
+    this.__tradeSnapshotUrl = url;
     return originalOpen.call(this, method, url, ...rest);
   };
   XMLHttpRequest.prototype.send = function(body) {
     this.addEventListener('load', () => {
       try {
         const parsed = this.responseType === 'json' ? this.response : JSON.parse(this.responseText);
-        retain(this.responseURL, this.status, this.__tradeSnapshotMethod || 'GET', body, parsed);
+        retain(this.__tradeSnapshotUrl, this.responseURL, this.status,
+          this.__tradeSnapshotMethod || 'GET', body, false, parsed);
       } catch (_) {}
     }, {once: true});
     return originalSend.apply(this, arguments);

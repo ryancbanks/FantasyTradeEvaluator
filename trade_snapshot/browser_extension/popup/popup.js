@@ -12,13 +12,13 @@
   const disconnect = document.querySelector("#disconnect");
 
   const labels = {
-    idle: ["Not paired", "Open Fantasy Trade Evaluator and choose its browser-extension connection."],
+    idle: ["Not paired", "If you just installed or reloaded this extension, refresh the Trade Evaluator page once. Then click Connect extension there."],
     pair_pending: ["Pairing approval needed", "Confirm that the local app address below is the app you opened."],
     pairing: ["Pairing…", "Exchanging the one-time code with the local app."],
     paired: ["Paired", "The bridge is ready for a scan command."],
     waiting: ["Paired", "Waiting for the local app's next scan command."],
     running: ["Scanning", "One dedicated browser tab is being used for the current command."],
-    error: ["Connection error", "Return to the local app and create a new pairing code."]
+    error: ["Connection error", "Refresh the Trade Evaluator page, click Connect extension there, then reopen this popup."]
   };
 
   function render(value) {
@@ -45,6 +45,13 @@
       const current = await chrome.runtime.sendMessage({kind: "fte.popup.status"});
       if (current?.ok) render(current.value);
     } catch (_) {
+      try {
+        const current = await chrome.runtime.sendMessage({kind: "fte.popup.status"});
+        if (current?.ok) {
+          render(current.value);
+          return;
+        }
+      } catch (_) {}
       render({phase: "error"});
     } finally {
       for (const button of [accept, reject, disconnect]) button.disabled = false;

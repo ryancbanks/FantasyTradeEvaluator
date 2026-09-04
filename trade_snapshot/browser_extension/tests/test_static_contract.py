@@ -124,6 +124,14 @@ class ExtensionStaticContractTests(unittest.TestCase):
             'sendLocalEvent(rejectedPair.appTabId, "pair.rejected")', worker
         )
 
+    def test_popup_hides_actions_that_do_not_match_the_connection_state(self) -> None:
+        stylesheet = (ROOT / "popup" / "popup.css").read_text(encoding="utf-8")
+        popup = self.javascript["popup/popup.js"]
+        self.assertRegex(stylesheet, r"\[hidden\]\s*\{[^}]*display:\s*none\s*!important")
+        self.assertIn("pairActions.hidden = !pending", popup)
+        self.assertIn("connectedActions.hidden = !", popup)
+        self.assertIn('kind: "fte.popup.status"', popup)
+
     def test_scan_code_is_marker_gated_and_one_tab_is_enforced(self) -> None:
         gated = [
             name for name in self.javascript
@@ -143,6 +151,10 @@ class ExtensionStaticContractTests(unittest.TestCase):
         league = self.javascript["collectors/league_main.js"]
         espn = self.javascript["collectors/espn_main.js"]
         self.assertIn("/v2/ajax/myplaybook.php", analyzer)
+        self.assertIn("mpbnfl.fantasypros.com", analyzer)
+        self.assertIn("/api/tradeAnalyzer", analyzer)
+        self.assertIn("team1drops", analyzer)
+        self.assertIn("response.redirected", analyzer)
         self.assertIn("response_too_large", analyzer)
         self.assertIn("privateColumn", projection)
         self.assertIn("Yahoo All Players", projection)

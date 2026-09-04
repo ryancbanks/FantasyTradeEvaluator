@@ -36,22 +36,60 @@ async (options) => {
     const number = Number(value);
     return Number.isFinite(number) ? number : null;
   };
+  const percentage = (value) => {
+    if (typeof value === 'string') {
+      const display = value.trim();
+      if (['<1%', '>99%'].includes(display)) return display;
+      if (!/^(?:\d+(?:\.\d+)?|\.\d+)%?$/.test(display)) return null;
+      value = display.endsWith('%') ? display.slice(0, -1) : display;
+    } else if (typeof value !== 'number') return null;
+    const number = finite(value);
+    return number !== null && number >= 0 && number <= 100 ? number : null;
+  };
   const text = (value) => typeof value === 'string' && value.trim() ? value.trim() : null;
+  const reserveSlot = (value) => {
+    const normalized = text(value)?.toUpperCase().replace(/[^A-Z0-9]+/g, '');
+    return new Set([
+      'IR', 'INJUREDRESERVE', 'RES', 'RESERVE', 'ROOKIERESERVE',
+      'TAXI', 'TAXISQUAD', 'NFI', 'PUP', 'NA'
+    ]).has(normalized);
+  };
   const teamsRaw = Array.isArray(pageData.teams) ? pageData.teams.slice(0, 100) : [];
   const leagueRaw = record(pageData.league) ? pageData.league : null;
   const settingsRaw = record(leagueRaw?.settings) ? leagueRaw.settings : {};
+  const configuredRosterSize = () => {
+    const slots = own(settingsRaw, ['roster_positions', 'rosterPositions']);
+    if (slots === undefined) return undefined;
+    if (!Array.isArray(slots) || !slots.length || slots.length > 100) return null;
+    let total = 0;
+    for (const slot of slots) {
+      const slotName = text(own(slot, ['type', 'position']));
+      const rawCount = own(slot, ['count']);
+      const count = Number.isInteger(rawCount) ? rawCount : null;
+      if (!slotName || count === null || count < 0 || count > 100) return null;
+      if (reserveSlot(slotName)) continue;
+      total += count;
+      if (total > 100) return null;
+    }
+    return total || null;
+  };
   const projectLeague = () => {
     const rosterSizes = teamsRaw.map((team) => Array.isArray(team?.players)
       ? team.players.length : null).filter(Number.isInteger);
-    const rosterSize = integer(own(leagueRaw, ['rosterSize', 'roster_size']) ??
-      own(settingsRaw, ['rosterSize', 'roster_size', 'totalRounds']) ??
+    const explicitRosterSize = own(leagueRaw, ['rosterSize', 'roster_size']) ??
+      own(settingsRaw, ['rosterSize', 'roster_size']);
+    const configuredSize = configuredRosterSize();
+    if (configuredSize === null) return null;
+    const rosterSize = integer(configuredSize ?? explicitRosterSize ??
+      own(settingsRaw, ['totalRounds']) ??
       (rosterSizes.length && new Set(rosterSizes).size === 1 ? rosterSizes[0] : null));
     const scoring = text(own(leagueRaw, ['scoring']) ??
-      own(settingsRaw, ['scoring', 'scoringType', 'scoring_type']));
+      own(settingsRaw, ['scoring', 'scoringType', 'scoring_type', 'basic_scoring']));
     const result = {
       season: integer(own(leagueRaw, ['season', 'year']) ?? own(pageData, ['season', 'year'])),
       team_count: teamsRaw.length,
       playoff_teams: integer(own(leagueRaw,
+        ['playoffsTeams', 'playoffTeams', 'playoff_teams']) ?? own(settingsRaw,
         ['playoffsTeams', 'playoffTeams', 'playoff_teams'])),
       roster_size: rosterSize,
       scoring
@@ -169,7 +207,10 @@ async (options) => {
     const standings = value.standings.slice(0, 100).map((row) => {
       if (!record(row) || !fields.every((name) => Object.hasOwn(row, name))) return null;
       const result = {teamId: identifier(row.teamId), teamName: text(row.teamName)};
-      for (const name of fields.slice(2)) result[name] = finite(row[name]);
+      for (const name of fields.slice(2)) {
+        result[name] = ['playoffs_odds', 'championship_odds'].includes(name)
+          ? percentage(row[name]) : finite(row[name]);
+      }
       return result.teamId && result.teamName && fields.slice(2)
         .every((name) => result[name] !== null) ? result : null;
     }).filter(Boolean);

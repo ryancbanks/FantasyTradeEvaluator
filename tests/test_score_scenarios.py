@@ -98,13 +98,47 @@ class PreparedScoreScenarioTests(unittest.TestCase):
         self.assertEqual(tuple(first), tuple(second))
         json.dumps(first.identity_record(), allow_nan=False)
 
-    def test_capacity_exempt_membership_is_preserved_in_scenario_identity(self):
+    def test_typed_reserve_capacity_and_placement_are_in_scenario_identity(self):
         ordinary = basic_prepared(scenario_count=2)
-        with_ir = prepare_score_scenarios(
+        reserve_counts = {"IR": 1}
+        reserve_state = replace(
             ordinary.state,
+            roster_rules=RosterRules(1, ("FLEX",), reserve_counts),
+        )
+        capacity_only = prepare_score_scenarios(
+            reserve_state,
+            tuple(
+                TeamRoster(
+                    team_id=row.team_id,
+                    player_ids=row.player_ids,
+                    current_size=row.current_size,
+                    roster_cap=row.roster_cap,
+                    reserve_slot_counts=reserve_counts,
+                )
+                for row in ordinary.rosters
+            ),
+            ordinary.projections,
+            ordinary.eligibilities,
+            ordinary.config,
+        )
+        with_ir = prepare_score_scenarios(
+            reserve_state,
             (
-                TeamRoster("a", ("p1",), 1, 1, {"p1"}),
-                ordinary.rosters[1],
+                TeamRoster(
+                    "a",
+                    ("p1",),
+                    1,
+                    1,
+                    reserve_slot_by_player={"p1": "IR"},
+                    reserve_slot_counts=reserve_counts,
+                ),
+                TeamRoster(
+                    "b",
+                    ("p2",),
+                    1,
+                    1,
+                    reserve_slot_counts=reserve_counts,
+                ),
             ),
             ordinary.projections,
             ordinary.eligibilities,
@@ -112,16 +146,19 @@ class PreparedScoreScenarioTests(unittest.TestCase):
         )
 
         self.assertEqual(with_ir.draw_space_id, ordinary.draw_space_id)
-        self.assertNotEqual(with_ir.run_id, ordinary.run_id)
+        self.assertNotEqual(capacity_only.run_id, ordinary.run_id)
+        self.assertNotEqual(with_ir.run_id, capacity_only.run_id)
         self.assertEqual(
-            with_ir.rosters[0].capacity_exempt_player_ids,
-            frozenset({"p1"}),
+            dict(with_ir.rosters[0].reserve_slot_by_player),
+            {"p1": "IR"},
         )
         self.assertEqual(
-            with_ir.identity_record()["rosters"][0][
-                "capacity_exempt_player_ids"
-            ],
-            ["p1"],
+            with_ir.identity_record()["rosters"][0]["reserve_slot_by_player"],
+            {"p1": "IR"},
+        )
+        self.assertEqual(
+            with_ir.identity_record()["rosters"][0]["reserve_slot_counts"],
+            reserve_counts,
         )
 
     def test_matchup_score_adjustment_changes_content_identity_not_player_draws(self):
@@ -145,7 +182,7 @@ class PreparedScoreScenarioTests(unittest.TestCase):
 
         self.assertEqual(adjusted.draw_space_id, ordinary.draw_space_id)
         self.assertNotEqual(adjusted.run_id, ordinary.run_id)
-        self.assertEqual(adjusted.identity_record()["schema_version"], 3)
+        self.assertEqual(adjusted.identity_record()["schema_version"], 4)
         self.assertEqual(
             adjusted.identity_record()["remaining_matchups"][0][
                 "team1_score_adjustment"

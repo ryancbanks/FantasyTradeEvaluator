@@ -160,9 +160,10 @@ class ResumableLeagueTradeSearch:
             counterparty_team_ids, ordered_league_ids, primary_team_id
         )
         primary = by_team[primary_team_id]
-        adjuster = None if constraints.require_no_drops else PreparedRosterAdjuster(
-            model, roster_rows
-        )
+        # Even a no-drop trade may create an ordinary active vacancy that should
+        # be filled from the captured waiver pool.  The trade-space constraint
+        # rejects cuts; the adjuster remains responsible for legal additions.
+        adjuster = PreparedRosterAdjuster(model, roster_rows)
         eligible_positions = {
             player_id: player.eligible_positions
             for player_id, player in model.players.items()

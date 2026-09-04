@@ -1,3 +1,4 @@
+from collections import Counter
 from itertools import product
 import unittest
 
@@ -16,10 +17,24 @@ from trade_snapshot.trade_filters import (
 from trade_snapshot.trade_space import TeamRoster, TradeConstraints
 
 
-def roster(team_id, player_ids, *, cap=None, exempt=()):
+def roster(
+    team_id,
+    player_ids,
+    *,
+    cap=None,
+    reserve_slots=None,
+    reserve_counts=None,
+):
     players = tuple(player_ids)
     capacity = len(players) if cap is None else cap
-    return TeamRoster(team_id, players, len(players), capacity, frozenset(exempt))
+    return TeamRoster(
+        team_id,
+        players,
+        len(players),
+        capacity,
+        reserve_slots or {},
+        reserve_counts or {},
+    )
 
 
 def signature(candidate):
@@ -42,11 +57,15 @@ def brute_force(rosters, constraints, positions=None):
         (origin, *(index for index in range(3) if index != origin))
         for origin, _ in players
     )
+    reserve_slot_by_player = {
+        player_id: kind
+        for row in rows
+        for player_id, kind in row.reserve_slot_by_player.items()
+    }
     results = []
     for destinations in product(*choices):
         outgoing = [[] for _ in rows]
         incoming = [[] for _ in rows]
-        active_outgoing = [0, 0, 0]
         routes = {}
         invalid = False
         for (origin, player_id), destination in zip(players, destinations):
@@ -57,9 +76,6 @@ def brute_force(rosters, constraints, positions=None):
                 break
             outgoing[origin].append(player_id)
             incoming[destination].append(player_id)
-            active_outgoing[origin] += int(
-                player_id not in rows[origin].capacity_exempt_player_ids
-            )
             routes.setdefault((origin, destination), []).append(player_id)
         if invalid:
             continue
@@ -85,11 +101,19 @@ def brute_force(rosters, constraints, positions=None):
             for sent, received in zip(out_sizes, in_sizes)
         ):
             continue
-        if constraints.require_no_drops and any(
-            row.active_size - sent_active + received > row.roster_cap
-            for row, sent_active, received in zip(
-                rows, active_outgoing, in_sizes
+        capacity = tuple(
+            capacity_result(
+                row,
+                outgoing[index],
+                incoming[index],
+                reserve_slot_by_player,
             )
+            for index, row in enumerate(rows)
+        )
+        if constraints.require_no_drops and any(cuts for cuts, _ in capacity):
+            continue
+        if not constraints.require_no_drops and any(
+            not feasible for _, feasible in capacity
         ):
             continue
         if not package_matches(
@@ -111,6 +135,47 @@ def brute_force(rosters, constraints, positions=None):
             )
         )
     return tuple(results)
+
+
+def capacity_result(roster, outgoing, incoming, reserve_slot_by_player):
+    """Independent typed-capacity oracle returning required cuts and feasibility."""
+
+    current = Counter(roster.reserve_slot_by_player.values())
+    sent_reserve = Counter(
+        roster.reserve_slot_by_player[player_id]
+        for player_id in outgoing
+        if player_id in roster.reserve_slot_by_player
+    )
+    incoming_reserve = Counter(
+        reserve_slot_by_player[player_id]
+        for player_id in incoming
+        if player_id in reserve_slot_by_player
+    )
+    retained = current - sent_reserve
+    candidates = retained + incoming_reserve
+    occupied = sum(
+        min(count, roster.reserve_slot_counts.get(kind, 0))
+        for kind, count in candidates.items()
+    )
+    required_cuts = max(
+        0,
+        roster.current_size - len(outgoing) + len(incoming)
+        - occupied
+        - roster.roster_cap,
+    )
+    retained_active = (
+        len(roster.player_ids)
+        - sum(current.values())
+        - (len(outgoing) - sum(sent_reserve.values()))
+    )
+    overflow_reductions = sum(
+        min(
+            retained.get(kind, 0),
+            max(0, count - roster.reserve_slot_counts.get(kind, 0)),
+        )
+        for kind, count in candidates.items()
+    )
+    return required_cuts, required_cuts <= retained_active + overflow_reductions
 
 
 def package_matches(player_ids, rule, positions):
@@ -570,11 +635,17 @@ class ThreeWayTradeSpaceTests(unittest.TestCase):
                 )
             )
 
-    def test_no_drop_uses_active_outgoing_and_treats_incoming_ir_as_active(self):
-        rows = (
-            roster("A", ("a1", "a2", "a-ir"), cap=2, exempt={"a-ir"}),
-            roster("B", ("b1", "b2")),
-            roster("C", ("c1", "c2")),
+    def test_no_drop_transfers_reserve_kind_without_cross_filling(self):
+        ir_rows = (
+            roster("A", ("a1",), cap=1, reserve_counts={"IR": 1}),
+            roster(
+                "B",
+                ("b1", "b-ir"),
+                cap=1,
+                reserve_slots={"b-ir": "IR"},
+                reserve_counts={"IR": 1},
+            ),
+            roster("C", ("c1",), cap=1),
         )
         constraints = TradeConstraints(
             min_outgoing=1,
@@ -582,28 +653,137 @@ class ThreeWayTradeSpaceTests(unittest.TestCase):
             min_incoming=1,
             max_incoming=2,
             max_total_players=4,
+            max_imbalance=1,
             require_no_drops=True,
         )
-        space = ThreeWayTradeSpace(rows, constraints)
-        candidates = tuple(space)
-
-        self.assertEqual(tuple(map(signature, candidates)), brute_force(rows, constraints))
-        self.assertTrue(candidates)
-        self.assertFalse(
-            any(candidate.outgoing_for("A") == ("a-ir",) for candidate in candidates)
+        target = (
+            ("A", "B", ("a1",)),
+            ("B", "A", ("b-ir",)),
+            ("B", "C", ("b1",)),
+            ("C", "A", ("c1",)),
         )
-        for candidate in candidates:
-            for row in space.rosters:
-                active_sent = sum(
-                    player_id not in row.capacity_exempt_player_ids
-                    for player_id in candidate.outgoing_for(row.team_id)
-                )
-                self.assertLessEqual(
-                    row.active_size
-                    - active_sent
-                    + len(candidate.incoming_for(row.team_id)),
-                    row.roster_cap,
-                )
+        ir_space = ThreeWayTradeSpace(ir_rows, constraints)
+        ir_candidates = tuple(map(signature, ir_space))
+
+        self.assertEqual(ir_space.candidate_count, len(ir_candidates))
+        self.assertEqual(ir_candidates, brute_force(ir_rows, constraints))
+        self.assertIn(target, ir_candidates)
+        for index in range(len(ir_candidates) + 1):
+            self.assertEqual(
+                tuple(map(signature, ir_space.iter_from(index))),
+                ir_candidates[index:],
+            )
+
+        rookie_rows = (
+            roster(
+                "A",
+                ("a1",),
+                cap=1,
+                reserve_counts={"ROOKIE_RESERVE": 1},
+            ),
+            ir_rows[1],
+            ir_rows[2],
+        )
+        rookie_space = ThreeWayTradeSpace(rookie_rows, constraints)
+        rookie_candidates = tuple(map(signature, rookie_space))
+
+        self.assertEqual(rookie_space.candidate_count, len(rookie_candidates))
+        self.assertEqual(rookie_candidates, brute_force(rookie_rows, constraints))
+        self.assertNotIn(target, rookie_candidates)
+        self.assertNotEqual(
+            ir_space.enumeration_record(), rookie_space.enumeration_record()
+        )
+
+        matching_rookie_rows = (
+            rookie_rows[0],
+            roster(
+                "B",
+                ("b1", "b-ir"),
+                cap=1,
+                reserve_slots={"b-ir": "ROOKIE_RESERVE"},
+                reserve_counts={"ROOKIE_RESERVE": 1},
+            ),
+            rookie_rows[2],
+        )
+        matching_rookie_space = ThreeWayTradeSpace(
+            matching_rookie_rows, constraints
+        )
+        matching_rookie_candidates = tuple(map(signature, matching_rookie_space))
+
+        self.assertEqual(
+            matching_rookie_space.candidate_count,
+            len(matching_rookie_candidates),
+        )
+        self.assertEqual(
+            matching_rookie_candidates,
+            brute_force(matching_rookie_rows, constraints),
+        )
+        self.assertIn(target, matching_rookie_candidates)
+
+    def test_drop_enabled_accepts_cuttable_retained_reserve_overflow(self):
+        rows = (
+            roster(
+                "A",
+                ("a1", "a-ir"),
+                cap=1,
+                reserve_slots={"a-ir": "IR"},
+                reserve_counts={"IR": 1},
+            ),
+            roster(
+                "B",
+                ("b1", "b-ir"),
+                cap=1,
+                reserve_slots={"b-ir": "IR"},
+                reserve_counts={"IR": 1},
+            ),
+            roster("C", ("c1",), cap=1),
+        )
+        constraints = TradeConstraints(
+            min_outgoing=1,
+            max_outgoing=2,
+            min_incoming=1,
+            max_incoming=2,
+            max_total_players=4,
+            max_imbalance=1,
+        )
+        accepted = (
+            ("A", "C", ("a1",)),
+            ("B", "A", ("b1", "b-ir")),
+            ("C", "B", ("c1",)),
+        )
+        space = ThreeWayTradeSpace(rows, constraints)
+        candidates = tuple(map(signature, space))
+
+        self.assertEqual(space.candidate_count, len(candidates))
+        self.assertEqual(candidates, brute_force(rows, constraints))
+        self.assertIn(accepted, candidates)
+
+    def test_drop_enabled_rejects_a_trade_that_would_cut_an_incoming_player(self):
+        rows = (
+            roster("A", ("a1",), cap=1),
+            roster("B", ("b1", "b2"), cap=2),
+            roster("C", ("c1",), cap=1),
+        )
+        constraints = TradeConstraints(
+            min_outgoing=1,
+            max_outgoing=2,
+            min_incoming=1,
+            max_incoming=2,
+            max_total_players=4,
+            max_imbalance=1,
+        )
+        rejected = (
+            ("A", "B", ("a1",)),
+            ("B", "A", ("b1",)),
+            ("B", "C", ("b2",)),
+            ("C", "A", ("c1",)),
+        )
+        space = ThreeWayTradeSpace(rows, constraints)
+        candidates = tuple(map(signature, space))
+
+        self.assertEqual(space.candidate_count, len(candidates))
+        self.assertEqual(candidates, brute_force(rows, constraints))
+        self.assertNotIn(rejected, candidates)
 
     def test_count_is_not_limited_to_sqlite_or_javascript_integers(self):
         rows = tuple(

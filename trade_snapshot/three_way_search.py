@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .analyzer_contract import PowerRankingChange
+from .roster_capacity import assign_reserve_slots
 from .roster_adjustment import PreparedRosterAdjuster, TeamRosterAdjustment
 from .search_runner import TradeSearchSettings
 from .strength import RosterStrength, StrengthModel
@@ -28,7 +29,7 @@ from .trade_impact import PreparedSeasonBaseline
 from .trade_space import TeamRoster
 
 
-THREE_WAY_SEARCH_ALGORITHM = "local-three-way-power-paired-playoffs-v1"
+THREE_WAY_SEARCH_ALGORITHM = "local-three-way-power-paired-playoffs-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,6 +318,12 @@ def _run_definition(space, prepared, baseline, settings):
 
 
 def _pure_adjustments(changes, model):
+    changes = tuple(changes)
+    reserve_slot_by_player = {
+        player_id: kind
+        for before, _, _ in changes
+        for player_id, kind in before.reserve_slot_by_player.items()
+    }
     adjustments = []
     for before, outgoing, incoming in changes:
         outgoing_set = set(outgoing)
@@ -327,11 +334,20 @@ def _pure_adjustments(changes, model):
         ) + tuple(incoming)
         if not set(players).issubset(model.players):
             raise ValueError("trade contains a player absent from the strength model")
-        exempt = before.capacity_exempt_player_ids.difference(outgoing_set)
+        assigned = assign_reserve_slots(
+            reserve_slot_by_player,
+            before.reserve_slot_counts,
+            players,
+        )
         adjustments.append(
             TeamRosterAdjustment(
                 TeamRoster(
-                    before.team_id, players, len(players), before.roster_cap, exempt
+                    before.team_id,
+                    players,
+                    len(players),
+                    before.roster_cap,
+                    assigned,
+                    before.reserve_slot_counts,
                 )
             )
         )
@@ -374,16 +390,18 @@ def _same_roster(left, right):
         and frozenset(left.player_ids) == frozenset(right.player_ids)
         and left.current_size == right.current_size
         and left.roster_cap == right.roster_cap
-        and left.capacity_exempt_player_ids == right.capacity_exempt_player_ids
+        and left.reserve_slot_by_player == right.reserve_slot_by_player
+        and left.reserve_slot_counts == right.reserve_slot_counts
     )
 
 
 def _roster_record(roster):
     return {
         "active_size": roster.active_size,
-        "capacity_exempt_player_ids": sorted(roster.capacity_exempt_player_ids),
         "current_size": roster.current_size,
         "player_ids": list(roster.player_ids),
+        "reserve_slot_by_player": dict(roster.reserve_slot_by_player),
+        "reserve_slot_counts": dict(roster.reserve_slot_counts),
         "roster_cap": roster.roster_cap,
         "team_id": roster.team_id,
     }

@@ -23,9 +23,10 @@ remote-debugging connection.
 
 The extension is served as a ZIP from the running local app. Until it is published
 through a browser extension store, the user loads it once with Chrome or Edge's
-**Load unpacked** control. A one-time code and explicit popup approval pair that
-installed extension with one local app tab. The extension then owns at most one
-temporary scan tab and closes it when collection finishes.
+**Load unpacked** control, then refreshes the already-open local app page once so
+the browser injects its content bridge. A one-time code and explicit popup approval
+pair that installed extension with one local app tab. The extension then owns at
+most one temporary scan tab and closes it when collection finishes.
 
 Every artifact contains `THIRD_PARTY_NOTICES` and a generated native dependency
 inventory. The build fails closed if an included native library lacks a reviewed

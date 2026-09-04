@@ -137,7 +137,7 @@ class CapturePlanTests(unittest.TestCase):
                 "analyzer": "capschema_bcf693343ec0769715115324a1c4e1bd210d418eb52abca72cca5d820f73092e",
                 "ecr_task": "capschema_75f616f4218befaa96bd8caaa5179825b5e22f4e088174d0e989f869602ef9a6",
                 "ecr": "capschema_7efe13de770357c2bc8031b32b1da11697c198e630c3664b6642b1a4dfb94faf",
-                "league": "capschema_d21e24b0e4ed0e7e97b1826bb8f8f8e40da8a52432be37b696dad6d52558291b",
+                "league": "capschema_5de2665e9d4c2e5de7ffa7ff467e13cb8b2a0bea85e8a96be30f6dfcf585a202",
             },
         )
 
@@ -266,6 +266,25 @@ class LeagueArtifactTests(unittest.TestCase):
         serialized = json.dumps(record)
         self.assertNotIn("secret", serialized)
         self.assertNotIn("example.test", serialized)
+
+    def test_projected_standings_preserve_censored_odds_and_reject_bad_percentages(self):
+        projected = next(
+            source for source in league_sources()
+            if source.source is LeagueSourceKind.PROJECTED_STANDINGS
+        ).to_record()["body"]["payload"]
+        projected["standings"][0]["championship_odds"] = "<1%"
+        source = LeagueSource("projected_standings", {"payload": projected})
+        self.assertEqual(
+            source.to_record()["body"]["payload"]["standings"][0]["championship_odds"],
+            "<1%",
+        )
+        for invalid in ("1-ish%", "101%", 101, -1, True, [], {}):
+            changed = copy.deepcopy(projected)
+            changed["standings"][0]["playoffs_odds"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, "percentage"
+            ):
+                LeagueSource("projected_standings", {"payload": changed})
 
     def test_missing_source_and_injected_persisted_secret_fail_closed(self):
         task = league_task()

@@ -191,10 +191,11 @@ def normalize_host_league_snapshot(
             tuple(resolved[player_id].canonical_player_id for player_id in row.source_player_ids),
             len(row.source_player_ids),
             snapshot.roster_rules.roster_cap,
-            frozenset(
-                resolved[player_id].canonical_player_id
-                for player_id in row.capacity_exempt_source_player_ids
-            ),
+            {
+                resolved[player_id].canonical_player_id: kind
+                for player_id, kind in row.reserve_slot_by_player.items()
+            },
+            snapshot.roster_rules.reserve_slot_counts,
         )
         for row in snapshot.rosters
     )

@@ -1,5 +1,6 @@
 """Strict provider-neutral evidence for one host fantasy league."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from math import isfinite
@@ -12,10 +13,18 @@ from .positions import (
     normalize_lineup_slot,
     normalize_player_position,
 )
+from .roster_capacity import normalize_reserve_slot_by_player
 from .scoring import ScoringProfile
 
 
-_ALLOWED_LINEUP_SLOTS = CANONICAL_PLAYER_POSITIONS | {"FLEX", "SFLX", "OP", "UTIL"}
+_ALLOWED_LINEUP_SLOTS = CANONICAL_PLAYER_POSITIONS | {
+    "FLEX",
+    "RB_WR",
+    "WR_TE",
+    "SFLX",
+    "OP",
+    "UTIL",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,16 +90,10 @@ class SourceLeaguePlayer:
 class SourceTeamRoster:
     source_team_id: str
     source_player_ids: tuple[str, ...]
-    capacity_exempt_source_player_ids: frozenset[str] = field(
-        default_factory=frozenset
-    )
+    reserve_slot_by_player: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _text("source_team_id", self.source_team_id)
-        if isinstance(self.capacity_exempt_source_player_ids, (str, bytes)):
-            raise ValueError(
-                "capacity_exempt_source_player_ids must contain non-empty strings"
-            )
         try:
             player_ids = tuple(self.source_player_ids)
         except TypeError:
@@ -99,21 +102,26 @@ class SourceTeamRoster:
             raise ValueError("source_player_ids must contain non-empty strings")
         if len(set(player_ids)) != len(player_ids):
             raise ValueError("source roster contains a duplicate player ID")
-        try:
-            capacity_exempt = frozenset(self.capacity_exempt_source_player_ids)
-        except TypeError:
-            raise ValueError(
-                "capacity_exempt_source_player_ids must contain non-empty strings"
-            ) from None
-        if any(not _is_text(value) for value in capacity_exempt):
-            raise ValueError(
-                "capacity_exempt_source_player_ids must contain non-empty strings"
-            )
-        if not capacity_exempt.issubset(player_ids):
-            raise ValueError("capacity-exempt source players must be rostered by the team")
+        reserve_slots = normalize_reserve_slot_by_player(
+            self.reserve_slot_by_player,
+            owned_player_ids=player_ids,
+        )
         object.__setattr__(self, "source_player_ids", player_ids)
-        object.__setattr__(
-            self, "capacity_exempt_source_player_ids", capacity_exempt
+        object.__setattr__(self, "reserve_slot_by_player", reserve_slots)
+
+    @property
+    def capacity_exempt_source_player_ids(self) -> frozenset[str]:
+        """Legacy read view of players occupying any typed reserve slot."""
+
+        return frozenset(self.reserve_slot_by_player)
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.source_team_id,
+                self.source_player_ids,
+                tuple(self.reserve_slot_by_player.items()),
+            )
         )
 
 

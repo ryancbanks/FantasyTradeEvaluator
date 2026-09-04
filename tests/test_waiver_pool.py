@@ -39,6 +39,23 @@ class WaiverPoolTests(unittest.TestCase):
             ("FLEX", "OP", "RB"),
         )
 
+    def test_composite_flex_slots_keep_their_position_boundaries(self):
+        starting = ("RB_WR", "WR_TE", "FLEX", "OP")
+
+        self.assertEqual(
+            waiver_eligible_slots("RB", starting),
+            ("FLEX", "OP", "RB", "RB_WR"),
+        )
+        self.assertEqual(
+            waiver_eligible_slots("WR", starting),
+            ("FLEX", "OP", "RB_WR", "WR", "WR_TE"),
+        )
+        self.assertEqual(
+            waiver_eligible_slots("TE", starting),
+            ("FLEX", "OP", "TE", "WR_TE"),
+        )
+        self.assertEqual(waiver_eligible_slots("QB", starting), ("OP", "QB"))
+
     def test_preserves_exact_best_ids_and_labels_deterministic_ecr_fill(self):
         pool = select_waiver_pool(
             snapshot_id="week-1",

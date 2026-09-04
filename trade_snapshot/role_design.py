@@ -37,8 +37,11 @@ def build_calibration_roles(
     eligibility = _eligibility(eligibilities)
     owned = set()
     for roster in roster_rows:
-        if roster.roster_cap != roster_rules.roster_cap:
-            raise ValueError("roster cap does not match league roster rules")
+        if (
+            roster.roster_cap != roster_rules.roster_cap
+            or roster.reserve_slot_counts != roster_rules.reserve_slot_counts
+        ):
+            raise ValueError("roster capacities do not match league roster rules")
         if roster.current_size != len(roster.player_ids):
             raise ValueError("role design requires complete current rosters")
         overlap = owned.intersection(roster.player_ids)

@@ -9,7 +9,10 @@ import unittest
 from tests.test_app_service import payload, wait_for_job
 from tests.test_engine_bundle import engine_bundle
 from trade_snapshot.app_service import LocalAppService, LocalSearchRequest
+from trade_snapshot.capture_schema import PageCaptureTask
 from trade_snapshot.local_server import create_local_server
+from trade_snapshot.operation_timing import OperationTiming
+from trade_snapshot.production_calibration import InteractiveSignInGate
 from trade_snapshot.weekly_collection import (
     WeeklyCollectionError,
     WeeklyCollectionJobs,
@@ -102,6 +105,105 @@ class InteractiveWorkflow(SuccessfulWorkflow):
         self.pending = None
         self.confirmed.append(provider)
         return provider
+
+
+class TimedInteractiveWorkflow(SuccessfulWorkflow):
+    def __init__(self):
+        super().__init__()
+        self.sign_in_gate = InteractiveSignInGate()
+        self.waiting_for_sign_in = Event()
+        self.continued_after_sign_in = Event()
+        self.finish_work = Event()
+
+    def __call__(self, request, *, data_directory, progress, cancelled):
+        task = PageCaptureTask(
+            "fantasypros",
+            request.season,
+            request.week,
+            "league_source",
+            "https://www.fantasypros.com/nfl/myplaybook/trade-analyzer.php",
+        )
+        while not self.sign_in_gate.is_ready(task):
+            self.waiting_for_sign_in.set()
+            if cancelled():
+                raise WeeklyCollectionError("cancelled")
+            time.sleep(0.001)
+        self.continued_after_sign_in.set()
+        if not self.finish_work.wait(1):
+            raise RuntimeError("test did not release post-sign-in work")
+        return super().__call__(
+            request,
+            data_directory=data_directory,
+            progress=progress,
+            cancelled=cancelled,
+        )
+
+
+class TerminalRaceGate:
+    def __init__(self):
+        self.pending = None
+        self.confirmed = []
+        self.listener = None
+        self.waiting_for_sign_in = Event()
+        self.confirmation_dispatched = Event()
+        self.release_confirmation = Event()
+
+    def subscribe_wait_state(self, listener):
+        self.listener = listener
+
+        def unsubscribe():
+            if self.listener is listener:
+                self.listener = None
+
+        return unsubscribe
+
+    def begin_wait(self):
+        self.pending = "fantasypros"
+        self.listener(True)
+        self.waiting_for_sign_in.set()
+
+    def status(self):
+        return {
+            "pending_provider": self.pending,
+            "confirmed_providers": list(self.confirmed),
+        }
+
+    def confirm(self):
+        provider = self.pending
+        if provider is None:
+            raise ValueError("no provider sign-in is waiting for confirmation")
+        self.pending = None
+        self.confirmed.append(provider)
+        dispatched_listener = self.listener
+        self.confirmation_dispatched.set()
+        if not self.release_confirmation.wait(1):
+            raise RuntimeError("test did not release confirmation")
+        if dispatched_listener is not None:
+            dispatched_listener(False)
+        return provider
+
+
+class TerminalRaceWorkflow:
+    def __init__(self):
+        self.sign_in_gate = TerminalRaceGate()
+        self.fail = Event()
+
+    def __call__(self, request, *, data_directory, progress, cancelled):
+        self.sign_in_gate.begin_wait()
+        if not self.fail.wait(1):
+            raise RuntimeError("test did not release workflow failure")
+        raise WeeklyCollectionError("forced collection failure")
+
+
+class FakeClock:
+    def __init__(self):
+        self.value = 0.0
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
 
 
 class WeeklyCollectionRequestTests(unittest.TestCase):
@@ -251,6 +353,66 @@ class WeeklyCollectionRequestTests(unittest.TestCase):
 
 
 class WeeklyCollectionJobTests(unittest.TestCase):
+    def test_sign_in_wait_is_excluded_without_polling_and_later_work_is_counted(self):
+        workflow = TimedInteractiveWorkflow()
+        clock = FakeClock()
+        with TemporaryDirectory() as directory:
+            jobs = WeeklyCollectionJobs(
+                directory,
+                Path(directory) / "bundles",
+                workflow,
+                timing_factory=lambda: OperationTiming(clock=clock),
+            )
+            started = jobs.start(valid_request())
+            self.assertTrue(workflow.waiting_for_sign_in.wait(1))
+
+            # No job-status read occurs while the user is signing in. The gate
+            # transition itself must pause timing and exclude this interval.
+            clock.advance(120)
+            jobs.confirm_sign_in(started["job_id"])
+            self.assertTrue(workflow.continued_after_sign_in.wait(1))
+
+            # The worker can finish before another UI poll. Confirmation must
+            # already have resumed timing so this work remains measurable.
+            clock.advance(4.25)
+            workflow.finish_work.set()
+            finished = wait_for_collection(jobs.job, started["job_id"])
+
+        self.assertEqual(finished["status"], "complete")
+        self.assertEqual(finished["operation"]["activity"], "terminal")
+        self.assertEqual(finished["operation"]["elapsed_seconds"], 4.25)
+
+    def test_in_flight_confirmation_is_harmless_after_job_terminalizes(self):
+        workflow = TerminalRaceWorkflow()
+        confirmation = []
+        errors = []
+        with TemporaryDirectory() as directory:
+            jobs = WeeklyCollectionJobs(
+                directory, Path(directory) / "bundles", workflow
+            )
+            started = jobs.start(valid_request())
+            self.assertTrue(workflow.sign_in_gate.waiting_for_sign_in.wait(1))
+
+            def confirm():
+                try:
+                    confirmation.append(jobs.confirm_sign_in(started["job_id"]))
+                except Exception as error:
+                    errors.append(error)
+
+            thread = Thread(target=confirm)
+            thread.start()
+            self.assertTrue(workflow.sign_in_gate.confirmation_dispatched.wait(1))
+            workflow.fail.set()
+            finished = wait_for_collection(jobs.job, started["job_id"])
+            workflow.sign_in_gate.release_confirmation.set()
+            thread.join(1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(confirmation[0]["confirmed_provider"], "fantasypros")
+        self.assertEqual(finished["status"], "failed")
+        self.assertEqual(finished["operation"]["activity"], "terminal")
+
     def test_interactive_sign_in_status_and_confirmation_are_job_scoped(self):
         workflow = InteractiveWorkflow()
         with TemporaryDirectory() as directory:
@@ -417,7 +579,7 @@ class WeeklyCollectionHTTPTests(unittest.TestCase):
         page = response.read().decode("utf-8")
         connection.close()
         self.assertEqual(response.status, 200)
-        self.assertIn("Scan league &amp; collect", page)
+        self.assertIn("Scan selected league &amp; collect", page)
         self.assertNotIn('id="expectedTeamCount"', page)
         self.assertIn("League size, every team, and every roster are detected", page)
         self.assertIn('id="hostLeagueUrl"', page)

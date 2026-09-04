@@ -102,8 +102,12 @@ def validate_engine_context(context: EngineContext) -> None:
     for roster in context.team_rosters:
         if roster.current_size != len(roster.player_ids):
             raise ValueError("EngineContext requires full rosters, not search-pool subsets")
-        if roster.roster_cap != state.roster_rules.roster_cap:
-            raise ValueError("team roster cap does not match league roster rules")
+        if (
+            roster.roster_cap != state.roster_rules.roster_cap
+            or roster.reserve_slot_counts
+            != state.roster_rules.reserve_slot_counts
+        ):
+            raise ValueError("team roster capacities do not match league roster rules")
         for player_id in roster.player_ids:
             previous_owner = owner_by_player.get(player_id)
             if previous_owner is not None:

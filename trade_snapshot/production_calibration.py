@@ -3,7 +3,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from threading import Lock
+from threading import RLock
 
 from .browser_capture import BrowserCaptureOptions, BrowserCollector, SignInGate
 from .calibration_capture import (
@@ -74,42 +74,83 @@ class InteractiveSignInGate:
     """Thread-safe UI handshake; it stores provider names, never credentials."""
 
     def __init__(self) -> None:
-        self._lock = Lock()
+        self._lock = RLock()
+        self._transition_lock = RLock()
+        self._notifying_wait_state = False
         self._pending: CaptureProvider | None = None
         self._confirmed: set[CaptureProvider] = set()
+        self._wait_state_listeners: list[Callable[[bool], None]] = []
+
+    def subscribe_wait_state(
+        self, listener: Callable[[bool], None]
+    ) -> Callable[[], None]:
+        """Notify a listener when a provider wait starts or ends."""
+
+        if not callable(listener):
+            raise ValueError("wait-state listener must be callable")
+        with self._lock:
+            self._wait_state_listeners.append(listener)
+
+        def unsubscribe() -> None:
+            with self._lock:
+                for index, candidate in enumerate(self._wait_state_listeners):
+                    if candidate is listener:
+                        del self._wait_state_listeners[index]
+                        break
+
+        return unsubscribe
 
     def reset(self) -> None:
-        with self._lock:
-            self._pending = None
-            self._confirmed.clear()
+        with self._transition_lock:
+            self._require_outside_listener()
+            with self._lock:
+                stopped_waiting = self._pending is not None
+                self._pending = None
+                self._confirmed.clear()
+            if stopped_waiting:
+                self._notify_wait_state(False)
 
     def is_ready(self, task: CaptureTask) -> bool:
         provider = getattr(task, "provider", None)
         if not isinstance(provider, CaptureProvider):
             raise ValueError("sign-in task provider is invalid")
-        with self._lock:
-            if provider in self._confirmed:
-                return True
-            if self._pending is None:
-                self._pending = provider
-            elif self._pending is not provider:
-                raise ValueError("another provider sign-in is already pending")
+        with self._transition_lock:
+            self._require_outside_listener()
+            with self._lock:
+                if provider in self._confirmed:
+                    return True
+                started_waiting = self._pending is None
+                if started_waiting:
+                    self._pending = provider
+                elif self._pending is not provider:
+                    raise ValueError("another provider sign-in is already pending")
+            if started_waiting:
+                self._notify_wait_state(True)
             return False
 
     def confirm(self, provider: str | CaptureProvider | None = None) -> str:
-        with self._lock:
-            if self._pending is None:
-                raise ValueError("no provider sign-in is waiting for confirmation")
-            expected = self._pending
-            if provider is not None:
-                try:
-                    supplied = provider if isinstance(provider, CaptureProvider) else CaptureProvider(provider)
-                except (TypeError, ValueError):
-                    raise ValueError("provider sign-in confirmation is invalid") from None
-                if supplied is not expected:
-                    raise ValueError("provider sign-in confirmation does not match")
-            self._confirmed.add(expected)
-            self._pending = None
+        with self._transition_lock:
+            self._require_outside_listener()
+            with self._lock:
+                if self._pending is None:
+                    raise ValueError("no provider sign-in is waiting for confirmation")
+                expected = self._pending
+                if provider is not None:
+                    try:
+                        supplied = (
+                            provider
+                            if isinstance(provider, CaptureProvider)
+                            else CaptureProvider(provider)
+                        )
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            "provider sign-in confirmation is invalid"
+                        ) from None
+                    if supplied is not expected:
+                        raise ValueError("provider sign-in confirmation does not match")
+                self._confirmed.add(expected)
+                self._pending = None
+            self._notify_wait_state(False)
             return expected.value
 
     def status(self) -> dict[str, object]:
@@ -120,6 +161,25 @@ class InteractiveSignInGate:
                     self._confirmed, key=lambda value: value.value
                 )],
             }
+
+    def _notify_wait_state(self, waiting: bool) -> None:
+        with self._lock:
+            listeners = tuple(self._wait_state_listeners)
+        self._notifying_wait_state = True
+        try:
+            for listener in listeners:
+                try:
+                    listener(waiting)
+                except Exception:
+                    # Timing/telemetry observers must never break the sign-in
+                    # state transition they are observing.
+                    continue
+        finally:
+            self._notifying_wait_state = False
+
+    def _require_outside_listener(self) -> None:
+        if self._notifying_wait_state:
+            raise RuntimeError("sign-in state cannot change from a wait-state listener")
 
 
 class BrowserCalibrationFactory:

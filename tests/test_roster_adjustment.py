@@ -178,16 +178,23 @@ class RosterAdjustmentTests(unittest.TestCase):
             ("fa-starter",),
         )
 
-    def test_ir_exemption_is_preserved_and_never_used_to_solve_active_overflow(self):
+    def test_incoming_ir_player_fills_open_ir_slot_without_a_drop(self):
         value = model()
         primary = TeamRoster(
             "primary",
-            ("p1", "p2", "fa2"),
-            3,
-            2,
-            {"fa2"},
+            ("p1", "p2"),
+            current_size=2,
+            roster_cap=2,
+            reserve_slot_counts={"IR": 1},
         )
-        other = TeamRoster("other", ("q1", "q2"), 2, 2)
+        other = TeamRoster(
+            "other",
+            ("q1", "q2"),
+            current_size=2,
+            roster_cap=1,
+            reserve_slot_by_player={"q2": "IR"},
+            reserve_slot_counts={"IR": 1},
+        )
         adjuster = PreparedRosterAdjuster(value, (primary, other))
 
         result = adjuster.adjust_trade(
@@ -196,36 +203,96 @@ class RosterAdjustmentTests(unittest.TestCase):
             TradeCandidate(("p2",), ("q1", "q2")),
         )
 
-        self.assertEqual(result.primary.dropped_player_ids, ("p1",))
-        self.assertIn("fa2", result.primary.roster.player_ids)
+        self.assertEqual(result.primary.dropped_player_ids, ())
         self.assertEqual(
-            result.primary.roster.capacity_exempt_player_ids,
-            frozenset({"fa2"}),
+            dict(result.primary.roster.reserve_slot_by_player),
+            {"q2": "IR"},
         )
         self.assertEqual(result.primary.roster.active_size, 2)
+        self.assertEqual(
+            set(result.primary.roster.player_ids),
+            {"p1", "q1", "q2"},
+        )
 
-    def test_traded_ir_player_becomes_active_for_the_receiving_team(self):
+    def test_full_ir_overflow_drops_least_damaging_retained_player(self):
         value = model()
         primary = TeamRoster(
             "primary",
             ("p1", "p2", "fa2"),
-            3,
-            2,
-            {"fa2"},
+            current_size=3,
+            roster_cap=2,
+            reserve_slot_by_player={"fa2": "IR"},
+            reserve_slot_counts={"IR": 1},
         )
-        other = TeamRoster("other", ("q1", "q2"), 2, 2)
+        other = TeamRoster(
+            "other",
+            ("q1", "q2"),
+            current_size=2,
+            roster_cap=1,
+            reserve_slot_by_player={"q2": "IR"},
+            reserve_slot_counts={"IR": 1},
+        )
 
         result = PreparedRosterAdjuster(value, (primary, other)).adjust_trade(
             primary,
             other,
-            TradeCandidate(("fa2",), ("q1",)),
+            TradeCandidate(("p2",), ("q1", "q2")),
         )
 
-        self.assertEqual(result.primary.roster.capacity_exempt_player_ids, frozenset())
+        self.assertEqual(result.primary.dropped_player_ids, ("fa2",))
+        self.assertEqual(
+            dict(result.primary.roster.reserve_slot_by_player),
+            {"q2": "IR"},
+        )
         self.assertEqual(result.primary.roster.active_size, 2)
-        self.assertEqual(result.primary.dropped_player_ids, ("p2",))
-        self.assertEqual(result.counterparty.roster.capacity_exempt_player_ids, frozenset())
-        self.assertEqual(result.counterparty.roster.active_size, 2)
+        self.assertEqual(
+            set(result.primary.roster.player_ids),
+            {"p1", "q1", "q2"},
+        )
+        self.assertEqual(
+            value.score_roster(result.primary.roster.player_ids).power_score,
+            56.0,
+        )
+
+    def test_power_delta_is_scored_after_the_required_drop(self):
+        value = model()
+        primary = TeamRoster(
+            "primary",
+            ("p1", "p2", "fa2"),
+            current_size=3,
+            roster_cap=2,
+            reserve_slot_by_player={"fa2": "IR"},
+            reserve_slot_counts={"IR": 1},
+        )
+        other = TeamRoster(
+            "other",
+            ("q1", "q2"),
+            current_size=2,
+            roster_cap=1,
+            reserve_slot_by_player={"q2": "IR"},
+            reserve_slot_counts={"IR": 1},
+        )
+        candidate = TradeCandidate(("p2",), ("q1", "q2"))
+        adjuster = PreparedRosterAdjuster(value, (primary, other))
+
+        evaluation = PreparedTradePair(
+            value, primary, other, adjuster
+        ).evaluate(candidate, candidate_index=0)
+
+        final_ids = evaluation.roster_adjustment.primary.roster.player_ids
+        raw_ids_before_drop = ("p1", "fa2", "q1", "q2")
+        self.assertEqual(
+            evaluation.primary.raw_after,
+            value.score_roster(final_ids).power_score,
+        )
+        self.assertNotEqual(
+            evaluation.primary.raw_after,
+            value.score_roster(raw_ids_before_drop).power_score,
+        )
+        self.assertEqual(
+            evaluation.roster_adjustment.primary.dropped_player_ids,
+            ("fa2",),
+        )
 
     def test_existing_open_active_slot_accepts_net_incoming_player_without_drop(self):
         value = model()

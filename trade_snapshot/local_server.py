@@ -13,7 +13,7 @@ from secrets import token_urlsafe
 import shutil
 from threading import Event, Lock, Thread, Timer
 from time import monotonic
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 import webbrowser
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
@@ -42,9 +42,28 @@ _COLLECTION_CANCEL_PATH = re.compile(
 _COLLECTION_SIGN_IN_PATH = re.compile(
     r"^/api/weekly-collections/([0-9a-f]{32})/sign-in$"
 )
+_PROFILE_ID = r"league_[0-9a-f]{32}"
+_BUNDLE_ID = r"engine_[0-9a-f]{64}"
+_LEAGUE_PATH = re.compile(rf"^/api/leagues/({_PROFILE_ID})$")
+_LEAGUE_ACTION_PATH = re.compile(
+    rf"^/api/leagues/({_PROFILE_ID})/(archive|restore|team)$"
+)
+_LEAGUE_BUNDLES_PATH = re.compile(
+    rf"^/api/leagues/({_PROFILE_ID}|unassigned)/bundles$"
+)
+_LEAGUE_BUNDLE_IMPORT_PATH = re.compile(
+    rf"^/api/leagues/({_PROFILE_ID}|unassigned)/bundles/import$"
+)
+_LEAGUE_BUNDLE_ASSIGN_PATH = re.compile(
+    rf"^/api/leagues/({_PROFILE_ID})/bundles/({_BUNDLE_ID})/assign$"
+)
+_BUNDLE_PATH = re.compile(rf"^/api/bundles/({_BUNDLE_ID})$")
 _EXPORT_PATH = re.compile(r"^/api/exports/([^/]+\.xlsx)$")
 _STATIC = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/league_ui.js": ("league_ui.js", "text/javascript; charset=utf-8"),
+    "/progress_ui.js": ("progress_ui.js", "text/javascript; charset=utf-8"),
+    "/results_workbench.js": ("results_workbench.js", "text/javascript; charset=utf-8"),
     "/trade_filter_ui.js": ("trade_filter_ui.js", "text/javascript; charset=utf-8"),
     "/three_way_ui.js": ("three_way_ui.js", "text/javascript; charset=utf-8"),
     "/styles.css": ("styles.css", "text/css; charset=utf-8"),
@@ -177,7 +196,8 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Unexpected local application error."})
 
     def _get(self) -> None:
-        path = urlsplit(self.path).path
+        target = urlsplit(self.path)
+        path = target.path
         if path == "/":
             template = _asset("index.html").decode("utf-8")
             body = template.replace("__APP_TOKEN__", self.server.app_token).encode("utf-8")
@@ -204,6 +224,8 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/browser-extension/status":
             self._json(HTTPStatus.OK, self.server.extension_bridge.public_status())
+            return
+        if self._workspace_get(path, target.query):
             return
         matched = _COLLECTION_PATH.fullmatch(path)
         if matched:
@@ -243,14 +265,10 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
             summary = self.server.app_service.import_bundle(self._read_json())
             self._json(HTTPStatus.CREATED, summary)
             return
+        if self._workspace_post(path):
+            return
         if path == "/api/weekly-collections":
-            request = WeeklyCollectionRequest.from_payload(
-                self._read_json(max_bytes=32 * 1024)
-            )
-            self._json(
-                HTTPStatus.ACCEPTED,
-                self.server.app_service.start_weekly_collection(request),
-            )
+            self._json(HTTPStatus.ACCEPTED, self._start_weekly_collection())
             return
         if path in {"/api/searches", "/api/searches/estimate"}:
             request = LocalSearchRequest.from_payload(self._read_json(max_bytes=1024 * 1024))
@@ -297,6 +315,88 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
             )
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+
+    def _workspace_get(self, path: str, query: str) -> bool:
+        if path == "/api/leagues":
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.league_profiles(
+                    **_league_page_options(query)
+                ),
+            )
+            return True
+        matched = _LEAGUE_BUNDLES_PATH.fullmatch(path)
+        if matched:
+            self._json(
+                HTTPStatus.OK,
+                self.server.app_service.league_bundle_catalog(matched.group(1)),
+            )
+            return True
+        matched = _BUNDLE_PATH.fullmatch(path)
+        if matched:
+            self._json(HTTPStatus.OK, self.server.app_service.bundle(matched.group(1)))
+            return True
+        return False
+
+    def _workspace_post(self, path: str) -> bool:
+        if path == "/api/leagues":
+            response = self.server.app_service.create_league_profile(
+                self._read_json(max_bytes=32 * 1024)
+            )
+            self._json(HTTPStatus.CREATED, response)
+            return True
+        matched = _LEAGUE_PATH.fullmatch(path)
+        if matched:
+            response = self.server.app_service.update_league_profile(
+                matched.group(1), self._read_json(max_bytes=32 * 1024)
+            )
+            self._json(HTTPStatus.OK, response)
+            return True
+        matched = _LEAGUE_ACTION_PATH.fullmatch(path)
+        if matched:
+            profile_id, action = matched.groups()
+            if action == "team":
+                response = self.server.app_service.save_league_team(
+                    profile_id, self._read_json(max_bytes=4 * 1024)
+                )
+            else:
+                self._require_empty_body()
+                operation = (
+                    self.server.app_service.archive_league_profile
+                    if action == "archive"
+                    else self.server.app_service.restore_league_profile
+                )
+                response = operation(profile_id)
+            self._json(HTTPStatus.OK, response)
+            return True
+        matched = _LEAGUE_BUNDLE_IMPORT_PATH.fullmatch(path)
+        if matched:
+            profile_id = matched.group(1)
+            response = self.server.app_service.import_bundle(
+                self._read_json(),
+                league_profile_id=None if profile_id == "unassigned" else profile_id,
+            )
+            self._json(HTTPStatus.CREATED, response)
+            return True
+        matched = _LEAGUE_BUNDLE_ASSIGN_PATH.fullmatch(path)
+        if matched:
+            self._require_empty_body()
+            response = self.server.app_service.assign_bundle_to_league(
+                *matched.groups()
+            )
+            self._json(HTTPStatus.OK, response)
+            return True
+        return False
+
+    def _start_weekly_collection(self) -> dict[str, object]:
+        payload = self._read_json(max_bytes=32 * 1024)
+        if isinstance(payload, dict) and "league_profile_id" in payload:
+            profile_id = payload.pop("league_profile_id")
+            return self.server.app_service.start_profile_weekly_collection(
+                profile_id, payload
+            )
+        request = WeeklyCollectionRequest.from_payload(payload)
+        return self.server.app_service.start_weekly_collection(request)
 
     def _extension_post(self, path: str) -> None:
         bridge = self.server.extension_bridge
@@ -508,6 +608,34 @@ def _extension_archive() -> bytes:
 
 def _reject_constant(value: str):
     raise ValueError(f"non-finite JSON constant {value}")
+
+
+def _league_page_options(query: str) -> dict[str, object]:
+    pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=True)
+    allowed = {"include_archived", "limit", "cursor"}
+    if any(key not in allowed for key, _ in pairs):
+        raise ValueError("league list query fields are invalid")
+    if len({key for key, _ in pairs}) != len(pairs):
+        raise ValueError("league list query fields cannot be repeated")
+    values = dict(pairs)
+
+    include_archived = values.get("include_archived", "false")
+    if include_archived not in {"true", "false"}:
+        raise ValueError("include_archived must be true or false")
+    raw_limit = values.get("limit", "100")
+    if not raw_limit.isascii() or not raw_limit.isdigit():
+        raise ValueError("limit must be an integer from 1 through 250")
+    limit = int(raw_limit)
+    if not 1 <= limit <= 250:
+        raise ValueError("limit must be an integer from 1 through 250")
+    cursor = values.get("cursor")
+    if cursor == "":
+        raise ValueError("cursor cannot be empty")
+    return {
+        "include_archived": include_archived == "true",
+        "limit": limit,
+        "cursor": cursor,
+    }
 
 
 def _unique_object(pairs):

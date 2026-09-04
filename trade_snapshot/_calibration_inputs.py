@@ -6,6 +6,7 @@ from numbers import Real
 from types import MappingProxyType
 from typing import Iterable, Mapping
 
+from .roster_capacity import assign_reserve_slots
 from .strength_calibration import (
     RoleDefinition,
     _content_id,
@@ -166,6 +167,8 @@ class CalibrationCorpus:
     player_features: tuple[PlayerFeatureVector, ...]
     baseline_rosters: Mapping[str, tuple[str, ...]]
     roster_cap: int
+    reserve_slot_counts: Mapping[str, int]
+    reserve_slot_by_player: Mapping[str, str]
     samples: tuple[RosterPowerSample, ...]
     held_out_trades: tuple[CalibrationTradeObservation, ...]
     corpus_id: str
@@ -200,10 +203,23 @@ class CalibrationCorpus:
         feature_names = tuple(features[0].values)
         if any(tuple(row.values) != feature_names for row in features):
             raise ValueError("every player must have exactly the same feature names")
-        baselines, roster_cap = _baselines(baseline_rosters, feature_by_id)
+        (
+            baselines,
+            roster_cap,
+            reserve_slot_counts,
+            reserve_slot_by_player,
+        ) = _baselines(baseline_rosters, feature_by_id)
         sample_rows = tuple(samples)
         heldouts = tuple(held_out_trades)
-        _validate_samples(sample_rows, heldouts, baselines, roster_cap, feature_by_id)
+        _validate_samples(
+            sample_rows,
+            heldouts,
+            baselines,
+            roster_cap,
+            reserve_slot_counts,
+            reserve_slot_by_player,
+            feature_by_id,
+        )
         sample_rows = tuple(sorted(sample_rows, key=lambda row: row.sample_id))
         heldouts = tuple(sorted(heldouts, key=lambda row: row.trade_id))
         record = _corpus_record(
@@ -214,6 +230,8 @@ class CalibrationCorpus:
             features,
             baselines,
             roster_cap,
+            reserve_slot_counts,
+            reserve_slot_by_player,
             sample_rows,
             heldouts,
         )
@@ -228,6 +246,16 @@ class CalibrationCorpus:
         )
         object.__setattr__(self, "baseline_rosters", MappingProxyType(baselines))
         object.__setattr__(self, "roster_cap", roster_cap)
+        object.__setattr__(
+            self,
+            "reserve_slot_counts",
+            MappingProxyType(dict(reserve_slot_counts)),
+        )
+        object.__setattr__(
+            self,
+            "reserve_slot_by_player",
+            MappingProxyType(dict(reserve_slot_by_player)),
+        )
         object.__setattr__(self, "samples", sample_rows)
         object.__setattr__(self, "held_out_trades", heldouts)
         object.__setattr__(self, "corpus_id", _content_id("calibration-corpus", record))
@@ -242,7 +270,14 @@ def _baselines(values, features):
     caps = {row.roster_cap for row in rows}
     if len(caps) != 1:
         raise ValueError("baseline_rosters must use one league-wide roster cap")
-    result, owned = {}, set()
+    reserve_capacity_signatures = {
+        tuple(row.reserve_slot_counts.items()) for row in rows
+    }
+    if len(reserve_capacity_signatures) != 1:
+        raise ValueError(
+            "baseline_rosters must use one league-wide set of reserve-slot capacities"
+        )
+    result, reserve_slots, owned = {}, {}, set()
     for row in sorted(rows, key=lambda item: item.team_id):
         if row.current_size != len(row.player_ids):
             raise ValueError("each baseline TeamRoster must contain its complete current roster")
@@ -254,10 +289,20 @@ def _baselines(values, features):
             raise ValueError(f"baseline rosters share player {min(overlap)!r}")
         owned.update(row.player_ids)
         result[row.team_id] = tuple(sorted(row.player_ids))
-    return result, next(iter(caps))
+        reserve_slots.update(row.reserve_slot_by_player)
+    reserve_slot_counts = dict(next(iter(reserve_capacity_signatures)))
+    return result, next(iter(caps)), reserve_slot_counts, reserve_slots
 
 
-def _validate_samples(samples, heldouts, baselines, cap, features):
+def _validate_samples(
+    samples,
+    heldouts,
+    baselines,
+    cap,
+    reserve_slot_counts,
+    reserve_slot_by_player,
+    features,
+):
     if not samples or any(not isinstance(row, RosterPowerSample) for row in samples):
         raise ValueError("samples must contain RosterPowerSample values")
     if len({row.sample_id for row in samples}) != len(samples):
@@ -266,7 +311,15 @@ def _validate_samples(samples, heldouts, baselines, cap, features):
     if len(semantic_samples) != len(samples):
         raise ValueError("samples contain the same semantic team roster more than once")
     for row in samples:
-        _validate_roster(row.team_id, row.roster_player_ids, baselines, cap, features)
+        _validate_roster(
+            row.team_id,
+            row.roster_player_ids,
+            baselines,
+            cap,
+            reserve_slot_counts,
+            reserve_slot_by_player,
+            features,
+        )
     baseline_scores = {}
     for team_id, roster in baselines.items():
         anchors = [
@@ -297,7 +350,15 @@ def _validate_samples(samples, heldouts, baselines, cap, features):
                 trade.team2_raw_before,
             ),
         ):
-            _validate_roster(team_id, after, baselines, cap, features)
+            _validate_roster(
+                team_id,
+                after,
+                baselines,
+                cap,
+                reserve_slot_counts,
+                reserve_slot_by_player,
+                features,
+            )
             if before != baselines[team_id]:
                 raise ValueError("held-out trade before roster must equal the captured baseline")
             if raw_before != baseline_scores[team_id]:
@@ -306,14 +367,46 @@ def _validate_samples(samples, heldouts, baselines, cap, features):
                 raise ValueError("held-out trade after roster leaks into training samples")
 
 
-def _validate_roster(team_id, roster, baselines, cap, features):
+def _validate_roster(
+    team_id,
+    roster,
+    baselines,
+    cap,
+    reserve_slot_counts,
+    reserve_slot_by_player,
+    features,
+):
     if team_id not in baselines:
         raise ValueError("calibration row team_id is not a baseline league team")
-    if len(roster) > cap:
-        raise ValueError("calibration roster exceeds the captured roster cap")
     unknown = set(roster).difference(features)
     if unknown:
         raise ValueError(f"calibration roster references unknown player {min(unknown)!r}")
+    active_occupancy = _active_occupancy(
+        roster, reserve_slot_counts, reserve_slot_by_player
+    )
+    if active_occupancy > cap:
+        raise ValueError("calibration roster exceeds the captured active roster cap")
+    baseline_active_occupancy = _active_occupancy(
+        baselines[team_id], reserve_slot_counts, reserve_slot_by_player
+    )
+    if active_occupancy != baseline_active_occupancy:
+        raise ValueError(
+            "calibration roster changes the team's captured active roster occupancy"
+        )
+
+
+def _active_occupancy(roster, reserve_slot_counts, reserve_slot_by_player):
+    reserve_candidates = {
+        player_id: reserve_slot_by_player[player_id]
+        for player_id in roster
+        if player_id in reserve_slot_by_player
+    }
+    assigned = assign_reserve_slots(
+        reserve_candidates,
+        reserve_slot_counts,
+        roster,
+    )
+    return len(roster) - len(assigned)
 
 
 def _validate_transfer(before1, after1, before2, after2):
@@ -325,7 +418,19 @@ def _validate_transfer(before1, after1, before2, after2):
         raise ValueError("held-out trade must change both team rosters")
 
 
-def _corpus_record(snapshot, season, profile, roles, features, baselines, cap, samples, heldouts):
+def _corpus_record(
+    snapshot,
+    season,
+    profile,
+    roles,
+    features,
+    baselines,
+    cap,
+    reserve_slot_counts,
+    reserve_slot_by_player,
+    samples,
+    heldouts,
+):
     return {
         "baseline_rosters": {key: list(value) for key, value in baselines.items()},
         "held_out_trades": [row.evidence_id for row in heldouts],
@@ -339,6 +444,8 @@ def _corpus_record(snapshot, season, profile, roles, features, baselines, cap, s
         ],
         "role_definitions": [row.to_record() for row in roles],
         "roster_cap": cap,
+        "reserve_slot_by_player": dict(reserve_slot_by_player),
+        "reserve_slot_counts": dict(reserve_slot_counts),
         "samples": [
             {
                 "raw_power_score": row.raw_power_score,
@@ -348,7 +455,7 @@ def _corpus_record(snapshot, season, profile, roles, features, baselines, cap, s
             }
             for row in samples
         ],
-        "schema_version": 2,
+        "schema_version": 3,
         "scoring_profile_id": profile,
         "season": season,
         "snapshot_id": snapshot,

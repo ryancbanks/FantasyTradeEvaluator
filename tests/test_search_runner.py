@@ -3,7 +3,9 @@ import math
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
+import trade_snapshot.search_runner as search_runner_module
 from trade_snapshot.ensemble import EnsembleProjection, ProviderObservation
 from trade_snapshot.league_state import (
     FantasyMatchup,
@@ -41,7 +43,12 @@ from trade_snapshot.trade_space import TeamRoster, TradeConstraints, TradeSpace
 PLAYER_POINTS = {"p1": 12.0, "p2": 8.0, "q1": 10.0, "q2": 6.0}
 
 
-def league_state(scoring_profile_id="profile-1"):
+def league_state(scoring_profile_id="profile-1", reserve_slot_counts=None):
+    roster_rules = (
+        RosterRules(2, ("FLEX",))
+        if reserve_slot_counts is None
+        else RosterRules(2, ("FLEX",), reserve_slot_counts)
+    )
     return LeagueState(
         snapshot_id="snapshot-1",
         season=2026,
@@ -53,7 +60,7 @@ def league_state(scoring_profile_id="profile-1"):
             TeamStanding("other", 0, 0, 0, 0, 0),
         ),
         remaining_matchups=(FantasyMatchup(1, "primary", "other"),),
-        roster_rules=RosterRules(2, ("FLEX",)),
+        roster_rules=roster_rules,
         playoff_rules=PlayoffRules(
             qualifier_count=1,
             regular_season_end_week=1,
@@ -120,11 +127,31 @@ def components(
     threshold=-100.0,
     checkpoint_interval=2,
     scoring_profile_id="profile-1",
-    primary_exempt=frozenset(),
+    primary_reserve_slots=None,
+    reserve_slot_counts=None,
     trade_constraints=None,
 ):
-    primary = TeamRoster("primary", ("p1", "p2"), 2, 2, primary_exempt)
-    other = TeamRoster("other", ("q1", "q2"), 2, 2)
+    if reserve_slot_counts is None and primary_reserve_slots is None:
+        primary = TeamRoster("primary", ("p1", "p2"), 2, 2)
+        other = TeamRoster("other", ("q1", "q2"), 2, 2)
+    else:
+        reserve_counts = {} if reserve_slot_counts is None else reserve_slot_counts
+        primary_slots = {} if primary_reserve_slots is None else primary_reserve_slots
+        primary = TeamRoster(
+            "primary",
+            ("p1", "p2"),
+            2,
+            2,
+            reserve_slot_by_player=primary_slots,
+            reserve_slot_counts=reserve_counts,
+        )
+        other = TeamRoster(
+            "other",
+            ("q1", "q2"),
+            2,
+            2,
+            reserve_slot_counts=reserve_counts,
+        )
     rosters = (primary, other)
     model = strength_model(scoring_profile_id)
     pair = PreparedTradePair(model, primary, other)
@@ -133,10 +160,25 @@ def components(
         tuple(reversed(primary.player_ids)) if reverse_space else primary.player_ids,
         2,
         2,
-        primary_exempt,
+        **(
+            {}
+            if reserve_slot_counts is None and primary_reserve_slots is None
+            else {
+                "reserve_slot_by_player": primary_slots,
+                "reserve_slot_counts": reserve_counts,
+            }
+        ),
     )
     space_other = TeamRoster(
-        "other", tuple(reversed(other.player_ids)) if reverse_space else other.player_ids, 2, 2
+        "other",
+        tuple(reversed(other.player_ids)) if reverse_space else other.player_ids,
+        2,
+        2,
+        **(
+            {}
+            if reserve_slot_counts is None and primary_reserve_slots is None
+            else {"reserve_slot_counts": reserve_counts}
+        ),
     )
     space = TradeSpace(
         space_primary,
@@ -150,7 +192,7 @@ def components(
         PlayerEligibility(player_id, ("FLEX",)) for player_id in PLAYER_POINTS
     )
     baseline = prepare_season_baseline(
-        league_state(scoring_profile_id),
+        league_state(scoring_profile_id, reserve_slot_counts),
         rosters,
         projections,
         eligibility,
@@ -209,6 +251,26 @@ class ResumableTradeSearchTests(unittest.TestCase):
             all(row.primary_playoff_before is not None for row in first.results)
         )
 
+    def test_progress_accounting_visits_each_qualified_result_once(self):
+        runner = components(checkpoint_interval=1)
+        progress_updates = []
+        original_is_mutual_gain = search_runner_module._is_mutual_gain
+
+        with TemporaryDirectory() as directory:
+            with patch.object(
+                search_runner_module,
+                "_is_mutual_gain",
+                wraps=original_is_mutual_gain,
+            ) as is_mutual_gain:
+                outcome = runner.run(
+                    Path(directory) / "search.sqlite3",
+                    on_progress=progress_updates.append,
+                )
+
+        self.assertEqual(len(progress_updates), runner.trade_space.candidate_count + 1)
+        self.assertEqual(is_mutual_gain.call_count, len(outcome.results))
+        self.assertEqual(progress_updates[-1], outcome.progress)
+
     def test_cancel_checkpoint_resumes_from_exact_next_candidate(self):
         runner = components(checkpoint_interval=100)
         calls = 0
@@ -249,16 +311,28 @@ class ResumableTradeSearchTests(unittest.TestCase):
             outcome = reordered.run(Path(directory) / "search.sqlite3")
         self.assertEqual(outcome.progress.next_candidate_index, 4)
 
-    def test_capacity_exempt_membership_changes_the_resumable_run_identity(self):
+    def test_reserve_capacity_and_placement_change_the_resumable_run_identity(self):
         ordinary = components()
-        with_ir = components(primary_exempt={"p2"})
+        capacity_only = components(reserve_slot_counts={"IR": 1})
+        with_ir = components(
+            reserve_slot_counts={"IR": 1},
+            primary_reserve_slots={"p2": "IR"},
+        )
 
         self.assertNotEqual(
             ordinary.season_baseline.scenarios.run_id,
+            capacity_only.season_baseline.scenarios.run_id,
+        )
+        self.assertNotEqual(
+            capacity_only.season_baseline.scenarios.run_id,
             with_ir.season_baseline.scenarios.run_id,
         )
         self.assertNotEqual(
             ordinary.run_definition.run_id,
+            capacity_only.run_definition.run_id,
+        )
+        self.assertNotEqual(
+            capacity_only.run_definition.run_id,
             with_ir.run_definition.run_id,
         )
 
