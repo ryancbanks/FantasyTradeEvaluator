@@ -38,6 +38,7 @@ from trade_snapshot.strength import (
 from trade_snapshot.three_way_search import (
     PreparedThreeWayTrade,
     ResumableThreeWayTradeSearch,
+    THREE_WAY_SEARCH_ALGORITHM,
     ThreeWayQualifiedResult,
     ThreeWaySearchOutcome,
     ThreeWaySearchRunDefinition,
@@ -322,6 +323,46 @@ class ThreeWayEvaluationTests(unittest.TestCase):
         }
         self.assertEqual(actual, expected)
 
+    def test_pure_adjustment_transfers_and_assigns_incoming_ir_status(self):
+        strength = model()
+        rosters = (
+            TeamRoster(
+                "a",
+                ("a1", "a2"),
+                2,
+                2,
+                reserve_slot_counts={"IR": 1},
+            ),
+            TeamRoster(
+                "b",
+                ("b1", "b2"),
+                2,
+                1,
+                reserve_slot_by_player={"b2": "IR"},
+                reserve_slot_counts={"IR": 1},
+            ),
+            TeamRoster("c", ("c1", "c2"), 2, 2),
+        )
+        candidate = ThreeWayTradeCandidate(
+            ("a", "b", "c"),
+            (
+                TradeTransfer("a", "b", ("a1",)),
+                TradeTransfer("b", "a", ("b2",)),
+                TradeTransfer("b", "c", ("b1",)),
+                TradeTransfer("c", "a", ("c1",)),
+            ),
+        )
+
+        result = PreparedThreeWayTrade(strength, rosters).evaluate(
+            candidate, candidate_index=0
+        )
+        by_team = {row.roster.team_id: row.roster for row in result.adjustments}
+
+        self.assertEqual(dict(by_team["a"].reserve_slot_by_player), {"b2": "IR"})
+        self.assertEqual(dict(by_team["a"].reserve_slot_counts), {"IR": 1})
+        self.assertEqual(by_team["a"].active_size, 2)
+        self.assertEqual(dict(by_team["b"].reserve_slot_by_player), {})
+
     def test_no_drop_runner_rejects_an_adjuster(self):
         space, prepared, baseline, _ = components()
         adjusted = PreparedThreeWayTrade(
@@ -339,6 +380,20 @@ class ThreeWayEvaluationTests(unittest.TestCase):
 
 
 class ThreeWayRunnerTests(unittest.TestCase):
+    def test_run_identity_uses_typed_rosters_and_bumped_algorithm(self):
+        _, _, _, runner = components()
+        record = runner.run_definition.trade_constraint_record
+        roster_record = record["candidate_order"]["rosters"][0]
+
+        self.assertEqual(
+            THREE_WAY_SEARCH_ALGORITHM,
+            "local-three-way-power-paired-playoffs-v2",
+        )
+        self.assertEqual(record["algorithm"], THREE_WAY_SEARCH_ALGORITHM)
+        self.assertIn("reserve_slot_by_player", roster_record)
+        self.assertIn("reserve_slot_counts", roster_record)
+        self.assertNotIn("capacity_exempt_player_ids", roster_record)
+
     def test_run_identity_binds_position_evidence_that_changes_candidate_order(self):
         _, prepared, baseline, _ = components()
         constraints = TradeConstraints(

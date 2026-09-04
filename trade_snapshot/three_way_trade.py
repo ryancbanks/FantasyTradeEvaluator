@@ -6,6 +6,11 @@ from functools import lru_cache
 from typing import Iterator
 
 from .positions import normalize_player_position
+from .roster_capacity import (
+    reserve_counts_for,
+    signature_record,
+    solve_post_trade_capacity,
+)
 from .trade_filters import (
     TradeFilterExpression,
     TradeFilterMode,
@@ -19,7 +24,16 @@ from .trade_space import TeamRoster, TradeConstraints
 
 PlayerId = str
 _Counts = tuple[int, int, int]
-_State = tuple[int, _Counts, _Counts, _Counts, int, int]
+_ReserveSignature = tuple[int, ...]
+_State = tuple[
+    int,
+    _Counts,
+    _Counts,
+    _ReserveSignature,
+    _ReserveSignature,
+    int,
+    int,
+]
 _FILTER_EVIDENCE_CACHE_SIZE = 256
 
 
@@ -143,7 +157,7 @@ class _PackageRule:
 class _PlayerDecision:
     origin: int
     player_id: PlayerId
-    active: int
+    reserve_slot: str | None
     destinations: tuple[int, ...]
     outgoing_coverage: int
     incoming_coverage: int
@@ -171,6 +185,25 @@ class ThreeWayTradeSpace:
         self.partners = rows[1:]
         self.participant_team_ids = tuple(row.team_id for row in rows)
         self.constraints = constraints
+        self._reserve_kinds = tuple(
+            sorted(
+                {
+                    kind
+                    for roster in rows
+                    for kind in (
+                        *roster.reserve_slot_counts,
+                        *roster.reserve_slot_by_player.values(),
+                    )
+                }
+            )
+        )
+        self._reserve_kind_index = {
+            kind: index for index, kind in enumerate(self._reserve_kinds)
+        }
+        self._current_reserve_counts = tuple(
+            reserve_counts_for(row.player_ids, row.reserve_slot_by_player)
+            for row in rows
+        )
 
         primary_players = rows[0].player_ids
         partner_players = tuple(
@@ -196,19 +229,19 @@ class ThreeWayTradeSpace:
             outgoing_rule,
             incoming_rule,
         )
-        (
-            self._remaining_moves,
-            self._remaining_receivers,
-            self._remaining_active_moves,
-        ) = _remaining_capacities(self._players)
+        self._remaining_moves, self._remaining_receivers = _remaining_capacities(
+            self._players
+        )
         self._outgoing_target = outgoing_rule.target_coverage
         self._incoming_target = incoming_rule.target_coverage
         self._memo: dict[_State, int] = {}
+        empty_reserve_signature = (0,) * (len(rows) * len(self._reserve_kinds))
         self._initial_state: _State = (
             0,
             (0, 0, 0),
             (0, 0, 0),
-            (0, 0, 0),
+            empty_reserve_signature,
+            empty_reserve_signature,
             0,
             0,
         )
@@ -223,21 +256,28 @@ class ThreeWayTradeSpace:
     def enumeration_record(self) -> dict[str, object]:
         """Return the compiled, JSON-ready identity of index-to-candidate order."""
 
+        player_decisions = [
+            {
+                "active": int(row.reserve_slot is None),
+                "destinations": list(row.destinations),
+                "incoming_coverage": row.incoming_coverage,
+                "origin": row.origin,
+                "outgoing_coverage": row.outgoing_coverage,
+                "player_id": row.player_id,
+            }
+            for row in self._players
+        ]
         record = {
             "incoming_target": self._incoming_target,
             "outgoing_target": self._outgoing_target,
-            "player_decisions": [
-                {
-                    "active": row.active,
-                    "destinations": list(row.destinations),
-                    "incoming_coverage": row.incoming_coverage,
-                    "origin": row.origin,
-                    "outgoing_coverage": row.outgoing_coverage,
-                    "player_id": row.player_id,
-                }
-                for row in self._players
-            ],
+            "player_decisions": player_decisions,
         }
+        if self._reserve_kinds:
+            record["reserve_slot_counts_by_team"] = [
+                dict(row.reserve_slot_counts) for row in self.rosters
+            ]
+            for decision, player in zip(player_decisions, self._players):
+                decision["reserve_slot"] = player.reserve_slot
         for name, value in (
             ("outgoing_filter_expression", self.constraints.outgoing_filter),
             ("incoming_filter_expression", self.constraints.incoming_filter),
@@ -311,9 +351,25 @@ class ThreeWayTradeSpace:
         player: _PlayerDecision,
         destination: int,
     ) -> _State | None:
-        index, outgoing, incoming, active_outgoing, out_mask, in_mask = state
+        (
+            index,
+            outgoing,
+            incoming,
+            outgoing_reserve,
+            incoming_reserve,
+            out_mask,
+            in_mask,
+        ) = state
         if destination == player.origin:
-            return (index + 1, outgoing, incoming, active_outgoing, out_mask, in_mask)
+            return (
+                index + 1,
+                outgoing,
+                incoming,
+                outgoing_reserve,
+                incoming_reserve,
+                out_mask,
+                in_mask,
+            )
         rules = self.constraints
         if (
             outgoing[player.origin] >= rules.max_outgoing
@@ -324,17 +380,26 @@ class ThreeWayTradeSpace:
             )
         ):
             return None
+        if player.reserve_slot is not None:
+            kind = self._reserve_kind_index[player.reserve_slot]
+            outgoing_reserve = _increment_reserve_signature(
+                outgoing_reserve, player.origin, kind, len(self._reserve_kinds)
+            )
+            incoming_reserve = _increment_reserve_signature(
+                incoming_reserve, destination, kind, len(self._reserve_kinds)
+            )
         return (
             index + 1,
             _increment(outgoing, player.origin, 1),
             _increment(incoming, destination, 1),
-            _increment(active_outgoing, player.origin, player.active),
+            outgoing_reserve,
+            incoming_reserve,
             out_mask | (player.outgoing_coverage if player.origin == 0 else 0),
             in_mask | (player.incoming_coverage if destination == 0 else 0),
         )
 
     def _impossible(self, state: _State) -> bool:
-        index, outgoing, incoming, active_outgoing, _, _ = state
+        index, outgoing, incoming, _, _, _, _ = state
         rules = self.constraints
         remaining_moves = self._remaining_moves[index]
         remaining_receivers = self._remaining_receivers[index]
@@ -357,20 +422,33 @@ class ThreeWayTradeSpace:
             ):
                 return True
         if rules.require_no_drops:
-            remaining_active = self._remaining_active_moves[index]
-            if any(
-                row.active_size
-                - active_outgoing[team]
-                - remaining_active[team]
-                + incoming[team]
-                > row.roster_cap
-                for team, row in enumerate(self.rosters)
-            ):
-                return True
+            for team, row in enumerate(self.rosters):
+                maximum_further_outgoing = min(
+                    remaining_moves[team], rules.max_outgoing - outgoing[team]
+                )
+                minimum_total_after = (
+                    row.current_size
+                    - outgoing[team]
+                    - maximum_further_outgoing
+                    + incoming[team]
+                )
+                if (
+                    minimum_total_after - sum(row.reserve_slot_counts.values())
+                    > row.roster_cap
+                ):
+                    return True
         return False
 
     def _complete(self, state: _State) -> bool:
-        _, outgoing, incoming, active_outgoing, out_mask, in_mask = state
+        (
+            _,
+            outgoing,
+            incoming,
+            outgoing_reserve,
+            incoming_reserve,
+            out_mask,
+            in_mask,
+        ) = state
         rules = self.constraints
         if any(
             not rules.min_outgoing <= sent <= rules.max_outgoing
@@ -390,14 +468,53 @@ class ThreeWayTradeSpace:
             for sent, received in zip(outgoing, incoming)
         ):
             return False
+        capacity_plans = tuple(
+            self._capacity_plan(
+                team,
+                outgoing[team],
+                incoming[team],
+                outgoing_reserve,
+                incoming_reserve,
+            )
+            for team in range(len(self.rosters))
+        )
         if rules.require_no_drops and any(
-            row.active_size - active_outgoing[team] + incoming[team]
-            > row.roster_cap
-            for team, row in enumerate(self.rosters)
+            row.required_cuts != 0 for row in capacity_plans
+        ):
+            return False
+        if not rules.require_no_drops and any(
+            not row.feasible for row in capacity_plans
         ):
             return False
         return self._outgoing_rule.matches(out_mask) and self._incoming_rule.matches(
             in_mask
+        )
+
+    def _capacity_plan(
+        self,
+        team: int,
+        outgoing_size: int,
+        incoming_size: int,
+        outgoing_reserve: _ReserveSignature,
+        incoming_reserve: _ReserveSignature,
+    ):
+        roster = self.rosters[team]
+        start = team * len(self._reserve_kinds)
+        stop = start + len(self._reserve_kinds)
+        return solve_post_trade_capacity(
+            active_cap=roster.roster_cap,
+            current_size=roster.current_size,
+            known_player_count=len(roster.player_ids),
+            reserve_slot_counts=roster.reserve_slot_counts,
+            current_reserve_counts=self._current_reserve_counts[team],
+            outgoing_size=outgoing_size,
+            outgoing_reserve_counts=signature_record(
+                self._reserve_kinds, outgoing_reserve[start:stop]
+            ),
+            incoming_size=incoming_size,
+            incoming_reserve_counts=signature_record(
+                self._reserve_kinds, incoming_reserve[start:stop]
+            ),
         )
 
     def _candidate(self, destinations: list[int]) -> ThreeWayTradeCandidate:
@@ -609,7 +726,7 @@ def _player_decisions(
                 _PlayerDecision(
                     origin,
                     player_id,
-                    int(player_id not in roster.capacity_exempt_player_ids),
+                    roster.reserve_slot_by_player.get(player_id),
                     choices,
                     outgoing_rule.coverage_by_player.get(player_id, 0),
                     incoming_rule.coverage_by_player.get(player_id, 0),
@@ -621,21 +738,17 @@ def _player_decisions(
 def _remaining_capacities(players: tuple[_PlayerDecision, ...]):
     moves = [(0, 0, 0)] * (len(players) + 1)
     receivers = [(0, 0, 0)] * (len(players) + 1)
-    active_moves = [(0, 0, 0)] * (len(players) + 1)
     for index in range(len(players) - 1, -1, -1):
         player = players[index]
         move = list(moves[index + 1])
         receive = list(receivers[index + 1])
-        active = list(active_moves[index + 1])
         if any(destination != player.origin for destination in player.destinations):
             move[player.origin] += 1
-            active[player.origin] += player.active
         for destination in set(player.destinations).difference({player.origin}):
             receive[destination] += 1
         moves[index] = tuple(move)
         receivers[index] = tuple(receive)
-        active_moves[index] = tuple(active)
-    return tuple(moves), tuple(receivers), tuple(active_moves)
+    return tuple(moves), tuple(receivers)
 
 
 def _participants(values: object) -> tuple[str, str, str]:
@@ -660,6 +773,17 @@ def _increment(values: _Counts, index: int, amount: int) -> _Counts:
     if index == 2:
         return values[0], values[1], values[2] + amount
     raise IndexError("three-team count index is outside 0..2")
+
+
+def _increment_reserve_signature(
+    values: _ReserveSignature,
+    team: int,
+    kind: int,
+    kind_count: int,
+) -> _ReserveSignature:
+    result = list(values)
+    result[team * kind_count + kind] += 1
+    return tuple(result)
 
 
 def _team_id(name: str, value: object) -> str:
