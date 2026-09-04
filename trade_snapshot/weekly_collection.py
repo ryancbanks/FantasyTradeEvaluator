@@ -1,8 +1,11 @@
 """Cancellable background boundary for publishing one weekly engine bundle."""
 
+import json
+import os
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from threading import Event, RLock, Thread
@@ -28,6 +31,8 @@ from .operation_timing import OperationTiming
 
 LEAGUE_HISTORY_FILENAME = "league-history.sqlite3"
 _PUBLICATION_STAGING_DIRECTORY = ".weekly-publications"
+_HISTORY_ATTEMPT_DIRECTORY = "history-attempts"
+_MAX_HISTORY_ATTEMPT_BYTES = 64 * 1024
 _ENGINE_BUNDLE_ID = re.compile(r"^engine_[0-9a-f]{64}$")
 _MAX_RETAINED_COLLECTION_JOBS = DEFAULT_TERMINAL_JOB_LIMIT
 
@@ -57,7 +62,9 @@ class WeeklyCollectionRequest:
     expected_team_count: int | None = None
     host_league_url: str | None = None
     yahoo_projection_league_url: str | None = None
-    include_future_weekly: bool = False
+    # FantasyPros always captures every remaining week. This option requests
+    # extra direct weekly pages from ESPN and Yahoo when they publish them.
+    include_future_weekly: bool = True
     allow_surrogate_power: bool = False
     use_fantasypros: bool = True
     # Kept false for programmatic backward compatibility. The localhost UI
@@ -171,21 +178,271 @@ class WeeklyCollectionError(RuntimeError):
     """Expected collection failure whose message is safe to show locally."""
 
 
+class WeeklyHistoryStatus(str, Enum):
+    CAPTURED = "captured"
+    UNAVAILABLE = "unavailable"
+    NOT_PROVIDED = "not_provided"
+
+
+class WeeklyHistoryReason(str, Enum):
+    CAPTURED = "captured"
+    ACTIVITY_UNAVAILABLE = "activity_unavailable"
+    ACTIVITY_SCHEMA_UNSUPPORTED = "activity_schema_unsupported"
+    CANONICALIZATION_FAILED = "canonicalization_failed"
+    HISTORY_PROCESSING_UNAVAILABLE = "history_processing_unavailable"
+    STORE_UNAVAILABLE = "store_unavailable"
+    NOT_PROVIDED = "not_provided"
+
+
+@dataclass(frozen=True, slots=True)
+class WeeklyHistoryAttempt:
+    """Credential-free status for the optional transaction-history sidecar."""
+
+    status: WeeklyHistoryStatus | str
+    reason_code: WeeklyHistoryReason | str
+    attempted_at: datetime | None
+    source_provider: str | None = None
+    capture_id: str | None = None
+    returned_transaction_count: int | None = None
+    normalized_transaction_count: int | None = None
+    transaction_limit: int | None = None
+    transactions_complete: bool | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            status = WeeklyHistoryStatus(self.status)
+            reason = WeeklyHistoryReason(self.reason_code)
+        except (TypeError, ValueError):
+            raise ValueError("weekly history attempt status is invalid") from None
+        if self.source_provider is not None and (
+            not isinstance(self.source_provider, str)
+            or not self.source_provider
+            or self.source_provider != self.source_provider.casefold()
+        ):
+            raise ValueError("history source_provider must be a lowercase identifier or null")
+        if self.capture_id is not None and (
+            not isinstance(self.capture_id, str)
+            or not self.capture_id.strip()
+            or self.capture_id != self.capture_id.strip()
+        ):
+            raise ValueError("history capture_id must be non-empty text or null")
+        attempted_at = self.attempted_at
+        if attempted_at is not None:
+            if attempted_at.tzinfo is None or attempted_at.utcoffset() is None:
+                raise ValueError("history attempted_at must include a timezone")
+            attempted_at = attempted_at.astimezone(timezone.utc)
+        for name in (
+            "returned_transaction_count",
+            "normalized_transaction_count",
+            "transaction_limit",
+        ):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{name} must be a non-negative integer or null")
+        if self.transaction_limit == 0:
+            raise ValueError("transaction_limit must be positive or null")
+        if self.transactions_complete is not None and not isinstance(
+            self.transactions_complete, bool
+        ):
+            raise ValueError("transactions_complete must be a boolean or null")
+        if status is WeeklyHistoryStatus.CAPTURED:
+            if (
+                reason is not WeeklyHistoryReason.CAPTURED
+                or not self.capture_id
+                or self.source_provider is None
+            ):
+                raise ValueError("captured history requires its capture identity")
+        elif reason is WeeklyHistoryReason.CAPTURED:
+            raise ValueError("unavailable history cannot use the captured reason")
+        if (status is WeeklyHistoryStatus.NOT_PROVIDED) != (
+            reason is WeeklyHistoryReason.NOT_PROVIDED
+        ):
+            raise ValueError("history not_provided status and reason must agree")
+        if status is WeeklyHistoryStatus.NOT_PROVIDED:
+            if reason is not WeeklyHistoryReason.NOT_PROVIDED or any(
+                value is not None
+                for value in (
+                    attempted_at,
+                    self.source_provider,
+                    self.capture_id,
+                    self.returned_transaction_count,
+                    self.normalized_transaction_count,
+                    self.transaction_limit,
+                    self.transactions_complete,
+                )
+            ):
+                raise ValueError("history not_provided status cannot invent evidence")
+        elif self.source_provider is None:
+            raise ValueError("attempted history requires its source_provider")
+        if status is not WeeklyHistoryStatus.NOT_PROVIDED and attempted_at is None:
+            raise ValueError("attempted history requires attempted_at")
+        if (
+            self.returned_transaction_count is not None
+            and self.transaction_limit is not None
+            and self.returned_transaction_count > self.transaction_limit
+        ):
+            raise ValueError("returned history count exceeds its limit")
+        if (
+            self.normalized_transaction_count is not None
+            and self.returned_transaction_count is not None
+            and self.normalized_transaction_count > self.returned_transaction_count
+        ):
+            raise ValueError("normalized history count exceeds returned count")
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "reason_code", reason)
+        object.__setattr__(self, "attempted_at", attempted_at)
+
+    @classmethod
+    def captured(cls, capture: LeagueHistoryCapture) -> "WeeklyHistoryAttempt":
+        acquisition = capture.acquisition_evidence
+        return cls(
+            WeeklyHistoryStatus.CAPTURED,
+            WeeklyHistoryReason.CAPTURED,
+            capture.captured_at,
+            source_provider=acquisition.provider,
+            capture_id=capture.capture_id,
+            returned_transaction_count=acquisition.returned_transaction_count,
+            normalized_transaction_count=acquisition.normalized_transaction_count,
+            transaction_limit=acquisition.transaction_limit,
+            transactions_complete=capture.transaction_history_complete,
+        )
+
+    @classmethod
+    def unavailable(
+        cls,
+        reason_code: WeeklyHistoryReason,
+        attempted_at: datetime,
+        *,
+        capture: LeagueHistoryCapture | None = None,
+    ) -> "WeeklyHistoryAttempt":
+        if reason_code in {
+            WeeklyHistoryReason.CAPTURED,
+            WeeklyHistoryReason.NOT_PROVIDED,
+        }:
+            raise ValueError("unavailable history requires a failure reason")
+        acquisition = None if capture is None else capture.acquisition_evidence
+        return cls(
+            WeeklyHistoryStatus.UNAVAILABLE,
+            reason_code,
+            attempted_at,
+            source_provider=("espn" if acquisition is None else acquisition.provider),
+            capture_id=None if capture is None else capture.capture_id,
+            returned_transaction_count=(
+                None if acquisition is None else acquisition.returned_transaction_count
+            ),
+            normalized_transaction_count=(
+                None if acquisition is None else acquisition.normalized_transaction_count
+            ),
+            transaction_limit=(
+                None if acquisition is None else acquisition.transaction_limit
+            ),
+            transactions_complete=(
+                None if capture is None else capture.transaction_history_complete
+            ),
+        )
+
+    @classmethod
+    def not_provided(cls) -> "WeeklyHistoryAttempt":
+        return cls(
+            WeeklyHistoryStatus.NOT_PROVIDED,
+            WeeklyHistoryReason.NOT_PROVIDED,
+            None,
+            source_provider=None,
+        )
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "attempted_at": (
+                None
+                if self.attempted_at is None
+                else self.attempted_at.isoformat(timespec="microseconds")
+            ),
+            "capture_id": self.capture_id,
+            "normalized_transaction_count": self.normalized_transaction_count,
+            "reason_code": self.reason_code.value,
+            "returned_transaction_count": self.returned_transaction_count,
+            "source_provider": self.source_provider,
+            "status": self.status.value,
+            "transaction_limit": self.transaction_limit,
+            "transactions_complete": self.transactions_complete,
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, object]) -> "WeeklyHistoryAttempt":
+        fields = {
+            "attempted_at",
+            "capture_id",
+            "normalized_transaction_count",
+            "reason_code",
+            "returned_transaction_count",
+            "source_provider",
+            "status",
+            "transaction_limit",
+            "transactions_complete",
+        }
+        if not isinstance(record, Mapping) or set(record) != fields:
+            raise ValueError("weekly history attempt fields are invalid")
+        attempted_at = record["attempted_at"]
+        if attempted_at is not None:
+            if not isinstance(attempted_at, str) or not attempted_at.strip():
+                raise ValueError("history attempted_at must be an ISO-8601 timestamp")
+            try:
+                attempted_at = datetime.fromisoformat(
+                    attempted_at.replace("Z", "+00:00")
+                )
+            except ValueError:
+                raise ValueError(
+                    "history attempted_at must be an ISO-8601 timestamp"
+                ) from None
+        return cls(
+            status=record["status"],
+            reason_code=record["reason_code"],
+            attempted_at=attempted_at,
+            source_provider=record["source_provider"],
+            capture_id=record["capture_id"],
+            returned_transaction_count=record["returned_transaction_count"],
+            normalized_transaction_count=record["normalized_transaction_count"],
+            transaction_limit=record["transaction_limit"],
+            transactions_complete=record["transactions_complete"],
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class WeeklyCollectionPublication:
-    """One weekly engine and the activity evidence bound to that exact engine."""
+    """One weekly engine and activity evidence bound to that immutable engine."""
 
     bundle: EngineBundle
-    history_capture: LeagueHistoryCapture
-    history_binding: HistoryBundleBinding
+    history_capture: LeagueHistoryCapture | None = None
+    history_binding: HistoryBundleBinding | None = None
+    history_attempt: WeeklyHistoryAttempt | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.bundle, EngineBundle):
             raise ValueError("publication bundle must be an EngineBundle")
-        if not isinstance(self.history_capture, LeagueHistoryCapture):
-            raise ValueError("publication history_capture must be a LeagueHistoryCapture")
-        if not isinstance(self.history_binding, HistoryBundleBinding):
-            raise ValueError("publication history_binding must be a HistoryBundleBinding")
+        has_capture = isinstance(self.history_capture, LeagueHistoryCapture)
+        has_binding = isinstance(self.history_binding, HistoryBundleBinding)
+        if has_capture != has_binding or (
+            self.history_capture is not None and not has_capture
+        ) or (self.history_binding is not None and not has_binding):
+            raise ValueError("publication history capture and binding must be provided together")
+        attempt = self.history_attempt
+        if attempt is None:
+            attempt = (
+                WeeklyHistoryAttempt.captured(self.history_capture)
+                if has_capture
+                else WeeklyHistoryAttempt.not_provided()
+            )
+            object.__setattr__(self, "history_attempt", attempt)
+        if not isinstance(attempt, WeeklyHistoryAttempt):
+            raise ValueError("publication history_attempt must be a WeeklyHistoryAttempt")
+        if has_capture != (attempt.status is WeeklyHistoryStatus.CAPTURED):
+            raise ValueError("publication history attempt conflicts with attached evidence")
+        if not has_capture:
+            return
+        if attempt != WeeklyHistoryAttempt.captured(self.history_capture):
+            raise ValueError(
+                "publication history attempt does not match the attached capture"
+            )
         if self.history_binding.bundle_id != self.bundle.bundle_id:
             raise ValueError("publication history binding does not match the bundle")
         if (
@@ -211,6 +468,81 @@ class WeeklyCollectionWorkflow(Protocol):
     ) -> EngineBundle | WeeklyCollectionPublication: ...
 
 
+def load_weekly_history_attempt(
+    data_directory: str | os.PathLike[str], bundle_id: str
+) -> WeeklyHistoryAttempt | None:
+    """Load one optional history diagnostic without trusting mutable local JSON."""
+
+    if not isinstance(bundle_id, str) or not _ENGINE_BUNDLE_ID.fullmatch(bundle_id):
+        raise ValueError("weekly bundle id is invalid")
+    path = Path(data_directory) / _HISTORY_ATTEMPT_DIRECTORY / f"{bundle_id}.json"
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("weekly history attempt path is invalid")
+    try:
+        body = path.read_bytes()
+    except OSError:
+        raise
+    if not body or len(body) > _MAX_HISTORY_ATTEMPT_BYTES:
+        raise ValueError("weekly history attempt size is invalid")
+    try:
+        record = json.loads(
+            body.decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeError, json.JSONDecodeError, RecursionError, ValueError):
+        raise ValueError("weekly history attempt JSON is invalid") from None
+    if not isinstance(record, Mapping) or set(record) != {
+        "bundle_id",
+        "history_attempt",
+        "schema_version",
+    }:
+        raise ValueError("weekly history attempt document fields are invalid")
+    if record["schema_version"] != 1 or record["bundle_id"] != bundle_id:
+        raise ValueError("weekly history attempt document identity is invalid")
+    attempt = record["history_attempt"]
+    if not isinstance(attempt, Mapping):
+        raise ValueError("weekly history attempt payload is invalid")
+    return WeeklyHistoryAttempt.from_record(attempt)
+
+
+def save_weekly_history_attempt(
+    data_directory: str | os.PathLike[str],
+    bundle_id: str,
+    attempt: WeeklyHistoryAttempt,
+) -> None:
+    """Atomically persist one credential-free, bundle-bound history diagnostic."""
+
+    if not isinstance(bundle_id, str) or not _ENGINE_BUNDLE_ID.fullmatch(bundle_id):
+        raise ValueError("weekly bundle id is invalid")
+    if not isinstance(attempt, WeeklyHistoryAttempt):
+        raise ValueError("history attempt must be a WeeklyHistoryAttempt")
+    directory = Path(data_directory) / _HISTORY_ATTEMPT_DIRECTORY
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{bundle_id}.json"
+    temporary = directory / f".{bundle_id}.{uuid4().hex}.tmp"
+    try:
+        body = json.dumps(
+            {
+                "bundle_id": bundle_id,
+                "history_attempt": attempt.to_record(),
+                "schema_version": 1,
+            },
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        temporary.write_text(body, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 @dataclass(slots=True)
 class _CollectionJob:
     job_id: str
@@ -219,6 +551,7 @@ class _CollectionJob:
     progress: WeeklyCollectionProgress | None = None
     error: str | None = None
     bundle_id: str | None = None
+    history_attempt: WeeklyHistoryAttempt | None = None
     cancel: Event = field(default_factory=Event)
     data_directory: Path | None = None
     on_published: Callable[[EngineBundle], None] | None = None
@@ -428,12 +761,22 @@ class WeeklyCollectionJobs:
             )
             if publication is None:
                 save_bundle_with_summary(bundle, self._bundle_path(bundle.bundle_id))
+                history_attempt = WeeklyHistoryAttempt.not_provided()
+                self._save_history_attempt(
+                    bundle.bundle_id,
+                    history_attempt,
+                    job.data_directory or self._data_directory,
+                )
             else:
-                self._publish_bound_publication(
+                history_attempt = self._publish_bound_publication(
                     publication,
                     job.data_directory or self._data_directory,
                 )
-            self._update(job, bundle_id=bundle.bundle_id)
+            self._update(
+                job,
+                bundle_id=bundle.bundle_id,
+                history_attempt=history_attempt,
+            )
             if job.on_published is not None:
                 try:
                     job.on_published(bundle)
@@ -477,18 +820,34 @@ class WeeklyCollectionJobs:
         self,
         publication: WeeklyCollectionPublication,
         data_directory: Path,
-    ) -> None:
-        """Keep a validated recovery copy until binding and final save both succeed."""
+    ) -> WeeklyHistoryAttempt:
+        """Publish core evidence even when its optional history sidecar is unavailable."""
 
         staged_path = self._staged_bundle_path(publication.bundle.bundle_id)
         staged_bundle = self._stage_exact_bundle(publication.bundle, staged_path)
-        LeagueHistoryStore(
-            data_directory / LEAGUE_HISTORY_FILENAME
-        ).ingest(
-            publication.history_capture,
-            bundle=publication.history_binding,
+        attempt = publication.history_attempt
+        assert attempt is not None
+        if publication.history_capture is not None:
+            try:
+                LeagueHistoryStore(
+                    data_directory / LEAGUE_HISTORY_FILENAME
+                ).ingest(
+                    publication.history_capture,
+                    bundle=publication.history_binding,
+                )
+            except Exception:
+                attempt = WeeklyHistoryAttempt.unavailable(
+                    WeeklyHistoryReason.STORE_UNAVAILABLE,
+                    publication.history_capture.captured_at,
+                    capture=publication.history_capture,
+                )
+        self._save_history_attempt(
+            publication.bundle.bundle_id,
+            attempt,
+            data_directory,
         )
         self._publish_staged_bundle(staged_bundle, staged_path)
+        return attempt
 
     def _stage_exact_bundle(self, bundle: EngineBundle, path: Path) -> EngineBundle:
         save_engine_bundle(bundle, path)
@@ -520,7 +879,7 @@ class WeeklyCollectionJobs:
             pass
 
     def _recover_staged_publications(self) -> None:
-        """Finish only stages whose content address already has a history binding."""
+        """Finish validated stages left behind after their sidecars were recorded."""
 
         try:
             staged_paths = tuple(
@@ -539,34 +898,23 @@ class WeeklyCollectionJobs:
                 bundle = load_engine_bundle(staged_path)
                 if staged_path.name != self._bundle_path(bundle.bundle_id).name:
                     continue
-                if not self._has_history_binding(bundle.bundle_id):
-                    continue
                 self._publish_staged_bundle(bundle, staged_path)
             except (OSError, RuntimeError, ValueError):
                 # Invalid, unbound, or temporarily unpublishable stages remain private.
                 continue
 
-    def _has_history_binding(self, bundle_id: str) -> bool:
-        roots = [self._data_directory]
-        league_root = self._data_directory / "leagues"
+    def _save_history_attempt(
+        self,
+        bundle_id: str,
+        attempt: WeeklyHistoryAttempt,
+        data_directory: Path,
+    ) -> None:
+        """Persist a small credential-free diagnostic without gating publication."""
+
         try:
-            roots.extend(
-                path
-                for path in league_root.iterdir()
-                if path.is_dir() and not path.is_symlink()
-            )
+            save_weekly_history_attempt(data_directory, bundle_id, attempt)
         except OSError:
             pass
-        for root in roots:
-            path = root / LEAGUE_HISTORY_FILENAME
-            if not path.is_file():
-                continue
-            try:
-                if LeagueHistoryStore(path).snapshot_for_bundle(bundle_id) is not None:
-                    return True
-            except (OSError, RuntimeError, ValueError):
-                continue
-        return False
 
     def _bundle_path(self, bundle_id: str) -> Path:
         if not isinstance(bundle_id, str) or not _ENGINE_BUNDLE_ID.fullmatch(
@@ -671,6 +1019,11 @@ class WeeklyCollectionJobs:
             "status": job.status,
             "error": job.error,
             "bundle_id": job.bundle_id,
+            "history_attempt": (
+                None
+                if job.history_attempt is None
+                else job.history_attempt.to_record()
+            ),
             "cancel_requested": job.cancel.is_set(),
             "sign_in": sign_in,
             "request": {
@@ -849,13 +1202,31 @@ def _league_number(value: str) -> bool:
     )
 
 
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value):
+    raise ValueError(f"non-finite JSON constant {value}")
+
+
 __all__ = (
     "LEAGUE_HISTORY_FILENAME",
     "WeeklyCollectionError",
     "WeeklyCollectionJobs",
     "WeeklyCollectionProgress",
     "WeeklyCollectionPublication",
+    "WeeklyHistoryAttempt",
+    "WeeklyHistoryReason",
+    "WeeklyHistoryStatus",
     "WeeklyCollectionRequest",
     "WeeklyCollectionStage",
     "WeeklyCollectionWorkflow",
+    "load_weekly_history_attempt",
+    "save_weekly_history_attempt",
 )

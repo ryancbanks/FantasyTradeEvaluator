@@ -16,14 +16,22 @@ from numbers import Real
 import re
 from typing import Iterable, Mapping
 
-from ._scenario_random import canonical_json, content_id
+from ._scenario_random import content_id
+from ._league_history_acquisition import (
+    HistoryAcquisitionEvidence,
+    HistoryAcquisitionOutcome,
+    HistorySkipCount,
+)
+from ._league_history_capture_record import roster_ownership_id
+from ._league_history_schema import (
+    LEAGUE_HISTORY_APPLICATION_ID,
+    LEAGUE_HISTORY_SCHEMA_VERSION,
+)
 
 
-LEAGUE_HISTORY_SCHEMA_VERSION = 1
-LEAGUE_HISTORY_APPLICATION_ID = 1_179_927_880  # ASCII "FTEH"
 HISTORY_CAPTURE_BINDING_TOLERANCE = timedelta(hours=1)
 
-_LEAGUE_KEY = re.compile(r"^league_[0-9a-f]{64}$")
+_LEAGUE_KEY = re.compile(r"^league_[0-9a-f]{32}(?:[0-9a-f]{32})?$")
 _PROVIDER = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _UNSAFE_URL = re.compile(r"(?:[a-z][a-z0-9+.-]*://|\bwww\.)", re.IGNORECASE)
 _SECRET_ASSIGNMENT = re.compile(
@@ -255,6 +263,9 @@ class HistoryTransaction:
     kind: HistoryTransactionKind
     assets: tuple[HistoryTransactionAsset, ...]
     bid_amount: float | None = None
+    accepted_at: datetime | None = None
+    processed_at: datetime | None = None
+    expires_at: datetime | None = None
 
     def __post_init__(self) -> None:
         transaction_id = _identifier("transaction_id", self.transaction_id)
@@ -290,6 +301,9 @@ class HistoryTransaction:
         if len(set(source_asset_keys)) != len(source_asset_keys):
             raise ValueError("a transaction contains a duplicate source asset key")
         bid_amount = _optional_nonnegative_number("bid_amount", self.bid_amount)
+        accepted_at = _optional_aware_datetime("accepted_at", self.accepted_at)
+        processed_at = _optional_aware_datetime("processed_at", self.processed_at)
+        expires_at = _optional_aware_datetime("expires_at", self.expires_at)
         _validate_asset_movements(kind, assets)
         object.__setattr__(self, "transaction_id", transaction_id)
         object.__setattr__(self, "recorded_at", recorded_at)
@@ -297,6 +311,9 @@ class HistoryTransaction:
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "assets", assets)
         object.__setattr__(self, "bid_amount", bid_amount)
+        object.__setattr__(self, "accepted_at", accepted_at)
+        object.__setattr__(self, "processed_at", processed_at)
+        object.__setattr__(self, "expires_at", expires_at)
 
     @property
     def participant_team_ids(self) -> tuple[str, ...]:
@@ -311,8 +328,14 @@ class HistoryTransaction:
             )
         )
 
+    @property
+    def source_event_at(self) -> datetime:
+        """Provider time with semantics named by ``timestamp_basis``."""
+
+        return self.recorded_at
+
     def to_record(self) -> dict[str, object]:
-        return {
+        record = {
             "transaction_id": self.transaction_id,
             "execution_status": "executed",
             "recorded_at": _timestamp(self.recorded_at),
@@ -322,23 +345,44 @@ class HistoryTransaction:
             "assets": [row.to_record() for row in self.assets],
             "bid_amount": self.bid_amount,
         }
+        # Retain the legacy shape when no source supplied any of these fields;
+        # this keeps existing content-addressed capture identities stable.
+        if any(
+            value is not None
+            for value in (self.accepted_at, self.processed_at, self.expires_at)
+        ):
+            record.update(
+                {
+                    "accepted_at": _optional_timestamp(self.accepted_at),
+                    "processed_at": _optional_timestamp(self.processed_at),
+                    "expires_at": _optional_timestamp(self.expires_at),
+                }
+            )
+        return record
 
     @classmethod
     def from_record(cls, value: object) -> "HistoryTransaction":
-        row = _record(
-            value,
-            {
-                "transaction_id",
-                "execution_status",
-                "recorded_at",
-                "timestamp_basis",
-                "effective_week",
-                "kind",
-                "assets",
-                "bid_amount",
-            },
-            "history transaction",
-        )
+        legacy_fields = {
+            "transaction_id",
+            "execution_status",
+            "recorded_at",
+            "timestamp_basis",
+            "effective_week",
+            "kind",
+            "assets",
+            "bid_amount",
+        }
+        extended_fields = legacy_fields | {
+            "accepted_at",
+            "processed_at",
+            "expires_at",
+        }
+        if not isinstance(value, Mapping):
+            raise ValueError("history transaction fields are invalid")
+        fields = set(value)
+        if fields != legacy_fields and fields != extended_fields:
+            raise ValueError("history transaction fields are invalid")
+        row = value
         if row["execution_status"] != "executed":
             raise ValueError("league history accepts executed transactions only")
         return cls(
@@ -352,6 +396,9 @@ class HistoryTransaction:
                 for item in _array("transaction assets", row["assets"])
             ),
             row["bid_amount"],
+            _optional_datetime_from_record("accepted_at", row.get("accepted_at")),
+            _optional_datetime_from_record("processed_at", row.get("processed_at")),
+            _optional_datetime_from_record("expires_at", row.get("expires_at")),
         )
 
 
@@ -368,7 +415,13 @@ class LeagueHistoryCapture:
     teams: tuple[HistoryTeam, ...]
     transactions: tuple[HistoryTransaction, ...]
     rosters: tuple[HistoryTeamRoster, ...]
+    host_snapshot_id: str | None = None
+    acquisition_evidence: HistoryAcquisitionEvidence | None = None
+    identity_schema_version: int = field(
+        default=LEAGUE_HISTORY_SCHEMA_VERSION, repr=False
+    )
     capture_id: str = field(init=False)
+    roster_ownership_id: str = field(init=False)
 
     def __post_init__(self) -> None:
         league_key = _league_key(self.league_key)
@@ -389,6 +442,13 @@ class LeagueHistoryCapture:
                 raise ValueError(f"{name} must be a boolean")
         if self.lineup_complete and not self.roster_complete:
             raise ValueError("lineup_complete requires roster_complete")
+        host_snapshot_id = (
+            None
+            if self.host_snapshot_id is None
+            else _identifier("host_snapshot_id", self.host_snapshot_id)
+        )
+        if self.identity_schema_version not in (1, LEAGUE_HISTORY_SCHEMA_VERSION):
+            raise ValueError("history capture identity schema version is unsupported")
 
         teams = _typed_tuple("history teams", self.teams, HistoryTeam)
         teams = tuple(sorted(teams, key=lambda row: row.team_id))
@@ -429,6 +489,41 @@ class LeagueHistoryCapture:
             player.lineup_slot is None for roster in rosters for player in roster.players
         ):
             raise ValueError("a complete lineup must assign every rostered player a slot")
+        event_times = tuple(row.recorded_at for row in transactions)
+        acquisition = self.acquisition_evidence or (
+            HistoryAcquisitionEvidence.legacy_unknown(
+                captured_at,
+                len(transactions),
+                earliest_source_event_at=min(event_times, default=None),
+                latest_source_event_at=max(event_times, default=None),
+            )
+        )
+        if not isinstance(acquisition, HistoryAcquisitionEvidence):
+            raise ValueError(
+                "acquisition_evidence must be HistoryAcquisitionEvidence or None"
+            )
+        if acquisition.attempted_at != captured_at:
+            raise ValueError("history acquisition does not match captured_at")
+        if acquisition.normalized_transaction_count != len(transactions):
+            raise ValueError("history acquisition does not match normalized transactions")
+        if (
+            acquisition.history_complete is not None
+            and acquisition.history_complete != self.transaction_history_complete
+        ):
+            raise ValueError("history acquisition does not match coverage completeness")
+        if acquisition.outcome is not HistoryAcquisitionOutcome.LEGACY_UNKNOWN:
+            earliest = acquisition.earliest_source_event_at
+            latest = acquisition.latest_source_event_at
+            if event_times and (
+                earliest is None
+                or latest is None
+                or min(event_times) < earliest
+                or max(event_times) > latest
+            ):
+                raise ValueError(
+                    "normalized history events fall outside the returned source bounds"
+                )
+        roster_id = roster_ownership_id(rosters)
 
         object.__setattr__(self, "league_key", league_key)
         object.__setattr__(self, "season", season)
@@ -438,76 +533,36 @@ class LeagueHistoryCapture:
         object.__setattr__(self, "teams", teams)
         object.__setattr__(self, "transactions", transactions)
         object.__setattr__(self, "rosters", rosters)
+        object.__setattr__(self, "host_snapshot_id", host_snapshot_id)
+        object.__setattr__(self, "acquisition_evidence", acquisition)
         object.__setattr__(
-            self, "capture_id", content_id("history-capture", self._content_record())
+            self, "identity_schema_version", self.identity_schema_version
+        )
+        object.__setattr__(self, "roster_ownership_id", roster_id)
+        object.__setattr__(
+            self, "capture_id", content_id("history-capture", self._identity_record())
         )
 
+    def _identity_record(self) -> dict[str, object]:
+        """Use v2 provenance for new IDs while preserving migrated v1 IDs."""
+
+        from ._league_history_capture_record import capture_identity_record
+
+        return capture_identity_record(self)
+
     def _content_record(self) -> dict[str, object]:
-        return {
-            "schema_version": LEAGUE_HISTORY_SCHEMA_VERSION,
-            "league_key": self.league_key,
-            "season": self.season,
-            "captured_at": _timestamp(self.captured_at),
-            "coverage_start": _timestamp(self.coverage_start),
-            "coverage_end": _timestamp(self.coverage_end),
-            "transaction_history_complete": self.transaction_history_complete,
-            "roster_complete": self.roster_complete,
-            "lineup_complete": self.lineup_complete,
-            "teams": [row.to_record() for row in self.teams],
-            "transactions": [row.to_record() for row in self.transactions],
-            "rosters": [row.to_record() for row in self.rosters],
-        }
+        from ._league_history_capture_record import capture_content_record
+
+        return capture_content_record(self)
 
     def to_record(self) -> dict[str, object]:
         return {**self._content_record(), "capture_id": self.capture_id}
 
     @classmethod
     def from_record(cls, value: object) -> "LeagueHistoryCapture":
-        fields = {
-            "schema_version",
-            "league_key",
-            "season",
-            "captured_at",
-            "coverage_start",
-            "coverage_end",
-            "transaction_history_complete",
-            "roster_complete",
-            "lineup_complete",
-            "teams",
-            "transactions",
-            "rosters",
-            "capture_id",
-        }
-        row = _record(value, fields, "league history capture")
-        if row["schema_version"] != LEAGUE_HISTORY_SCHEMA_VERSION:
-            raise ValueError("league history capture schema version is unsupported")
-        result = cls(
-            league_key=row["league_key"],
-            season=row["season"],
-            captured_at=_datetime_from_record("captured_at", row["captured_at"]),
-            coverage_start=_datetime_from_record(
-                "coverage_start", row["coverage_start"]
-            ),
-            coverage_end=_datetime_from_record("coverage_end", row["coverage_end"]),
-            transaction_history_complete=row["transaction_history_complete"],
-            roster_complete=row["roster_complete"],
-            lineup_complete=row["lineup_complete"],
-            teams=tuple(
-                HistoryTeam.from_record(item)
-                for item in _array("history teams", row["teams"])
-            ),
-            transactions=tuple(
-                HistoryTransaction.from_record(item)
-                for item in _array("history transactions", row["transactions"])
-            ),
-            rosters=tuple(
-                HistoryTeamRoster.from_record(item)
-                for item in _array("history rosters", row["rosters"])
-            ),
-        )
-        if row["capture_id"] != result.capture_id:
-            raise ValueError("league history capture does not match capture_id")
-        return result
+        from ._league_history_capture_record import capture_from_record
+
+        return capture_from_record(cls, value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,34 +571,27 @@ class HistoryBundleBinding:
     season: int
     bundle_id: str
     captured_at: datetime
+    host_snapshot_id: str | None = None
+    host_captured_at: datetime | None = None
+    history_capture_id: str | None = None
+    roster_ownership_id: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "league_key", _league_key(self.league_key))
-        object.__setattr__(self, "season", _season(self.season))
-        object.__setattr__(self, "bundle_id", _bundle_id(self.bundle_id))
-        object.__setattr__(
-            self, "captured_at", _aware_datetime("bundle captured_at", self.captured_at)
-        )
+        from ._league_history_binding import normalized_binding_fields
+
+        for name, value in normalized_binding_fields(self).items():
+            object.__setattr__(self, name, value)
 
     def to_record(self) -> dict[str, object]:
-        return {
-            "league_key": self.league_key,
-            "season": self.season,
-            "bundle_id": self.bundle_id,
-            "captured_at": _timestamp(self.captured_at),
-        }
+        from ._league_history_binding import binding_record
+
+        return binding_record(self)
 
     @classmethod
     def from_record(cls, value: object) -> "HistoryBundleBinding":
-        row = _record(
-            value, {"league_key", "season", "bundle_id", "captured_at"}, "bundle binding"
-        )
-        return cls(
-            row["league_key"],
-            row["season"],
-            row["bundle_id"],
-            _datetime_from_record("bundle captured_at", row["captured_at"]),
-        )
+        from ._league_history_binding import binding_from_record
+
+        return binding_from_record(cls, value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -571,6 +619,18 @@ class LeagueHistorySnapshot:
         captures = tuple(sorted(captures, key=lambda row: (row.captured_at, row.capture_id)))
         if any((row.league_key, row.season) != identity for row in captures):
             raise ValueError("history captures do not share the requested league season")
+        capture_by_id = {row.capture_id: row for row in captures}
+        for binding in bindings:
+            if binding.history_capture_id is None:
+                continue
+            bound_capture = capture_by_id.get(binding.history_capture_id)
+            if bound_capture is None or (
+                binding.host_snapshot_id != bound_capture.host_snapshot_id
+                or binding.host_captured_at != bound_capture.captured_at
+                or binding.roster_ownership_id
+                != bound_capture.roster_ownership_id
+            ):
+                raise ValueError("exact history binding does not match its capture")
         from ._league_history_evidence import merge_transaction_versions
 
         by_transaction: dict[str, HistoryTransaction] = {}
@@ -620,6 +680,12 @@ class LeagueHistorySnapshot:
     def bundle_captured_at(self) -> datetime:
         return self.requested_binding.captured_at
 
+    @property
+    def evidence_as_of(self) -> datetime:
+        """Latest time this bundle is allowed to observe from mutable history."""
+
+        return self.requested_binding.captured_at
+
     def to_record(self) -> dict[str, object]:
         return {
             "schema_version": LEAGUE_HISTORY_SCHEMA_VERSION,
@@ -627,6 +693,7 @@ class LeagueHistorySnapshot:
             "league_key": self.league_key,
             "season": self.season,
             "bundle_captured_at": _timestamp(self.bundle_captured_at),
+            "evidence_as_of": _timestamp(self.evidence_as_of),
             "history_revision": self.history_revision,
             "bundle_bindings": [row.to_record() for row in self.bundle_bindings],
             "captures": [_snapshot_capture_record(row) for row in self.captures],
@@ -636,7 +703,11 @@ class LeagueHistorySnapshot:
 
 
 def make_league_key(provider: str, source_league_id: str) -> str:
-    """Return a stable pseudonym without retaining the source league ID."""
+    """Return the legacy deterministic key used by pre-v2 local stores.
+
+    New captures must use ``WeeklySourceManifest.league_binding_id`` so the
+    history identity cannot be correlated from a known provider league ID.
+    """
 
     if not isinstance(provider, str):
         raise ValueError("provider must be a lowercase identifier")
@@ -681,6 +752,7 @@ def _validate_asset_movements(
 
 def _snapshot_capture_record(capture: LeagueHistoryCapture) -> dict[str, object]:
     return {
+        "acquisition_evidence": capture.acquisition_evidence.to_record(),
         "capture_id": capture.capture_id,
         "captured_at": _timestamp(capture.captured_at),
         "coverage_start": _timestamp(capture.coverage_start),
@@ -688,6 +760,9 @@ def _snapshot_capture_record(capture: LeagueHistoryCapture) -> dict[str, object]
         "transaction_history_complete": capture.transaction_history_complete,
         "roster_complete": capture.roster_complete,
         "lineup_complete": capture.lineup_complete,
+        "host_snapshot_id": capture.host_snapshot_id,
+        "identity_schema_version": capture.identity_schema_version,
+        "roster_ownership_id": capture.roster_ownership_id,
         "transaction_ids": [row.transaction_id for row in capture.transactions],
         "teams": [row.to_record() for row in capture.teams],
         "rosters": [row.to_record() for row in capture.rosters],
@@ -696,7 +771,7 @@ def _snapshot_capture_record(capture: LeagueHistoryCapture) -> dict[str, object]
 
 def _league_key(value: object) -> str:
     if not isinstance(value, str) or not _LEAGUE_KEY.fullmatch(value):
-        raise ValueError("league_key must be a pseudonymous league SHA-256 key")
+        raise ValueError("league_key must be an opaque local league binding")
     return value
 
 
@@ -753,10 +828,18 @@ def _aware_datetime(name: str, value: object) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _optional_aware_datetime(name: str, value: object) -> datetime | None:
+    return None if value is None else _aware_datetime(name, value)
+
+
 def _timestamp(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(
         timespec="microseconds"
     ).replace("+00:00", "Z")
+
+
+def _optional_timestamp(value: datetime | None) -> str | None:
+    return None if value is None else _timestamp(value)
 
 
 def _datetime_from_record(name: str, value: object) -> datetime:
@@ -770,6 +853,10 @@ def _datetime_from_record(name: str, value: object) -> datetime:
     if _timestamp(result) != value:
         raise ValueError(f"{name} must use the canonical UTC timestamp format")
     return result
+
+
+def _optional_datetime_from_record(name: str, value: object) -> datetime | None:
+    return None if value is None else _datetime_from_record(name, value)
 
 
 def _typed_tuple(name: str, values: Iterable[object], item_type: type) -> tuple:
@@ -803,6 +890,8 @@ __all__ = (
     "HISTORY_CAPTURE_BINDING_TOLERANCE",
     "LEAGUE_HISTORY_APPLICATION_ID",
     "LEAGUE_HISTORY_SCHEMA_VERSION",
+    "HistoryAcquisitionEvidence",
+    "HistoryAcquisitionOutcome",
     "HistoryBundleBinding",
     "HistoryRosterPlayer",
     "HistoryTeam",
@@ -812,6 +901,7 @@ __all__ = (
     "HistoryTransactionAssetKind",
     "HistoryTransactionKind",
     "HistoryTimestampBasis",
+    "HistorySkipCount",
     "LeagueHistoryCapture",
     "LeagueHistoryConflictError",
     "LeagueHistorySnapshot",

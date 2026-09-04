@@ -94,11 +94,14 @@ installs the hash-locked dependency closure from
 self-check:
 
 ```text
-python3.12 build_installer.py
+python3.12 build_installer.py --output release/release-candidate
 ```
 
-On Windows, use `py -3.12 build_installer.py`. The Windows installer also needs
-Inno Setup. The official package can be installed with
+On Windows, use
+`py -3.12 build_installer.py --output release/release-candidate`. The output
+directory must be absent, empty, or already marked as owned by the release builder;
+use a new dedicated child when `release/` contains unrelated files. The Windows
+installer also needs Inno Setup. The official package can be installed with
 `winget install --id JRSoftware.InnoSetup -e -s winget -i`.
 `--portable-only` skips that compiler and still creates the portable ZIP. Inno
 Setup is free for non-commercial use; commercial builders should review and

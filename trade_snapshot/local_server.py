@@ -263,7 +263,7 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
             return
         self._require_token()
         if path == "/api/health":
-            self._json(HTTPStatus.OK, {"status": "ready", "version": "0.1.0"})
+            self._json(HTTPStatus.OK, {"status": "ready", "version": "0.2.0"})
             return
         if path == "/api/activity":
             self._json(

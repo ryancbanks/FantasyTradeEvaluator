@@ -11,6 +11,7 @@ from .independent_power_disclosure import INDEPENDENT_POWER_NOTICE
 from .surrogate_disclosure import SURROGATE_NOTICE
 from .three_way_workbook import ThreeWayExportProvenance, ThreeWayWorkbookRow
 from .workbook_model import TradeWorkbookContext, WorkbookTeamOutlook
+from .xlsx_export import data_readiness_detail_rows, write_team_outlook_sheet
 
 
 MAX_THREE_WAY_EXPORT_ROWS = 10_000
@@ -51,6 +52,7 @@ def export_three_way_trade_workbook(
         raise ValueError("trade_rows must contain ThreeWayWorkbookRow values")
     if any(not isinstance(row, WorkbookTeamOutlook) for row in outlook):
         raise ValueError("team_outlook must contain WorkbookTeamOutlook values")
+    _validate_export_binding(context, provenance, trades)
     target = Path(output_path)
     if target.suffix.casefold() != ".xlsx":
         raise ValueError("output_path must end in .xlsx")
@@ -121,7 +123,12 @@ def _write_workbook(path, context, provenance, trades, outlook):
             formats,
             "AllThreeWayTradesTable",
         )
-        _outlook_sheet(workbook, outlook, formats)
+        write_team_outlook_sheet(
+            workbook,
+            outlook,
+            formats,
+            table_name="ThreeWayTeamOutlookTable",
+        )
         _details_sheet(
             workbook, context, provenance, len(trades), len(best), formats
         )
@@ -316,63 +323,6 @@ def _trade_conditional_formats(sheet, first, last, formats):
     )
 
 
-def _outlook_sheet(workbook, rows, formats):
-    sheet = workbook.add_worksheet("Team Outlook")
-    sheet.hide_gridlines(2)
-    headers = (
-        "Team",
-        "Current W",
-        "Current L",
-        "Current T",
-        "Expected W",
-        "Expected L",
-        "Expected T",
-        "Mean Rank",
-        "Playoff Chance",
-    )
-    sheet.set_row(0, 30)
-    sheet.merge_range(
-        0, 0, 0, len(headers) - 1,
-        "Projected Standings and Playoff Outlook",
-        formats["title"],
-    )
-    sheet.write_row(2, 0, headers, formats["header"])
-    for index, row in enumerate(rows, start=3):
-        values = (
-            row.team_name,
-            row.current_wins,
-            row.current_losses,
-            row.current_ties,
-            row.expected_final_wins,
-            row.expected_final_losses,
-            row.expected_final_ties,
-            row.mean_rank,
-            row.playoff_probability,
-        )
-        for column, value in enumerate(values):
-            format_name = "text" if column == 0 else "percent" if column == 8 else "decimal" if column >= 4 else "integer"
-            sheet.write(index, column, value, formats[format_name])
-    if rows:
-        sheet.add_table(
-            2,
-            0,
-            2 + len(rows),
-            len(headers) - 1,
-            {
-                "name": "ThreeWayTeamOutlookTable",
-                "style": "Table Style Medium 2",
-                "columns": [{"header": header} for header in headers],
-            },
-        )
-        sheet.conditional_format(
-            3, 8, 2 + len(rows), 8,
-            {"type": "data_bar", "bar_color": "#2A9D8F"},
-        )
-    sheet.freeze_panes(3, 1)
-    sheet.set_column(0, 0, 24)
-    sheet.set_column(1, 8, 14)
-
-
 def _details_sheet(
     workbook, context, provenance, trade_count, all_gain_count, formats
 ):
@@ -380,14 +330,14 @@ def _details_sheet(
     sheet.hide_gridlines(2)
     sheet.set_row(0, 30)
     sheet.merge_range("A1:C1", "Calculation Provenance", formats["title"])
-    exact = context.power_engine_mode == "exact"
+    attested = context.power_engine_mode == "holdout_validated"
     independent = context.power_engine_mode == "independent"
-    if exact:
+    if attested:
         three_way_notice = (
             "EXTRAPOLATED — three-way trades are outside the attested two-team "
             "trade-shape scope; playoff projections remain local."
         )
-        power_mode_label = "EXACT / ATTESTED"
+        power_mode_label = "BLIND-HOLDOUT VALIDATED"
         accuracy_notice = three_way_notice
     elif independent:
         three_way_notice = (
@@ -405,8 +355,12 @@ def _details_sheet(
         accuracy_notice = f"{three_way_notice} {SURROGATE_NOTICE}"
     details = (
         ("Trade Format", "three_team"),
+        ("Engine Bundle ID", context.bundle_id),
+        ("Waiver Pool ID", context.waiver_pool_id),
         ("Request ID", provenance.request_id),
+        ("Search Request (Canonical JSON)", provenance.request_json),
         ("Search Run ID", provenance.search_run_id),
+        ("Search Run Definition (Canonical JSON)", provenance.search_run_json),
         *(
             (
                 f"Participant Team {index}",
@@ -430,6 +384,9 @@ def _details_sheet(
             or "Not applicable — this search did not allow forced roster adjustments.",
         ),
         ("Snapshot ID", context.snapshot_id),
+        ("Scoring Profile ID", context.scoring_profile_id),
+        ("NFL Schedule ID", context.nfl_schedule_id),
+        ("Ensemble Configuration ID", context.ensemble_config_id),
         ("Strength Model ID", context.strength_model_id),
         ("Scenario Run ID", context.scenario_run_id),
         ("Primary Team", context.primary_team_name),
@@ -441,7 +398,7 @@ def _details_sheet(
             power_mode_label,
         ),
         ("Three-Way Power Method", three_way_notice),
-        ("Calibration Status", context.calibration_status),
+        ("Calibration Evidence Status", context.calibration_status),
         ("Methodology Evidence Type", context.methodology_evidence_kind),
         ("Methodology Evidence Record ID", context.methodology_record_id),
         ("Strength Formula ID", context.formula_id),
@@ -454,7 +411,7 @@ def _details_sheet(
         ("Formula Action", context.formula_action),
         ("Current Methodology Evidence ID", context.methodology_current_evidence_id),
         (
-            "Exact FantasyPros-Power Scope",
+            "Blind-Validated FantasyPros-Power Scope",
             (
                 "NONE — independent local power does not claim FantasyPros exactness."
                 if independent
@@ -465,6 +422,7 @@ def _details_sheet(
             "Power Accuracy Notice",
             accuracy_notice,
         ),
+        *data_readiness_detail_rows(context),
         ("Qualified Three-Way Trades", trade_count),
         ("All-Three Playoff Gains", all_gain_count),
     )
@@ -476,14 +434,19 @@ def _details_sheet(
             value_format = formats["percent"]
         elif label in {
             "Three-Way Power Method",
-            "Exact FantasyPros-Power Scope",
+            "Blind-Validated FantasyPros-Power Scope",
             "Power Accuracy Notice",
-        } or (label == "Power Engine Mode" and not exact):
+        } or label.endswith(" Limitation") or (
+            label == "Power Engine Mode" and not attested
+        ):
             value_format = formats["warning"]
             sheet.set_row(row, 55)
-        elif label in {"Full Trade Constraints", "Power Search Settings"}:
+        elif label in {
+            "Full Trade Constraints",
+            "Power Search Settings",
+        } or label.endswith(" Policy"):
             value_format = formats["wrapped"]
-            sheet.set_row(row, 110)
+            sheet.set_row(row, 45 if label.endswith(" Policy") else 110)
         sheet.write(row, 1, value, value_format)
     source_row = 4 + len(details)
     sheet.write(source_row, 0, "Weekly Sources", formats["section"])
@@ -501,6 +464,48 @@ def _details_sheet(
     sheet.set_column(0, 0, 40)
     sheet.set_column(1, 1, 90)
     sheet.set_column(2, 2, 21)
+
+
+def _validate_export_binding(context, provenance, trades):
+    if context.data_readiness.trade_search_status == "not_ready":
+        raise ValueError("cannot export a search whose data readiness is not_ready")
+    if (
+        context.bundle_id != provenance.bundle_id
+        or context.waiver_pool_id != provenance.waiver_pool_id
+    ):
+        raise ValueError("workbook context does not match bundle provenance")
+    request = provenance.request_record
+    run = provenance.search_run_definition
+    run_inputs = run.trade_constraint_record
+    if (
+        context.primary_team_id != request["primary_team_id"]
+        or context.primary_team_name != provenance.participant_team_names[0]
+        or context.scenario_count != request["scenario_count"]
+        or context.minimum_power_delta
+        != request["settings"]["minimum_displayed_power_delta"]
+    ):
+        raise ValueError("workbook context does not match the search request")
+    if (
+        context.snapshot_id != run.snapshot_id
+        or context.strength_model_id != run.strength_model_id
+        or context.scenario_run_id != run_inputs.get("scenario_run_id")
+    ):
+        raise ValueError("workbook context does not match the search run")
+    candidate_indexes = set()
+    participant_ids = set(provenance.participant_team_ids)
+    for row in trades:
+        if (
+            row.candidate_index >= provenance.total_candidate_count
+            or row.candidate_index in candidate_indexes
+            or {impact.team_id for impact in row.team_impacts} != participant_ids
+            or any(
+                transfer.source_team_id not in participant_ids
+                or transfer.destination_team_id not in participant_ids
+                for transfer in row.transfers
+            )
+        ):
+            raise ValueError("three-team trade row does not match its search run")
+        candidate_indexes.add(row.candidate_index)
 
 
 def _cell(column: int, row: int) -> str:

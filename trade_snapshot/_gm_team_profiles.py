@@ -8,6 +8,7 @@ from statistics import fmean, median
 from types import MappingProxyType
 
 from ._league_history_evidence import transaction_executed_by
+from ._gm_model_evidence import FORESIGHT_POWER_STATUS
 from ._gm_statistics import (
     gini,
     partial_pool,
@@ -202,7 +203,7 @@ def _trade_value_summary(rows, league_edges, league_estimates, complete):
             "label": "Not enough contemporaneous evidence",
             "plain_language_alias": None,
             "valued_trades": 0,
-            "exact_valued_trades": 0,
+            "holdout_validated_valued_trades": 0,
             "relative_power_edge": _unavailable_metric(
                 "relative_power_edge",
                 "No strictly prior compatible weekly model can value these trades.",
@@ -217,21 +218,25 @@ def _trade_value_summary(rows, league_edges, league_estimates, complete):
             "all_methodologies_relative_power_edge_mean": None,
             "methodology_counts": {},
         }
-    exact_rows = tuple(
-        pair for pair in rows if pair[0].methodology_status == "exact"
+    validated_rows = tuple(
+        pair
+        for pair in rows
+        if pair[0].methodology_status == FORESIGHT_POWER_STATUS
     )
-    exact_edges = [outcome.relative_power_edge for _, outcome in exact_rows]
+    validated_edges = [
+        outcome.relative_power_edge for _, outcome in validated_rows
+    ]
     all_edges = [outcome.relative_power_edge for _, outcome in rows]
     own = [outcome.power_delta for _, outcome in rows]
     playoff = [outcome.playoff_probability_delta for _, outcome in rows if outcome.playoff_probability_delta is not None]
-    pooled = partial_pool(exact_edges, league_edges)
+    pooled = partial_pool(validated_edges, league_edges)
     if pooled is None:
         inferred = {
-            "label": "No tendency without sufficient exact at-time evidence",
+            "label": "No tendency without sufficient holdout-validated at-time evidence",
             "alias": None,
             "confidence": "unavailable",
             "reasons": [
-                "At least three exact at-time valuations are required for a value tendency label."
+                "At least three blind-holdout-validated at-time valuations are required for a value tendency label."
             ],
         }
         edge_metric = _unavailable_metric(
@@ -241,7 +246,7 @@ def _trade_value_summary(rows, league_edges, league_estimates, complete):
     else:
         inferred = _value_label(
             pooled,
-            len(exact_rows),
+            len(validated_rows),
             complete,
         )
         edge_metric = _metric(
@@ -251,14 +256,14 @@ def _trade_value_summary(rows, league_edges, league_estimates, complete):
             percentile(pooled["estimate"], league_estimates.values()),
             pooled["interval_95"],
             0.95,
-            "normal_partial_pooling_exact_at_time_v1",
-            len(exact_rows),
-            len(exact_rows),
+            "normal_partial_pooling_holdout_validated_at_time_v2",
+            len(validated_rows),
+            len(validated_rows),
             complete,
             inferred["confidence"],
             reasons=inferred["reasons"],
             limitations=[
-                "Only exact at-time valuations drive this tendency metric; approximate valuations remain descriptive."
+                "Only blind-holdout-validated at-time valuations drive this tendency metric; extrapolated and surrogate valuations remain descriptive."
             ],
         )
     team_id = rows[0][1].team_id
@@ -273,15 +278,15 @@ def _trade_value_summary(rows, league_edges, league_estimates, complete):
     return {
         "status": (
             "available"
-            if len(exact_rows) >= 3
+            if len(validated_rows) >= 3
             else "insufficient_sample"
-            if exact_rows
+            if validated_rows
             else "unavailable"
         ),
         "label": inferred["label"],
         "plain_language_alias": inferred["alias"],
         "valued_trades": len(rows),
-        "exact_valued_trades": len(exact_rows),
+        "holdout_validated_valued_trades": len(validated_rows),
         "relative_power_edge": edge_metric,
         "mean_power_change": fmean(own),
         "median_power_change": median(own),
@@ -307,7 +312,7 @@ def _value_label(pooled, count, complete):
         }
     if count < 3:
         reasons.append(
-            "At least three exact at-time valued trades are required for a tendency label."
+            "At least three blind-holdout-validated at-time valued trades are required for a tendency label."
         )
         return {
             "label": "Mixed / no clear lean",

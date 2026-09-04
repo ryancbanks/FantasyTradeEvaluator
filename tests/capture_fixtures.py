@@ -35,7 +35,10 @@ def league_sources(team_count: int = 2) -> tuple[LeagueSource, ...]:
                 {"player_id": player_id, "name": f"Player {player_id}",
                  "position_id": "RB", "eligibility": ["RB"]}
                 for player_id in player_ids
-            ],
+            ] + [{
+                "player_id": "9001", "name": "Best Free Agent",
+                "position_id": "RB", "team_id": "CAR", "eligibility": ["RB"],
+            }],
             "teams": teams, "rosters": rosters,
         },
         LeagueSourceKind.ANALYZER_INIT: {

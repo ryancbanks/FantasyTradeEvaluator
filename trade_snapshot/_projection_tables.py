@@ -23,9 +23,9 @@ _PRIVATE = re.compile(
 _PLAYER = re.compile(r"^(?:PLAYER|PLAYERS|PLAYER NAME|ATHLETE|NAME)$")
 _IDENTITY = re.compile(r"^(?:TEAM|TM|POS|POSITION|OPP|OPPONENT|STATUS|BYE)$")
 _STAT = re.compile(
-    r"^(?:PROJ|PROJECTED|FPTS|FPPG|FAN PTS|FANTASY POINTS|PTS|POINTS|GP|CMP|ATT|YDS|YD|TD|TDS|INT|INTS|REC|TGT|TAR|FUM|FL|FGM|FGA|XPM|XPA|SACK|SACKS|TACK|ASST|SAFE|PA|YA|RET|LONG|AVG|RATE)$|"
+    r"^(?:PROJ|PROJECTED|FPTS|FPPG|FAN PTS|FANTASY POINTS|PTS|POINTS|GP|CMP|ATT|YDS|YD|TD|TDS|INT|INTS|REC|TGT|TAR|FUM|FL|FG|FGM|FGA|XPT|XPM|XPA|SACK|SACKS|TACK|TACKLE|ASST|ASSIST|SAFE|SAFETY|PA|YA|YDS AGN|RET|LONG|AVG|RATE|FR|FF|PD)$|"
     r"^(?:PASS|RUSH|REC|RECEIVING|KICK|DEF|DST) (?:CMP|ATT|YDS|YD|TD|TDS|INT|REC|TGT|TAR|FUM|PTS|POINTS|SACK|SAFE|FUM REC|BLK KICK)$|"
-    r"^(?:RET TD|MISC 2PT|FUM LOST|PASS DEF|FUM FRC|FUM REC|DEF TD|RZ TGT|BLK KICK|KICK RET YDS|YDS ALLOWED|PTS AGN|SCORING OPPORTUNITIES|FGM MISS|XPM MISS|PASS YDS PER GAME|RUSH YDS PER GAME|XPM|FGM (?:0 19|10 19|20 29|30 39|40 49|50)|(?:0 19|10 19|20 29|30 39|40 49|50) FGM)$"
+    r"^(?:RET TD|MISC (?:2PT|FL)|FUM LOST|PASS DEF|FUM FRC|FUM REC|DEF TD|RZ TGT|BLK KICK|KICK RET YDS|YDS ALLOWED|PTS AGN|SCORING OPPORTUNITIES|FGM MISS|XPM MISS|PASS YDS PER GAME|RUSH YDS PER GAME|XPM|FGM (?:0 19|10 19|20 29|30 39|40 49|50)|(?:0 19|10 19|20 29|30 39|40 49|50) FGM)$"
 )
 
 
@@ -45,7 +45,11 @@ def projection_capture(
         raise BrowserCaptureError("projection traversal produced no bounded segments")
     sources, parsed_tables = [], []
     for segment in segments:
-        if not isinstance(segment, dict) or set(segment) != {"source", "tables"}:
+        if (
+            not isinstance(segment, dict)
+            or set(segment) != {"availability", "source", "tables"}
+            or segment["availability"] != "available"
+        ):
             raise BrowserCaptureError("projection extraction returned an invalid shape")
         sources.append(_source(segment["source"], task))
         tables = segment["tables"]
@@ -110,6 +114,8 @@ def _table(value: object, provider: CaptureProvider) -> VisibleTable:
     if not width or width > 64 or any(len(row) != width for row in parsed):
         raise BrowserCaptureError("projection table rows had inconsistent widths")
     headers = tuple(_header(cell.text) for cell in parsed[0])
+    if len(set(headers)) != len(headers):
+        raise BrowserCaptureError("projection table contained duplicate semantic headers")
     if any(_PRIVATE.search(header) for header in headers):
         raise BrowserCaptureError("projection table contained a private column")
     players = [index for index, header in enumerate(headers) if _PLAYER.fullmatch(header)]

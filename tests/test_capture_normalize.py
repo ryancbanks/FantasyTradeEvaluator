@@ -1,6 +1,8 @@
 from dataclasses import replace
+from datetime import datetime, timezone
 import unittest
 
+from tests.ecr_fixtures import ecr_source_details
 from trade_snapshot.capture_normalize import (
     ecr_provider_records,
     ecr_snapshot_from_artifact,
@@ -18,7 +20,7 @@ from trade_snapshot.capture_schema import (
     VisibleTable,
     VisibleTableCell,
 )
-from trade_snapshot.ecr import EcrPeriod
+from trade_snapshot.ecr import EcrExpertPanel, EcrPeriod
 from trade_snapshot.identity_match import ProviderPlayerRecord, reconcile_player_identities
 from trade_snapshot.nfl_schedule import (
     NflSchedule,
@@ -28,11 +30,11 @@ from trade_snapshot.nfl_schedule import (
 )
 from trade_snapshot.projections import (
     ProjectionStatus,
+    ProviderStatusScope,
     RemainingSeasonOrigin,
     RemainingSeasonProjection,
     WeeklyProjection,
 )
-from datetime import datetime, timezone
 
 
 def artifact(*, horizon=RankingHorizon.WEEKLY):
@@ -42,13 +44,19 @@ def artifact(*, horizon=RankingHorizon.WEEKLY):
         week=8,
         horizon=horizon,
         scoring="PPR",
-        position_scope=("ALL",),
+        source_scoring="PPR",
+        position_scope=("WR",),
         expert_ids=("expert-1", "expert-2"),
         expert_count=2,
         capture_method=ECRCaptureMethod.VISIBLE_PAGE,
         last_updated_text="Updated today",
         last_updated_at="2026-10-27T15:00:00Z",
         captured_at="2026-10-27T16:00:00Z",
+        source_details=ecr_source_details(
+            week=8,
+            horizon=horizon.value,
+            position="WR",
+        ),
         rankings=(
             ECRRankingRow(
                 "101", "A.J. Brown", "PHI", "WR", 5, 2, 11, 5.5, 1.2,
@@ -72,6 +80,12 @@ class CaptureNormalizeTests(unittest.TestCase):
         self.assertEqual(snapshot.rankings[0].canonical_player_id, "fantasypros:101")
         self.assertEqual(snapshot.rankings[0].position_rank, 2)
         self.assertEqual(snapshot.expert_ids, ("expert-1", "expert-2"))
+        self.assertEqual(len(snapshot.expert_panels), 1)
+        panel = snapshot.expert_panels[0]
+        self.assertEqual(panel.position, "WR")
+        self.assertEqual(panel.expert_ids, ("expert-1", "expert-2"))
+        self.assertEqual(panel.provenance.source_details.page_position, "WR")
+        self.assertEqual(panel.provenance.source_scoring, "PPR")
 
     def test_ros_maps_period_and_unresolved_or_incomplete_rows_fail_closed(self):
         source = artifact(horizon=RankingHorizon.ROS)
@@ -94,6 +108,63 @@ class CaptureNormalizeTests(unittest.TestCase):
                 snapshot_id="week-8",
                 scoring_profile_id="ppr",
             )
+
+    def test_idp_artifact_retains_source_completeness_but_ranks_primary_page_rows(self):
+        source = FantasyProsECRArtifact(
+            task_id="captask_" + "4" * 64,
+            season=2026,
+            week=1,
+            horizon=RankingHorizon.WEEKLY,
+            scoring="PPR",
+            source_scoring="STD",
+            position_scope=("DL",),
+            expert_ids=("expert-1",),
+            expert_count=1,
+            capture_method=ECRCaptureMethod.VISIBLE_PAGE,
+            last_updated_text="Updated today",
+            last_updated_at="2026-09-01T15:00:00Z",
+            captured_at="2026-09-01T16:00:00Z",
+            source_details=ecr_source_details(
+                position="DL",
+                source_scoring="STD",
+                source_player_count=3,
+                source_position_counts={"DE": 1, "DT": 1, "LB": 1},
+            ),
+            rankings=(
+                ECRRankingRow(
+                    "201", "End", "ARI", "DL", 1, 1, 2, 1.2, .2,
+                    "DE1", {"ECR": "1"}, "DE",
+                ),
+                ECRRankingRow(
+                    "202", "Tackle", "ATL", "DL", 2, 1, 3, 2.1, .3,
+                    "DT1", {"ECR": "2"}, "DT",
+                ),
+                ECRRankingRow(
+                    "203", "Linebacker", "BUF", "LB", 3, 2, 4, 3.1, .3,
+                    "LB1", {"ECR": "3"}, "LB",
+                ),
+            ),
+        )
+        registry = reconcile_player_identities(ecr_provider_records(source))
+
+        snapshot = ecr_snapshot_from_artifact(
+            source,
+            registry,
+            snapshot_id="week-1",
+            scoring_profile_id="ppr",
+        )
+
+        self.assertEqual(
+            tuple(row.fantasypros_player_id for row in snapshot.rankings),
+            ("201", "202"),
+        )
+        panel = snapshot.expert_panels[0]
+        self.assertEqual(panel.position, "DL")
+        self.assertEqual(panel.provenance.source_details.source_player_count, 3)
+        self.assertEqual(
+            dict(panel.provenance.source_details.source_position_counts),
+            {"DE": 1, "DT": 1, "LB": 1},
+        )
         incomplete = replace(source.rankings[0], rank_std=None)
         broken = replace(source, rankings=(incomplete,))
         with self.assertRaisesRegex(ValueError, "missing required rank_std"):
@@ -117,6 +188,7 @@ class CaptureNormalizeTests(unittest.TestCase):
             CaptureProvider.ESPN,
             RankingHorizon.WEEKLY,
             "https://www.espn.com/nfl/player/_/id/202/aj-brown",
+            status="Q",
         )
         registry = reconcile_player_identities(
             (
@@ -139,12 +211,83 @@ class CaptureNormalizeTests(unittest.TestCase):
         self.assertEqual(dict(row.raw_projected_stats), {"pass_yds": 12.0})
         self.assertEqual(row.nfl_game_id, "2026-W08-DAL-PHI")
         self.assertFalse(row.is_home)
+        self.assertEqual(len(row.provider_status_observations), 1)
+        designation = row.provider_status_observations[0]
+        self.assertEqual(designation.designation, "Q")
+        self.assertEqual(designation.captured_at, row.captured_at)
+        self.assertIs(designation.source_scope, ProviderStatusScope.WEEKLY)
+        self.assertEqual(designation.source_week, 8)
+
+    def test_complete_table_omission_uses_only_exact_in_scope_registry_reference(self):
+        source = projection_artifact(
+            CaptureProvider.ESPN,
+            RankingHorizon.WEEKLY,
+            "https://www.espn.com/nfl/player/_/id/202/aj-brown",
+        )
+        registry = reconcile_player_identities(
+            (
+                ProviderPlayerRecord("fantasypros", "101", "A.J. Brown", "WR", "PHI"),
+                ProviderPlayerRecord(
+                    "fantasypros", "102", "Missing Receiver", "WR", "DAL"
+                ),
+                ProviderPlayerRecord(
+                    "fantasypros", "103", "Out-of-scope Back", "RB", "DAL"
+                ),
+                ProviderPlayerRecord(
+                    "fantasypros", "104", "No ESPN Reference", "WR", "DAL"
+                ),
+                *projection_provider_records(source),
+                ProviderPlayerRecord(
+                    "espn", "302", "Missing Receiver", "WR", "DAL"
+                ),
+                ProviderPlayerRecord(
+                    "espn", "303", "Out-of-scope Back", "RB", "DAL"
+                ),
+            )
+        )
+
+        evidence = projection_evidence_from_artifact(
+            source,
+            registry,
+            snapshot_id="week-8",
+            scoring_profile_id="ppr",
+        )
+
+        by_player = {row.canonical_player_id: row for row in evidence}
+        omitted = by_player["fantasypros:102"]
+        self.assertEqual(omitted.status, ProjectionStatus.NOT_PUBLISHED)
+        self.assertEqual(omitted.provider_player_id, "302")
+        self.assertEqual(omitted.nfl_team_id, "DAL")
+        self.assertNotIn("fantasypros:103", by_player)
+        self.assertNotIn("fantasypros:104", by_player)
+
+        ros_source = replace(
+            source,
+            horizon=RankingHorizon.ROS,
+            source_period_text="2026 | Rest of Season | PPR | WR",
+        )
+        ros_evidence = projection_evidence_from_artifact(
+            ros_source,
+            registry,
+            snapshot_id="week-8",
+            scoring_profile_id="ppr",
+            applicable_weeks=(8, 9, 10),
+        )
+        ros_omitted = next(
+            row
+            for row in ros_evidence
+            if row.canonical_player_id == "fantasypros:102"
+        )
+        self.assertIsInstance(ros_omitted, RemainingSeasonProjection)
+        self.assertEqual(ros_omitted.applicable_weeks, (8, 9, 10))
+        self.assertIs(ros_omitted.status, ProjectionStatus.NOT_PUBLISHED)
 
     def test_ros_projection_uses_applicable_weeks_and_unresolved_is_explicit(self):
         source = projection_artifact(
             CaptureProvider.YAHOO,
             RankingHorizon.ROS,
             "https://sports.yahoo.com/nfl/players/303/",
+            status="IR",
         )
         records = projection_provider_records(source)
         registry = reconcile_player_identities(
@@ -162,6 +305,10 @@ class CaptureNormalizeTests(unittest.TestCase):
         self.assertEqual(evidence[0].status, ProjectionStatus.UNMATCHED_PLAYER)
         self.assertIsNone(evidence[0].canonical_player_id)
         self.assertEqual(evidence[0].applicable_weeks, (8, 9, 10))
+        designation = evidence[0].provider_status_observations[0]
+        self.assertEqual(designation.designation, "IR")
+        self.assertIs(designation.source_scope, ProviderStatusScope.REST_OF_SEASON)
+        self.assertIsNone(designation.source_week)
 
     def test_fftoday_full_season_total_is_scaled_to_remaining_schedule(self):
         source = public_projection_artifact(
@@ -242,7 +389,12 @@ class CaptureNormalizeTests(unittest.TestCase):
             )
 
 
-def projection_artifact(provider, horizon, link):
+def projection_artifact(provider, horizon, link, *, status=None):
+    headers = ["PLAYER", "TEAM", "POS", "FPTS", "PASS YDS", "OPP"]
+    values = ["A.J. Brown", "PHI", "WR", "18.4", "12", "@DAL"]
+    if status is not None:
+        headers.insert(3, "STATUS")
+        values.insert(3, status)
     return GenericTableArtifact(
         task_id="captask_" + "2" * 64,
         provider=provider,
@@ -259,14 +411,10 @@ def projection_artifact(provider, horizon, link):
         tables=(
             VisibleTable(
                 (
-                    tuple(VisibleTableCell(value) for value in ("PLAYER", "TEAM", "POS", "FPTS", "PASS YDS", "OPP")),
+                    tuple(VisibleTableCell(value) for value in headers),
                     (
-                        VisibleTableCell("A.J. Brown", (link,)),
-                        VisibleTableCell("PHI"),
-                        VisibleTableCell("WR"),
-                        VisibleTableCell("18.4"),
-                        VisibleTableCell("12"),
-                        VisibleTableCell("@DAL"),
+                        VisibleTableCell(values[0], (link,)),
+                        *(VisibleTableCell(value) for value in values[1:]),
                     ),
                 )
             ),

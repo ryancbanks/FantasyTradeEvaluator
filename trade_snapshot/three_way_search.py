@@ -7,7 +7,11 @@ from pathlib import Path
 
 from .analyzer_contract import PowerRankingChange
 from .roster_capacity import assign_reserve_slots
-from .roster_adjustment import PreparedRosterAdjuster, TeamRosterAdjustment
+from .roster_adjustment import (
+    InfeasibleRosterAdjustment,
+    PreparedRosterAdjuster,
+    TeamRosterAdjustment,
+)
 from .search_runner import TradeSearchSettings
 from .strength import RosterStrength, StrengthModel
 from .three_way_search_records import (
@@ -176,10 +180,19 @@ class PreparedThreeWayTrade:
 class ThreeWaySearchOutcome:
     progress: ThreeWaySearchProgress
     database_path: Path
+    run_definition: ThreeWaySearchRunDefinition
 
     def __post_init__(self) -> None:
         if not isinstance(self.progress, ThreeWaySearchProgress):
             raise ValueError("progress must be ThreeWaySearchProgress")
+        if not isinstance(self.run_definition, ThreeWaySearchRunDefinition):
+            raise ValueError("run_definition must be ThreeWaySearchRunDefinition")
+        if (
+            self.progress.run_id != self.run_definition.run_id
+            or self.progress.total_candidate_count
+            != self.run_definition.total_candidate_count
+        ):
+            raise ValueError("search outcome does not match its run definition")
         object.__setattr__(self, "database_path", Path(self.database_path).resolve())
 
     def results(
@@ -219,10 +232,10 @@ class ResumableThreeWayTradeSearch:
             for left, right in zip(space.rosters, prepared.rosters)
         ):
             raise ValueError("trade space and prepared rosters do not match")
-        if space.constraints.require_no_drops and prepared.adjuster is not None:
-            raise ValueError("no-drop trades require pure simultaneous roster changes")
-        if not space.constraints.require_no_drops and prepared.adjuster is None:
-            raise ValueError("trades allowing roster drops require a prepared adjuster")
+        if prepared.adjuster is None:
+            raise ValueError("trade searches require a prepared roster adjuster")
+        if prepared.adjuster.forbid_drops is not space.constraints.require_no_drops:
+            raise ValueError("roster adjuster drop policy does not match trade constraints")
         baseline_by_team = {row.team_id: row for row in baseline.scenarios.rosters}
         if any(
             roster.team_id not in baseline_by_team
@@ -267,10 +280,14 @@ class ResumableThreeWayTradeSearch:
                     pending_results.clear()
                     next_index, cancelled = index, True
                     break
-                power = self.prepared.evaluate(candidate, candidate_index=index)
+                try:
+                    power = self.prepared.evaluate(candidate, candidate_index=index)
+                except InfeasibleRosterAdjustment:
+                    power = None
                 next_index = index + 1
-                qualified = self._power_qualifies(power)
+                qualified = power is not None and self._power_qualifies(power)
                 if qualified:
+                    assert power is not None
                     result = self._simulate_candidate(power)
                     pending_results.append(result)
                     qualified_count += 1
@@ -310,7 +327,7 @@ class ResumableThreeWayTradeSearch:
             )
             if on_progress is not None:
                 on_progress(progress)
-        return ThreeWaySearchOutcome(progress, path)
+        return ThreeWaySearchOutcome(progress, path, self.run_definition)
 
     def _power_qualifies(self, result: ThreeWayPowerEvaluation) -> bool:
         threshold = self.settings.minimum_displayed_power_delta

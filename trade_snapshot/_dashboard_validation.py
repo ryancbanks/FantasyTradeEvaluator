@@ -21,6 +21,7 @@ def validate_dashboard_inputs(bundle, projection, scenarios) -> None:
         projection.snapshot_id != state.snapshot_id
         or projection.scoring_profile_id != state.scoring_profile_id
         or projection.scenario_count != scenarios.config.scenario_count
+        or projection.scenario_run_id != scenarios.run_id
     ):
         raise ValueError("baseline projection does not match the engine bundle")
     if (
@@ -30,6 +31,10 @@ def validate_dashboard_inputs(bundle, projection, scenarios) -> None:
         or scenarios.eligibilities != bundle.eligibilities
         or scenarios.config.seed != bundle.scenario_config.seed
         or scenarios.config.loadings != bundle.scenario_config.loadings
+        or (
+            scenarios.config.player_score_floor
+            != bundle.scenario_config.player_score_floor
+        )
         or scenarios.config.scenario_count > bundle.scenario_config.scenario_count
     ):
         raise ValueError("prepared scenarios do not match the engine bundle")
@@ -157,10 +162,27 @@ def _is_finite_number(value) -> bool:
 
 def validate_dashboard_result(result) -> None:
     teams = result["teams"]
+    comparison = result["fantasypros_comparison"]
+    if comparison["team_count"] != len(teams):
+        raise AssertionError("FantasyPros comparison must cover every dashboard team")
+    rank_matches = sum(
+        row["fantasypros_comparison"]["current_rank_match"] for row in teams
+    )
+    record_matches = sum(
+        row["fantasypros_comparison"]["current_record_match"] for row in teams
+    )
+    if (
+        comparison["current_rank_match_count"] != rank_matches
+        or comparison["current_rank_all_match"] != (rank_matches == len(teams))
+        or comparison["current_record_match_count"] != record_matches
+        or comparison["current_record_all_match"] != (record_matches == len(teams))
+    ):
+        raise AssertionError("FantasyPros comparison summary does not reconcile")
     championship_sum = fsum(row["championship_probability"] for row in teams)
     if abs(championship_sum - 1.0) > _PROBABILITY_TOLERANCE:
         raise AssertionError("championship probabilities must sum to one")
     for row in teams:
+        _validate_benchmark_comparison(row)
         title = row["championship_probability"]
         playoffs = row["playoff_probability"]
         if (
@@ -181,6 +203,41 @@ def validate_dashboard_result(result) -> None:
         json.dumps(result, allow_nan=False)
     except (TypeError, ValueError) as error:
         raise AssertionError("dashboard result must be strict JSON data") from error
+
+
+def _validate_benchmark_comparison(row) -> None:
+    comparison = row["fantasypros_comparison"]
+    source = comparison["source"]
+    deltas = comparison["local_minus_source"]
+    expected = {
+        "current_rank": row["current_rank"] - source["current_rank"],
+        "projected_rank": row["mean_projected_rank"] - source["projected_rank"],
+        "projected_wins": (
+            row["projected_record"]["wins"]
+            - source["projected_record"]["wins"]
+        ),
+        "projected_losses": (
+            row["projected_record"]["losses"]
+            - source["projected_record"]["losses"]
+        ),
+        "playoff_probability": (
+            row["playoff_probability"] - source["playoff_probability"]
+        ),
+        "championship_probability": (
+            row["championship_probability"]
+            - source["championship_probability"]
+        ),
+    }
+    if set(deltas) != set(expected) or any(
+        not _is_finite_number(value)
+        or abs(value - expected[name]) > _PROBABILITY_TOLERANCE
+        for name, value in deltas.items()
+    ):
+        raise AssertionError("FantasyPros comparison deltas do not reconcile")
+    if comparison["current_rank_match"] != (
+        row["current_rank"] == source["current_rank"]
+    ):
+        raise AssertionError("FantasyPros current-rank comparison is inconsistent")
 
 
 __all__ = ("validate_dashboard_inputs", "validate_dashboard_result")

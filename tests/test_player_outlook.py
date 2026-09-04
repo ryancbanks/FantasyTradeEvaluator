@@ -3,7 +3,14 @@ from datetime import timedelta
 import json
 import unittest
 
-from tests.test_engine_bundle import NOW, engine_bundle
+from tests.test_engine_bundle import (
+    NOW,
+    engine_bundle,
+    nfl_schedule_for,
+    rebuild_bundle_inputs,
+    ros_derived_bundle,
+)
+from tests.source_fixtures import projection_source_manifest
 from trade_snapshot.ecr import EcrPeriod
 from trade_snapshot.engine_bundle import EngineBundle
 from trade_snapshot.ensemble import (
@@ -11,6 +18,7 @@ from trade_snapshot.ensemble import (
     ProviderWeight,
     fuse_weekly_projections,
 )
+from trade_snapshot.nfl_schedule import NflSchedule, NflTeamWeek, NflTeamWeekStatus
 from trade_snapshot.player_outlook import (
     build_player_outlook,
     build_player_outlook_catalog,
@@ -25,6 +33,8 @@ from trade_snapshot.player_lab_projections import (
 from trade_snapshot.player_profile_outlook import assign_player_ranks
 from trade_snapshot.projections import (
     ProjectionStatus,
+    ProviderStatusObservation,
+    ProviderStatusScope,
     RemainingSeasonOrigin,
     RemainingSeasonProjection,
     WeeklyProjection,
@@ -130,10 +140,14 @@ def player_bundle(*, degraded_player=None, bye_player=None):
                 _remaining(
                     source,
                     provider,
-                    None,
-                    ProjectionStatus.NOT_APPLICABLE,
+                    points,
+                    applicable_weeks=tuple(range(2, 19)),
                 )
-                for provider in PROVIDERS
+                for provider, points in (
+                    ("fantasypros", base_points * 17),
+                    ("espn", (base_points + 1) * 17),
+                    ("yahoo", (base_points - 1) * 17),
+                )
             )
         else:
             fantasypros = _weekly(source, "fantasypros", base_points)
@@ -142,7 +156,11 @@ def player_bundle(*, degraded_player=None, bye_player=None):
                 if player_id == degraded_player
                 else ProjectionStatus.OBSERVED
             )
-            espn_points = None if espn_status is not ProjectionStatus.OBSERVED else base_points + 1
+            espn_points = (
+                None
+                if espn_status is not ProjectionStatus.OBSERVED
+                else base_points + 1
+            )
             espn = _weekly(source, "espn", espn_points, espn_status)
             yahoo = _weekly(
                 source,
@@ -160,11 +178,111 @@ def player_bundle(*, degraded_player=None, bye_player=None):
                 )
             )
         projections.append(fuse_weekly_projections(rows, source.position, config))
-    return replace(
+    schedule = _schedule_for(projections)
+    if bye_player is not None:
+        target = next(
+            row for row in base.projections
+            if row.canonical_player_id == bye_player
+        )
+        bye_teams = {target.nfl_team_id, target.opponent_team_id}
+        schedule = NflSchedule(
+            schedule.season,
+            schedule.captured_at,
+            schedule.source_provider,
+            (
+                *(
+                    row
+                    for row in schedule.team_weeks
+                    if not (
+                        row.week > target.week
+                        and row.nfl_team_id in bye_teams
+                    )
+                ),
+                NflTeamWeek(
+                    target.opponent_team_id,
+                    target.week,
+                    NflTeamWeekStatus.BYE,
+                ),
+                *(
+                    row
+                    for week in range(target.week + 1, 19)
+                    for row in (
+                        NflTeamWeek(
+                            target.nfl_team_id,
+                            week,
+                            NflTeamWeekStatus.SCHEDULED,
+                            f"G{week}-{bye_player}",
+                            target.opponent_team_id,
+                            target.is_home,
+                        ),
+                        NflTeamWeek(
+                            target.opponent_team_id,
+                            week,
+                            NflTeamWeekStatus.SCHEDULED,
+                            f"G{week}-{bye_player}",
+                            target.nfl_team_id,
+                            not target.is_home,
+                        ),
+                    )
+                ),
+            ),
+        )
+    return rebuild_bundle_inputs(
         base,
         projections=tuple(projections),
         projection_evidence=tuple(evidence),
+        nfl_schedule=schedule,
+        ensemble_config=config,
     )
+
+
+def _schedule_for(projections):
+    rows = []
+    seen = set()
+    weeks = set(range(1, 19))
+    for projection in projections:
+        key = (projection.nfl_team_id, projection.week)
+        if key in seen:
+            continue
+        seen.add(key)
+        if projection.status is ProjectionStatus.BYE:
+            rows.append(
+                NflTeamWeek(
+                    projection.nfl_team_id,
+                    projection.week,
+                    NflTeamWeekStatus.BYE,
+                )
+            )
+            continue
+        rows.extend(
+            (
+                NflTeamWeek(
+                    projection.nfl_team_id,
+                    projection.week,
+                    NflTeamWeekStatus.SCHEDULED,
+                    projection.nfl_game_id,
+                    projection.opponent_team_id,
+                    projection.is_home,
+                ),
+                NflTeamWeek(
+                    projection.opponent_team_id,
+                    projection.week,
+                    NflTeamWeekStatus.SCHEDULED,
+                    projection.nfl_game_id,
+                    projection.nfl_team_id,
+                    not projection.is_home,
+                ),
+            )
+        )
+    teams = {row.nfl_team_id for row in rows}
+    covered = {(row.nfl_team_id, row.week) for row in rows}
+    rows.extend(
+        NflTeamWeek(team_id, week, NflTeamWeekStatus.BYE)
+        for team_id in teams
+        for week in weeks
+        if (team_id, week) not in covered
+    )
+    return NflSchedule(2026, NOW, "espn", tuple(rows))
 
 
 def multiweek_player_bundle():
@@ -198,7 +316,6 @@ def multiweek_player_bundle():
                 source,
                 week=week,
                 nfl_game_id=f"G{week}-{source.canonical_player_id}",
-                opponent_team_id=f"OPP{week}-{source.canonical_player_id}",
                 is_home=week % 2 == 1,
             )
             if week == 4:
@@ -238,11 +355,14 @@ def multiweek_player_bundle():
                     applicable_weeks=(1, 2, 3),
                 )
             )
-    return replace(
+    projections = tuple(projections)
+    return rebuild_bundle_inputs(
         base,
         state=state,
-        projections=tuple(projections),
+        projections=projections,
         projection_evidence=tuple(evidence),
+        nfl_schedule=_schedule_for(projections),
+        ensemble_config=config,
     )
 
 
@@ -416,39 +536,40 @@ class PlayerOutlookTests(unittest.TestCase):
             {"local remaining projection"},
         )
 
-    def test_valid_bundle_without_matching_raw_provider_keeps_provenance_unknown(self):
+    def test_valid_bundle_reports_matching_raw_provider_provenance(self):
         result = build_player_outlook(engine_bundle())
         self.assertEqual(result["providers"], [{
-            "provider": "espn",
-            "label": "ESPN",
-            "captured_at": None,
+            "provider": "fantasypros",
+            "label": "FantasyPros",
+            "captured_at": "2026-09-01T18:00:00.000000Z",
             "source_published_at": None,
         }])
         value = result["players"][0]["weeks"][0]["provider_values"][0]
-        self.assertIsNone(value["origin"])
-        self.assertIsNone(value["captured_at"])
-        self.assertEqual(result["players"][0]["all_direct_week_count"], 0)
+        self.assertEqual(value["origin"], "provider_published")
+        self.assertEqual(value["captured_at"], "2026-09-01T18:00:00.000000Z")
+        self.assertEqual(result["players"][0]["all_direct_week_count"], 1)
         self.assertEqual(value["status"], "observed")
         ros = result["players"][0]["provider_remaining_season"][0]
-        self.assertEqual(ros["status"], "not_retained")
-        self.assertIsNone(ros["provider_player_id"])
+        self.assertEqual(ros["status"], "observed")
+        self.assertEqual(
+            ros["provider_player_id"],
+            f"fantasypros-{result['players'][0]['player_id']}",
+        )
 
-    def test_absent_provider_row_is_explicitly_not_retained(self):
+    def test_missing_provider_evidence_cannot_enter_a_portable_bundle(self):
         bundle = player_bundle()
         target = next(
             row for row in bundle.projections if row.canonical_player_id == "p1"
         )
-        config = EnsembleConfig(
-            tuple(
-                ProviderWeight(provider, 1.0)
-                for provider in ("espn", "yahoo")
-            ),
-            2,
-            {row.position: 0.5 for row in bundle.projections},
-        )
         reduced = fuse_weekly_projections(
             (
-                _weekly(target, "espn", 13.0),
+                _weekly(target, "fantasypros", 12.0),
+                _weekly(
+                    target,
+                    "espn",
+                    None,
+                    ProjectionStatus.NOT_PUBLISHED,
+                ),
                 _weekly(
                     target,
                     "yahoo",
@@ -457,7 +578,7 @@ class PlayerOutlookTests(unittest.TestCase):
                 ),
             ),
             target.position,
-            config,
+            bundle.ensemble_config,
         )
         projections = tuple(
             reduced if row is target else row for row in bundle.projections
@@ -466,31 +587,18 @@ class PlayerOutlookTests(unittest.TestCase):
             row
             for row in bundle.projection_evidence
             if not (
-                row.canonical_player_id == "p1" and row.provider == "fantasypros"
+                isinstance(row, WeeklyProjection)
+                and row.canonical_player_id == "p1"
+                and row.provider == "espn"
             )
         )
 
-        player = _player(
-            build_player_outlook(
-                replace(bundle, projections=projections, projection_evidence=evidence)
-            ),
-            "p1",
-        )
-        week = player["weeks"][0]
-        fantasypros = next(
-            value
-            for value in week["provider_values"]
-            if value["provider"] == "fantasypros"
-        )
-        self.assertEqual(fantasypros["status"], "not_retained")
-        self.assertIsNone(fantasypros["provider_player_id"])
-        self.assertEqual(week["not_retained_source_count"], 1)
-        fantasypros_ros = next(
-            value
-            for value in player["provider_remaining_season"]
-            if value["provider"] == "fantasypros"
-        )
-        self.assertEqual(fantasypros_ros["status"], "not_retained")
+        with self.assertRaisesRegex(ValueError, "does not reconcile to ROS evidence"):
+            rebuild_bundle_inputs(
+                bundle,
+                projections=projections,
+                projection_evidence=evidence,
+            )
 
     def test_builds_deterministic_json_safe_contract_for_every_player(self):
         bundle = player_bundle()
@@ -510,6 +618,8 @@ class PlayerOutlookTests(unittest.TestCase):
                 "first_remaining_week",
                 "weeks",
                 "providers",
+                "raw_stat_key_fields",
+                "provider_status_observation_policy",
                 "ecr_snapshots",
                 "waiver_scope_notice",
                 "profile_scope",
@@ -517,9 +627,14 @@ class PlayerOutlookTests(unittest.TestCase):
                 "players",
             },
         )
-        self.assertEqual(first["schema_version"], 2)
+        self.assertEqual(first["schema_version"], 5)
         self.assertEqual(first["profile_scope"], "calculation_pool_only")
         self.assertIsNone(first["profile_snapshot"])
+        self.assertEqual(first["raw_stat_key_fields"], ["provider", "stat_name"])
+        self.assertIn(
+            "not converted into certain availability",
+            first["provider_status_observation_policy"],
+        )
         self.assertEqual(first["bundle_id"], bundle.bundle_id)
         self.assertEqual(first["weeks"], [1])
         self.assertEqual(
@@ -546,11 +661,19 @@ class PlayerOutlookTests(unittest.TestCase):
                 "weekly_ecr",
                 "rest_of_season_ecr",
                 "remaining_projected_points",
+                "remaining_projected_week_count",
+                "remaining_projection_status",
+                "remaining_fantasy_regular_season_points",
+                "unmaterialized_remaining_points",
                 "average_weekly_points",
+                "average_fantasy_regular_season_points",
                 "average_provider_disagreement",
                 "average_predictive_uncertainty",
                 "provider_complete_week_count",
                 "all_direct_week_count",
+                "provider_status_disagreement_week_count",
+                "provider_status_coverage_complete_week_count",
+                "provider_status_unknown_provider_week_count",
                 "total_week_count",
                 "weeks",
                 "provider_remaining_season",
@@ -567,7 +690,12 @@ class PlayerOutlookTests(unittest.TestCase):
         self.assertEqual(player["provider_complete_week_count"], 1)
         self.assertEqual(player["all_direct_week_count"], 0)
         self.assertEqual(player["remaining_projected_points"], 12.0)
+        self.assertEqual(player["remaining_projected_week_count"], 1)
+        self.assertEqual(player["remaining_projection_status"], "complete")
+        self.assertEqual(player["remaining_fantasy_regular_season_points"], 12.0)
+        self.assertEqual(player["unmaterialized_remaining_points"], 0.0)
         self.assertEqual(player["average_weekly_points"], 12.0)
+        self.assertEqual(player["average_fantasy_regular_season_points"], 12.0)
         self.assertEqual(
             set(player["weeks"][0]),
             {
@@ -585,6 +713,12 @@ class PlayerOutlookTests(unittest.TestCase):
                 "derived_source_count",
                 "unattributed_source_count",
                 "not_retained_source_count",
+                "provider_status_observation_count",
+                "provider_status_expected_provider_count",
+                "provider_status_reporting_provider_count",
+                "provider_status_unknown_provider_count",
+                "provider_status_coverage_complete",
+                "provider_status_disagreement",
                 "provider_values",
             },
         )
@@ -599,8 +733,34 @@ class PlayerOutlookTests(unittest.TestCase):
                 "origin",
                 "captured_at",
                 "source_published_at",
+                "raw_projected_stats",
+                "provider_status_observations",
             },
         )
+        provider_values = {
+            row["provider"]: row for row in player["weeks"][0]["provider_values"]
+        }
+        self.assertEqual(
+            provider_values["fantasypros"]["raw_projected_stats"],
+            {"points": 12.0},
+        )
+        self.assertEqual(
+            provider_values["espn"]["raw_projected_stats"],
+            {"points": 13.0},
+        )
+        self.assertEqual(provider_values["yahoo"]["raw_projected_stats"], {})
+        self.assertEqual(player["provider_status_coverage_complete_week_count"], 0)
+        self.assertEqual(player["provider_status_unknown_provider_week_count"], 3)
+        self.assertEqual(
+            player["weeks"][0]["provider_status_expected_provider_count"], 3
+        )
+        self.assertEqual(
+            player["weeks"][0]["provider_status_reporting_provider_count"], 0
+        )
+        self.assertEqual(
+            player["weeks"][0]["provider_status_unknown_provider_count"], 3
+        )
+        self.assertFalse(player["weeks"][0]["provider_status_coverage_complete"])
 
         waiver = _player(first, "w1")
         self.assertIsNone(waiver["owner"])
@@ -628,6 +788,28 @@ class PlayerOutlookTests(unittest.TestCase):
         self.assertTrue(all(row["expert_count"] == 2 for row in result["ecr_snapshots"]))
         self.assertTrue(
             all(row["selected_expert_count"] == 2 for row in result["ecr_snapshots"])
+        )
+        self.assertTrue(
+            all(
+                row["expert_population_mode"] == "position_specific"
+                for row in result["ecr_snapshots"]
+            )
+        )
+        self.assertTrue(
+            all(
+                row["expert_panels"]
+                == [{
+                    "position": "FLEX",
+                    "expert_count": 2,
+                    "expert_ids": ["22", "9"],
+                    "expert_selection_policy": "fantasypros_latest_ecr_v1",
+                    "expert_group_title": "Latest ECR",
+                    "expert_group_description": (
+                        "More accurate experts with recent updates"
+                    ),
+                }]
+                for row in result["ecr_snapshots"]
+            )
         )
         fantasypros = result["providers"][0]
         self.assertEqual(fantasypros["label"], "FantasyPros")
@@ -669,34 +851,294 @@ class PlayerOutlookTests(unittest.TestCase):
                 "applicable_weeks",
                 "captured_at",
                 "source_published_at",
+                "raw_projected_stats",
+                "provider_status_observations",
             },
         )
         self.assertEqual(ros["yahoo"]["origin"], "provider_published")
         self.assertEqual(ros["yahoo"]["applicable_weeks"], [1])
         self.assertEqual(ros["yahoo"]["projected_points"], 11.0)
+        self.assertEqual(ros["fantasypros"]["raw_projected_stats"], {"points": 12.0})
+        self.assertEqual(ros["espn"]["raw_projected_stats"], {"points": 13.0})
+        self.assertEqual(ros["yahoo"]["raw_projected_stats"], {"points": 11.0})
 
-    def test_preserves_degraded_and_bye_values_as_null(self):
-        degraded = _player(
-            build_player_outlook(player_bundle(degraded_player="p1")),
+    def test_exposes_provider_status_as_scoped_observations_not_availability(self):
+        bundle = player_bundle()
+        designations = {
+            ("fantasypros", "weekly"): "Questionable",
+            ("espn", "weekly"): "Out",
+            ("yahoo", "remaining"): "Doubtful",
+        }
+        evidence = []
+        for row in bundle.projection_evidence:
+            key = (
+                row.provider,
+                "weekly" if isinstance(row, WeeklyProjection) else "remaining",
+            )
+            if row.canonical_player_id == "p1" and key in designations:
+                scope = (
+                    ProviderStatusScope.WEEKLY
+                    if isinstance(row, WeeklyProjection)
+                    else ProviderStatusScope.REST_OF_SEASON
+                )
+                row = replace(
+                    row,
+                    provider_status_observations=(
+                        ProviderStatusObservation(
+                            designations[key],
+                            row.captured_at,
+                            scope,
+                            row.week if isinstance(row, WeeklyProjection) else None,
+                        ),
+                    ),
+                )
+            evidence.append(row)
+
+        result = build_player_outlook(
+            rebuild_bundle_inputs(bundle, projection_evidence=tuple(evidence))
+        )
+        player = _player(result, "p1")
+        values = {
+            row["provider"]: row
+            for row in player["weeks"][0]["provider_values"]
+        }
+
+        self.assertEqual(player["availability"], "rostered")
+        self.assertEqual(
+            player["provider_status_disagreement_week_count"],
+            1,
+        )
+        self.assertTrue(player["weeks"][0]["provider_status_disagreement"])
+        self.assertEqual(
+            player["weeks"][0]["provider_status_reporting_provider_count"], 3
+        )
+        self.assertEqual(
+            player["weeks"][0]["provider_status_unknown_provider_count"], 0
+        )
+        self.assertTrue(player["weeks"][0]["provider_status_coverage_complete"])
+        self.assertEqual(
+            values["fantasypros"]["provider_status_observations"],
+            [{
+                "designation": "Questionable",
+                "captured_at": "2026-09-01T18:10:00.000000Z",
+                "source_scope": "weekly",
+                "source_week": 1,
+            }],
+        )
+        self.assertEqual(
+            values["yahoo"]["provider_status_observations"][0]["source_scope"],
+            "ros",
+        )
+        self.assertIn(
+            "not converted into certain availability",
+            result["provider_status_observation_policy"],
+        )
+
+    def test_incomplete_status_coverage_is_not_presented_as_agreement(self):
+        bundle = player_bundle()
+        evidence = []
+        for row in bundle.projection_evidence:
+            if (
+                row.canonical_player_id == "p1"
+                and row.provider == "fantasypros"
+                and isinstance(row, WeeklyProjection)
+            ):
+                row = replace(
+                    row,
+                    provider_status_observations=(
+                        ProviderStatusObservation(
+                            "Questionable",
+                            row.captured_at,
+                            ProviderStatusScope.WEEKLY,
+                            row.week,
+                        ),
+                    ),
+                )
+            evidence.append(row)
+
+        result = build_player_outlook(
+            rebuild_bundle_inputs(bundle, projection_evidence=tuple(evidence))
+        )
+        player = _player(result, "p1")
+        week = player["weeks"][0]
+
+        self.assertEqual(week["provider_status_reporting_provider_count"], 1)
+        self.assertEqual(week["provider_status_unknown_provider_count"], 2)
+        self.assertFalse(week["provider_status_coverage_complete"])
+        self.assertFalse(week["provider_status_disagreement"])
+        self.assertEqual(player["provider_status_coverage_complete_week_count"], 0)
+        self.assertEqual(player["provider_status_unknown_provider_week_count"], 2)
+        self.assertIn(
+            "incomplete coverage is not an agreement",
+            result["provider_status_observation_policy"],
+        )
+
+    def test_full_horizon_card_uses_complete_published_weekly_rows(self):
+        bundle = player_bundle()
+        target = next(
+            row
+            for row in bundle.projection_evidence
+            if isinstance(row, RemainingSeasonProjection)
+            and row.canonical_player_id == "p1"
+            and row.provider == "fantasypros"
+        )
+        evidence = tuple(
+            replace(
+                row,
+                status=ProjectionStatus.NOT_PUBLISHED,
+                projected_fantasy_points=None,
+                raw_projected_stats={},
+            )
+            if row is target
+            else row
+            for row in bundle.projection_evidence
+        )
+
+        player = _player(
+            build_player_outlook(
+                rebuild_bundle_inputs(bundle, projection_evidence=evidence)
+            ),
             "p1",
         )
-        week = degraded["weeks"][0]
-        espn = next(row for row in week["provider_values"] if row["provider"] == "espn")
-        self.assertEqual(espn["status"], "not_published")
-        self.assertIsNone(espn["projected_points"])
-        self.assertEqual(week["observed_source_count"], 2)
-        self.assertEqual(degraded["provider_complete_week_count"], 0)
-        self.assertEqual(week["usable_source_count"], 2)
-        self.assertEqual(week["direct_source_count"], 1)
-        self.assertEqual(week["derived_source_count"], 1)
+        fantasypros = next(
+            row
+            for row in player["provider_remaining_season"]
+            if row["provider"] == "fantasypros"
+        )
 
-        bye = _player(build_player_outlook(player_bundle(bye_player="p1")), "p1")
-        bye_week = bye["weeks"][0]
+        self.assertEqual(fantasypros["status"], "observed")
+        self.assertEqual(fantasypros["origin"], "derived_weekly")
+        self.assertEqual(fantasypros["applicable_weeks"], [1])
+        self.assertEqual(fantasypros["projected_points"], 12.0)
+        self.assertEqual(fantasypros["raw_projected_stats"], {"points": 12.0})
+        self.assertEqual(
+            fantasypros["captured_at"],
+            "2026-09-01T18:10:00.000000Z",
+        )
+
+    def test_weekly_sum_keeps_only_raw_stats_published_in_every_week(self):
+        bundle = multiweek_player_bundle()
+        evidence = []
+        for row in bundle.projection_evidence:
+            if (
+                isinstance(row, RemainingSeasonProjection)
+                and row.canonical_player_id == "p1"
+                and row.provider == "fantasypros"
+            ):
+                row = replace(
+                    row,
+                    status=ProjectionStatus.NOT_PUBLISHED,
+                    projected_fantasy_points=None,
+                    raw_projected_stats={},
+                )
+            elif (
+                isinstance(row, WeeklyProjection)
+                and row.canonical_player_id == "p1"
+                and row.provider == "fantasypros"
+                and row.status is ProjectionStatus.OBSERVED
+            ):
+                row = replace(
+                    row,
+                    raw_projected_stats={
+                        "points": row.projected_fantasy_points,
+                        **({"carries": 5.0} if row.week == 1 else {}),
+                    },
+                )
+            evidence.append(row)
+
+        player = _player(
+            build_player_outlook(
+                rebuild_bundle_inputs(
+                    bundle,
+                    projection_evidence=tuple(evidence),
+                )
+            ),
+            "p1",
+        )
+        fantasypros = next(
+            row
+            for row in player["provider_remaining_season"]
+            if row["provider"] == "fantasypros"
+        )
+
+        self.assertEqual(fantasypros["origin"], "derived_weekly")
+        self.assertEqual(fantasypros["applicable_weeks"], [1, 2, 3])
+        self.assertEqual(
+            fantasypros["raw_projected_stats"],
+            {
+                "points": sum(
+                    row.projected_fantasy_points
+                    for row in evidence
+                    if isinstance(row, WeeklyProjection)
+                    and row.canonical_player_id == "p1"
+                    and row.provider == "fantasypros"
+                    and row.status is ProjectionStatus.OBSERVED
+                )
+            },
+        )
+
+    def test_reports_ros_lineage_that_accounts_for_future_direct_rows(self):
+        player = _player(build_player_outlook(ros_derived_bundle()), "p1")
+        source = player["weeks"][0]["provider_values"][0]
+
+        self.assertEqual(source["origin"], "derived_rest_of_season")
+        self.assertEqual(source["projected_points"], 5.0)
+        self.assertEqual(source["captured_at"], "2026-09-01T18:00:00.000000Z")
+
+    def test_rejects_partial_direct_weekly_evidence_without_ros_rows(self):
+        base = engine_bundle()
+        evidence = tuple(
+            row
+            for row in base.projection_evidence
+            if isinstance(row, WeeklyProjection)
+        )
+        with self.assertRaisesRegex(ValueError, "full_ros|full-season|remaining-season|horizon"):
+            rebuild_bundle_inputs(base, projection_evidence=evidence)
+
+    def test_separates_full_nfl_ros_from_the_fantasy_regular_season_slice(self):
+        bundle = engine_bundle()
+        source = next(
+            row
+            for row in bundle.projection_evidence
+            if isinstance(row, RemainingSeasonProjection)
+            and row.canonical_player_id == "p1"
+        )
+        evidence = tuple(
+            replace(
+                row,
+                applicable_weeks=tuple(range(1, 19)),
+                projected_fantasy_points=(
+                    40.0 if row is source else row.projected_fantasy_points
+                ),
+            )
+            if isinstance(row, RemainingSeasonProjection)
+            else row
+            for row in bundle.projection_evidence
+        )
+        player = _player(
+            build_player_outlook(
+                rebuild_bundle_inputs(
+                    bundle,
+                    projection_evidence=evidence,
+                    nfl_schedule=nfl_schedule_for(bundle.projections),
+                )
+            ),
+            "p1",
+        )
+
+        self.assertEqual(player["remaining_projected_points"], 40.0)
+        self.assertEqual(player["remaining_projected_week_count"], 18)
+        self.assertEqual(player["remaining_projection_status"], "complete")
+        self.assertEqual(player["remaining_fantasy_regular_season_points"], 12.0)
+        self.assertEqual(player["unmaterialized_remaining_points"], 28.0)
+        self.assertAlmostEqual(player["average_weekly_points"], 40.0 / 18.0)
+        self.assertEqual(player["average_fantasy_regular_season_points"], 12.0)
+
+    def test_preserves_bye_values_as_null(self):
+        bye = _player(build_player_outlook(multiweek_player_bundle()), "p1")
+        bye_week = next(row for row in bye["weeks"] if row["week"] == 4)
         self.assertEqual(bye_week["status"], "bye")
         self.assertIsNone(bye_week["projected_points"])
-        self.assertIsNone(bye["average_weekly_points"])
-        self.assertEqual(bye["provider_complete_week_count"], 1)
-        self.assertEqual(bye["all_direct_week_count"], 1)
         self.assertEqual(bye_week["usable_source_count"], 3)
         self.assertEqual(bye_week["direct_source_count"], 3)
         self.assertTrue(
@@ -781,6 +1223,37 @@ class PlayerOutlookTests(unittest.TestCase):
             yahoo_ros["projected_points"],
         )
 
+    def test_schedule_derived_bye_is_not_claimed_as_portably_proven(self):
+        bundle = multiweek_player_bundle()
+        evidence = tuple(
+            row
+            for row in bundle.projection_evidence
+            if not (
+                isinstance(row, WeeklyProjection)
+                and row.canonical_player_id == "p1"
+                and row.provider == "yahoo"
+                and row.week == 4
+            )
+        )
+
+        player = _player(
+            build_player_outlook(
+                replace(
+                    bundle,
+                    projection_evidence=evidence,
+                    projection_source_manifest=projection_source_manifest(evidence),
+                )
+            ),
+            "p1",
+        )
+        bye = next(row for row in player["weeks"] if row["week"] == 4)
+        yahoo = next(
+            row for row in bye["provider_values"] if row["provider"] == "yahoo"
+        )
+
+        self.assertIsNone(yahoo["origin"])
+        self.assertEqual(bye["unattributed_source_count"], 1)
+
     def test_rejects_duplicate_raw_weekly_and_remaining_season_evidence(self):
         bundle = player_bundle()
         weekly = next(
@@ -796,12 +1269,11 @@ class PlayerOutlookTests(unittest.TestCase):
             (remaining, "duplicate remaining-season"),
         ):
             with self.subTest(message=message):
-                duplicate = replace(
-                    bundle,
-                    projection_evidence=(*bundle.projection_evidence, row),
-                )
                 with self.assertRaisesRegex(ValueError, message):
-                    build_player_outlook(duplicate)
+                    replace(
+                        bundle,
+                        projection_evidence=(*bundle.projection_evidence, row),
+                    )
 
     def test_rejects_parse_error_evidence_for_an_observed_ensemble_value(self):
         bundle = player_bundle()
@@ -829,12 +1301,11 @@ class PlayerOutlookTests(unittest.TestCase):
         bundle = player_bundle()
         first = bundle.projections[0]
         inconsistent_position = replace(first, position="QB")
-        bad_position = replace(
-            bundle,
-            projections=(inconsistent_position, *bundle.projections[1:]),
-        )
-        with self.assertRaisesRegex(ValueError, "position"):
-            build_player_outlook(bad_position)
+        with self.assertRaisesRegex(ValueError, "primary position"):
+            replace(
+                bundle,
+                projections=(inconsistent_position, *bundle.projections[1:]),
+            )
 
         target = next(
             row
@@ -848,9 +1319,8 @@ class PlayerOutlookTests(unittest.TestCase):
             conflicting if row is target else row
             for row in bundle.projection_evidence
         )
-        bad_team = replace(bundle, projection_evidence=evidence)
         with self.assertRaisesRegex(ValueError, "NFL team"):
-            build_player_outlook(bad_team)
+            replace(bundle, projection_evidence=evidence)
 
 
 if __name__ == "__main__":

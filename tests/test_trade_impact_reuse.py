@@ -137,7 +137,15 @@ class PreparedSeasonBaselineReuseTests(unittest.TestCase):
         self.assertEqual(optimized, uncached)
         self.assertEqual(optimized_calls, ())
         self.assertIs(optimized.before, baseline.season_projection)
-        self.assertIs(optimized.after, baseline.season_projection)
+        self.assertIsNot(optimized.after, baseline.season_projection)
+        self.assertEqual(
+            optimized.after.teams,
+            baseline.season_projection.teams,
+        )
+        self.assertEqual(
+            optimized.after.scenario_run_id,
+            optimized.after_scenario_run_id,
+        )
         self.assertNotEqual(
             optimized.after_scenario_run_id,
             optimized.before_scenario_run_id,
@@ -262,7 +270,7 @@ def projection(
     nfl_team_id: str,
 ) -> EnsembleProjection:
     observation = ProviderObservation(
-        provider="impact-reuse-fixture",
+        provider="espn",
         provider_player_id=f"source-{player_id}-{week}",
         status=ProjectionStatus.OBSERVED,
         projected_fantasy_points=points,

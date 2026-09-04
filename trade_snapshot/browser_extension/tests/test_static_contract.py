@@ -174,6 +174,7 @@ class ExtensionStaticContractTests(unittest.TestCase):
                 "collectors/projection_advance.js",
             )
         )
+        ecr = self.javascript["collectors/ecr_main.js"]
         league = self.javascript["collectors/league_main.js"]
         espn = self.javascript["collectors/espn_main.js"]
         self.assertIn("/v2/ajax/myplaybook.php", analyzer)
@@ -184,6 +185,7 @@ class ExtensionStaticContractTests(unittest.TestCase):
         self.assertIn("response_too_large", analyzer)
         self.assertIn("privateColumn", projection)
         self.assertIn("Yahoo All Players", projection)
+        self.assertIn("last_updated_ts: scalar(value.last_updated_ts)", ecr)
         self.assertIn("projected_standings", league)
         self.assertIn("roster_positions", league)
         self.assertIn("proTeamSchedules_wl", espn)

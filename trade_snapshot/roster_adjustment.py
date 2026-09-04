@@ -12,10 +12,15 @@ from .trade_space import TeamRoster, TradeCandidate
 
 ROSTER_ADJUSTMENT_ALGORITHM = "post-trade-optimal-replacement-v4"
 MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY = (
-    "When automatic roster adjustments are allowed, each team's drops are "
-    "optimized locally and scarce free-agent replacements are reserved in "
-    "ascending team-ID order from the players still available."
+    "Post-trade vacancies are filled from the bounded weekly waiver pool even "
+    "when drops are forbidden. When drops are allowed, each team's drops are "
+    "optimized locally. Scarce free-agent replacements are reserved in ascending "
+    "team-ID order from the players still available."
 )
+
+
+class InfeasibleRosterAdjustment(ValueError):
+    """One otherwise legal trade cannot satisfy the configured roster policy."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +66,13 @@ class TradeRosterAdjustment:
 class PreparedRosterAdjuster:
     """Select exact post-trade drops and replacements from the local player pool."""
 
-    def __init__(self, model: StrengthModel, rosters: Iterable[TeamRoster]) -> None:
+    def __init__(
+        self,
+        model: StrengthModel,
+        rosters: Iterable[TeamRoster],
+        *,
+        forbid_drops: bool = False,
+    ) -> None:
         if not isinstance(model, StrengthModel):
             raise ValueError("model must be a StrengthModel")
         rows = tuple(rosters)
@@ -70,6 +81,8 @@ class PreparedRosterAdjuster:
         by_team = {row.team_id: row for row in rows}
         if len(by_team) != len(rows):
             raise ValueError("rosters contain a duplicate team")
+        if not isinstance(forbid_drops, bool):
+            raise ValueError("forbid_drops must be a boolean")
         owned = set()
         for row in rows:
             if row.current_size != len(row.player_ids):
@@ -83,10 +96,12 @@ class PreparedRosterAdjuster:
         self.model = model
         self.rosters = by_team
         self.free_agent_ids = free_agents
+        self.forbid_drops = forbid_drops
         self.adjustment_id = content_id(
             "radj",
             {
                 "algorithm": ROSTER_ADJUSTMENT_ALGORITHM,
+                "forbid_drops": forbid_drops,
                 "free_agent_ids": list(free_agents),
                 "model_id": model.model_id,
                 "rosters": [
@@ -222,6 +237,10 @@ class PreparedRosterAdjuster:
         )
         active_count = len(players) - len(assigned)
         excess = max(0, active_count - before.roster_cap)
+        if excess and self.forbid_drops:
+            raise InfeasibleRosterAdjustment(
+                "trade exceeds the active roster cap while drops are forbidden"
+            )
         dropped = self._optimal_drops(
             players,
             protected,
@@ -272,7 +291,9 @@ class PreparedRosterAdjuster:
             return ()
         candidates = tuple(sorted(set(players).difference(protected)))
         if len(candidates) < count:
-            raise ValueError("trade requires dropping a protected incoming player")
+            raise InfeasibleRosterAdjustment(
+                "trade requires dropping a protected incoming player"
+            )
         best_package = None
         best_score = None
         for package in combinations(candidates, count):
@@ -293,7 +314,9 @@ class PreparedRosterAdjuster:
                 best_package = package
                 best_score = score
         if best_package is None:
-            raise ValueError("trade requires dropping a protected incoming player")
+            raise InfeasibleRosterAdjustment(
+                "trade requires dropping a protected incoming player"
+            )
         return best_package
 
     def _optimal_additions(self, players, count, *, free_agent_ids=None):
@@ -303,11 +326,12 @@ class PreparedRosterAdjuster:
         candidates = tuple(
             player for player in pool if player not in players
         )
-        available_count = min(count, len(candidates))
-        if available_count == 0:
-            return ()
+        if len(candidates) < count:
+            raise InfeasibleRosterAdjustment(
+                "waiver pool cannot fill post-trade roster vacancies"
+            )
         return _best_package(
-            combinations(candidates, available_count),
+            combinations(candidates, count),
             lambda package: (*players, *package),
             self.model,
         )

@@ -1,6 +1,6 @@
 from copy import copy, deepcopy
 from datetime import datetime, timezone
-from dataclasses import asdict, fields, replace
+from dataclasses import fields, replace
 import math
 from pathlib import Path
 import pickle
@@ -20,6 +20,10 @@ from trade_snapshot.league_state import (
     Tiebreaker,
 )
 from trade_snapshot.projections import ProjectionStatus
+from trade_snapshot.roster_adjustment import (
+    InfeasibleRosterAdjustment,
+    PreparedRosterAdjuster,
+)
 from trade_snapshot.scenario_config import (
     CorrelatedScenarioConfig,
     FactorLoadings,
@@ -158,7 +162,17 @@ def components(
         )
     rosters = (primary, other)
     model = strength_model(scoring_profile_id)
-    pair = PreparedTradePair(model, primary, other)
+    constraints = trade_constraints or TradeConstraints(require_no_drops=True)
+    pair = PreparedTradePair(
+        model,
+        primary,
+        other,
+        PreparedRosterAdjuster(
+            model,
+            rosters,
+            forbid_drops=constraints.require_no_drops,
+        ),
+    )
     space_primary = TeamRoster(
         "primary",
         tuple(reversed(primary.player_ids)) if reverse_space else primary.player_ids,
@@ -187,7 +201,7 @@ def components(
     space = TradeSpace(
         space_primary,
         space_other,
-        trade_constraints or TradeConstraints(require_no_drops=True),
+        constraints,
     )
     projections = tuple(
         projection(player_id, scoring_profile_id) for player_id in PLAYER_POINTS
@@ -212,6 +226,26 @@ def components(
 
 
 class ResumableTradeSearchTests(unittest.TestCase):
+    def test_infeasible_roster_adjustment_skips_only_that_candidate(self):
+        runner = components()
+        original = PreparedTradePair.evaluate
+
+        def fail_first(prepared, candidate, *, candidate_index):
+            if candidate_index == 0:
+                raise InfeasibleRosterAdjustment("bounded waiver pool exhausted")
+            return original(prepared, candidate, candidate_index=candidate_index)
+
+        with TemporaryDirectory() as directory, patch.object(
+            PreparedTradePair, "evaluate", new=fail_first
+        ):
+            outcome = runner.run(Path(directory) / "search.sqlite3")
+
+        self.assertEqual(outcome.progress.next_candidate_index, 4)
+        self.assertEqual(
+            tuple(row.candidate_index for row in outcome.results),
+            (1, 2, 3),
+        )
+
     def test_active_package_filter_is_bound_into_checkpoint_identity(self):
         unfiltered = components()
         filtered = components(
@@ -251,13 +285,18 @@ class ResumableTradeSearchTests(unittest.TestCase):
             self.assertEqual(len(first.results), 4)
             self.assertEqual(
                 tuple(field.name for field in fields(first)),
-                ("progress", "results"),
+                ("progress", "results", "run_definition"),
             )
-            self.assertEqual(len(asdict(first)["results"]), 4)
             replaced = replace(first, progress=first.progress)
             self.assertEqual(replaced.results, first.results)
+            self.assertEqual(replaced.run_definition, first.run_definition)
             self.assertIsNone(replaced.database_path)
             self.assertEqual(first, second)
+            self.assertEqual(first.run_definition.run_id, first.progress.run_id)
+            self.assertEqual(
+                first.run_definition.total_candidate_count,
+                first.progress.total_candidate_count,
+            )
             self.assertEqual(progress_updates[-1], first.progress)
             self.assertTrue(
                 all(row.primary_playoff_before is not None for row in first.results)
@@ -479,6 +518,14 @@ class ResumableTradeSearchTests(unittest.TestCase):
             changed,
             runner.prepared_strength.primary,
             runner.prepared_strength.counterparty,
+            PreparedRosterAdjuster(
+                changed,
+                (
+                    runner.prepared_strength.primary,
+                    runner.prepared_strength.counterparty,
+                ),
+                forbid_drops=True,
+            ),
         )
 
         with self.assertRaisesRegex(ValueError, "engine identity"):

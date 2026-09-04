@@ -13,11 +13,18 @@ from tests.test_methodology_reuse import SCHEMA, formula, fingerprint
 from tests.test_weekly_engine import (
     FORECAST_PROVIDERS,
     SCORING_PROFILE,
+    complete_ros_rows,
     nfl_schedule,
     raw_rows,
     state,
     waiver_pool,
 )
+from tests.source_fixtures import (
+    fantasypros_league_benchmark,
+    projection_source_manifest,
+    weekly_source_manifest,
+)
+from tests.ecr_fixtures import with_ecr_rankings
 from trade_snapshot.ensemble import EnsembleConfig, ProviderWeight
 from trade_snapshot.formula_verification import FormulaVerificationReport
 from trade_snapshot.methodology import DEFAULT_POWER_METHODOLOGY
@@ -44,10 +51,11 @@ def evidence():
     profile_id = SCORING_PROFILE.scoring_profile_id
     ecr, ensembles, eligibility = inputs(profile_id)
     ecr = tuple(
-        replace(
+        with_ecr_rankings(
             snapshot,
-            rankings=(
+            (
                 *snapshot.rankings,
+                ecr_rank("p2", "202", 5, 5),
                 ecr_rank("p3", "303", 3, 3),
                 ecr_rank("p4", "304", 4, 4),
             ),
@@ -67,6 +75,11 @@ def evidence():
         PlayerEligibility("p4", ("RB", "FLEX")),
     )
     method = fingerprint()
+    projection_evidence = raw_rows(ensembles)
+    projection_evidence = (
+        *projection_evidence,
+        *complete_ros_rows(projection_evidence),
+    )
     return WeeklyRefreshEvidence(
         state=state(profile_id),
         scoring_profile=SCORING_PROFILE,
@@ -74,8 +87,11 @@ def evidence():
             TeamRoster("a", ("p1",), 1, 2),
             TeamRoster("b", ("p2",), 1, 2),
         ),
-        projection_evidence=raw_rows(ensembles),
+        projection_evidence=projection_evidence,
         nfl_schedule=nfl_schedule(),
+        source_manifest=weekly_source_manifest(),
+        projection_source_manifest=projection_source_manifest(projection_evidence),
+        fantasypros_benchmark=fantasypros_league_benchmark(team_ids=("a", "b")),
         ecr_snapshots=ecr,
         eligibilities=eligibility,
         player_positions={"p1": "RB", "p2": "RB", "p3": "RB", "p4": "RB"},
@@ -159,7 +175,7 @@ class WeeklyRefreshTests(unittest.TestCase):
             root = Path(directory)
             formula_path = root / "formula.json"
             save_strength_formula(refresh_formula(), formula_path)
-            stages = []
+            progress_rows = []
             verifier_calls = []
             current = evidence()
 
@@ -176,8 +192,9 @@ class WeeklyRefreshTests(unittest.TestCase):
                 bundle_directory=root / "bundles",
                 calibrate=forbidden,
                 verify_reuse=verify,
-                progress=lambda row: stages.append(row.stage),
+                progress=progress_rows.append,
             )
+            stages = [row.stage for row in progress_rows]
             self.assertEqual(len(verifier_calls), 1)
             self.assertEqual(result.formula_decision.action, FormulaAction.REUSE)
             self.assertEqual(result.reuse_verification, verification_report(current))
@@ -193,6 +210,12 @@ class WeeklyRefreshTests(unittest.TestCase):
             self.assertIn(RefreshStage.VERIFYING_FORMULA, stages)
             self.assertIn(RefreshStage.REUSING_FORMULA, stages)
             self.assertEqual(stages[-1], RefreshStage.COMPLETE)
+            reuse_message = next(
+                row.message
+                for row in progress_rows
+                if row.stage is RefreshStage.REUSING_FORMULA
+            )
+            self.assertIn("current-week blind-holdout validation", reuse_message)
 
     def test_missing_or_failed_verification_routes_to_recalibration(self):
         with TemporaryDirectory() as directory:

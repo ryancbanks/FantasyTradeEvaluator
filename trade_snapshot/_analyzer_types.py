@@ -138,7 +138,7 @@ class PowerRankingChange:
     raw_after: float
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "team_id", _canonical_id("team_id", self.team_id))
+        object.__setattr__(self, "team_id", _analysis_team_id("team_id", self.team_id))
         object.__setattr__(self, "raw_before", _finite_number("raw_before", self.raw_before))
         object.__setattr__(self, "raw_after", _finite_number("raw_after", self.raw_after))
 
@@ -176,7 +176,7 @@ class PlayoffOddsChange:
     raw_after: float
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "team_id", _canonical_id("team_id", self.team_id))
+        object.__setattr__(self, "team_id", _analysis_team_id("team_id", self.team_id))
         before = _finite_number("raw_before playoff odds", self.raw_before)
         after = _finite_number("raw_after playoff odds", self.raw_after)
         if not 0 <= before <= 100 or not 0 <= after <= 100:
@@ -310,6 +310,29 @@ def _canonical_id(name: str, value: object) -> str:
         )
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", normalized):
         raise AnalyzerContractError(f"{name} must use only portable provider-ID characters")
+    return normalized
+
+
+def _analysis_team_id(name: str, value: object) -> str:
+    """Accept local canonical team IDs without weakening provider requests.
+
+    ESPN league ingestion namespaces team IDs with colons (for example,
+    ``espn:team:6``). Power/playoff change values are also used by the fully
+    local engines, while analyzer requests and parsed provider responses must
+    retain the narrower transport-safe contract enforced by ``_canonical_id``.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise AnalyzerContractError(f"{name} must be a non-empty string or integer ID")
+    normalized = str(value)
+    if not normalized or normalized != normalized.strip():
+        raise AnalyzerContractError(f"{name} must be a non-empty ID without outer whitespace")
+    if any(marker in normalized for marker in ("/", "\\", "?", "=", "%", ";", " ")):
+        raise AnalyzerContractError(
+            f"{name} cannot contain a URL, query, cookie, or transport data"
+        )
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", normalized):
+        raise AnalyzerContractError(f"{name} must use only portable canonical-ID characters")
     return normalized
 
 

@@ -26,6 +26,7 @@ class PlayerLabAssetTests(unittest.TestCase):
         self.app_script = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
         self.script = (ASSET_ROOT / "player_lab_ui.js").read_text(encoding="utf-8")
         self.catalog_script = (ASSET_ROOT / "player_lab_catalog_ui.js").read_text(encoding="utf-8")
+        self.provenance_script = (ASSET_ROOT / "player_lab_provenance_ui.js").read_text(encoding="utf-8")
         self.profile_script = (ASSET_ROOT / "player_lab_profile_ui.js").read_text(encoding="utf-8")
         self.styles = (ASSET_ROOT / "player_lab.css").read_text(encoding="utf-8")
 
@@ -70,13 +71,21 @@ class PlayerLabAssetTests(unittest.TestCase):
         self.assertIn("prefers-reduced-motion", self.styles)
         self.assertIn("fantasy_points_selected", self.profile_script)
         self.assertIn("scoring_mode", self.profile_script)
-        self.assertNotIn("innerHTML", self.script + self.catalog_script + self.profile_script)
+        self.assertNotIn(
+            "innerHTML",
+            self.script + self.catalog_script + self.profile_script + self.provenance_script,
+        )
 
     def test_player_lab_script_has_valid_javascript_syntax_when_node_is_available(self):
         node = shutil.which("node")
         if node is None:
             self.skipTest("Node.js is not installed in this source-test environment")
-        for name in ("player_lab_profile_ui.js", "player_lab_catalog_ui.js", "player_lab_ui.js"):
+        for name in (
+            "player_lab_profile_ui.js",
+            "player_lab_catalog_ui.js",
+            "player_lab_provenance_ui.js",
+            "player_lab_ui.js",
+        ):
             with self.subTest(name=name):
                 result = subprocess.run(
                     [node, "--check", str(ASSET_ROOT / name)],
@@ -90,10 +99,13 @@ class PlayerLabAssetTests(unittest.TestCase):
     def test_profile_module_loads_before_the_player_lab_controller(self):
         profile_index = self.page.index('src="/player_lab_profile_ui.js"')
         catalog_index = self.page.index('src="/player_lab_catalog_ui.js"')
+        provenance_index = self.page.index('src="/player_lab_provenance_ui.js"')
         controller_index = self.page.index('src="/player_lab_ui.js"')
         self.assertLess(profile_index, catalog_index)
-        self.assertLess(catalog_index, controller_index)
+        self.assertLess(catalog_index, provenance_index)
+        self.assertLess(provenance_index, controller_index)
         self.assertIn("window.PlayerLabCatalogUi.create", self.script)
+        self.assertIn("window.PlayerLabProvenanceUi.create", self.script)
         self.assertIn("window.PlayerLabProfileUi.describe", self.script)
         self.assertIn("window.PlayerLabProfileUi.render", self.script)
 
@@ -187,7 +199,7 @@ class PlayerLabAssetTests(unittest.TestCase):
         ]
         self.assertNotIn("rest_of_season_ecr?.rank", rank_basis)
         self.assertIn('return "Local remaining projection"', rank_basis)
-        self.assertIn("source response size at capture", self.script)
+        self.assertIn("source response size at capture", self.provenance_script)
         self.assertNotIn("bytes retained", self.script)
 
     def test_source_debug_discloses_future_week_preview_scope(self):
@@ -200,6 +212,7 @@ class PlayerLabAssetTests(unittest.TestCase):
     def test_player_lab_modules_stay_bounded_by_responsibility(self):
         self.assertLessEqual(len(self.script.splitlines()), 800)
         self.assertLessEqual(len(self.catalog_script.splitlines()), 800)
+        self.assertLessEqual(len(self.provenance_script.splitlines()), 400)
         self.assertLessEqual(len(self.profile_script.splitlines()), 600)
 
 

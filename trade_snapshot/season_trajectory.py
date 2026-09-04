@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from math import ceil, fsum
 
+from ._scenario_random import content_id
 from ._season_ranking import (
     _add_score_adjustment,
     clone_records,
@@ -25,7 +26,7 @@ from ._record_trend import (
 from .season import ScoreScenario
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,13 +205,40 @@ def _build_season_trajectory(
         }
         for team_id in team_ids
     ]
+    scenario_ids = sorted(row.scenario_id for row in scenario_rows)
+    scenario_identity = {
+        "host_snapshot_id": state.snapshot_id,
+        "scoring_profile_id": state.scoring_profile_id,
+        "scenario_ids": scenario_ids,
+    }
     trajectory = {
         "schema_version": _SCHEMA_VERSION,
         "snapshot_id": state.snapshot_id,
         "scenario_count": len(scenario_rows),
+        "scenario_evidence": {
+            "scenario_set_id": content_id(
+                "trajectory-scenario-set", scenario_identity
+            ),
+            "host_snapshot_id": state.snapshot_id,
+            "scoring_profile_id": state.scoring_profile_id,
+            "first_scenario_id": scenario_ids[0],
+            "last_scenario_id": scenario_ids[-1],
+            "scenario_count": len(scenario_rows),
+        },
         "history_status": (
             "complete" if observed is not None else "unavailable_or_inconsistent"
         ),
+        "history_coverage": {
+            "completed_matchups_usable": observed is not None,
+            "observed_trajectory_status": (
+                "complete" if observed is not None else "withheld"
+            ),
+            "limitation": (
+                None
+                if observed is not None
+                else "Completed matchup history is missing or inconsistent with standings."
+            ),
+        },
         "methodology": {
             "record_value": "win=1, tie=0.5, loss=0",
             "slope": (

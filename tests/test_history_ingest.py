@@ -1,5 +1,5 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 import unittest
 
 from tests.test_engine_bundle import engine_bundle
@@ -16,13 +16,33 @@ from trade_snapshot.league_history import (
     HistoryTransactionAssetKind,
     HistoryTransactionKind,
 )
+from trade_snapshot.league_ingest import (
+    CanonicalPlayerProviderId,
+    CanonicalTeamProviderId,
+    NormalizedLeagueInputs,
+)
 from trade_snapshot.weekly_assembly import AssembledWeeklyEvidence
 
 
 CAPTURED_AT = datetime(2026, 9, 15, 12, tzinfo=timezone.utc)
 
 
-def _assembled(source_league_id="77"):
+def _bundle(*, league_binding_id=None):
+    bundle = engine_bundle()
+    manifest = replace(
+        bundle.source_manifest,
+        host_captured_at=CAPTURED_AT,
+        league_binding_id=(
+            bundle.source_manifest.league_binding_id
+            if league_binding_id is None
+            else league_binding_id
+        ),
+    )
+    return replace(bundle, source_manifest=manifest)
+
+
+def _assembled(source_league_id="77", bundle=None):
+    bundle = bundle or _bundle()
     identities = IdentityRegistry(
         tuple(
             PlayerIdentity(
@@ -41,13 +61,43 @@ def _assembled(source_league_id="77"):
             )
         )
     )
-    league_inputs = SimpleNamespace(
+    rostered_player_ids = {
+        player_id
+        for roster in bundle.rosters
+        for player_id in roster.player_ids
+    }
+    rostered_identities = tuple(
+        player
+        for player in identities.players
+        if player.canonical_player_id in rostered_player_ids
+    )
+    league_inputs = NormalizedLeagueInputs(
         source_provider="espn",
         source_league_id=source_league_id,
-        league_state=SimpleNamespace(season=2026),
-        team_ids_for=lambda provider: (
-            {"primary": "1", "other": "2"} if provider == "espn" else {}
+        captured_at=CAPTURED_AT,
+        scoring_profile=bundle.scoring_profile,
+        league_state=bundle.state,
+        rosters=bundle.rosters,
+        eligibilities=tuple(
+            row
+            for row in bundle.eligibilities
+            if row.canonical_player_id in rostered_player_ids
         ),
+        player_identities=rostered_identities,
+        player_provider_ids=tuple(
+            CanonicalPlayerProviderId(
+                player.canonical_player_id,
+                reference.provider,
+                reference.provider_player_id,
+            )
+            for player in rostered_identities
+            for reference in player.provider_references
+        ),
+        team_provider_ids=(
+            CanonicalTeamProviderId("primary", "espn", "1"),
+            CanonicalTeamProviderId("other", "espn", "2"),
+        ),
+        completed_history_available=False,
     )
     assembled = object.__new__(AssembledWeeklyEvidence)
     object.__setattr__(assembled, "identities", identities)
@@ -55,32 +105,41 @@ def _assembled(source_league_id="77"):
     return assembled
 
 
-def _capture(*, extra_trade_items=()):
+def _capture(
+    *,
+    extra_trade_items=(),
+    extra_transactions=(),
+    transaction_limit=1_000,
+    trade_fields=None,
+):
+    trade_event = transaction(
+        "a97ddebc-2b48-4110-9e3a-ee927830b736",
+        "TRADE_ACCEPT",
+        [
+            item(
+                101,
+                1,
+                2,
+                from_slot=-1,
+                to_slot=-1,
+                overall_pick=0,
+            ),
+            item(
+                202,
+                2,
+                1,
+                from_slot=-1,
+                to_slot=-1,
+                overall_pick=0,
+            ),
+            *extra_trade_items,
+        ],
+    )
+    if trade_fields:
+        trade_event.update(trade_fields)
     payload = league_payload(
         [
-            transaction(
-                "a97ddebc-2b48-4110-9e3a-ee927830b736",
-                "TRADE_ACCEPT",
-                [
-                    item(
-                        101,
-                        1,
-                        2,
-                        from_slot=-1,
-                        to_slot=-1,
-                        overall_pick=0,
-                    ),
-                    item(
-                        202,
-                        2,
-                        1,
-                        from_slot=-1,
-                        to_slot=-1,
-                        overall_pick=0,
-                    ),
-                    *extra_trade_items,
-                ],
-            ),
+            trade_event,
             transaction(
                 "12305a93-4917-4800-9e3a-ee927830b736",
                 "WAIVER",
@@ -96,6 +155,7 @@ def _capture(*, extra_trade_items=()):
                 ],
                 bid=9,
             ),
+            *extra_transactions,
         ]
     )
     payload["teams"][0]["roster"]["entries"] = [
@@ -122,25 +182,40 @@ def _capture(*, extra_trade_items=()):
             "playerPoolEntry": {"player": {"injuryStatus": "ACTIVE"}},
         },
     ]
-    return espn_activity_capture(payload, captured_at=CAPTURED_AT)
+    return espn_activity_capture(
+        payload,
+        captured_at=CAPTURED_AT,
+        transaction_limit=transaction_limit,
+    )
 
 
 class HistoryIngestTests(unittest.TestCase):
     def test_canonicalizes_activity_without_retaining_provider_league_identity(self):
-        bundle = engine_bundle()
+        bundle = _bundle()
 
         capture, binding = canonicalize_espn_history(
             _capture(),
-            _assembled(),
+            _assembled(bundle=bundle),
             bundle,
             bundle_captured_at=CAPTURED_AT,
         )
 
-        self.assertTrue(capture.league_key.startswith("league_"))
-        self.assertEqual(len(capture.league_key), len("league_") + 64)
+        self.assertEqual(
+            capture.league_key, bundle.source_manifest.league_binding_id
+        )
         self.assertFalse(hasattr(capture, "source_league_id"))
         self.assertEqual(binding.bundle_id, bundle.bundle_id)
         self.assertEqual(binding.league_key, capture.league_key)
+        self.assertEqual(binding.history_capture_id, capture.capture_id)
+        self.assertEqual(binding.host_snapshot_id, "snapshot-1")
+        self.assertEqual(
+            binding.roster_ownership_id, capture.roster_ownership_id
+        )
+        self.assertEqual(
+            capture.acquisition_evidence.returned_transaction_count, 2
+        )
+        self.assertEqual(capture.acquisition_evidence.transaction_limit, 1_000)
+        self.assertTrue(capture.transaction_history_complete)
         self.assertEqual(
             [(row.team_id, row.name) for row in capture.teams],
             [("other", "Other"), ("primary", "Primary")],
@@ -184,8 +259,40 @@ class HistoryIngestTests(unittest.TestCase):
         self.assertNotIn("source_transaction_id", repr(serialized))
         self.assertNotIn("a97ddebc-2b48-4110-9e3a-ee927830b736", repr(serialized))
 
+    def test_preserves_distinct_source_action_times_without_inventing_execution(self):
+        bundle = _bundle()
+        source = _capture(
+            trade_fields={
+                "acceptedDate": 1_788_800_350_000,
+                "processDate": 1_788_800_375_000,
+                "expirationDate": 1_788_900_400_000,
+            }
+        )
+
+        capture, _ = canonicalize_espn_history(
+            source,
+            _assembled(bundle=bundle),
+            bundle,
+            bundle_captured_at=CAPTURED_AT,
+        )
+
+        source_trade = next(row for row in source.transactions if row.kind.value == "trade")
+        history_trade = next(
+            row for row in capture.transactions
+            if row.kind is HistoryTransactionKind.TRADE
+        )
+        self.assertEqual(history_trade.recorded_at, source_trade.proposed_at)
+        self.assertEqual(history_trade.accepted_at, source_trade.accepted_at)
+        self.assertEqual(history_trade.processed_at, source_trade.processed_at)
+        self.assertEqual(history_trade.expires_at, source_trade.expires_at)
+        self.assertFalse(hasattr(history_trade, "executed_at"))
+        self.assertEqual(
+            type(history_trade).from_record(history_trade.to_record()),
+            history_trade,
+        )
+
     def test_canonical_history_retains_unsupported_trade_asset_without_provider_data(self):
-        bundle = engine_bundle()
+        bundle = _bundle()
         source = _capture(
             extra_trade_items=(
                 item(0, 2, 1, item_type="DRAFT", overall_pick=7),
@@ -194,7 +301,7 @@ class HistoryIngestTests(unittest.TestCase):
 
         capture, _ = canonicalize_espn_history(
             source,
-            _assembled(),
+            _assembled(bundle=bundle),
             bundle,
             bundle_captured_at=CAPTURED_AT,
         )
@@ -217,7 +324,7 @@ class HistoryIngestTests(unittest.TestCase):
         self.assertNotIn("overall_pick", repr(capture))
 
     def test_repeated_unsupported_assets_have_distinct_stable_pseudonyms(self):
-        bundle = engine_bundle()
+        bundle = _bundle()
         source = _capture(
             extra_trade_items=(
                 item(0, 2, 1, item_type="DRAFT", overall_pick=7),
@@ -227,13 +334,13 @@ class HistoryIngestTests(unittest.TestCase):
 
         first, _ = canonicalize_espn_history(
             source,
-            _assembled(),
+            _assembled(bundle=bundle),
             bundle,
             bundle_captured_at=CAPTURED_AT,
         )
         second, _ = canonicalize_espn_history(
             source,
-            _assembled(),
+            _assembled(bundle=bundle),
             bundle,
             bundle_captured_at=CAPTURED_AT,
         )
@@ -257,26 +364,27 @@ class HistoryIngestTests(unittest.TestCase):
         self.assertEqual(first_trade, second_trade)
 
     def test_rejects_activity_capture_stale_for_selected_bundle(self):
+        bundle = _bundle()
         with self.assertRaisesRegex(ValueError, "does not match"):
             canonicalize_espn_history(
                 _capture(),
-                _assembled(),
-                engine_bundle(),
+                _assembled(bundle=bundle),
+                bundle,
                 bundle_captured_at=CAPTURED_AT + timedelta(hours=1, seconds=1),
             )
 
     def test_fails_closed_on_mismatched_league_or_unresolved_current_roster(self):
-        bundle = engine_bundle()
+        bundle = _bundle()
         with self.assertRaisesRegex(ValueError, "does not match"):
             canonicalize_espn_history(
                 _capture(),
-                _assembled("different"),
+                _assembled("different", bundle),
                 bundle,
                 bundle_captured_at=CAPTURED_AT,
             )
 
         unresolved = _capture()
-        assembled = _assembled()
+        assembled = _assembled(bundle=bundle)
         reduced = IdentityRegistry(tuple(
             player for player in assembled.identities.players
             if player.canonical_player_id != "p2"
@@ -285,6 +393,95 @@ class HistoryIngestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not exactly resolved"):
             canonicalize_espn_history(
                 unresolved,
+                assembled,
+                bundle,
+                bundle_captured_at=CAPTURED_AT,
+            )
+
+    def test_local_binding_salts_history_identifiers_without_source_id_hashing(self):
+        first_bundle = _bundle(league_binding_id="league_" + "a" * 32)
+        second_bundle = _bundle(league_binding_id="league_" + "b" * 32)
+
+        first, _ = canonicalize_espn_history(
+            _capture(),
+            _assembled(bundle=first_bundle),
+            first_bundle,
+            bundle_captured_at=CAPTURED_AT,
+        )
+        second, _ = canonicalize_espn_history(
+            _capture(),
+            _assembled(bundle=second_bundle),
+            second_bundle,
+            bundle_captured_at=CAPTURED_AT,
+        )
+
+        self.assertNotEqual(first.league_key, second.league_key)
+        self.assertNotEqual(
+            first.transactions[0].transaction_id,
+            second.transactions[0].transaction_id,
+        )
+        self.assertNotIn("'77'", repr(first.to_record()))
+
+    def test_acquisition_evidence_explains_filtered_rows_and_provider_cap(self):
+        bundle = _bundle()
+        cancelled = transaction(
+            "cancelled-1",
+            "WAIVER",
+            [item(303, 0, 1)],
+            status="CANCELED",
+            date=1_788_800_300_000,
+        )
+        source = _capture(extra_transactions=(cancelled,))
+
+        capture, _ = canonicalize_espn_history(
+            source,
+            _assembled(bundle=bundle),
+            bundle,
+            bundle_captured_at=CAPTURED_AT,
+        )
+
+        evidence = capture.acquisition_evidence
+        self.assertEqual(evidence.returned_transaction_count, 3)
+        self.assertEqual(evidence.normalized_transaction_count, 2)
+        self.assertEqual(evidence.skipped[0].count, 1)
+        self.assertEqual(
+            evidence.skipped[0].reason_code,
+            "not_executed",
+        )
+        self.assertEqual(
+            evidence.earliest_source_event_at,
+            source.earliest_returned_proposed_at,
+        )
+        self.assertLess(
+            evidence.earliest_source_event_at,
+            min(row.recorded_at for row in capture.transactions),
+        )
+
+        capped_source = _capture(transaction_limit=2)
+        capped, _ = canonicalize_espn_history(
+            capped_source,
+            _assembled(bundle=bundle),
+            bundle,
+            bundle_captured_at=CAPTURED_AT,
+        )
+        self.assertFalse(capped.transaction_history_complete)
+        self.assertEqual(capped.acquisition_evidence.outcome.value, "captured_partial")
+
+    def test_rejects_activity_roster_that_does_not_match_bound_bundle(self):
+        bundle = _bundle()
+        assembled = _assembled(bundle=bundle)
+        source = _capture()
+        mismatched = replace(
+            source,
+            rosters=(
+                replace(source.rosters[0], entries=source.rosters[0].entries[:1]),
+                source.rosters[1],
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "rosters do not exactly match"):
+            canonicalize_espn_history(
+                mismatched,
                 assembled,
                 bundle,
                 bundle_captured_at=CAPTURED_AT,

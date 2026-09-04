@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from array import array
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .score_scenarios import PreparedScoreScenarios
@@ -21,6 +22,17 @@ __all__ = (
     "ScenarioScoreCache",
     "ScenarioScoreCacheBuilder",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _IdentifiedScoreScenarios:
+    """A cached score stream carrying the candidate roster-run identity."""
+
+    run_id: str
+    rows: Iterable[ScoreScenario]
+
+    def __iter__(self) -> Iterator[ScoreScenario]:
+        return iter(self.rows)
 
 
 class ScenarioScoreCacheBuilder:
@@ -78,6 +90,12 @@ class ScenarioScoreCacheBuilder:
     @property
     def max_bytes(self) -> int:
         return self._max_bytes
+
+    @property
+    def run_id(self) -> str:
+        """Preserve the wrapped scenario stream's public identity."""
+
+        return self._baseline.run_id
 
     @property
     def estimated_byte_count(self) -> int:
@@ -195,13 +213,14 @@ class ScenarioScoreCache:
     def prepare_projection(
         self,
         prepared: PreparedScoreScenarios,
-    ) -> tuple[int, Iterator[ScoreScenario]]:
+    ) -> tuple[int, Iterable[ScoreScenario]]:
         """Validate one candidate once and return its work count and score stream."""
 
         reused = self._reuse_mask(prepared)
+        rows = self._iter_scenarios(prepared, reused, 0, self._scenario_count)
         return (
             reused.count(False) * self._scenario_count,
-            self._iter_scenarios(prepared, reused, 0, self._scenario_count),
+            _IdentifiedScoreScenarios(prepared.run_id, rows),
         )
 
     def iter_scenarios(

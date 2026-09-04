@@ -76,6 +76,7 @@ class CorrelatedScenarioConfig:
     scenario_count: int
     seed: int
     loadings: FactorLoadings
+    player_score_floor: float | None = None
     config_id: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -83,12 +84,21 @@ class CorrelatedScenarioConfig:
         require_json_int("seed", self.seed, minimum=-SAFE_INTEGER)
         if not isinstance(self.loadings, FactorLoadings):
             raise ValueError("loadings must be FactorLoadings")
+        if self.player_score_floor is not None:
+            if (
+                isinstance(self.player_score_floor, bool)
+                or not isinstance(self.player_score_floor, Real)
+                or not isfinite(float(self.player_score_floor))
+            ):
+                raise ValueError("player_score_floor must be finite numeric data or null")
+            object.__setattr__(self, "player_score_floor", float(self.player_score_floor))
         object.__setattr__(self, "config_id", content_id("scfg", self._content_record()))
 
     def _content_record(self) -> dict[str, object]:
         return {
             "algorithm": DRAW_ALGORITHM,
             "loadings": self.loadings.to_record(),
+            "player_score_floor": self.player_score_floor,
             "scenario_count": self.scenario_count,
             "seed": self.seed,
         }
@@ -96,7 +106,7 @@ class CorrelatedScenarioConfig:
     def to_record(self) -> dict[str, object]:
         return {
             "kind": "correlated_scenario_config",
-            "schema_version": 1,
+            "schema_version": 2,
             **self._content_record(),
             "config_id": self.config_id,
         }
@@ -108,6 +118,7 @@ class CorrelatedScenarioConfig:
             "config_id",
             "kind",
             "loadings",
+            "player_score_floor",
             "scenario_count",
             "schema_version",
             "seed",
@@ -117,7 +128,7 @@ class CorrelatedScenarioConfig:
         if (
             record["kind"] != "correlated_scenario_config"
             or type(record["schema_version"]) is not int
-            or record["schema_version"] != 1
+            or record["schema_version"] != 2
             or record["algorithm"] != DRAW_ALGORITHM
         ):
             raise ValueError(
@@ -140,6 +151,7 @@ class CorrelatedScenarioConfig:
                 nfl_team=raw["nfl_team"],
                 player=raw["player"],
             ),
+            player_score_floor=record["player_score_floor"],
         )
         if record["config_id"] != config.config_id:
             raise ValueError("scenario config_id does not match its content")

@@ -1,4 +1,5 @@
 import json
+import copy
 import pickle
 import threading
 import time
@@ -47,6 +48,7 @@ from trade_snapshot.browser_capture import (
     LeagueCaptureData,
     ProjectionCaptureData,
     YahooScoringError,
+    YahooScoringMismatch,
 )
 from trade_snapshot.capture_schema import (
     AnalyzerCapturePhase,
@@ -54,6 +56,7 @@ from trade_snapshot.capture_schema import (
     CapturePlan,
     CaptureProvider,
     ECRRankingRow,
+    FantasyProsECRArtifact,
     FantasyProsECRTask,
     FantasyProsLeagueArtifact,
     GenericTableArtifact,
@@ -64,6 +67,7 @@ from trade_snapshot.capture_schema import (
     VisibleTable,
     VisibleTableCell,
 )
+from trade_snapshot.ecr_source import EcrHorizonEvidence, EcrSourceDetails
 
 
 CAPTURED = datetime(2026, 9, 1, 14, 15, 16, tzinfo=timezone.utc)
@@ -275,7 +279,7 @@ class BrowserCollectorTests(unittest.TestCase):
         with collector.open_session(
             BrowserCaptureOptions(Path("profile")), sign_in_gate=FakeGate()
         ) as opened, self.assertRaisesRegex(
-            YahooScoringError, "Half PPR.*set to PPR"
+            YahooScoringMismatch, "Half PPR.*set to PPR"
         ):
             opened.verify_yahoo_scoring(task, runtime)
 
@@ -750,8 +754,8 @@ class PlaywrightAdapterTests(unittest.TestCase):
                         "eligibility": ["RB"]},
                 "102": {"player_id": 102, "player_name": "B", "position_id": 3,
                         "eligibility": ["WR"]},
-                "103": {"player_id": 103, "player_name": "C", "position_id": 1,
-                        "eligibility": ["QB"]},
+                "103": {"player_id": 103, "player_name": "C", "position_id": 2,
+                        "team_id": "CAR", "eligibility": ["RB"]},
             },
         }
         current = [
@@ -928,14 +932,34 @@ class PlaywrightAdapterTests(unittest.TestCase):
                     projection_capture([rb_only], projection_task("espn", requested))
 
     def test_current_ecr_bootstrap_contract_uses_numeric_filters_and_source_dimensions(self):
+        self.assertIn("last_updated_ts", ECR_TABLE_SCRIPT)
+        self.assertIn("expertGroupsData", ECR_TABLE_SCRIPT)
+        self.assertIn("fantasypros_latest_ecr_v1", ECR_TABLE_SCRIPT)
         task = ecr_task(expected=False)
         raw = ecr_raw(expert_count=19)
         data = ecr_capture_data(raw, task)
         self.assertEqual(data.expert_count, 19)
+        self.assertEqual(data.source_scoring, "PPR")
         self.assertTrue(all(value.isdigit() for value in data.expert_ids))
         self.assertEqual(data.rankings[0].provider_player_id, "22968")
         self.assertEqual(data.rankings[0].position_rank, "RB1")
         self.assertEqual(data.last_updated_text, "9/01")
+        self.assertIsNone(data.last_updated_at)
+        self.assertEqual(
+            data.source_details.expert_selection_policy,
+            "fantasypros_latest_ecr_v1",
+        )
+        self.assertEqual(data.source_details.expert_group_title, "Latest ECR")
+
+        exact_update = ecr_raw(expert_count=19)
+        exact_update["source"]["last_updated_ts"] = 1_787_000_000
+        data = ecr_capture_data(exact_update, task)
+        self.assertEqual(data.last_updated_at, "2026-08-17T20:53:20Z")
+
+        invalid_update = ecr_raw(expert_count=19)
+        invalid_update["source"]["last_updated_ts"] = "9/01"
+        with self.assertRaisesRegex(BrowserCaptureError, "last_updated_ts"):
+            ecr_capture_data(invalid_update, task)
 
         wrong = ecr_raw(expert_count=19)
         wrong["source"]["ranking_type"] = "draft"
@@ -945,6 +969,187 @@ class PlaywrightAdapterTests(unittest.TestCase):
         wrong["source"]["year"] = "2025"
         with self.assertRaisesRegex(BrowserCaptureError, "season"):
             ecr_capture_data(wrong, task)
+
+        for mutation in (
+            ("title", "My Experts"),
+            ("description", "A custom signed-in expert preference"),
+            ("expert_ids", ["1"]),
+        ):
+            wrong = ecr_raw(expert_count=19)
+            wrong["source"]["expert_policy"][mutation[0]] = mutation[1]
+            with self.subTest(policy_field=mutation[0]), self.assertRaisesRegex(
+                BrowserCaptureError, "Latest ECR"
+            ):
+                ecr_capture_data(wrong, task)
+
+    def test_preseason_ros_fallback_requires_and_retains_independent_page_proof(self):
+        task = FantasyProsECRTask(
+            2026,
+            1,
+            "ros",
+            "PPR",
+            ("RB",),
+            (),
+            None,
+            "https://www.fantasypros.com/nfl/rankings/ros-ppr-rb.php",
+        )
+        raw = preseason_ros_ecr_raw()
+
+        data = ecr_capture_data(raw, task)
+        artifact = FantasyProsECRArtifact.from_task(
+            task,
+            expert_ids=data.expert_ids,
+            expert_count=data.expert_count,
+            source_scoring=data.source_scoring,
+            last_updated_text=data.last_updated_text,
+            last_updated_at=data.last_updated_at,
+            captured_at="2026-09-01T14:15:16Z",
+            source_details=data.source_details,
+            rankings=data.rankings,
+        )
+
+        self.assertEqual(
+            data.source_details.horizon_evidence,
+            EcrHorizonEvidence.PRESEASON_REST_OF_SEASON_PAGE,
+        )
+        self.assertEqual(artifact.source_details.ranking_type, "draft")
+        self.assertEqual(
+            FantasyProsECRArtifact.from_record(artifact.to_record()), artifact
+        )
+
+        mutations = []
+        missing_timestamp = copy.deepcopy(raw)
+        del missing_timestamp["source"]["last_updated_ts"]
+        mutations.append(missing_timestamp)
+        missing_visible_notice = copy.deepcopy(raw)
+        page = missing_visible_notice["source"]["page_evidence"]
+        page["visible_fallback_note"] = None
+        page["visible_fallback_note_count"] = 0
+        mutations.append(missing_visible_notice)
+        wrong_type = copy.deepcopy(raw)
+        wrong_type["source"]["type_text"] = "Draft"
+        mutations.append(wrong_type)
+        duplicate_heading = copy.deepcopy(raw)
+        duplicate_heading["source"]["page_evidence"]["visible_page_heading_count"] = 2
+        mutations.append(duplicate_heading)
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(
+                BrowserCaptureError, "horizon"
+            ):
+                ecr_capture_data(mutation, task)
+
+    def test_ppr_non_reception_ecr_retains_league_and_source_scoring(self):
+        task = FantasyProsECRTask(
+            2026,
+            1,
+            "weekly",
+            "PPR",
+            ("DB",),
+            (),
+            None,
+            "https://www.fantasypros.com/nfl/rankings/db.php",
+        )
+        raw = ecr_raw(expert_count=19)
+        raw["source"].update(
+            {
+                "position": "DB",
+                "scoring": "STD",
+                "type_text": "Weekly rankings",
+                "position_counts": {"DB": 1},
+            }
+        )
+        bind_ecr_page(raw, "/nfl/rankings/db.php", "DB")
+        raw["rankings"][0].update({"position": "DB", "position_rank": "DB1"})
+
+        data = ecr_capture_data(raw, task)
+        artifact = FantasyProsECRArtifact.from_task(
+            task,
+            expert_ids=data.expert_ids,
+            expert_count=data.expert_count,
+            source_scoring=data.source_scoring,
+            last_updated_text=data.last_updated_text,
+            last_updated_at=data.last_updated_at,
+            captured_at="2026-09-01T14:15:16Z",
+            source_details=data.source_details,
+            rankings=data.rankings,
+        )
+
+        self.assertEqual(data.source_scoring, "STD")
+        self.assertEqual(artifact.scoring, "PPR")
+        self.assertEqual(artifact.source_scoring, "STD")
+
+    def test_idp_page_retains_complete_source_and_canonicalizes_granular_positions(self):
+        task = FantasyProsECRTask(
+            2026,
+            1,
+            "weekly",
+            "PPR",
+            ("DL",),
+            (),
+            None,
+            "https://www.fantasypros.com/nfl/rankings/dl.php",
+        )
+        raw = ecr_raw(expert_count=19)
+        raw["source"].update(
+            {
+                "position": "DL",
+                "scoring": "STD",
+                "player_count": 3,
+                "position_counts": {"DE": 1, "DT": 1, "LB": 1},
+            }
+        )
+        bind_ecr_page(raw, "/nfl/rankings/dl.php", "DL")
+        raw["rankings"] = [
+            {
+                **raw["rankings"][0],
+                "player_id": 1,
+                "position": "DE",
+                "position_rank": "DE1",
+            },
+            {
+                **raw["rankings"][0],
+                "player_id": 2,
+                "position": "DT",
+                "position_rank": "DT1",
+            },
+            {
+                **raw["rankings"][0],
+                "player_id": 3,
+                "position": "LB",
+                "position_rank": "LB1",
+            },
+        ]
+
+        data = ecr_capture_data(raw, task)
+
+        self.assertEqual(
+            tuple(
+                (row.provider_player_id, row.position, row.source_position)
+                for row in data.rankings
+            ),
+            (("1", "DL", "DE"), ("2", "DL", "DT"), ("3", "LB", "LB")),
+        )
+
+    def test_idp_page_fails_when_overlap_filter_leaves_no_selected_rows(self):
+        task = FantasyProsECRTask(
+            2026,
+            1,
+            "weekly",
+            "PPR",
+            ("DB",),
+            (),
+            None,
+            "https://www.fantasypros.com/nfl/rankings/db.php",
+        )
+        raw = ecr_raw(expert_count=19)
+        raw["source"].update(
+            {"position": "DB", "scoring": "STD", "position_counts": {"LB": 1}}
+        )
+        bind_ecr_page(raw, "/nfl/rankings/db.php", "DB")
+        raw["rankings"][0].update({"position": "LB", "position_rank": "LB1"})
+
+        with self.assertRaisesRegex(BrowserCaptureError, "no rows"):
+            ecr_capture_data(raw, task)
 
     def test_export_mode_is_rejected_in_schema_not_masked_by_fake_dom(self):
         with self.assertRaises(ValueError):
@@ -957,8 +1162,10 @@ class WorkerBoundaryTests(unittest.TestCase):
             "capture_ecr_rankings": ECRCaptureData(
                 tuple(str(index) for index in range(1, 20)),
                 19,
+                "PPR",
                 "9/01",
                 None,
+                ecr_source_details(),
                 (ecr_row(),),
             ),
             "capture_league_sources": LeagueCaptureData(2, league_sources()),
@@ -1017,6 +1224,18 @@ class WorkerBoundaryTests(unittest.TestCase):
         with self.assertRaises(BrowserCaptureCancelled):
             session._receive(1000, lambda: True, "evaluate")
         self.assertTrue(process.terminated)
+
+    def test_yahoo_scoring_failure_keeps_worker_alive_for_other_providers(self):
+        process = FakeProcess()
+        session = _WorkerSession(BlockingConnection(), process)
+
+        with self.assertRaisesRegex(YahooScoringError, "settings unavailable"):
+            session._raise_response(
+                ("error", "yahoo_scoring", "Yahoo settings unavailable")
+            )
+
+        self.assertTrue(process.is_alive())
+        self.assertFalse(process.terminated)
 
     def test_lazy_dependency_error_remains_clear(self):
         def missing():
@@ -1103,7 +1322,8 @@ class FakeSession:
     def capture_ecr_rankings(self, task, timeout_ms, cancelled):
         self._op("ecr", task.horizon, True)
         return ECRCaptureData(
-            tuple(str(index) for index in range(1, 20)), 19, "9/01", None,
+            tuple(str(index) for index in range(1, 20)), 19, task.source_scoring,
+            "9/01", None, ecr_source_details(),
             (ecr_row(),),
         )
 
@@ -1310,7 +1530,7 @@ def league_task():
 
 def projection_task(provider, positions=("RB",)):
     url = {
-        "fantasypros": "https://www.fantasypros.com/nfl/projections/rb.php",
+        "fantasypros": "https://www.fantasypros.com/nfl/projections/rb.php?week=1&scoring=PPR",
         "espn": "https://fantasy.espn.com/football/players/projections",
         "yahoo": "https://football.fantasysports.yahoo.com/f1/players",
     }[provider]
@@ -1336,6 +1556,7 @@ def projection_raw(provider, player, player_id, points):
         "yahoo": f"https://sports.yahoo.com/nfl/players/{player_id}/",
     }[provider]
     return {
+        "availability": "available",
         "source": {
             "season": 2026, "week": 1, "horizon": "weekly", "scoring": "PPR",
             "positions": ["RB"], "period_text": "2026 | Week 1 | PPR | RB",
@@ -1354,6 +1575,15 @@ def ecr_raw(expert_count=19):
             "year": "2026", "week": "1", "position": "RB", "scoring": "PPR",
             "expert_ids": [str(index) for index in range(1, expert_count + 1)],
             "expert_count": expert_count, "last_updated": "9/01", "player_count": 1,
+            "position_counts": {"RB": 1},
+            "expert_policy": {
+                "policy_id": "fantasypros_latest_ecr_v1",
+                "group_id": "default",
+                "title": "Latest ECR",
+                "description": "More accurate experts with recent updates",
+                "expert_ids": [str(index) for index in range(1, expert_count + 1)],
+            },
+            "page_evidence": ecr_page_evidence(),
         },
         "rankings": [{
             "player_id": 22968, "player_name": "Player A", "team": "DET",
@@ -1368,6 +1598,110 @@ def ecr_row():
         "22968", "Player A", "DET", "RB", 1, 1, 3, 2, 0.8, "RB1",
         {"ECR": "1", "BEST": "1", "WORST": "3", "AVG": "2", "STD DEV": "0.8"},
     )
+
+
+def ecr_page_evidence():
+    return {
+        "protocol": "https:",
+        "hostname": "www.fantasypros.com",
+        "port": "",
+        "pathname": "/nfl/rankings/ppr-rb.php",
+        "canonical_protocol": "https:",
+        "canonical_hostname": "www.fantasypros.com",
+        "canonical_port": "",
+        "canonical_pathname": "/nfl/rankings/ppr-rb.php",
+        "canonical_link_count": 1,
+        "document_title": "Fantasy Football Week 1 Rankings | FantasyPros",
+        "settings_ranking_type": "weekly",
+        "settings_position": "RB",
+        "settings_page_heading": "Fantasy Football Week 1 Rankings (2026)",
+        "settings_fallback_note": None,
+        "visible_page_heading": "Fantasy Football Week 1 Rankings (2026)",
+        "visible_page_heading_count": 1,
+        "visible_ranking_period": "Week 1",
+        "visible_ranking_period_count": 1,
+        "visible_fallback_note": None,
+        "visible_fallback_note_count": 0,
+    }
+
+
+def bind_ecr_page(raw, path, position):
+    page = raw["source"]["page_evidence"]
+    page["pathname"] = path
+    page["canonical_pathname"] = path
+    page["settings_position"] = position
+
+
+def ecr_source_details():
+    return EcrSourceDetails(
+        ranking_type="weekly",
+        type_text="Weekly PPR",
+        source_week=1,
+        page_position="RB",
+        source_player_count=1,
+        source_position_counts={"RB": 1},
+        expert_selection_policy="fantasypros_latest_ecr_v1",
+        expert_group_id="default",
+        expert_group_title="Latest ECR",
+        expert_group_description="More accurate experts with recent updates",
+        page_protocol="https:",
+        page_hostname="www.fantasypros.com",
+        page_port="",
+        page_path="/nfl/rankings/ppr-rb.php",
+        canonical_protocol="https:",
+        canonical_hostname="www.fantasypros.com",
+        canonical_port="",
+        canonical_path="/nfl/rankings/ppr-rb.php",
+        canonical_link_count=1,
+        document_title="Fantasy Football Week 1 Rankings | FantasyPros",
+        settings_ranking_type="weekly",
+        settings_position="RB",
+        settings_page_heading="Fantasy Football Week 1 Rankings (2026)",
+        settings_fallback_note=None,
+        visible_page_heading="Fantasy Football Week 1 Rankings (2026)",
+        visible_page_heading_count=1,
+        visible_ranking_period="Week 1",
+        visible_ranking_period_count=1,
+        visible_fallback_note=None,
+        visible_fallback_note_count=0,
+        horizon_evidence=EcrHorizonEvidence.DIRECT_METADATA,
+    )
+
+
+def preseason_ros_ecr_raw():
+    raw = ecr_raw(expert_count=19)
+    source = raw["source"]
+    source.update(
+        {
+            "ranking_type": "draft",
+            "type_text": "Draft PPR",
+            "week": "0",
+            "last_updated_ts": 1_787_000_000,
+        }
+    )
+    page = source["page_evidence"]
+    note = (
+        "We are currently displaying 2026 Draft Rankings. "
+        "Updated ROS Rankings will be available after the first week."
+    )
+    page.update(
+        {
+            "pathname": "/nfl/rankings/ros-ppr-rb.php",
+            "canonical_pathname": "/nfl/rankings/ros-ppr-rb.php",
+            "document_title": (
+                "Rest of Season Running Back Rankings, RB Waiver Wire Rankings, "
+                "RB Trade Advice | FantasyPros"
+            ),
+            "settings_ranking_type": "ros",
+            "settings_page_heading": "Fantasy Football ROS Rankings (2026)",
+            "settings_fallback_note": note,
+            "visible_page_heading": "Fantasy Football ROS Rankings (2026)",
+            "visible_ranking_period": "Rest of Season",
+            "visible_fallback_note": note,
+            "visible_fallback_note_count": 1,
+        }
+    )
+    return raw
 
 
 def cell(text, links=()):

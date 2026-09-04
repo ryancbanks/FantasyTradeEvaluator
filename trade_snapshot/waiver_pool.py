@@ -5,7 +5,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from ._scenario_random import content_id
-from .positions import normalize_lineup_slot, normalize_player_position
+from .positions import (
+    CANONICAL_PLAYER_POSITIONS,
+    normalize_lineup_slot,
+    normalize_player_position,
+)
 
 
 WAIVER_POOL_SELECTION_ALGORITHM = "fantasypros-best-plus-ecr-position-fill-v1"
@@ -411,29 +415,20 @@ def select_waiver_pool(
 
 def required_waiver_positions(
     starting_lineup_slots: Iterable[str],
-    rostered_positions: Iterable[str],
 ) -> tuple[str, ...]:
-    """Return every observed primary position that can fill a starting slot."""
+    """Return every primary position that can fill a captured starting slot."""
 
     slots = _slots(starting_lineup_slots)
-    if isinstance(rostered_positions, (str, bytes)):
-        raise ValueError("rostered_positions must be an iterable")
-    try:
-        positions = {
-            normalize_player_position(value, require_supported=True)
-            for value in rostered_positions
-        }
-    except TypeError:
-        raise ValueError("rostered_positions must be an iterable") from None
     required = tuple(
         sorted(
             position
-            for position in positions
+            for position in CANONICAL_PLAYER_POSITIONS
+            if position != "IDP"
             if set(waiver_eligible_slots(position, slots)).intersection(slots)
         )
     )
     if not required:
-        raise ValueError("no rostered position can fill a supported starting slot")
+        raise ValueError("no supported player position can fill a starting slot")
     return required
 
 

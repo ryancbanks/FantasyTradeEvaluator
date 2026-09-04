@@ -3,6 +3,7 @@
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
+from ._scenario_random import content_id
 from ._ensemble_math import weighted_metrics
 from ._ensemble_validation import (
     finite_float,
@@ -54,6 +55,7 @@ class EnsembleConfig:
     provider_weights: tuple[ProviderWeight, ...]
     minimum_observed_sources: int
     position_stddev_floors: Mapping[str, float] = field(hash=False)
+    config_id: str = field(init=False)
 
     def __post_init__(self) -> None:
         try:
@@ -76,6 +78,11 @@ class EnsembleConfig:
         floors = freeze_floors(self.position_stddev_floors)
         object.__setattr__(self, "provider_weights", weights)
         object.__setattr__(self, "position_stddev_floors", floors)
+        object.__setattr__(
+            self,
+            "config_id",
+            content_id("ensemble-config", self._content_record()),
+        )
 
     def __hash__(self) -> int:
         return hash(
@@ -85,6 +92,72 @@ class EnsembleConfig:
                 tuple(self.position_stddev_floors.items()),
             )
         )
+
+    def _content_record(self) -> dict[str, object]:
+        return {
+            "minimum_observed_sources": self.minimum_observed_sources,
+            "position_stddev_floors": dict(self.position_stddev_floors),
+            "provider_weights": [
+                {"provider": item.provider, "weight": item.weight}
+                for item in self.provider_weights
+            ],
+        }
+
+    def to_record(self) -> dict[str, object]:
+        """Return this content-addressed configuration as strict JSON data."""
+
+        return {
+            "kind": "ensemble_config",
+            "schema_version": 1,
+            **self._content_record(),
+            "config_id": self.config_id,
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, object]) -> "EnsembleConfig":
+        """Rebuild a configuration and reject malformed or tampered records."""
+
+        expected_fields = {
+            "config_id",
+            "kind",
+            "minimum_observed_sources",
+            "position_stddev_floors",
+            "provider_weights",
+            "schema_version",
+        }
+        if not isinstance(record, Mapping) or set(record) != expected_fields:
+            raise ValueError("ensemble config record fields are invalid")
+        if (
+            record["kind"] != "ensemble_config"
+            or type(record["schema_version"]) is not int
+            or record["schema_version"] != 1
+        ):
+            raise ValueError("ensemble config record kind or schema version is invalid")
+        raw_weights = record["provider_weights"]
+        if not isinstance(raw_weights, list):
+            raise ValueError("ensemble config provider_weights must be a JSON array")
+        raw_floors = record["position_stddev_floors"]
+        if not isinstance(raw_floors, Mapping) or any(
+            not isinstance(position, str) for position in raw_floors
+        ):
+            raise ValueError(
+                "ensemble config position_stddev_floors must be a JSON object"
+            )
+        weights = tuple(_provider_weight_from_record(row) for row in raw_weights)
+        config = cls(
+            provider_weights=weights,
+            minimum_observed_sources=record["minimum_observed_sources"],
+            position_stddev_floors=raw_floors,
+        )
+        if record["config_id"] != config.config_id:
+            raise ValueError("ensemble config content does not match config_id")
+        return config
+
+
+def _provider_weight_from_record(record: object) -> ProviderWeight:
+    if not isinstance(record, Mapping) or set(record) != {"provider", "weight"}:
+        raise ValueError("ensemble provider-weight record fields are invalid")
+    return ProviderWeight(provider=record["provider"], weight=record["weight"])
 
 
 @dataclass(frozen=True, slots=True)

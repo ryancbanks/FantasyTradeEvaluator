@@ -9,7 +9,7 @@ PROJECTION_PAGE_SCRIPT = r"""
   const profiles = {
     fantasypros: {
       hosts: ['fantasypros.com', 'www.fantasypros.com'],
-      tables: '#projections-app table, table#projections, table.player-table, main table'
+      tables: 'table#data, #projections-app table, table#projections, table.player-table, main table'
     },
     espn: {
       hosts: ['espn.com', 'www.espn.com'],
@@ -55,6 +55,18 @@ PROJECTION_PAGE_SCRIPT = r"""
   };
   const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
   const normalized = (value) => clean(value).toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim();
+  const fantasyProsRequestMatches = () => {
+    if (!Array.isArray(request.positions) || request.positions.length !== 1 ||
+        request.horizon !== 'weekly') return false;
+    const expectedPath = `/nfl/projections/${request.positions[0].toLowerCase()}.php`;
+    const expected = [['week', String(request.week)]];
+    if (request.scoring !== 'HALF') expected.push(['scoring', request.scoring]);
+    const actual = Array.from(new URLSearchParams(location.search).entries());
+    return location.pathname.toLowerCase() === expectedPath &&
+      actual.length === expected.length && expected.every(([key, value]) =>
+        actual.filter((item) => item[0] === key && item[1] === value).length === 1);
+  };
+  if (provider === 'fantasypros' && !fantasyProsRequestMatches()) return null;
   const providerHeader = (value) => {
     let header = normalized(value);
     if (provider === 'fantasysharks') {
@@ -85,9 +97,9 @@ PROJECTION_PAGE_SCRIPT = r"""
     (provider === 'cbs' && request.positions.length === 1 &&
       request.positions[0] === 'DST' && header === 'TEAM');
   const identityColumn = (header) => /^(?:TEAM|TM|POS|POSITION|OPP|OPPONENT|STATUS|BYE)$/.test(header);
-  const statColumn = (header) => /^(?:PROJ|PROJECTED|FPTS|FPPG|FAN PTS|FANTASY POINTS|PTS|POINTS|GP|CMP|ATT|YDS|YD|TD|TDS|INT|INTS|REC|TGT|TAR|FUM|FL|FGM|FGA|XPM|XPA|SACK|SACKS|TACK|ASST|SAFE|PA|YA|RET|LONG|AVG|RATE)$/.test(header) ||
+  const statColumn = (header) => /^(?:PROJ|PROJECTED|FPTS|FPPG|FAN PTS|FANTASY POINTS|PTS|POINTS|GP|CMP|ATT|YDS|YD|TD|TDS|INT|INTS|REC|TGT|TAR|FUM|FL|FG|FGM|FGA|XPT|XPM|XPA|SACK|SACKS|TACK|TACKLE|ASST|ASSIST|SAFE|SAFETY|PA|YA|YDS AGN|RET|LONG|AVG|RATE|FR|FF|PD)$/.test(header) ||
     /^(?:PASS|RUSH|REC|RECEIVING|KICK|DEF|DST) (?:CMP|ATT|YDS|YD|TD|TDS|INT|REC|TGT|TAR|FUM|PTS|POINTS|SACK|SAFE|FUM REC|BLK KICK)$/.test(header) ||
-    /^(?:RET TD|MISC 2PT|FUM LOST|PASS DEF|FUM FRC|FUM REC|DEF TD|RZ TGT|BLK KICK|KICK RET YDS|YDS ALLOWED|PTS AGN|SCORING OPPORTUNITIES|FGM MISS|XPM MISS|PASS YDS PER GAME|RUSH YDS PER GAME|XPM|FGM (?:0 19|10 19|20 29|30 39|40 49|50)|(?:0 19|10 19|20 29|30 39|40 49|50) FGM)$/.test(header);
+    /^(?:RET TD|MISC (?:2PT|FL)|FUM LOST|PASS DEF|FUM FRC|FUM REC|DEF TD|RZ TGT|BLK KICK|KICK RET YDS|YDS ALLOWED|PTS AGN|SCORING OPPORTUNITIES|FGM MISS|XPM MISS|PASS YDS PER GAME|RUSH YDS PER GAME|XPM|FGM (?:0 19|10 19|20 29|30 39|40 49|50)|(?:0 19|10 19|20 29|30 39|40 49|50) FGM)$/.test(header);
   const publicLink = (anchor, position = null) => {
     if (!visible(anchor)) return null;
     try {
@@ -110,7 +122,7 @@ PROJECTION_PAGE_SCRIPT = r"""
         ? (url.pathname === '/apps/bert/players/playerpage.php' &&
           /^[1-9]\d{0,9}$/.test(url.searchParams.get('id') || '') &&
           [...url.searchParams.keys()].every((key) => key === 'id'))
-        : /^\/nfl\/players\/[a-z0-9-]+\.php$/i.test(url.pathname);
+        : /^\/nfl\/(?:players|projections)\/[a-z0-9-]+\.php$/i.test(url.pathname);
       if (!path) return null;
       if (provider !== 'fantasysharks') url.search = '';
       url.hash = '';
@@ -286,19 +298,34 @@ PROJECTION_PAGE_SCRIPT = r"""
   } else if (provider === 'fantasysharks') {
     source = fantasySharksSource();
   } else {
-    const evidence = Array.from(document.querySelectorAll(
+    const evidence = provider === 'fantasypros' ? [clean(document.title)] : [];
+    evidence.push(...Array.from(document.querySelectorAll(
       'h1, h2, [aria-current="true"], [aria-selected="true"]'
-    )).filter(visible).map((node) => clean(node.innerText));
+    )).filter(visible).map((node) => clean(node.innerText)));
     for (const control of Array.from(document.querySelectorAll('select')).filter(visible)) {
       for (const option of control.selectedOptions) evidence.push(clean(option.textContent));
+    }
+    for (const control of Array.from(document.querySelectorAll(
+      '[role="combobox"], [aria-haspopup="listbox"]'
+    )).filter(visible)) {
+      evidence.push(clean(control.getAttribute('aria-label')));
+      evidence.push(clean(control.getAttribute('aria-valuetext')));
+      evidence.push(clean(control.innerText));
+      for (const id of clean(control.getAttribute('aria-labelledby')).split(' ').filter(Boolean)) {
+        evidence.push(clean(document.getElementById(id)?.innerText));
+      }
     }
     const evidenceText = evidence.filter(Boolean).slice(0, 80).join(' | ');
     const years = [...new Set((evidenceText.match(/\b20\d{2}\b/g) || []))];
     const weekMatch = evidenceText.match(/\bWEEK\s*([1-9]|1\d|2[0-5])\b/i);
     const isRos = /\bREST OF (?:THE )?SEASON\b|\bROS\b/i.test(evidenceText);
-    const scoring = /\bHALF(?:\s+POINT)?\s*PPR\b/i.test(evidenceText) ? 'HALF' :
+    const displayedScoring = /\bHALF(?:\s+POINT)?\s*PPR\b/i.test(evidenceText) ? 'HALF' :
       /\bPPR\b/i.test(evidenceText) ? 'PPR' :
       /\bSTANDARD\b|\bSTD\b/i.test(evidenceText) ? 'STD' : null;
+    const scoring = displayedScoring || (
+      provider === 'fantasypros' && request.positions.length === 1 &&
+      !['RB', 'WR', 'TE', 'FLX'].includes(request.positions[0]) ? request.scoring : null
+    );
     const positions = [...new Set((evidenceText.toUpperCase().match(
       /\b(?:ALL|QB|RB|WR|TE|K|DST|DL|LB|DB|IDP|FLEX|FLX)\b/g
     ) || []).map((item) => item === 'FLEX' ? 'FLX' : item))].sort();
@@ -314,43 +341,98 @@ PROJECTION_PAGE_SCRIPT = r"""
         scoring, positions.length ? positions.join('/') : null].filter(Boolean).join(' | ')
     };
   }
-  const groupedHeaders = (candidates, headerRow, rawHeaders) => {
-    if (!['yahoo', 'cbs', 'fftoday'].includes(provider) || candidates.length < 2) return rawHeaders;
-    const groupRow = candidates[candidates.length - 2];
-    const groups = [];
-    for (const cell of Array.from(groupRow.cells)) {
-      for (let index = 0; index < Math.max(1, cell.colSpan || 1); index += 1) {
-        groups.push(normalized(cell.innerText));
+  const semanticGroup = (value) => {
+    if (/^(?:PASS|PASSING)(?: STATS?| PROJECTIONS?)?$/.test(value)) return 'PASS';
+    if (/^(?:RUSH|RUSHING)(?: STATS?| PROJECTIONS?)?$/.test(value)) return 'RUSH';
+    if (/^(?:REC|RECEIVING)(?: STATS?| PROJECTIONS?)?$/.test(value)) return 'REC';
+    if (/^(?:RET|RETURNS?|RETURNING)$/.test(value)) return 'RET';
+    if (/^(?:FUM|FUMBLES?)$/.test(value)) return 'FUM';
+    if (/^(?:KICK|KICKING)$/.test(value)) return 'KICK';
+    if (/^(?:DEF|DEFENSE|DEFENSIVE|DST|DEFENSE SPECIAL TEAMS)$/.test(value)) return 'DEF';
+    if (value === 'FIELD GOALS MADE') return 'FGM';
+    if (/^(?:PAT|PATS|EXTRA POINTS?)$/.test(value)) return 'PAT';
+    if (value === 'MISC') return 'MISC';
+    return null;
+  };
+  const semanticLeaf = (value) => ({
+    ATTEMPT: 'ATT', ATTEMPTS: 'ATT', CAR: 'ATT', CARRIES: 'ATT',
+    COMPLETION: 'CMP', COMPLETIONS: 'CMP', COMP: 'CMP',
+    YARD: 'YD', YARDS: 'YDS', TOUCHDOWN: 'TD', TOUCHDOWNS: 'TD', TDS: 'TD',
+    INTERCEPTION: 'INT', INTERCEPTIONS: 'INT', INTS: 'INT',
+    RECEPTION: 'REC', RECEPTIONS: 'REC', RECS: 'REC',
+    TARGET: 'TGT', TARGETS: 'TGT', TGTS: 'TGT',
+    FUMBLE: 'FUM', FUMBLES: 'FUM', 'FUMBLES LOST': 'FL',
+    SACKS: 'SACK', POINT: 'PTS', POINTS: 'PTS'
+  })[value] || value;
+  const semanticHeader = (path, defense) => {
+    const leafValue = path[path.length - 1] || '';
+    if (playerColumn(leafValue) ||
+        (provider === 'yahoo' && /^(?:OFFENSE|KICKERS|DEFENSE SPECIAL TEAMS)$/.test(leafValue))) {
+      return 'PLAYER';
+    }
+    if (identityColumn(leafValue) ||
+        /^(?:PROJ|PROJECTED|FPTS|FAN PTS|FANTASY POINTS|PTS|POINTS)$/.test(leafValue)) {
+      return semanticLeaf(leafValue);
+    }
+    const leaf = semanticLeaf(leafValue);
+    const ancestors = path.slice(0, -1);
+    let group = null;
+    for (let index = ancestors.length - 1; index >= 0 && !group; index -= 1) {
+      const candidate = ancestors[index];
+      if (defense && /^(?:TACKLES|TURNOVERS|TD|MISC)$/.test(candidate)) group = 'DEF';
+      else group = semanticGroup(candidate);
+    }
+    if (group === 'PAT' && /^(?:MADE|XPM)$/.test(leaf)) return 'XPM';
+    if (!group || group === leaf || leaf.startsWith(`${group} `)) return leaf;
+    return `${group} ${leaf}`;
+  };
+  const projectionHeaderGrid = (rows) => {
+    if (!rows.length || rows.length > 8) return null;
+    const grid = Array.from({length: rows.length}, () => []);
+    let width = 0;
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+      let column = 0;
+      for (const cell of Array.from(rows[rowIndex].cells)) {
+        while (grid[rowIndex][column]) column += 1;
+        const rawRowSpan = Number(cell.rowSpan);
+        const rowSpan = rawRowSpan === 0 ? rows.length - rowIndex : rawRowSpan;
+        const colSpan = Number(cell.colSpan);
+        if (!Number.isInteger(rowSpan) || !Number.isInteger(colSpan) ||
+            rowSpan < 1 || colSpan < 1 || rowIndex + rowSpan > rows.length ||
+            column + colSpan > 64) return null;
+        const entry = {cell, text: providerHeader(cell.innerText)};
+        for (let row = rowIndex; row < rowIndex + rowSpan; row += 1) {
+          for (let col = column; col < column + colSpan; col += 1) {
+            if (grid[row][col]) return null;
+            grid[row][col] = entry;
+          }
+        }
+        column += colSpan;
+        width = Math.max(width, column);
       }
     }
-    if (groups.length !== rawHeaders.length) return rawHeaders;
-    const defense = rawHeaders.some((header) =>
-      header === 'DEFENSE SPECIAL TEAMS' ||
-      (provider === 'cbs' && header === 'TEAM' && request.positions[0] === 'DST'));
-    const counts = rawHeaders.reduce((result, header) => {
-      result[header] = (result[header] || 0) + 1;
+    if (!width || grid.some((row) =>
+      row.length !== width || Array.from({length: width}, (_, column) => row[column]).some(
+        (cell) => !cell))) {
+      return null;
+    }
+    const paths = Array.from({length: width}, (_, column) => {
+      const result = [];
+      let previous = null;
+      for (const row of grid) {
+        const entry = row[column];
+        if (entry.cell !== previous && entry.text) result.push(entry.text);
+        previous = entry.cell;
+      }
       return result;
-    }, Object.create(null));
-    return rawHeaders.map((header, index) => {
-      if (playerColumn(header)) return 'PLAYER';
-      const group = groups[index];
-      const prefixes = {PASSING: 'PASS', RUSHING: 'RUSH', RECEIVING: 'REC'};
-      if (prefixes[group] && header && (provider === 'yahoo' || counts[header] > 1)) {
-        return `${prefixes[group]} ${header}`;
-      }
-      if (provider === 'yahoo' && group === 'RET' && header) return `RET ${header}`;
-      if (provider === 'yahoo' && group === 'MISC' && header) {
-        return defense ? `DEF ${header}` : `MISC ${header}`;
-      }
-      if (provider === 'yahoo' && group === 'FUM' && header) return `FUM ${header}`;
-      if (provider === 'yahoo' && group === 'FIELD GOALS MADE' && header) return `FGM ${header}`;
-      if (provider === 'yahoo' && group === 'PAT' && header === 'MADE') return 'XPM';
-      if (provider === 'yahoo' && defense &&
-          ['TACKLES', 'TURNOVERS', 'TD'].includes(group) && header) {
-        return `DEF ${header}`;
-      }
-      return header;
     });
+    const defense = request.positions.includes('DST') || paths.some((path) =>
+      path.includes('DEFENSE SPECIAL TEAMS'));
+    return {
+      headers: paths.map((path) => semanticHeader(path, defense)),
+      privatePaths: paths.map((path) => path.join(' ')),
+      width,
+    };
   };
   const fftodayOccurrenceHeaders = (headers) => {
     if (provider !== 'fftoday' || request.positions.length !== 1) return headers;
@@ -396,23 +478,30 @@ PROJECTION_PAGE_SCRIPT = r"""
     return {text: `${clean(anchors[0].innerText)} ${detail[1]} - ${position}`.slice(0, 1000),
       links: [link]};
   };
+  let validHeaderCount = 0;
   const tables = Array.from(document.querySelectorAll(profile.tables)).filter(visible)
     .slice(0, 8).map((table) => {
       let candidates = Array.from(table.querySelectorAll('thead tr')).filter(visible);
       if (provider === 'fftoday') {
-        candidates = Array.from(table.querySelectorAll('tr.tablehdr, tr.tableclmhdr'))
+        // FFToday's `tablehdr` row is a full-width period/title banner, not a
+        // column header.  Including it in the span grid makes the real table
+        // look malformed whenever its declared colspan differs from the
+        // number of data columns (which the site currently does for kickers).
+        candidates = Array.from(table.querySelectorAll('tr.tableclmhdr'))
           .filter(visible);
       }
-      const headerRow = candidates.length ? candidates[candidates.length - 1] :
-        Array.from(table.rows).filter(visible).find((row) => {
+      let headerRows = candidates;
+      if (!headerRows.length) {
+        const headerRow = Array.from(table.rows).filter(visible).find((row) => {
           const headers = Array.from(row.cells).map((cell) => providerHeader(cell.innerText));
           return headers.some(playerColumn) && headers.some(statColumn);
         });
-      if (!headerRow) return null;
-      const rawHeaders = Array.from(headerRow.cells).map((cell) => providerHeader(cell.innerText));
-      let headers = fftodayOccurrenceHeaders(
-        groupedHeaders(candidates, headerRow, rawHeaders)
-      );
+        headerRows = headerRow ? [headerRow] : [];
+      }
+      const headerGrid = projectionHeaderGrid(headerRows);
+      if (!headerGrid) return null;
+      const {privatePaths, width} = headerGrid;
+      let headers = fftodayOccurrenceHeaders(headerGrid.headers);
       if (provider === 'fantasysharks') {
         let opponentCount = 0;
         headers = headers.map((header) => {
@@ -422,17 +511,23 @@ PROJECTION_PAGE_SCRIPT = r"""
             ? 'OPP' : 'SCORING OPPORTUNITIES';
         });
       }
-      let allowed = headers.map((header, index) => (
-        !privateColumn(header) && (playerColumn(header) || identityColumn(header) || statColumn(header))
+      const allowed = headers.map((header, index) => (
+        !privateColumn(privatePaths[index]) &&
+        (playerColumn(header) || identityColumn(header) || statColumn(header))
       ) ? index : -1).filter((index) => index >= 0);
-      const playerIndex = rawHeaders.findIndex(playerColumn);
+      const playerIndex = headers.findIndex(playerColumn);
       if (playerIndex < 0 || !allowed.includes(playerIndex) ||
           !allowed.some((index) => statColumn(headers[index]))) return null;
+      const selectedHeaders = allowed.map((index) => headers[index]);
+      if (new Set(selectedHeaders).size !== selectedHeaders.length) return null;
+      validHeaderCount += 1;
       const result = [[...allowed.map((index) => ({text: headers[index], links: []}))]];
       for (const row of Array.from(table.rows).filter(visible).slice(0, 5000)) {
-        if (row === headerRow || row.closest('table') !== table) continue;
+        if (headerRows.includes(row) || row.closest('table') !== table) continue;
         const cells = Array.from(row.cells);
-        if (cells.length <= Math.max(...allowed)) continue;
+        if (cells.length !== width || cells.some((cell) => cell.colSpan !== 1 || cell.rowSpan !== 1)) {
+          continue;
+        }
         const yahooIdentity = provider === 'yahoo' ? yahooPlayer(cells[playerIndex]) : null;
         const playerLinks = provider === 'yahoo' ?
           (yahooIdentity ? yahooIdentity.links : []) :
@@ -469,7 +564,30 @@ PROJECTION_PAGE_SCRIPT = r"""
         `Week ${genericDimensions.weekMatch[1]}` : null,
       genericDimensions.scoring, positionText].filter(Boolean).join(' | ');
   }
-  return {source, tables};
+  const primaryText = [clean(document.title), ...Array.from(
+    document.querySelectorAll('h1')
+  ).filter(visible).map((node) => clean(node.innerText))].filter(Boolean).join(' | ');
+  const primaryWeek = primaryText.match(/\bWEEK\s*([1-9]|1\d|2[0-5])\b/i);
+  const primarySeason = primaryText.match(/\b(20\d{2})\s+WEEK\b/i);
+  const staleFantasyProsWeek = provider === 'fantasypros' && primaryWeek &&
+    Number(primaryWeek[1]) === Number(request.week) && primarySeason &&
+    Number(primarySeason[1]) !== Number(request.season);
+  const emptyFantasyProsCandidate = provider === 'fantasypros' && primaryWeek &&
+    Number(primaryWeek[1]) === Number(request.week) && validHeaderCount > 0 &&
+    tables.length === 0;
+  const emptyKey = `${request.season}|${request.week}|${request.scoring}|${request.positions.join(',')}`;
+  if (emptyFantasyProsCandidate) {
+    if (globalThis.__fteProjectionEmpty?.key !== emptyKey) {
+      globalThis.__fteProjectionEmpty = {key: emptyKey, since: Date.now()};
+    }
+  } else {
+    delete globalThis.__fteProjectionEmpty;
+  }
+  const confirmedEmptyFantasyProsWeek = emptyFantasyProsCandidate &&
+    Date.now() - globalThis.__fteProjectionEmpty.since >= 1500;
+  const availability = staleFantasyProsWeek || confirmedEmptyFantasyProsWeek
+    ? 'not_published' : tables.length ? 'available' : 'unavailable';
+  return {availability, source, tables: availability === 'not_published' ? [] : tables};
 }
 """
 

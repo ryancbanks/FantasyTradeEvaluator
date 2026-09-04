@@ -103,6 +103,24 @@ def pro_team_payload():
 
 
 class EspnLeagueAdapterTests(unittest.TestCase):
+    def test_rejects_rostered_unassigned_player_before_schedule_assembly(self):
+        payload = league_payload()
+        payload["teams"][0]["roster"]["entries"][0]["playerPoolEntry"]["player"][
+            "proTeamId"
+        ] = 0
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"Player One.*101.*unassigned NFL free agent.*proTeamId=0.*"
+            r"weekly projections and playoff odds cannot be calculated safely",
+        ):
+            espn_host_league_snapshot(
+                payload,
+                pro_team_payload(),
+                captured_at=NOW,
+                expected_team_count=2,
+            )
+
     def test_builds_complete_provider_neutral_snapshot_and_drops_private_members(self):
         snapshot = espn_host_league_snapshot(
             league_payload(), pro_team_payload(), captured_at=NOW, expected_team_count=2
@@ -250,6 +268,81 @@ class EspnLeagueAdapterTests(unittest.TestCase):
             if row.canonical_player_id == "espn:101"
         )
         self.assertEqual(normalized_player.eligible_slots, ("QB",))
+
+    def test_rejects_unmodeled_regular_season_scoring_rules(self):
+        for field, value, message in (
+            ("allowOutOfPositionScoring", True, "out-of-position"),
+            ("matchupTieRule", "MOST_BENCH_POINTS", "matchup tie rules"),
+            ("matchupTieRuleBy", 1, "matchup tie rules"),
+        ):
+            with self.subTest(field=field):
+                payload = league_payload()
+                payload["settings"]["scoringSettings"][field] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    espn_host_league_snapshot(
+                        payload,
+                        pro_team_payload(),
+                        captured_at=NOW,
+                        expected_team_count=2,
+                    )
+
+    def test_maps_defensive_player_positions_and_rejects_coaches(self):
+        for position_id, expected, eligible_slots in (
+            (9, "DL", [8, 11, 15, 20]),
+            (10, "DL", [9, 11, 15, 20]),
+            (11, "LB", [10, 15, 20]),
+            (12, "DB", [12, 14, 15, 20]),
+            (13, "DB", [13, 14, 15, 20]),
+        ):
+            with self.subTest(position_id=position_id):
+                payload = league_payload()
+                payload["settings"]["rosterSettings"]["lineupSlotCounts"]["20"] = 1
+                entry = payload["teams"][0]["roster"]["entries"][0]
+                entry["lineupSlotId"] = 20
+                entry["playerPoolEntry"]["player"].update(
+                    defaultPositionId=position_id,
+                    eligibleSlots=eligible_slots,
+                )
+
+                snapshot = espn_host_league_snapshot(
+                    payload,
+                    pro_team_payload(),
+                    captured_at=NOW,
+                    expected_team_count=2,
+                )
+                imported = next(
+                    row for row in snapshot.players if row.source_player_id == "101"
+                )
+
+                self.assertEqual(imported.position, expected)
+                self.assertIn(expected, imported.eligible_slots)
+
+        coach = league_payload()
+        coach["teams"][0]["roster"]["entries"][0]["playerPoolEntry"]["player"][
+            "defaultPositionId"
+        ] = 14
+        with self.assertRaisesRegex(ValueError, "default position 14"):
+            espn_host_league_snapshot(
+                coach,
+                pro_team_payload(),
+                captured_at=NOW,
+                expected_team_count=2,
+            )
+
+    def test_rejects_fine_grained_idp_lineup_slots_until_modeled_exactly(self):
+        for slot_id in (8, 9, 12, 13):
+            with self.subTest(slot_id=slot_id):
+                payload = league_payload()
+                payload["settings"]["rosterSettings"]["lineupSlotCounts"][
+                    str(slot_id)
+                ] = 1
+                with self.assertRaisesRegex(ValueError, "fine-grained IDP"):
+                    espn_host_league_snapshot(
+                        payload,
+                        pro_team_payload(),
+                        captured_at=NOW,
+                        expected_team_count=2,
+                    )
 
     def test_ir_and_rookie_reserve_placements_remain_typed_through_ingest(self):
         payload = league_payload()

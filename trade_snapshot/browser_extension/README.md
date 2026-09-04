@@ -1,10 +1,10 @@
 # Fantasy Trade Evaluator browser bridge
 
-This is an unpacked Manifest V3 extension for current Chrome and Edge. It lets the
-local Fantasy Trade Evaluator ask the user's normal, installed browser to collect
-the same bounded provider evidence as the packaged collector. Google and other
-provider sign-in therefore happen in the user's ordinary browser profile rather
-than an automation-only browser.
+This is an unpacked Manifest V3 extension for current Chrome, Brave, and Edge. It
+lets the local Fantasy Trade Evaluator ask the user's normal, installed browser
+to collect the same bounded provider evidence as the packaged collector. Google
+and other provider sign-in therefore happen in the user's ordinary browser
+profile rather than an automation-only browser.
 
 The extension is inert until a loopback app page asks to pair and the user approves
 that request in the extension popup. Pairing lasts only for the browser session.
@@ -166,23 +166,27 @@ operation list is:
 12. `espn.authenticated_json` — bounded `season`, numeric `league_id`, `timeout_ms`,
     and `maximum_bytes`; constructs exactly the two existing ESPN URLs and returns
     `{league,pro_teams}`.
-13. `session.wait` — bounded `timeout_ms`; returns `{"ok":true}`.
-14. `session.close` — payload `{}` or a fixed reason; acknowledges, closes the scan
+13. `yahoo.scoring` — payload `{}`; reads the selected Yahoo league's reception
+    scoring from its verified Settings page and returns the canonical scoring mode.
+14. `session.wait` — bounded `timeout_ms`; returns `{"ok":true}`.
+15. `session.close` — payload `{}` or a fixed reason; acknowledges, closes the scan
     tab, clears the token, and disconnects.
 
 The projection request is exactly `{provider,season,week,horizon,scoring,positions}`.
-Providers are `fantasypros`, `espn`, `cbs`, `fftoday`, or
+Providers are `fantasypros`, `espn`, `yahoo`, `cbs`, `fftoday`, or
 `fantasysharks`; weeks are 1–25; horizons are `weekly` or `ros`; scoring is
 `STD`, `HALF`, or `PPR`; and positions use the application's fixed canonical
 enum. ESPN is always used for league data. FantasyPros is visited only when its
 power mode is enabled. Supported public projection publishers are attempted
-automatically. The standard workflow does not require a Yahoo league.
+automatically. The standard workflow uses the selected signed-in Yahoo league for
+league-scored Yahoo projections and reception-scoring verification.
 
 ## Navigation and privacy boundary
 
 Managed navigation is limited to the existing FantasyPros analyzer, ranking, and
-projection paths; ESPN's projections path; CBS's public fantasy projection paths;
-FFToday's public projection paths; and FantasySharks' public forecast path.
+projection paths; ESPN's projections path; Yahoo's league projection and Settings
+paths; CBS's public fantasy projection paths; FFToday's public projection paths;
+and FantasySharks' public forecast path.
 Manifest access is limited to those providers, the exact ESPN JSON host, and
 loopback HTTP. There is no
 `<all_urls>`, cookie, web-request, debugger, or arbitrary scripting permission.

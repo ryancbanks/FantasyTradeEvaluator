@@ -72,6 +72,12 @@ class LocalServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
 
+        status, _, body = self.request("GET", "/api/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body), {"status": "ready", "version": "0.2.0"}
+        )
+
     def test_active_job_catalog_is_authenticated_and_read_only(self):
         status, _, raw = self.request("GET", "/api/activity")
         self.assertEqual(status, 200)
@@ -193,6 +199,9 @@ class LocalServerTests(unittest.TestCase):
         dashboard = json.loads(raw)
         self.assertEqual(status, 200)
         self.assertEqual(dashboard["bundle_id"], bundle.bundle_id)
+        self.assertEqual(
+            dashboard["data_readiness"]["status"], "ready_with_limitations"
+        )
         self.assertEqual(dashboard["championship_model"]["status"], "modeled_estimate")
         self.assertEqual(len(dashboard["teams"]), 2)
         self.assertAlmostEqual(
@@ -208,6 +217,9 @@ class LocalServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(player_outlook["bundle_id"], bundle.bundle_id)
         self.assertEqual(player_outlook["view"], "catalog")
+        self.assertEqual(
+            player_outlook["data_readiness"]["status"], "ready_with_limitations"
+        )
         self.assertEqual(
             len(player_outlook["players"]),
             len({row.canonical_player_id for row in bundle.projections}),
@@ -342,12 +354,30 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn("text/javascript", headers["Content-Type"])
         self.assertIn(b"startSearch", body)
         self.assertIn(b"power_methodology_status", body)
+        for label in (
+            b"Holdout-validated shape",
+            b"Extrapolated",
+            b"Surrogate",
+            b"Surrogate extrapolation",
+        ):
+            self.assertIn(label, body)
+        self.assertIn(b"bundle.data_readiness", body)
+        self.assertIn(b"renderBundleDataReadiness", body)
+        self.assertIn(b"bundleCapabilityIsUsable", body)
+        self.assertIn(b'Trade search is unavailable for this weekly bundle', body)
+        self.assertIn(b"Exact championship simulation", body)
+        self.assertIn(b"FantasyPros comparison benchmark", body)
+        self.assertIn(b"Comparison only", body)
         self.assertIn(b"combinations counted exactly", body)
         self.assertIn(b"allow_surrogate_power", body)
         self.assertIn(b"SURROGATE / APPROXIMATE POWER", body)
         self.assertIn(b'addEventListener("change", changeBundle)', body)
         self.assertIn(b'$("resultsPanel").classList.add("hidden")', body)
         self.assertIn(b'$("bundleSelect").disabled = bundleRows.length === 0 || busy', body)
+        self.assertIn(
+            b'response.bundles.filter(item => item.status === "ready")', body
+        )
+        self.assertIn(b"row.textContent = readiness.message", body)
         self.assertIn(b"TradeFilterUi.requestFields", body)
         self.assertIn(b'trade_format: format', body)
         self.assertIn(b'format === "three_team"', body)
@@ -390,14 +420,25 @@ class LocalServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Power evidence", page)
         self.assertIn(b"allowSurrogatePower", page)
-        self.assertIn(b"never be labeled exact", page)
+        self.assertIn(b"labeled surrogate or surrogate extrapolated", page)
         self.assertIn(b"League size, every team, and every roster are detected", page)
         self.assertIn(b"Connect extension", page)
         self.assertIn(b"never exports your cookies", page)
         self.assertIn(b'id="extensionPairCode"', page)
+        self.assertIn(b'id="bundleDataReadiness"', page)
+        self.assertIn(b"Data coverage and model limits", page)
+        self.assertIn(b'id="playerLabRawStats"', page)
+        self.assertIn(b"divided evenly across missing active weeks", page)
         self.assertIn(b"four-character code matches", page)
         self.assertIn(b"Pairing code ends in", body)
         self.assertIn(b"offer.pair_code.slice(-4)", body)
+        self.assertIn(b'expected_standings: "Expected standings"', body)
+        self.assertIn(
+            b'playoff_model_estimates: "Playoff model estimates"', body
+        )
+        self.assertIn(b"Model estimate with limitations", body)
+        self.assertIn(b"retained projection source artifacts", body)
+        self.assertIn(b"bundle.league_label", body)
         self.assertIn(b'<meta name="color-scheme" content="dark">', page)
         self.assertIn(b"Package contents", page)
         self.assertIn(b"Exactly the selected players", page)
@@ -450,6 +491,7 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b'src="/gm_insights_evidence_ui.js"', page)
         self.assertIn(b'src="/gm_insights_ui.js"', page)
         self.assertIn(b'src="/trade_timing_ui.js"', page)
+        self.assertIn(b'src="/player_lab_provenance_ui.js"', page)
         self.assertIn(b'src="/player_lab_ui.js"', page)
         self.assertLess(page.index(b'/dashboard_charts.js'), page.index(b'/dashboard_ui.js'))
         self.assertLess(page.index(b'/dashboard_ui.js'), page.index(b'/app.js'))
@@ -457,6 +499,7 @@ class LocalServerTests(unittest.TestCase):
         self.assertLess(page.index(b'/gm_insights_evidence_ui.js'), page.index(b'/gm_insights_ui.js'))
         self.assertLess(page.index(b'/gm_insights_ui.js'), page.index(b'/app.js'))
         self.assertLess(page.index(b'/trade_timing_ui.js'), page.index(b'/app.js'))
+        self.assertLess(page.index(b'/player_lab_provenance_ui.js'), page.index(b'/player_lab_ui.js'))
         self.assertLess(page.index(b'/player_lab_ui.js'), page.index(b'/app.js'))
         self.assertLess(page.index(b'/three_way_ui.js'), page.index(b'/app.js'))
         self.assertNotIn(b'id="expectedTeamCount"', page)
@@ -468,6 +511,7 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b".trade-format-options", stylesheet)
         self.assertIn(b".team-impact-cell", stylesheet)
         self.assertIn(b".roster-adjustment-warning", stylesheet)
+        self.assertIn(b".bundle-capability-grid", stylesheet)
         self.assertNotIn(b"color-scheme: light", stylesheet)
 
         status, headers, three_way_ui = self.request(
@@ -591,12 +635,32 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b"window.PlayerLabUi", player_lab_ui)
         self.assertIn(b"AbortController", player_lab_ui)
         self.assertIn(b"player-outlook", player_lab_ui)
+        self.assertIn(b"schema_version !== 5", player_lab_ui)
         self.assertIn(b"not_retained", player_lab_ui)
         self.assertIn(b"maximumFractionDigits: 3", player_lab_ui)
         self.assertIn(b"Exact stored value", player_lab_ui)
         self.assertIn(b"Exact stored weight", player_lab_ui)
         self.assertIn(b"direct_source_count", player_lab_ui)
+        self.assertIn(b"raw_stat_key_fields", player_lab_ui)
+        self.assertIn(b"provider_status_observation_policy", player_lab_ui)
+        self.assertIn(b"provider status labels disagree", player_lab_ui)
+        self.assertIn(b"provider_status_unknown_provider_count", player_lab_ui)
+        self.assertIn(b"without a status label", player_lab_ui)
         self.assertNotIn(b"innerHTML", player_lab_ui)
+
+        status, headers, player_lab_provenance = self.request(
+            "GET", "/player_lab_provenance_ui.js", token=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/javascript", headers["Content-Type"])
+        self.assertIn(b"window.PlayerLabProvenanceUi", player_lab_provenance)
+        self.assertIn(b"Position panels", player_lab_provenance)
+        self.assertIn(b"expert_selection_policy", player_lab_provenance)
+        self.assertIn(b"expert_group_description", player_lab_provenance)
+        self.assertIn(b"Provider status observed", player_lab_provenance)
+        self.assertIn(b"Retained raw projected stats", player_lab_provenance)
+        self.assertIn(b"dataset.statProvider", player_lab_provenance)
+        self.assertNotIn(b"innerHTML", player_lab_provenance)
 
         status, headers, player_lab_catalog = self.request(
             "GET", "/player_lab_catalog_ui.js", token=False
@@ -625,6 +689,8 @@ class LocalServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("text/css", headers["Content-Type"])
         self.assertIn(b".player-lab-layout", player_lab_styles)
+        self.assertIn(b".player-lab-raw-card", player_lab_styles)
+        self.assertIn(b".player-lab-provider-status", player_lab_styles)
         self.assertIn(b"@media", player_lab_styles)
 
         status, headers, three_way = self.request("GET", "/three_way_ui.js", token=False)
@@ -638,6 +704,7 @@ class LocalServerTests(unittest.TestCase):
         self.assertIn(b"Minimum each team sends", three_way)
         self.assertIn(b"Do not force any team", three_way)
         self.assertIn(b"three_team_free_agent_allocation_policy", three_way)
+        self.assertIn(b"powerEvidenceLabel(row.power_methodology_status)", three_way)
 
         status, headers, extension = self.request(
             "GET", "/browser-extension.zip", token=False

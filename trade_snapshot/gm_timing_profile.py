@@ -18,6 +18,7 @@ from ._record_trend import (
     record_slope_direction,
     trailing_record_slope,
 )
+from ._scenario_random import content_id
 from .league_history import (
     HISTORY_CAPTURE_BINDING_TOLERANCE,
     HistoryTransactionKind,
@@ -26,7 +27,7 @@ from .league_history import (
 from .league_state import LeagueState
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _WILSON_80_Z = 1.281551565545
 _WILSON_95_Z = 1.95996398454
 _MIN_COMPARISON_EXPOSURES = 5
@@ -103,8 +104,18 @@ def build_completed_deal_timing_profiles(
         profiles[team_id] = {
             "schema_version": _SCHEMA_VERSION,
             "team_id": team_id,
-            "status": "descriptive" if captures else "unavailable",
+            "status": (
+                "descriptive"
+                if normalized
+                else "partial"
+                if captures
+                else "unavailable"
+            ),
             "as_of": None if as_of is None else _iso(as_of),
+            "analysis_as_of": None if as_of is None else _iso(as_of),
+            "evidence": _evidence_record(
+                state, history, captures, latest, team_trades, team_id
+            ),
             "manager_acceptance_modeled": False,
             "use_for_personalization": False,
             "behavioral_label": None,
@@ -115,6 +126,26 @@ def build_completed_deal_timing_profiles(
                 "completed_history_usable": state.completed_history_is_usable,
                 "elapsed_scoring_period_count": len(elapsed_periods),
                 "latest_capture_id": None if latest is None else latest.capture_id,
+                "transaction_history_complete": (
+                    False if latest is None else latest.transaction_history_complete
+                ),
+                "roster_history_complete": (
+                    False if latest is None else latest.roster_complete
+                ),
+                "lineup_history_complete": (
+                    False if latest is None else latest.lineup_complete
+                ),
+                "incomplete_dimensions": _incomplete_dimensions(
+                    state, latest, coverage_status
+                ),
+            },
+            "trade_legality": {
+                "status": "not_captured",
+                "trade_deadline_status": "not_captured",
+                "transaction_processing_rules_status": "not_captured",
+                "player_lock_status": "not_captured",
+                "undroppable_player_status": "not_captured",
+                "host_legality_verified": False,
             },
             "scoring_period_context": {
                 "rule": (
@@ -142,10 +173,54 @@ def build_completed_deal_timing_profiles(
                 "Historical health is not reliably aligned to each decision window, so directional behavioral labels and personalization are disabled.",
                 "Associations with prior results are descriptive and do not establish that winning or losing caused a trade.",
                 "The trade deadline is not captured, so elapsed scoring periods may include weeks when trades were not allowed.",
+                "Transaction processing rules, player locks, undroppable status, and historical trade legality are not captured.",
+                "Roster and lineup capture completeness is disclosed but is not evidence of historical player health at each decision window.",
             ],
         }
         json.dumps(profiles[team_id], allow_nan=False, sort_keys=True)
     return profiles
+
+
+def _evidence_record(state, history, captures, latest, transactions, team_id):
+    timestamp_coverage = {
+        "proposed_at": len(transactions),
+        "accepted_at": sum(row.accepted_at is not None for row in transactions),
+        "processed_at": sum(row.processed_at is not None for row in transactions),
+        "expires_at": sum(row.expires_at is not None for row in transactions),
+    }
+    record = {
+        "team_id": team_id,
+        "host_snapshot_id": state.snapshot_id,
+        "scoring_profile_id": state.scoring_profile_id,
+        "history_revision": None if history is None else history.history_revision,
+        "history_capture_ids": sorted(row.capture_id for row in captures),
+        "latest_history_capture_id": None if latest is None else latest.capture_id,
+        "completed_trade_transaction_ids": sorted(
+            row.transaction_id for row in transactions
+        ),
+        "source_timestamp_coverage": timestamp_coverage,
+    }
+    return {
+        **record,
+        "evidence_id": content_id("gm-timing-evidence", record),
+    }
+
+
+def _incomplete_dimensions(state, latest, coverage_status):
+    dimensions = []
+    if coverage_status == "not_collected":
+        dimensions.append("history_not_collected")
+    elif coverage_status == "latest_capture_stale":
+        dimensions.append("latest_capture_stale")
+    if not state.completed_history_is_usable:
+        dimensions.append("completed_matchups")
+    if latest is None or not latest.transaction_history_complete:
+        dimensions.append("transactions")
+    if latest is None or not latest.roster_complete:
+        dimensions.append("rosters")
+    if latest is None or not latest.lineup_complete:
+        dimensions.append("lineups")
+    return dimensions
 
 
 def _coverage_status(state, latest, as_of):

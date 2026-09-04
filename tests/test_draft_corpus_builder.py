@@ -1,7 +1,9 @@
 import csv
+import gc
 import gzip
 import json
 import unittest
+import warnings
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -50,9 +52,15 @@ class DraftCorpusSourceTests(unittest.TestCase):
                 ["player_id", "season", "week", "season_type", "passing_interceptions"],
                 [["p1", 2025, 1, "REG", 0]],
             )
-            row = load_player_week_stats(stats, 2025)["p1"][1]
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                row = load_player_week_stats(stats, 2025)["p1"][1]
+                gc.collect()
             self.assertEqual(row["interceptions"], 0.0)
             self.assertEqual(row["fumbles_lost"], 0.0)
+            self.assertFalse(
+                [warning for warning in caught if warning.category is ResourceWarning]
+            )
 
 
 class DraftCorpusBuilderTests(unittest.TestCase):

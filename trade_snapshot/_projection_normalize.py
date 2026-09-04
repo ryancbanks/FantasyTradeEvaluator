@@ -6,13 +6,17 @@ from .capture_schema import GenericTableArtifact, RankingHorizon
 from .identity import IdentityRegistry
 from .identity_match import ProviderPlayerRecord
 from .nfl_schedule import NflSchedule, NflTeamWeekStatus, canonical_nfl_game_id
+from .positions import projection_position_in_scope
 from ._projection_parse import (
     ProjectionArtifactRow,
     normalize_position,
     projection_artifact_rows,
+    projection_identity_provider,
 )
 from .projections import (
     ProjectionStatus,
+    ProviderStatusObservation,
+    ProviderStatusScope,
     RemainingSeasonOrigin,
     RemainingSeasonProjection,
     WeeklyProjection,
@@ -62,8 +66,9 @@ def projection_evidence_from_artifact(
             f"{artifact.provider.value} full-season normalization requires the NFL schedule"
         )
     captured_at = _time(artifact.captured_at)
+    artifact_rows = projection_artifact_rows(artifact, known_registry=registry)
     result = []
-    for row in projection_artifact_rows(artifact, known_registry=registry):
+    for row in artifact_rows:
         identity = registry.lookup(row.identity_provider, row.provider_player_id)
         unmatched = identity is None
         if identity is not None and normalize_position(identity.position) != row.position:
@@ -93,6 +98,24 @@ def projection_evidence_from_artifact(
                 if status is ProjectionStatus.OBSERVED
                 else {}
             ),
+            provider_status_observations=(
+                (
+                    ProviderStatusObservation(
+                        row.provider_status_designation,
+                        captured_at,
+                        (
+                            ProviderStatusScope.WEEKLY
+                            if artifact.horizon is RankingHorizon.WEEKLY
+                            else ProviderStatusScope.REST_OF_SEASON
+                        ),
+                        artifact.week
+                        if artifact.horizon is RankingHorizon.WEEKLY
+                        else None,
+                    ),
+                )
+                if row.provider_status_designation is not None
+                else ()
+            ),
         )
         if artifact.horizon is RankingHorizon.WEEKLY:
             result.append(_weekly(common, artifact, row, unmatched, status))
@@ -104,7 +127,82 @@ def projection_evidence_from_artifact(
                     origin=ros_origin,
                 )
             )
+    result.extend(
+        _complete_capture_omissions(
+            artifact,
+            registry,
+            artifact_rows,
+            snapshot_id=snapshot_id,
+            scoring_profile_id=scoring_profile_id,
+            applicable_weeks=weeks,
+            captured_at=captured_at,
+        )
+    )
     return tuple(result)
+
+
+def _complete_capture_omissions(
+    artifact,
+    registry,
+    artifact_rows,
+    *,
+    snapshot_id,
+    scoring_profile_id,
+    applicable_weeks,
+    captured_at,
+):
+    """Represent an exact known player omitted from a proven-complete table."""
+
+    if not artifact.complete:
+        return ()
+    identity_provider = projection_identity_provider(artifact.provider)
+    captured_ids = {
+        row.provider_player_id
+        for row in artifact_rows
+        if row.identity_provider == identity_provider
+    }
+    omitted = []
+    for identity in registry.players:
+        if not projection_position_in_scope(
+            identity.position, artifact.position_scope
+        ):
+            continue
+        references = tuple(
+            reference.provider_player_id
+            for reference in identity.provider_references
+            if reference.provider == identity_provider
+        )
+        if len(references) != 1 or references[0] in captured_ids:
+            continue
+        common = dict(
+            canonical_player_id=identity.canonical_player_id,
+            snapshot_id=snapshot_id,
+            scoring_profile_id=scoring_profile_id,
+            provider=artifact.provider.value,
+            provider_player_id=references[0],
+            season=artifact.season,
+            status=ProjectionStatus.NOT_PUBLISHED,
+            captured_at=captured_at,
+        )
+        if artifact.horizon is RankingHorizon.WEEKLY:
+            omitted.append(
+                WeeklyProjection(
+                    **common,
+                    week=artifact.week,
+                    nfl_team_id=identity.nfl_team_id,
+                )
+            )
+        else:
+            omitted.append(
+                RemainingSeasonProjection(
+                    **common,
+                    applicable_weeks=applicable_weeks,
+                    origin=RemainingSeasonOrigin.PROVIDER_PUBLISHED,
+                )
+            )
+    return tuple(
+        sorted(omitted, key=lambda row: (row.canonical_player_id, row.provider_player_id))
+    )
 
 
 def _status(

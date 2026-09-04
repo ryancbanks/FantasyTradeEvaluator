@@ -219,11 +219,9 @@ class YahooProjectionScriptTests(unittest.TestCase):
         }
 
         self.assertEqual(page.evaluate(CONFIGURE_PROJECTION_SCRIPT, request), {
-            "action": "changed", "dimension": "availability",
-        })
-        self.assertEqual(page.evaluate(CONFIGURE_PROJECTION_SCRIPT, request), {
             "action": "error", "dimension": "yahoo period",
         })
+        self.assertEqual(page.locator("#statusselect").input_value(), "A")
 
     def test_duplicate_next_links_accept_playersearch_to_players_alias(self):
         destination = (

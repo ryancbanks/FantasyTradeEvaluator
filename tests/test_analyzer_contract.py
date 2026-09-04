@@ -9,6 +9,8 @@ from trade_snapshot.analyzer_contract import (
     AnalyzerPeriod,
     AnalyzerTradeRequest,
     BundleFingerprint,
+    PlayoffOddsChange,
+    PowerRankingChange,
     observation_from_record,
     observation_to_record,
     parse_analyzer_observation,
@@ -103,6 +105,24 @@ class AnalyzerTradeRequestTests(unittest.TestCase):
             with self.subTest(changes=changes):
                 with self.assertRaisesRegex(AnalyzerContractError, message):
                     AnalyzerTradeRequest(**{**valid, **changes})
+
+    def test_local_change_records_accept_namespaced_team_ids_without_weakening_requests(self):
+        self.assertEqual(
+            PowerRankingChange("espn:team:6", 50, 51).team_id,
+            "espn:team:6",
+        )
+        self.assertEqual(
+            PlayoffOddsChange("espn:team:6", 40, 45).team_id,
+            "espn:team:6",
+        )
+        with self.assertRaisesRegex(AnalyzerContractError, "portable provider-ID"):
+            AnalyzerTradeRequest(
+                period="ros",
+                team1_id="espn:team:6",
+                team2_id="2",
+                team1_gets=("a",),
+                team2_gets=("b",),
+            )
 
 
 class ResponseParserTests(unittest.TestCase):

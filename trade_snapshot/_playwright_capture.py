@@ -32,6 +32,7 @@ from .browser_capture import (
     BrowserCaptureOptions,
     BrowserCaptureTimeout,
     ProjectionCaptureData,
+    ProjectionNotPublished,
     YahooScoringError,
 )
 from .capture_schema import (
@@ -232,6 +233,10 @@ class _PlaywrightSession:
                 PROJECTION_TABLE_SCRIPT, projection_request(task), _projection_ready,
                 _remaining_ms(deadline), cancelled, "projection table",
             )
+            if raw["availability"] == "not_published":
+                raise ProjectionNotPublished(
+                    "FantasyPros has not published projections for the requested week."
+                )
             if raw != previous:
                 segments.append(raw)
                 previous = raw
@@ -413,6 +418,10 @@ class _PlaywrightSession:
                 PROJECTION_TABLE_SCRIPT, projection_request(task), _projection_ready,
                 _remaining_ms(deadline), cancelled, "projection page transition",
             )
+            if value["availability"] == "not_published":
+                raise ProjectionNotPublished(
+                    "FantasyPros has not published projections for the requested week."
+                )
             if value != previous:
                 return value
             self._wait(min(_POLL_MS, _remaining_ms(deadline)), cancelled)
@@ -466,9 +475,15 @@ def _ecr_ready(value: object) -> bool:
 
 def _projection_ready(value: object) -> bool:
     return (
-        isinstance(value, Mapping) and set(value) == {"source", "tables"}
+        isinstance(value, Mapping)
+        and set(value) == {"availability", "source", "tables"}
+        and value["availability"] in {"available", "not_published", "unavailable"}
         and isinstance(value["source"], Mapping)
-        and isinstance(value["tables"], list) and bool(value["tables"])
+        and isinstance(value["tables"], list)
+        and (
+            (value["availability"] == "available" and bool(value["tables"]))
+            or (value["availability"] == "not_published" and not value["tables"])
+        )
     )
 
 

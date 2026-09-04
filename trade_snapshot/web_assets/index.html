@@ -106,11 +106,11 @@
         </div>
         <div class="collection-actions">
           <div class="collection-options">
-            <label class="check"><input id="useFantasyPros" type="checkbox" checked><span>Use FantasyPros for ECR and replicated power. Turn this off for a completely independent ESPN + Yahoo engine with optional public publishers.</span></label>
+            <label class="check"><input id="useFantasyPros" type="checkbox" checked><span>Use FantasyPros for ECR and holdout-validated FantasyPros-style power. Turn this off for a completely independent ESPN + Yahoo engine with optional public publishers.</span></label>
             <label class="check"><input id="useBroadConsensus" type="checkbox" checked><span>Broad projection consensus (recommended): equal-average independent ESPN, Yahoo, CBS, FFToday, and FantasySharks projections when available. Each publisher receives one vote.</span></label>
-            <label class="check"><input id="includeFutureWeekly" type="checkbox"><span>Try every future week too (advanced; required sources must publish it)</span></label>
+            <label class="check"><input id="includeFutureWeekly" type="checkbox" checked><span>Try every remaining ESPN and Yahoo weekly page when available (recommended for matchup-level forecasts). Every remaining FantasyPros week is also attempted; unpublished future pages are recorded explicitly.</span></label>
             <label class="check"><input id="refreshPublicPlayerData" type="checkbox"><span>Refresh public Player Lab data even if it was already collected for this NFL week</span></label>
-            <label class="check surrogate-consent"><input id="allowSurrogatePower" type="checkbox"><span>If exact FantasyPros replication fails, publish a <strong>SURROGATE</strong> weekly engine. Its power scores are approximations and will never be labeled exact.</span></label>
+            <label class="check surrogate-consent"><input id="allowSurrogatePower" type="checkbox"><span>If the formula does not pass the blind-holdout validation gate, publish a <strong>SURROGATE</strong> weekly engine. Its results remain approximations and are labeled surrogate or surrogate extrapolated.</span></label>
           </div>
           <div class="action-row compact-actions">
             <button id="collectButton" type="submit" class="primary">Scan selected league &amp; collect</button>
@@ -155,6 +155,10 @@
           </div>
         </div>
       </div>
+      <details id="bundleDataReadiness" class="bundle-data-readiness hidden">
+        <summary>Data coverage and model limits</summary>
+        <div id="bundleDataReadinessContent" class="bundle-data-readiness-content"></div>
+      </details>
     </section>
 
     <section id="dashboardPanel" class="panel dashboard-panel" aria-labelledby="dashboardHeading">
@@ -415,7 +419,7 @@
         <div class="player-lab-layout">
           <div class="table-wrap player-lab-master-wrap" role="region" aria-label="Scrollable Player Lab results" tabindex="0">
             <table class="player-lab-master">
-              <caption class="player-lab-sr-only">Players with ownership, depth, projections, rankings, and trends</caption>
+              <caption class="player-lab-sr-only">Players with ownership, depth, full NFL rest-of-season projections, rankings, trends, and source coverage</caption>
               <thead><tr><th>Player</th><th>Fantasy team</th><th>Pos / depth</th><th>ROS pts</th><th>Trend</th><th>Overall</th><th>ROS ECR</th><th>Sources</th></tr></thead>
               <tbody id="playerLabTableBody"></tbody>
             </table>
@@ -426,8 +430,8 @@
             <div id="playerLabDetail" class="player-lab-detail" aria-live="polite"></div>
             <div id="playerLabChart" class="player-lab-chart" role="img" aria-label="Selected player's weekly actual and projected fantasy points"></div>
             <div id="playerLabSeasonStats" class="player-lab-season-stats"></div>
-            <div class="player-lab-grid-heading"><h4>Weekly projection breakdown</h4><p>Ensemble alongside every retained provider value</p></div>
-            <p class="player-lab-coverage-note">Usable sources include direct weekly values and disclosed rest-of-season allocations. “All-direct” excludes locally allocated values.</p>
+            <div class="player-lab-grid-heading"><h4>Fantasy regular-season weekly breakdown</h4><p>Ensemble alongside every retained provider value</p></div>
+            <p class="player-lab-coverage-note">Usable sources include direct weekly values and disclosed rest-of-season allocations. Residual points and stat components are divided evenly across missing active weeks; that shape is local, not a provider-published matchup projection. “All-direct” excludes every locally allocated value.</p>
             <div class="table-wrap player-lab-weekly-wrap" role="region" aria-label="Scrollable weekly projection breakdown" tabindex="0">
               <table class="player-lab-weekly">
                 <caption class="player-lab-sr-only">Weekly ensemble and provider projections for the selected player</caption>
@@ -436,6 +440,7 @@
               </table>
             </div>
             <div id="playerLabRosSources" class="player-lab-ros-sources"></div>
+            <div id="playerLabRawStats" class="player-lab-raw-stats" aria-label="Retained raw projected statistics"></div>
           </article>
         </div>
       </div>
@@ -536,7 +541,7 @@
             <label class="check"><input id="balancedOnly" type="checkbox"><span>Only equal-size swaps</span></label>
             <label id="skipSmallRow" class="check"><input id="skipSmall" type="checkbox" checked><span>Skip trades FantasyPros already covers (3 or fewer per side)</span></label>
             <label class="check"><input id="noDrops" type="checkbox" checked><span id="noDropsLabel">Do not force either team to drop a player</span></label>
-            <label id="surrogateSearchConsentRow" class="check surrogate-consent hidden"><input id="acceptSurrogateSearch" type="checkbox"><span>I understand this selected week uses <strong>SURROGATE</strong> power, which affects trade filtering and is not an exact FantasyPros result.</span></label>
+            <label id="surrogateSearchConsentRow" class="check surrogate-consent hidden"><input id="acceptSurrogateSearch" type="checkbox"><span>I understand this selected week uses <strong>SURROGATE</strong> power, which affects trade filtering and is not holdout validated. Results are labeled surrogate or surrogate extrapolated.</span></label>
             <label><span>Minimum power change for each team</span><input id="powerFloor" type="number" step="0.1" value="-5"></label>
             <label><span>Season simulations per candidate</span><input id="scenarioCount" type="number" min="100" max="1000000" step="100" value="10000"></label>
           </fieldset>
@@ -843,6 +848,7 @@
   <script src="/trade_filter_ui.js" defer></script>
   <script src="/player_lab_profile_ui.js" defer></script>
   <script src="/player_lab_catalog_ui.js" defer></script>
+  <script src="/player_lab_provenance_ui.js" defer></script>
   <script src="/player_lab_ui.js" defer></script>
   <script src="/results_workbench.js" defer></script>
   <script src="/app.js" defer></script>

@@ -4,7 +4,13 @@ from datetime import datetime, timezone
 import re
 
 from .capture_schema import FantasyProsECRArtifact, RankingHorizon
-from .ecr import EcrPeriod, EcrPlayerRanking, EcrSnapshot
+from .ecr import (
+    EcrExpertPanel,
+    EcrPeriod,
+    EcrPlayerRanking,
+    EcrSnapshot,
+    EcrSourceProvenance,
+)
 from .identity import IdentityRegistry
 from .positions import normalize_player_position
 from .identity_match import ProviderPlayerRecord
@@ -67,8 +73,16 @@ def ecr_snapshot_from_artifact(
     _artifact(artifact)
     if not isinstance(registry, IdentityRegistry):
         raise ValueError("registry must be an IdentityRegistry")
+    page_position = _position(artifact.source_details.page_position)
+    source_rows = (
+        tuple(row for row in artifact.rankings if _position(row.position) == page_position)
+        if page_position in {"DL", "LB", "DB"}
+        else artifact.rankings
+    )
+    if not source_rows:
+        raise ValueError("ECR artifact has no primary-position rankings")
     rankings = []
-    for row in artifact.rankings:
+    for row in source_rows:
         identity = registry.lookup(identity_provider, row.provider_player_id)
         if identity is None:
             raise ValueError(
@@ -97,21 +111,41 @@ def ecr_snapshot_from_artifact(
         if artifact.horizon is RankingHorizon.WEEKLY
         else EcrPeriod.REST_OF_SEASON
     )
+    captured_at = _time("captured_at", artifact.captured_at)
+    source_updated_at = (
+        None
+        if artifact.last_updated_at is None
+        else _time("last_updated_at", artifact.last_updated_at)
+    )
+    provenance = EcrSourceProvenance(
+        league_scoring=artifact.scoring,
+        source_scoring=artifact.source_scoring,
+        capture_method=artifact.capture_method.value,
+        captured_at=captured_at,
+        source_updated_at=source_updated_at,
+        source_updated_text=artifact.last_updated_text,
+        source_details=artifact.source_details,
+    )
     return EcrSnapshot(
         snapshot_id=snapshot_id,
         scoring_profile_id=scoring_profile_id,
         season=artifact.season,
         as_of_week=artifact.week,
         period=period,
-        captured_at=_time("captured_at", artifact.captured_at),
-        source_updated_at=(
-            None
-            if artifact.last_updated_at is None
-            else _time("last_updated_at", artifact.last_updated_at)
-        ),
+        captured_at=captured_at,
+        source_updated_at=source_updated_at,
         expert_ids=artifact.expert_ids,
         total_experts=artifact.expert_count,
         rankings=tuple(rankings),
+        expert_panels=tuple(
+            EcrExpertPanel(
+                position,
+                artifact.expert_ids,
+                artifact.expert_count,
+                provenance,
+            )
+            for position in sorted({row.position for row in rankings})
+        ),
     )
 
 

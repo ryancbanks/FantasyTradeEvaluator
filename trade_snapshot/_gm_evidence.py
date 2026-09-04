@@ -52,7 +52,22 @@ def build_trade_evidence(
         )
         rows.append(
             {
+                "transaction_id": trade.transaction_id,
                 "source_event_at": _iso(trade.recorded_at),
+                "source_timestamps": {
+                    "proposed_at": _iso(trade.recorded_at),
+                    "accepted_at": _optional_iso(trade.accepted_at),
+                    "processed_at": _optional_iso(trade.processed_at),
+                    "expires_at": _optional_iso(trade.expires_at),
+                    "completion_observed_by": (
+                        None
+                        if trade.transaction_id not in first_observed_at
+                        else _iso(first_observed_at[trade.transaction_id])
+                    ),
+                    "completion_observed_by_is_upper_bound": (
+                        trade.timestamp_basis.value != "executed_at"
+                    ),
+                },
                 "first_observed_completed_at": (
                     None
                     if trade.transaction_id not in first_observed_at
@@ -82,14 +97,23 @@ def _at_time_record(valuation, team_id):
     outcome = next(row for row in valuation.outcomes if row.team_id == team_id)
     return {
         "status": valuation.methodology_status,
+        "analysis_as_of": _iso(valuation.analysis_as_of),
+        "source_bundle_id": valuation.source_bundle_id,
         "source_bundle_captured_at": _iso(valuation.source_bundle_captured_at),
         "valuation_lag_hours": valuation.valuation_lag_hours,
         "power_delta": outcome.power_delta,
         "relative_power_edge": outcome.relative_power_edge,
         "playoff_probability_delta": outcome.playoff_probability_delta,
+        "playoff_scenario_count": valuation.playoff_scenario_count,
+        "playoff_evidence": (
+            None
+            if valuation.playoff_evidence is None
+            else valuation.playoff_evidence.to_record()
+        ),
         "playoff_probability_unavailable_reason": (
             valuation.playoff_unavailable_reason
         ),
+        "model_evidence": valuation.source_model_evidence.to_record(),
     }
 
 
@@ -100,9 +124,11 @@ def _current_record(valuation, team_id):
     outcome = next(row for row in current.outcomes if row.team_id == team_id)
     return {
         "status": current.methodology_status,
+        "bundle_id": current.bundle_id,
         "selected_bundle_captured_at": _iso(current.bundle_captured_at),
         "power_delta": outcome.power_delta,
         "relative_power_edge": outcome.relative_power_edge,
+        "model_evidence": current.model_evidence.to_record(),
     }
 
 
@@ -113,8 +139,17 @@ def _comparison_record(valuation, team_id, unavailable_reason):
         if current is None
         else next(row for row in current.outcomes if row.team_id == team_id)
     )
+    status = (
+        "unavailable"
+        if current is None
+        else "foresight_comparable"
+        if current.foresight_eligible
+        else "model_incomparable_raw_only"
+        if current.model_comparability_reasons
+        else "health_ineligible_raw_only"
+    )
     return {
-        "status": "comparable_raw" if current is not None else "unavailable",
+        "status": status,
         "relative_power_edge_drift": (
             None
             if current_outcome is None
@@ -130,6 +165,24 @@ def _comparison_record(valuation, team_id, unavailable_reason):
             if current is None
             else list(current.foresight_ineligibility_reasons)
         ),
+        "model_comparability_reasons": (
+            [] if current is None else list(current.model_comparability_reasons)
+        ),
+        "evidence_ids": (
+            None
+            if valuation is None
+            else {
+                "transaction_id": valuation.transaction_id,
+                "at_time_model_evidence_id": (
+                    valuation.source_model_evidence.evidence_id
+                ),
+                "current_model_evidence_id": (
+                    None
+                    if current is None
+                    else current.model_evidence.evidence_id
+                ),
+            }
+        ),
         "interpretation": "hindsight_current_value_drift_not_at_time_fairness",
     }
 
@@ -138,6 +191,10 @@ def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace(
         "+00:00", "Z"
     )
+
+
+def _optional_iso(value: datetime | None) -> str | None:
+    return None if value is None else _iso(value)
 
 
 def _asset_label(asset, player_names):

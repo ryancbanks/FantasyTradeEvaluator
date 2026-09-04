@@ -58,9 +58,16 @@ def configure_projection(
                     dimension,
                     "Yahoo Player List filters could not be verified.",
                 ))
+            dimension = result.get("dimension")
+            if task.provider.value == "espn" and dimension in {
+                "season", "period", "scoring", "position"
+            }:
+                raise BrowserCaptureError(
+                    f"ESPN projections did not expose one verifiable {dimension} filter."
+                )
             raise BrowserCaptureError("projection filters were ambiguous")
         changes += 1
-        if changes > 6:
+        if changes > 12:
             if task.provider.value == "yahoo":
                 raise BrowserCaptureError(
                     "Yahoo Player List did not finish applying the requested filters."

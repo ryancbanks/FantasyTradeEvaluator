@@ -7,7 +7,9 @@ from typing import Protocol
 from ._analyzer_types import BundleFingerprint
 from ._capture_errors import (
     BrowserCaptureCancelled, BrowserCaptureDependencyError, BrowserCaptureError,
-    BrowserCaptureTimeout, BrowserExtensionUpgradeRequired, YahooScoringError,
+    BrowserCaptureTimeout, BrowserExtensionUpgradeRequired, ProjectionNotPublished,
+    YahooScoringError,
+    YahooScoringMismatch,
 )
 from ._capture_runtime import (
     ActionPacer, BrowserCaptureOptions, ECRCaptureData, LeagueCaptureData,
@@ -41,7 +43,8 @@ __all__ = (
     "BrowserCaptureError", "BrowserCaptureOptions", "BrowserCaptureTimeout",
     "BrowserExtensionUpgradeRequired",
     "BrowserCollectionSession", "BrowserCollector", "CaptureBackend", "CaptureSession", "ECRCaptureData",
-    "LeagueCaptureData", "ProjectionCaptureData", "SignInGate", "YahooScoringError",
+    "LeagueCaptureData", "ProjectionCaptureData", "ProjectionNotPublished", "SignInGate",
+    "YahooScoringError", "YahooScoringMismatch",
 )
 
 
@@ -329,9 +332,12 @@ class BrowserCollector:
         try:
             return FantasyProsECRArtifact.from_task(
                 task, expert_ids=data.expert_ids, expert_count=data.expert_count,
+                source_scoring=data.source_scoring,
                 last_updated_text=data.last_updated_text,
                 last_updated_at=data.last_updated_at,
-                captured_at=capture_time(self._now()), rankings=data.rankings,
+                captured_at=capture_time(self._now()),
+                source_details=data.source_details,
+                rankings=data.rankings,
             )
         except ValueError:
             raise BrowserCaptureError("FantasyPros ECR data failed capture-schema validation") from None
@@ -591,7 +597,7 @@ class BrowserCollectionSession:
         expected = task.projection.scoring
         if actual != expected:
             labels = {"STD": "Standard", "HALF": "Half PPR", "PPR": "PPR"}
-            raise YahooScoringError(
+            raise YahooScoringMismatch(
                 f"Yahoo league scoring is {labels[actual]}, but this refresh is set to "
                 f"{labels[expected]}. Change the refresh scoring or use a matching Yahoo league."
             )

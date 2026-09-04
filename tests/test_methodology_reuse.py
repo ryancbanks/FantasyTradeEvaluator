@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timezone
 import unittest
 
@@ -91,6 +92,29 @@ class MethodologyReuseTests(unittest.TestCase):
         self.assertIn("season changed", changed.reasons)
         self.assertIn("league scoring profile changed", changed.reasons)
         self.assertIn("FantasyPros analyzer bundle content changed", changed.reasons)
+
+    def test_recalibrates_a_formula_using_the_superseded_partial_horizon_feature(self):
+        current = formula()
+        legacy = replace(
+            current,
+            residual_weights={"projection_fantasypros_remaining_points": 1},
+            role_weights={
+                role().role_id: {
+                    "projection_fantasypros_remaining_points": 1,
+                }
+            },
+        )
+
+        decision = decide_formula_reuse(
+            legacy,
+            fingerprint(),
+            season=2026,
+            scoring_profile_id="profile-1",
+        )
+
+        self.assertEqual(decision.action, FormulaAction.RECALIBRATE)
+        self.assertIn("FantasyPros power feature policy changed", decision.reasons)
+        self.assertIn("FantasyPros role feature policy changed", decision.reasons)
 
     def test_fingerprint_is_content_addressed_and_order_independent(self):
         first = fingerprint()

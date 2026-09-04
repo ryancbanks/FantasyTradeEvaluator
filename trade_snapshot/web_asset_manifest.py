@@ -38,6 +38,10 @@ WEB_ASSET_ROUTES = MappingProxyType(
             "player_lab_profile_ui.js",
             "text/javascript; charset=utf-8",
         ),
+        "/player_lab_provenance_ui.js": (
+            "player_lab_provenance_ui.js",
+            "text/javascript; charset=utf-8",
+        ),
         "/player_lab_ui.js": (
             "player_lab_ui.js",
             "text/javascript; charset=utf-8",

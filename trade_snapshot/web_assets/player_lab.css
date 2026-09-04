@@ -283,8 +283,33 @@
 .player-lab-source-value strong { color: var(--text-primary); font-variant-numeric: tabular-nums; }
 .player-lab-source-origin { display: block; margin-top: 5px; color: var(--accent); font-size: 11px; font-weight: 750; }
 .player-lab-trace-time { display: block; margin-top: 3px; color: var(--text-secondary); font-size: 10px; overflow-wrap: anywhere; }
+.player-lab-provider-status { display: block; margin-top: 5px; color: var(--warning); font-size: 11px; font-weight: 750; }
+.player-lab-provider-status .player-lab-trace-time { color: var(--text-secondary); font-weight: 500; }
+.player-lab-status-notice { border-color: var(--warning-border); }
 
 .player-lab-ros-sources { display: grid; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); gap: 9px; }
+.player-lab-raw-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 9px; }
+.player-lab-raw-card {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.player-lab-raw-card summary {
+  cursor: pointer;
+  color: var(--text-primary);
+  padding: 11px 12px;
+  font-size: 12px;
+  font-weight: 800;
+}
+.player-lab-raw-card[open] summary { border-bottom: 1px solid var(--border); }
+.player-lab-raw-card-content { display: grid; gap: 12px; padding: 12px; }
+.player-lab-raw-period h5 { margin: 0 0 6px; color: var(--accent); font-size: 11px; }
+.player-lab-raw-values { display: grid; gap: 3px; margin: 0; }
+.player-lab-raw-value { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; }
+.player-lab-raw-value dt { color: var(--text-secondary); overflow-wrap: anywhere; }
+.player-lab-raw-value dd { margin: 0; color: var(--text-primary); font-variant-numeric: tabular-nums; font-weight: 750; }
 .player-lab-freshness { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }
 .player-lab-grid-heading { display: flex; grid-column: 1 / -1; align-items: baseline; justify-content: space-between; gap: 12px; }
 .player-lab-grid-heading h3,
@@ -329,6 +354,7 @@
   .player-lab-ros-sources,
   .player-lab-freshness,
   .player-lab-season-stats,
+  .player-lab-raw-stats,
   .player-lab-facts { grid-template-columns: 1fr; }
   .player-lab-detail-heading,
   .player-lab-grid-heading { align-items: stretch; flex-direction: column; }

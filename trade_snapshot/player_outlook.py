@@ -6,6 +6,7 @@ from math import fsum
 
 from .ecr import EcrPeriod
 from .engine_bundle import EngineBundle
+from .nfl_schedule import NflTeamWeekStatus
 from .player_profile_outlook import (
     PROFILE_SCOPE_NOTICE,
     assign_player_ranks,
@@ -15,8 +16,19 @@ from .player_profile_outlook import (
 from .player_outlook_evidence import (
     _EvidenceIndex,
     _iso_utc,
-    _optional_time,
     _provider_names,
+)
+from .player_outlook_projection_records import (
+    _average,
+    _ecr_detail,
+    _ecr_snapshot_records,
+    _not_retained_weekly_record,
+    _provider_metadata,
+    _provider_status_coverage,
+    _provider_value,
+    _remaining_records,
+    _remaining_status,
+    _source_counts,
 )
 from .player_outlook_views import (
     _catalog_player_record,
@@ -24,14 +36,12 @@ from .player_outlook_views import (
     build_player_outlook_catalog,
     select_player_outlook_detail,
 )
-from .projections import (
-    ProjectionStatus,
-    WeeklyProjectionOrigin,
-)
+from .projection_lineage import ProjectionLineageIndex
+from .remaining_projection import summarize_remaining_projection
+from .projections import ProjectionStatus
 
 
-_SCHEMA_VERSION = 2
-_ECR_ORDER = {EcrPeriod.WEEKLY: 0, EcrPeriod.REST_OF_SEASON: 1}
+_SCHEMA_VERSION = 5
 _WAIVER_SCOPE_NOTICE = (
     "Available players are limited to this bundle's bounded waiver pool, not the "
     "host platform's complete free-agent list."
@@ -39,6 +49,13 @@ _WAIVER_SCOPE_NOTICE = (
 _PROJECTION_CATALOG_NOTICE = (
     "Captured projections outside the bounded trade pool remain available in "
     "Player Lab. Public history and depth enrichment were unavailable for this bundle."
+)
+_PROVIDER_STATUS_POLICY = (
+    "Provider injury/status designations are timestamped source observations only. "
+    "They are not converted into certain availability or appearance probabilities. "
+    "Disagreement compares only providers that reported a designation; explicit "
+    "coverage fields identify missing labels, so incomplete coverage is not an "
+    "agreement claim."
 )
 
 
@@ -59,7 +76,10 @@ def build_player_outlook(bundle: EngineBundle) -> dict[str, object]:
     )
     lab_player_ids = () if lab_snapshot is None else lab_snapshot.player_ids
     providers = _provider_names({**projections, **lab_projections})
-    evidence = _EvidenceIndex(bundle.projection_evidence)
+    evidence = ProjectionLineageIndex(
+        bundle.projections,
+        bundle.projection_evidence,
+    )
     owners = _owners(bundle)
     eligibilities = {
         row.canonical_player_id: row.eligible_slots for row in bundle.eligibilities
@@ -211,7 +231,9 @@ def _outlook_header(
         "scoring_mode": scoring_mode,
         "first_remaining_week": bundle.state.first_remaining_week,
         "weeks": list(weeks),
-        "providers": [evidence.provider_metadata(provider) for provider in providers],
+        "providers": [_provider_metadata(evidence, provider) for provider in providers],
+        "raw_stat_key_fields": ["provider", "stat_name"],
+        "provider_status_observation_policy": _PROVIDER_STATUS_POLICY,
         "ecr_snapshots": _ecr_snapshot_records(bundle),
         "waiver_scope_notice": scope_notice,
         "profile_scope": (
@@ -309,6 +331,8 @@ def _outside_projected_record(
         for row in rows
         if row.predictive_stddev is not None
     ]
+    complete = len(rows) == len(remaining_weeks)
+    remaining_points = fsum(points) if complete else None
     return {
         "player_id": player_id,
         "name": name,
@@ -319,22 +343,34 @@ def _outside_projected_record(
         "availability": "outside_calculation_pool",
         "weekly_ecr": weekly_ecr,
         "rest_of_season_ecr": rest_of_season_ecr,
-        "remaining_projected_points": (
-            fsum(points) if len(rows) == len(remaining_weeks) else None
+        "remaining_projected_points": remaining_points,
+        "remaining_projected_week_count": (
+            sum(row.status is not ProjectionStatus.BYE for row in rows)
+            if complete
+            else None
         ),
+        "remaining_projection_status": "complete" if complete else "partial",
+        "remaining_fantasy_regular_season_points": remaining_points,
+        "unmaterialized_remaining_points": 0.0 if complete else None,
         "average_weekly_points": (
-            _average(points) if len(rows) == len(remaining_weeks) else None
+            _average(points) if complete else None
+        ),
+        "average_fantasy_regular_season_points": (
+            _average(points) if complete else None
         ),
         "average_provider_disagreement": (
-            _average(disagreements) if len(rows) == len(remaining_weeks) else None
+            _average(disagreements) if complete else None
         ),
         "average_predictive_uncertainty": (
-            _average(uncertainties) if len(rows) == len(remaining_weeks) else None
+            _average(uncertainties) if complete else None
         ),
         "provider_complete_week_count": sum(
             row["usable_source_count"] == len(providers) for row in weekly_records
         ),
         "all_direct_week_count": 0,
+        "provider_status_disagreement_week_count": 0,
+        "provider_status_coverage_complete_week_count": 0,
+        "provider_status_unknown_provider_week_count": len(remaining_weeks) * len(providers),
         "total_week_count": len(remaining_weeks),
         "weeks": weekly_records,
         "provider_remaining_season": _retained_provider_totals(
@@ -358,6 +394,8 @@ def _retained_ensemble_week(projection, providers, provider_provenance):
             "source_published_at": _provider_capture(
                 provider_provenance, row.provider, "source_published_at"
             ),
+            "raw_projected_stats": {},
+            "provider_status_observations": [],
         }
         for row in projection.provider_observations
     }
@@ -392,6 +430,8 @@ def _retained_missing_week(week, providers, provider_provenance):
             "source_published_at": _provider_capture(
                 provider_provenance, provider, "source_published_at"
             ),
+            "raw_projected_stats": {},
+            "provider_status_observations": [],
         }
         for provider in providers
     ]
@@ -460,6 +500,8 @@ def _retained_provider_totals(
                 "source_published_at": _provider_capture(
                     provider_provenance, provider, "source_published_at"
                 ),
+                "raw_projected_stats": {},
+                "provider_status_observations": [],
             }
         )
     return result
@@ -507,6 +549,18 @@ def _player_record(
     waiver_players,
     ecr_by_period,
 ):
+    # ``player_outlook_lazy`` retains the earlier evidence-only read context.
+    # Bind that context to the exact fused rows before producing audited detail;
+    # eager callers already pass the bundle-wide lineage index.
+    if not isinstance(evidence, ProjectionLineageIndex):
+        evidence = ProjectionLineageIndex(
+            rows,
+            (
+                row
+                for row in bundle.projection_evidence
+                if row.canonical_player_id == player_id
+            ),
+        )
     position = rows[0].position
     eligible_slots = eligibilities.get(player_id)
     if eligible_slots is None or position not in eligible_slots:
@@ -518,14 +572,31 @@ def _player_record(
         raise ValueError("calculation player must be rostered or in the waiver pool")
     if waiver is not None and waiver.position != position:
         raise ValueError(f"player {player_id!r} has inconsistent positions")
-    weekly_records = [
-        _week_record(player_id, row, providers, evidence, rows) for row in rows
-    ]
+    weekly_records = [_week_record(row, providers, evidence) for row in rows]
     projected = [
         row.projected_fantasy_points
         for row in rows
         if row.projected_fantasy_points is not None
     ]
+    remaining = summarize_remaining_projection(
+        rows,
+        evidence,
+        applicable_weeks=(
+            tuple(row.week for row in rows if row.status is not ProjectionStatus.BYE)
+            if bundle.nfl_schedule is None
+            else tuple(
+                row.week
+                for row in bundle.nfl_schedule.team_weeks
+                if row.nfl_team_id == nfl_team_id
+                and row.week >= bundle.state.first_remaining_week
+                and row.status is NflTeamWeekStatus.SCHEDULED
+            )
+        ),
+    )
+    remaining_points = (
+        None if remaining is None else remaining.projected_fantasy_points
+    )
+    regular_season_points = fsum(projected)
     disagreements = [
         row.between_provider_stddev
         for row in rows
@@ -548,8 +619,21 @@ def _player_record(
         "rest_of_season_ecr": _ecr_detail(
             ecr_by_period, EcrPeriod.REST_OF_SEASON, player_id
         ),
-        "remaining_projected_points": fsum(projected),
-        "average_weekly_points": _average(projected),
+        "remaining_projected_points": remaining_points,
+        "remaining_projected_week_count": (
+            None if remaining is None else len(remaining.applicable_weeks)
+        ),
+        "remaining_projection_status": _remaining_status(remaining),
+        "remaining_fantasy_regular_season_points": regular_season_points,
+        "unmaterialized_remaining_points": (
+            None
+            if remaining_points is None
+            else remaining_points - regular_season_points
+        ),
+        "average_weekly_points": (
+            None if remaining is None else remaining.average_active_week
+        ),
+        "average_fantasy_regular_season_points": _average(projected),
         "average_provider_disagreement": _average(disagreements),
         "average_predictive_uncertainty": _average(uncertainties),
         "provider_complete_week_count": sum(
@@ -560,10 +644,19 @@ def _player_record(
             bool(providers) and row["direct_source_count"] == len(providers)
             for row in weekly_records
         ),
+        "provider_status_disagreement_week_count": sum(
+            row["provider_status_disagreement"] for row in weekly_records
+        ),
+        "provider_status_coverage_complete_week_count": sum(
+            row["provider_status_coverage_complete"] for row in weekly_records
+        ),
+        "provider_status_unknown_provider_week_count": sum(
+            row["provider_status_unknown_provider_count"] for row in weekly_records
+        ),
         "total_week_count": len(rows),
         "weeks": weekly_records,
-        "provider_remaining_season": evidence.remaining_records(
-            player_id, providers
+        "provider_remaining_season": _remaining_records(
+            evidence, player_id, providers, remaining
         ),
     }
 
@@ -584,14 +677,28 @@ def _player_nfl_team(player_id, rows, evidence, waiver_players):
     return values[0] if values else None
 
 
-def _week_record(player_id, projection, providers, evidence, player_weeks):
+def _week_record(*args):
+    if len(args) == 3:
+        projection, providers, evidence = args
+        values_for = lambda observation: _provider_value(  # noqa: E731
+            evidence, projection, observation
+        )
+        include_status_coverage = True
+    elif len(args) == 5:
+        # Compatibility for the bounded catalog builder. Exact-player detail
+        # rebinds this legacy context to ``ProjectionLineageIndex`` above.
+        player_id, projection, providers, evidence, player_weeks = args
+        values_for = lambda observation: evidence.provider_value(  # noqa: E731
+            player_id, projection, observation, player_weeks
+        )
+        include_status_coverage = False
+    else:
+        raise TypeError("_week_record expects 3 or 5 arguments")
     by_provider = {
         row.provider: row for row in projection.provider_observations
     }
     values = [
-        evidence.provider_value(
-            player_id, projection, by_provider[provider], player_weeks
-        )
+        values_for(by_provider[provider])
         for provider in providers
         if provider in by_provider
     ]
@@ -601,7 +708,7 @@ def _week_record(player_id, projection, providers, evidence, player_weeks):
         for provider in providers
     ]
     source_counts = _source_counts(values)
-    return {
+    result = {
         "week": projection.week,
         "status": projection.status.value,
         "opponent_team_id": projection.opponent_team_id,
@@ -614,77 +721,9 @@ def _week_record(player_id, projection, providers, evidence, player_weeks):
         **source_counts,
         "provider_values": values,
     }
-
-
-def _ecr_snapshot_records(bundle):
-    return [
-        {
-            "period": snapshot.period.value,
-            "captured_at": _iso_utc(snapshot.captured_at),
-            "source_updated_at": _optional_time(snapshot.source_updated_at),
-            "expert_count": snapshot.total_experts,
-            "selected_expert_count": len(snapshot.expert_ids),
-            "ranking_count": len(snapshot.rankings),
-        }
-        for snapshot in sorted(
-            bundle.ecr_snapshots,
-            key=lambda row: (_ECR_ORDER.get(row.period, len(_ECR_ORDER)), row.period.value),
-        )
-    ]
-
-
-def _ecr_detail(ecr_by_period, period, player_id):
-    ranking = ecr_by_period.get(period, {}).get(player_id)
-    if ranking is None:
-        return None
-    return {
-        "rank": ranking.rank_ecr,
-        "position_rank": ranking.position_rank,
-        "rank_min": ranking.rank_min,
-        "rank_max": ranking.rank_max,
-        "rank_average": ranking.rank_average,
-        "rank_stddev": ranking.rank_stddev,
-    }
-
-
-def _not_retained_weekly_record(provider):
-    return {
-        "provider": provider,
-        "provider_player_id": None,
-        "status": "not_retained",
-        "projected_points": None,
-        "weight": None,
-        "origin": None,
-        "captured_at": None,
-        "source_published_at": None,
-    }
-
-
-def _source_counts(values):
-    usable_statuses = {ProjectionStatus.OBSERVED.value, ProjectionStatus.BYE.value}
-    derived_origins = {
-        WeeklyProjectionOrigin.DERIVED_REST_OF_SEASON.value,
-    }
-    usable = [row for row in values if row["status"] in usable_statuses]
-    direct = [
-        row
-        for row in usable
-        if row["origin"] == WeeklyProjectionOrigin.PROVIDER_PUBLISHED.value
-    ]
-    derived = [row for row in usable if row["origin"] in derived_origins]
-    return {
-        "usable_source_count": len(usable),
-        "direct_source_count": len(direct),
-        "derived_source_count": len(derived),
-        "unattributed_source_count": len(usable) - len(direct) - len(derived),
-        "not_retained_source_count": sum(
-            row["status"] == "not_retained" for row in values
-        ),
-    }
-
-
-def _average(values):
-    return fsum(values) / len(values) if values else None
+    if include_status_coverage:
+        result.update(_provider_status_coverage(values, len(providers)))
+    return result
 
 
 __all__ = (

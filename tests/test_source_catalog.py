@@ -31,9 +31,9 @@ class SourceCatalogTests(unittest.TestCase):
         self.assertEqual(
             catalog["weekly_projection_preview"],
             {
-                "scope": "current_week_only",
-                "weeks": [1],
-                "league_end_discovered_during_scan": False,
+                "scope": "remaining_nfl_weeks",
+                "weeks": list(range(1, 19)),
+                "league_end_discovered_during_scan": True,
             },
         )
         self.assertEqual(calculation["FantasyPros"]["status"], "required")

@@ -20,7 +20,10 @@ from trade_snapshot.league_state import (
     Tiebreaker,
 )
 from trade_snapshot.projections import ProjectionStatus
-from trade_snapshot.roster_adjustment import PreparedRosterAdjuster
+from trade_snapshot.roster_adjustment import (
+    InfeasibleRosterAdjustment,
+    PreparedRosterAdjuster,
+)
 from trade_snapshot.scenario_config import (
     CorrelatedScenarioConfig,
     FactorLoadings,
@@ -179,7 +182,11 @@ def components(*, threshold=-100.0, checkpoint_interval=3):
         require_no_drops=True,
     )
     space = ThreeWayTradeSpace((rosters[0], rosters[2], rosters[1]), constraints)
-    prepared = PreparedThreeWayTrade(strength, space.rosters)
+    prepared = PreparedThreeWayTrade(
+        strength,
+        space.rosters,
+        PreparedRosterAdjuster(strength, rosters, forbid_drops=True),
+    )
     runner = ResumableThreeWayTradeSearch(
         space,
         prepared,
@@ -363,15 +370,21 @@ class ThreeWayEvaluationTests(unittest.TestCase):
         self.assertEqual(by_team["a"].active_size, 2)
         self.assertEqual(dict(by_team["b"].reserve_slot_by_player), {})
 
-    def test_no_drop_runner_rejects_an_adjuster(self):
+    def test_no_drop_runner_requires_an_add_only_adjuster(self):
         space, prepared, baseline, _ = components()
-        adjusted = PreparedThreeWayTrade(
+        without_adjuster = PreparedThreeWayTrade(
+            prepared.model,
+            space.rosters,
+        )
+        with self.assertRaisesRegex(ValueError, "prepared roster adjuster"):
+            ResumableThreeWayTradeSearch(space, without_adjuster, baseline)
+        drop_enabled = PreparedThreeWayTrade(
             prepared.model,
             space.rosters,
             PreparedRosterAdjuster(prepared.model, league_rosters()),
         )
-        with self.assertRaisesRegex(ValueError, "pure simultaneous"):
-            ResumableThreeWayTradeSearch(space, adjusted, baseline)
+        with self.assertRaisesRegex(ValueError, "drop policy"):
+            ResumableThreeWayTradeSearch(space, drop_enabled, baseline)
         for invalid in (0, "", []):
             with self.subTest(settings=invalid), self.assertRaisesRegex(
                 ValueError, "settings"
@@ -393,6 +406,28 @@ class ThreeWayRunnerTests(unittest.TestCase):
         self.assertIn("reserve_slot_by_player", roster_record)
         self.assertIn("reserve_slot_counts", roster_record)
         self.assertNotIn("capacity_exempt_player_ids", roster_record)
+
+    def test_infeasible_roster_adjustment_skips_only_that_candidate(self):
+        space, _, _, runner = components()
+        original = PreparedThreeWayTrade.evaluate
+
+        def fail_first(prepared, candidate, *, candidate_index):
+            if candidate_index == 0:
+                raise InfeasibleRosterAdjustment("bounded waiver pool exhausted")
+            return original(prepared, candidate, candidate_index=candidate_index)
+
+        with TemporaryDirectory() as directory, patch.object(
+            PreparedThreeWayTrade, "evaluate", new=fail_first
+        ):
+            outcome = runner.run(Path(directory) / "three.sqlite3")
+            self.assertEqual(
+                outcome.progress.next_candidate_index,
+                space.candidate_count,
+            )
+            self.assertNotIn(
+                0,
+                (row.candidate_index for row in outcome.results()),
+            )
 
     def test_run_identity_binds_position_evidence_that_changes_candidate_order(self):
         _, prepared, baseline, _ = components()
@@ -667,7 +702,9 @@ class ThreeWayStoreTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     store.results(0)
             outcome = ThreeWaySearchOutcome(
-                progress=runner_progress(definition, state), database_path=path
+                progress=runner_progress(definition, state),
+                database_path=path,
+                run_definition=definition,
             )
             rows = outcome.results()
             preview = outcome.results(1)
@@ -812,7 +849,9 @@ class ThreeWayStoreTests(unittest.TestCase):
                         )
                     )
             with self.assertRaises(ThreeWaySearchRunMismatchError):
-                ThreeWaySearchOutcome(runner_progress(other), path).results()
+                ThreeWaySearchOutcome(
+                    runner_progress(other), path, other
+                ).results()
 
     def test_missing_run_row_cannot_rebind_stale_results(self):
         definition = run_definition()
@@ -826,7 +865,9 @@ class ThreeWayStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ThreeWaySearchStoreError, "missing"):
                 ThreeWaySearchStore(path, definition)
             with self.assertRaisesRegex(ThreeWaySearchStoreError, "missing"):
-                ThreeWaySearchOutcome(runner_progress(definition), path).results()
+                ThreeWaySearchOutcome(
+                    runner_progress(definition), path, definition
+                ).results()
 
     def test_wrong_version_one_table_layout_is_rejected(self):
         with TemporaryDirectory() as directory:
@@ -861,7 +902,9 @@ class ThreeWayStoreTests(unittest.TestCase):
                 )
                 database.commit()
             with self.assertRaisesRegex(ThreeWaySearchStoreError, "invalid"):
-                ThreeWaySearchOutcome(runner_progress(definition), path).results(1)
+                ThreeWaySearchOutcome(
+                    runner_progress(definition), path, definition
+                ).results(1)
 
     def test_run_mismatch_and_corrupt_result_fail_closed(self):
         with TemporaryDirectory() as directory:
@@ -886,7 +929,9 @@ class ThreeWayStoreTests(unittest.TestCase):
                 with self.assertRaisesRegex(ThreeWaySearchStoreError, "invalid"):
                     store.resume()
             with self.assertRaisesRegex(ThreeWaySearchStoreError, "invalid"):
-                ThreeWaySearchOutcome(runner_progress(definition), path).results()
+                ThreeWaySearchOutcome(
+                    runner_progress(definition), path, definition
+                ).results()
 
     def test_tampered_adjustment_conflict_fails_closed(self):
         with TemporaryDirectory() as directory:
@@ -905,7 +950,9 @@ class ThreeWayStoreTests(unittest.TestCase):
                 )
                 database.commit()
             with self.assertRaisesRegex(ThreeWaySearchStoreError, "invalid"):
-                ThreeWaySearchOutcome(runner_progress(definition), path).results()
+                ThreeWaySearchOutcome(
+                    runner_progress(definition), path, definition
+                ).results()
 
 
 def runner_progress(definition, state=None):

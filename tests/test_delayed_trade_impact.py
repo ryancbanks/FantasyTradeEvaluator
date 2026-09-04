@@ -39,7 +39,7 @@ def _projection(player_id, week, points):
         status=ProjectionStatus.OBSERVED,
         provider_observations=(
             ProviderObservation(
-                "source",
+                "espn",
                 f"source-{player_id}",
                 ProjectionStatus.OBSERVED,
                 points,
@@ -114,7 +114,13 @@ class DelayedTradeImpactTests(unittest.TestCase):
             baseline, after, ("a", "b")
         )
 
-        self.assertEqual(delayed.project(1).after, baseline.project(after).after)
+        delayed_now = delayed.project(1)
+        immediate = baseline.project(after)
+        self.assertEqual(delayed_now.after, immediate.after)
+        self.assertEqual(
+            delayed_now.after.scenario_run_id,
+            delayed_now.after_scenario_run_id,
+        )
         self.assertEqual(
             delayed.project(1).for_team("a").expected_wins_delta,
             -2,
@@ -133,6 +139,7 @@ class DelayedTradeImpactTests(unittest.TestCase):
 
         result = delayed.project(2)
 
+        self.assertEqual(result.after.scenario_run_id, result.after_scenario_run_id)
         self.assertEqual(result.for_team("a").expected_wins_delta, -1)
         self.assertEqual(result.for_team("b").expected_wins_delta, 1)
         self.assertEqual(tuple(delayed.project_many((2, 1))), (1, 2))
@@ -152,6 +159,14 @@ class DelayedTradeImpactTests(unittest.TestCase):
 
         self.assertEqual(tuple(results), (1, 2))
         self.assertEqual(results[1].before.scenario_count, 2)
+        self.assertEqual(
+            results[1].before.scenario_run_id,
+            results[1].before_scenario_run_id,
+        )
+        self.assertEqual(
+            results[2].after.scenario_run_id,
+            results[2].after_scenario_run_id,
+        )
         self.assertEqual(
             results[1].before_scenario_run_id,
             results[2].before_scenario_run_id,

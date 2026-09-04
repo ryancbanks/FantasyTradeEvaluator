@@ -527,8 +527,7 @@ def _csv_rows(path: str | Path, required: set[str], maximum_rows: int):
     finally:
         if text is not None:
             text.close()
-        else:
-            binary.close()
+        binary.close()
 
 
 class _BoundedTextLines:

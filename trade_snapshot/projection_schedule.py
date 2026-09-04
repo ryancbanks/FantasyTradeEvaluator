@@ -20,6 +20,78 @@ _ROS_DERIVATION_STATUSES = frozenset(
 )
 
 
+def normalize_ros_active_weeks(
+    row: RemainingSeasonProjection,
+    *,
+    nfl_team_id: str,
+    nfl_schedule: NflSchedule,
+) -> RemainingSeasonProjection:
+    """Seal one ROS row to its verified player-active NFL weeks."""
+
+    if not isinstance(row, RemainingSeasonProjection):
+        raise ValueError("row must be a RemainingSeasonProjection")
+    if not isinstance(nfl_schedule, NflSchedule):
+        raise ValueError("nfl_schedule must be an NflSchedule")
+    if not isinstance(nfl_team_id, str) or not nfl_team_id:
+        raise ValueError("nfl_team_id must be a non-empty string")
+    if row.status is ProjectionStatus.NOT_APPLICABLE:
+        return row
+    active_weeks = tuple(
+        week
+        for week in row.applicable_weeks
+        if nfl_schedule.team_week(nfl_team_id, week).status
+        is NflTeamWeekStatus.SCHEDULED
+    )
+    if not active_weeks:
+        raise ValueError(
+            f"ROS projection for {row.canonical_player_id!r} has no remaining NFL games"
+        )
+    return replace(row, applicable_weeks=active_weeks)
+
+
+def validate_weekly_projection_schedule(
+    nfl_schedule: NflSchedule,
+    player_nfl_team_ids: Mapping[str, str],
+    evidence: Iterable[WeeklyProjection | RemainingSeasonProjection],
+) -> None:
+    """Validate every retained weekly row against the authoritative NFL schedule."""
+
+    if not isinstance(nfl_schedule, NflSchedule):
+        raise ValueError("nfl_schedule must be an NflSchedule")
+    if not isinstance(player_nfl_team_ids, Mapping):
+        raise ValueError("player_nfl_team_ids must be a mapping")
+    for row in evidence:
+        if not isinstance(row, WeeklyProjection) or row.canonical_player_id is None:
+            continue
+        expected_team = player_nfl_team_ids.get(row.canonical_player_id)
+        if expected_team is None:
+            raise ValueError("weekly evidence player is absent from the projection grid")
+        if row.nfl_team_id not in {None, expected_team}:
+            raise ValueError("weekly evidence NFL team conflicts with the projection grid")
+        team_week = nfl_schedule.team_week(expected_team, row.week)
+        if team_week.status is NflTeamWeekStatus.BYE:
+            if row.status not in {
+                ProjectionStatus.BYE,
+                ProjectionStatus.NOT_PUBLISHED,
+            }:
+                raise ValueError("weekly evidence conflicts with an NFL bye")
+            if any(
+                value is not None
+                for value in (row.nfl_game_id, row.opponent_team_id, row.is_home)
+            ):
+                raise ValueError("weekly bye evidence contains scheduled-game context")
+            continue
+        if row.status is ProjectionStatus.BYE:
+            raise ValueError("weekly evidence conflicts with a scheduled NFL game")
+        for actual, expected in (
+            (row.nfl_game_id, team_week.nfl_game_id),
+            (row.opponent_team_id, team_week.opponent_team_id),
+            (row.is_home, team_week.is_home),
+        ):
+            if actual is not None and actual != expected:
+                raise ValueError("weekly evidence game context conflicts with NFL schedule")
+
+
 def materialize_weekly_grid(
     state: LeagueState,
     evidence: Iterable[WeeklyProjection | RemainingSeasonProjection],
@@ -61,8 +133,6 @@ def materialize_weekly_grid(
         elif references[key] != row.provider_player_id:
             raise ValueError("one player/provider has conflicting provider IDs")
         if isinstance(row, WeeklyProjection):
-            if row.week not in state.remaining_regular_season_weeks:
-                continue
             row_key = (*key, row.week)
             if row_key in weekly:
                 raise ValueError("projection evidence contains a duplicate weekly row")
@@ -103,20 +173,22 @@ def _player_provider_rows(
     state, player, provider, provider_id, nfl_team, nfl_schedule, weekly, ros
 ) -> tuple[WeeklyProjection, ...]:
     weeks = state.remaining_regular_season_weeks
+    scope_weeks, schedule, active = _ros_schedule_scope(
+        weeks,
+        nfl_team,
+        nfl_schedule,
+        ros,
+        player,
+        provider,
+    )
     published = {
         week: weekly[(player, provider, week)]
-        for week in weeks
+        for week in scope_weeks
         if (player, provider, week) in weekly
     }
-    schedule = {week: nfl_schedule.team_week(nfl_team, week) for week in weeks}
-    active = {
-        week
-        for week, team_week in schedule.items()
-        if team_week.status is NflTeamWeekStatus.SCHEDULED
-    }
-    _validate_ros_weeks(weeks, active, ros, player, provider)
+    _validate_published_schedule(published, schedule)
     derived_points, derived_stats = _ros_derivation(
-        weeks, active, published, ros
+        scope_weeks, active, published, ros
     )
     result = []
     for week in weeks:
@@ -182,7 +254,11 @@ def _player_provider_rows(
                 state.season,
                 week,
                 ProjectionStatus.OBSERVED,
-                ros.captured_at,
+                max(
+                    row.captured_at
+                    for row in (published_row, ros)
+                    if row is not None
+                ),
                 derived_points,
                 derived_stats,
                 nfl_team_id=nfl_team,
@@ -191,20 +267,57 @@ def _player_provider_rows(
                 is_home=team_week.is_home,
                 source_published_at=ros.source_published_at,
                 origin=WeeklyProjectionOrigin.DERIVED_REST_OF_SEASON,
+                provider_status_observations=_merged_status_observations(
+                    *(row for row in (published_row, ros) if row is not None)
+                ),
             )
         )
     return tuple(result)
 
 
-def _validate_ros_weeks(weeks, active, ros, player, provider):
-    if ros is None or ros.status is not ProjectionStatus.OBSERVED:
-        return
-    declared = set(ros.applicable_weeks)
-    if declared not in (set(weeks), set(active)):
+def _ros_schedule_scope(weeks, nfl_team, nfl_schedule, ros, player, provider):
+    declared = (
+        set(ros.applicable_weeks)
+        if ros is not None and ros.status is ProjectionStatus.OBSERVED
+        else set()
+    )
+    if declared and min(declared) < weeks[0]:
+        raise ValueError(
+            f"ROS projection for {(player, provider)!r} predates the league snapshot"
+        )
+    final_week = max((*weeks, *declared))
+    scope_weeks = tuple(range(weeks[0], final_week + 1))
+    schedule = {
+        week: nfl_schedule.team_week(nfl_team, week) for week in scope_weeks
+    }
+    active = {
+        week
+        for week, team_week in schedule.items()
+        if team_week.status is NflTeamWeekStatus.SCHEDULED
+    }
+    if declared and declared not in (set(scope_weeks), active):
         raise ValueError(
             f"ROS projection for {(player, provider)!r} has applicable weeks "
             "that conflict with the verified NFL schedule"
         )
+    return scope_weeks, schedule, active
+
+
+def _validate_published_schedule(published, schedule):
+    for week, row in published.items():
+        team_week = schedule[week]
+        if team_week.status is NflTeamWeekStatus.BYE:
+            if row.status not in {
+                ProjectionStatus.BYE,
+                ProjectionStatus.NOT_PUBLISHED,
+            }:
+                raise ValueError("provider projection conflicts with a verified NFL bye")
+            if row.nfl_team_id not in {None, team_week.nfl_team_id}:
+                raise ValueError(
+                    "provider NFL team conflicts with the verified NFL schedule"
+                )
+        else:
+            _scheduled_row(row, team_week)
 
 
 def _ros_derivation(weeks, active, published, ros):
@@ -236,21 +349,47 @@ def _derived_points(ros, published, missing_weeks, active):
         for week, row in published.items()
         if week in active and row.status is ProjectionStatus.OBSERVED
     )
-    return (ros.projected_fantasy_points - observed) / len(missing_weeks)
+    return _residual_average(
+        "projected fantasy points",
+        ros.projected_fantasy_points,
+        observed,
+        len(missing_weeks),
+    )
 
 
 def _derived_stats(ros, published, missing_weeks, active):
     if not missing_weeks or ros is None or ros.status is not ProjectionStatus.OBSERVED:
         return {}
     result = {}
+    observed_rows = tuple(
+        row
+        for week, row in published.items()
+        if week in active and row.status is ProjectionStatus.OBSERVED
+    )
     for name, total in ros.raw_projected_stats.items():
+        if any(name not in row.raw_projected_stats for row in observed_rows):
+            continue
         observed = fsum(
-            row.raw_projected_stats.get(name, 0)
-            for week, row in published.items()
-            if week in active and row.status is ProjectionStatus.OBSERVED
+            row.raw_projected_stats[name] for row in observed_rows
         )
-        result[name] = (total - observed) / len(missing_weeks)
+        result[name] = _residual_average(
+            f"raw projection stat {name!r}",
+            total,
+            observed,
+            len(missing_weeks),
+        )
     return result
+
+
+def _residual_average(label, total, observed, missing_count):
+    residual = total - observed
+    tolerance = max(1e-9, abs(total) * 1e-12)
+    if residual < -tolerance:
+        raise ValueError(
+            f"ROS {label} total is smaller than its observed weekly subtotal; "
+            "the captures are not coherent enough for residual allocation"
+        )
+    return max(0.0, residual) / missing_count
 
 
 def _scheduled_row(row: WeeklyProjection, team_week: NflTeamWeek) -> WeeklyProjection:
@@ -317,6 +456,19 @@ def _bye_row(
             else published_row.source_published_at if published_row is not None else None
         ),
         origin=WeeklyProjectionOrigin.DERIVED_REST_OF_SEASON,
+        provider_status_observations=_merged_status_observations(
+            *(row for row in (published_row, ros) if row is not None)
+        ),
+    )
+
+
+def _merged_status_observations(*rows):
+    return tuple(
+        dict.fromkeys(
+            observation
+            for row in rows
+            for observation in row.provider_status_observations
+        )
     )
 
 

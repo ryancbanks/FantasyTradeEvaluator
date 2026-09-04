@@ -2,6 +2,7 @@ import http.client
 import json
 import time
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -19,7 +20,6 @@ from trade_snapshot.league_history import (
     HistoryTeamRoster,
     LeagueHistoryCapture,
     LeagueHistoryStore,
-    make_league_key,
 )
 from trade_snapshot.local_server import create_local_server
 from trade_snapshot.operation_timing import OperationTiming
@@ -31,6 +31,8 @@ from trade_snapshot.weekly_collection import (
     WeeklyCollectionPublication,
     WeeklyCollectionRequest,
     WeeklyCollectionStage,
+    WeeklyHistoryAttempt,
+    load_weekly_history_attempt,
 )
 
 
@@ -242,7 +244,7 @@ class HistoryWorkflow(SuccessfulWorkflow):
 
 def history_publication(bundle):
     captured_at = datetime(2026, 9, 1, tzinfo=timezone.utc)
-    league_key = make_league_key("espn", "test-private-league")
+    league_key = bundle.source_manifest.league_binding_id
     names = {team.team_id: team.name for team in bundle.state.teams}
     capture = LeagueHistoryCapture(
         league_key=league_key,
@@ -279,9 +281,9 @@ def history_publication(bundle):
 
 
 class WeeklyCollectionRequestTests(unittest.TestCase):
-    def test_direct_request_defaults_to_current_week_plus_ros(self):
+    def test_direct_request_defaults_to_maximum_weekly_projection_coverage(self):
         request = WeeklyCollectionRequest(2026, 1, "PPR")
-        self.assertFalse(request.include_future_weekly)
+        self.assertTrue(request.include_future_weekly)
         self.assertIsNone(request.yahoo_projection_league_url)
         self.assertFalse(request.refresh_public_player_data)
 
@@ -398,6 +400,67 @@ class WeeklyCollectionRequestTests(unittest.TestCase):
         for changes in invalid:
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 valid_request(**changes)
+
+
+class WeeklyHistoryAttemptTests(unittest.TestCase):
+    def test_not_provided_does_not_claim_a_provider_or_capture_evidence(self):
+        record = WeeklyHistoryAttempt.not_provided().to_record()
+
+        self.assertEqual(record["status"], "not_provided")
+        self.assertIsNone(record["source_provider"])
+        self.assertIsNone(record["attempted_at"])
+        self.assertIsNone(record["capture_id"])
+        self.assertIsNone(record["transactions_complete"])
+
+    def test_not_provided_rejects_invented_attempt_evidence(self):
+        with self.assertRaisesRegex(ValueError, "cannot invent evidence"):
+            WeeklyHistoryAttempt(
+                "not_provided",
+                "not_provided",
+                None,
+                source_provider="espn",
+            )
+        with self.assertRaisesRegex(ValueError, "status and reason"):
+            WeeklyHistoryAttempt(
+                "unavailable",
+                "not_provided",
+                datetime(2026, 9, 1, tzinfo=timezone.utc),
+                source_provider="espn",
+            )
+
+    def test_loader_rejects_a_document_bound_to_a_different_bundle(self):
+        bundle_id = "engine_" + "1" * 64
+        with TemporaryDirectory() as directory:
+            attempt_directory = Path(directory) / "history-attempts"
+            attempt_directory.mkdir()
+            (attempt_directory / f"{bundle_id}.json").write_text(
+                json.dumps(
+                    {
+                        "bundle_id": "engine_" + "2" * 64,
+                        "history_attempt": WeeklyHistoryAttempt.not_provided().to_record(),
+                        "schema_version": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "identity"):
+                load_weekly_history_attempt(directory, bundle_id)
+
+    def test_publication_rejects_attempt_from_a_different_capture(self):
+        publication = history_publication(engine_bundle())
+        mismatched_attempt = replace(
+            publication.history_attempt,
+            capture_id="history-from-a-different-capture",
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            WeeklyCollectionPublication(
+                publication.bundle,
+                publication.history_capture,
+                publication.history_binding,
+                mismatched_attempt,
+            )
 
 
 class WeeklyCollectionJobTests(unittest.TestCase):
@@ -644,6 +707,16 @@ class WeeklyCollectionJobTests(unittest.TestCase):
             finished = wait_for_collection(jobs.job, started["job_id"])
             bundle_path = Path(directory) / "bundles" / f"{finished['bundle_id']}.json"
             bundle_exists = bundle_path.is_file()
+            attempt_path = (
+                Path(directory)
+                / "history-attempts"
+                / f"{finished['bundle_id']}.json"
+            )
+            attempt_record = json.loads(attempt_path.read_text(encoding="utf-8"))
+            loaded_attempt = load_weekly_history_attempt(
+                directory,
+                finished["bundle_id"],
+            )
 
         self.assertEqual(finished["status"], "complete")
         self.assertEqual(finished["progress"]["stage"], "ready")
@@ -656,6 +729,12 @@ class WeeklyCollectionJobTests(unittest.TestCase):
         self.assertIsNone(finished["request"]["expected_team_count"])
         self.assertFalse(finished["request"]["allow_surrogate_power"])
         self.assertFalse(finished["request"]["refresh_public_player_data"])
+        self.assertEqual(finished["history_attempt"]["status"], "not_provided")
+        self.assertIsNone(finished["history_attempt"]["source_provider"])
+        self.assertEqual(
+            attempt_record["history_attempt"], finished["history_attempt"]
+        )
+        self.assertEqual(loaded_attempt.to_record(), finished["history_attempt"])
         self.assertEqual(len(workflow.calls), 1)
 
     def test_publishes_bound_history_before_exposing_the_weekly_bundle(self):
@@ -698,7 +777,7 @@ class WeeklyCollectionJobTests(unittest.TestCase):
         self.assertIsNotNone(history)
         self.assertEqual(history.bundle_id, finished["bundle_id"])
 
-    def test_history_failure_does_not_expose_an_unbound_bundle(self):
+    def test_optional_history_failure_still_publishes_the_core_bundle(self):
         workflow = HistoryWorkflow()
         with TemporaryDirectory() as directory, patch(
             "trade_snapshot.weekly_collection.LeagueHistoryStore.ingest",
@@ -708,12 +787,27 @@ class WeeklyCollectionJobTests(unittest.TestCase):
             started = jobs.start(valid_request())
             finished = wait_for_collection(jobs.job, started["job_id"])
             bundles = tuple((Path(directory) / "bundles").glob("*.json"))
+            attempt_path = (
+                Path(directory)
+                / "history-attempts"
+                / f"{finished['bundle_id']}.json"
+            )
+            attempt_record = json.loads(attempt_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(finished["status"], "failed")
-        self.assertEqual(bundles, ())
-        self.assertNotIn("history unavailable", finished["error"])
+        self.assertEqual(finished["status"], "complete")
+        self.assertEqual(len(bundles), 1)
+        self.assertEqual(finished["history_attempt"]["status"], "unavailable")
+        self.assertEqual(
+            finished["history_attempt"]["reason_code"], "store_unavailable"
+        )
+        self.assertEqual(attempt_record["bundle_id"], finished["bundle_id"])
+        self.assertEqual(
+            attempt_record["history_attempt"], finished["history_attempt"]
+        )
+        self.assertNotIn("history unavailable", json.dumps(attempt_record))
+        self.assertIsNone(finished["error"])
 
-    def test_final_save_failure_keeps_a_bound_exact_stage_and_startup_recovers(self):
+    def test_final_save_failure_keeps_a_validated_stage_and_startup_recovers(self):
         workflow = HistoryWorkflow()
         expected = engine_bundle()
         with TemporaryDirectory() as directory:
@@ -751,7 +845,7 @@ class WeeklyCollectionJobTests(unittest.TestCase):
         self.assertFalse(stage_exists_after_recovery)
         self.assertFalse(recovered_jobs.available)
 
-    def test_startup_does_not_promote_an_unbound_private_stage(self):
+    def test_startup_promotes_a_validated_stage_without_optional_history(self):
         expected = engine_bundle()
         with TemporaryDirectory() as directory:
             bundle_directory = Path(directory) / "bundles"
@@ -765,10 +859,10 @@ class WeeklyCollectionJobTests(unittest.TestCase):
 
             WeeklyCollectionJobs(directory, bundle_directory, None)
             final_exists = final_path.exists()
-            stage_remains_private = staged_path.exists()
+            stage_exists = staged_path.exists()
 
-        self.assertFalse(final_exists)
-        self.assertTrue(stage_remains_private)
+        self.assertTrue(final_exists)
+        self.assertFalse(stage_exists)
 
     def test_cancellation_and_expected_failure_publish_nothing(self):
         entered = Event()
@@ -884,6 +978,71 @@ class WeeklyCollectionServiceTests(unittest.TestCase):
         )
         self.assertIsNotNone(history)
 
+    def test_assigning_a_direct_collection_preserves_only_its_history_evidence(self):
+        workflow = HistoryWorkflow()
+        unrelated_bundle_id = "engine_" + "9" * 64
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = LocalAppService(
+                directory,
+                weekly_collection_workflow=workflow,
+            )
+            started = service.start_weekly_collection(valid_request())
+            finished = wait_for_collection(
+                service.weekly_collection,
+                started["job_id"],
+            )
+            bundle_id = finished["bundle_id"]
+            source_store = LeagueHistoryStore(root / LEAGUE_HISTORY_FILENAME)
+            source_snapshot = source_store.snapshot_for_bundle(bundle_id)
+            unrelated_capture = replace(
+                source_snapshot.captures[0],
+                league_key="league_" + "f" * 32,
+            )
+            source_store.ingest(
+                unrelated_capture,
+                bundle=HistoryBundleBinding(
+                    unrelated_capture.league_key,
+                    unrelated_capture.season,
+                    unrelated_bundle_id,
+                    unrelated_capture.captured_at,
+                ),
+            )
+            profile = service.create_league_profile({
+                "name": "Assigned direct collection",
+                "season": 2026,
+                "scoring": "PPR",
+                "host_league_url": (
+                    "https://fantasy.espn.com/football/league?leagueId=123"
+                ),
+                "yahoo_projection_league_url": (
+                    "https://football.fantasysports.yahoo.com/f1/456/players"
+                ),
+            })
+
+            service.assign_bundle_to_league(profile["profile_id"], bundle_id)
+
+            workspace = root / "leagues" / profile["profile_id"]
+            destination_store = LeagueHistoryStore(
+                workspace / LEAGUE_HISTORY_FILENAME
+            )
+            migrated = destination_store.snapshot_for_bundle(bundle_id)
+            unrelated_migrated = destination_store.snapshot_for_bundle(
+                unrelated_bundle_id
+            )
+            migrated_attempt = load_weekly_history_attempt(workspace, bundle_id)
+            insights = service.gm_insights(bundle_id)
+
+        self.assertEqual(migrated, source_snapshot)
+        self.assertIsNone(unrelated_migrated)
+        self.assertEqual(migrated_attempt.to_record(), finished["history_attempt"])
+        self.assertNotEqual(insights["status"], "not_collected")
+        self.assertEqual(insights["data_readiness"]["store_status"], "available")
+        self.assertEqual(
+            insights["data_readiness"]["collection_attempt"]["status"],
+            "captured",
+        )
+
     def test_collection_registers_bundle_and_search_does_not_call_collection_workflow(self):
         workflow = SuccessfulWorkflow()
         bundle = engine_bundle()
@@ -998,9 +1157,10 @@ class WeeklyCollectionHTTPTests(unittest.TestCase):
         self.assertNotIn('id="expectedTeamCount"', page)
         self.assertIn("League size, every team, and every roster are detected", page)
         self.assertIn('id="hostLeagueUrl"', page)
-        self.assertNotIn(
+        self.assertIn(
             'id="includeFutureWeekly" type="checkbox" checked', page
         )
+        self.assertIn("recommended for matchup-level forecasts", page)
         self.assertIn('id="yahooProjectionUrl"', page)
         self.assertIn("Yahoo league or player-list link", page)
         self.assertIn('id="useFantasyPros" type="checkbox" checked', page)

@@ -10,19 +10,21 @@ from .ensemble import EnsembleConfig, EnsembleProjection, fuse_weekly_projection
 from .feature_engineering import StrengthFeatureSet, build_strength_features
 from .league_state import LeagueState
 from .formula_verification import FormulaVerificationReport
+from .fantasypros_benchmark import FantasyProsLeagueBenchmark
 from .methodology_attestation import MethodologyAttestation
-from .methodology import default_projection_ensemble
 from .methodology_reuse import FormulaReuseDecision, MethodologyFingerprint
-from .nfl_schedule import NflSchedule
+from .nfl_schedule import NflSchedule, NflTeamWeekStatus
 from .projections import RemainingSeasonProjection, WeeklyProjection
-from .projection_schedule import materialize_weekly_grid
+from .projection_schedule import materialize_weekly_grid, normalize_ros_active_weeks
 from .projection_source_policy import (
     validate_no_composite_double_count,
     validate_selectable_projection_providers,
 )
+from .projection_source import ProjectionSourceManifest
 from .positions import normalize_player_position
 from .scenario_config import CorrelatedScenarioConfig, PlayerEligibility
 from .scoring import ScoringProfile
+from .source_manifest import WeeklySourceManifest
 from .strength import CalibrationStatus
 from .strength_formula import StrengthFormula
 from .surrogate_disclosure import SurrogateDisclosure
@@ -48,6 +50,9 @@ def build_weekly_engine(
     player_nfl_team_ids: Mapping[str, str],
     player_names: Mapping[str, str],
     nfl_schedule: NflSchedule,
+    source_manifest: WeeklySourceManifest,
+    projection_source_manifest: ProjectionSourceManifest,
+    fantasypros_benchmark: FantasyProsLeagueBenchmark,
     ensemble_config: EnsembleConfig,
     scenario_config: CorrelatedScenarioConfig,
     strength_formula: StrengthFormula,
@@ -65,8 +70,34 @@ def build_weekly_engine(
         raise ValueError("scoring_profile must be a ScoringProfile")
     if scoring_profile.scoring_profile_id != state.scoring_profile_id:
         raise ValueError("league state does not match the exact scoring profile")
+    if not isinstance(source_manifest, WeeklySourceManifest):
+        raise ValueError("source_manifest must be a WeeklySourceManifest")
+    if source_manifest.host_snapshot_id != state.snapshot_id:
+        raise ValueError("source manifest does not match the league snapshot")
+    if not isinstance(projection_source_manifest, ProjectionSourceManifest):
+        raise ValueError(
+            "projection_source_manifest must be a ProjectionSourceManifest"
+        )
+    if (
+        projection_source_manifest.evaluation_scoring_profile_id
+        != state.scoring_profile_id
+    ):
+        raise ValueError(
+            "projection source manifest does not match the league scoring profile"
+        )
+    if not isinstance(fantasypros_benchmark, FantasyProsLeagueBenchmark):
+        raise ValueError(
+            "fantasypros_benchmark must be a FantasyProsLeagueBenchmark"
+        )
+    if fantasypros_benchmark.snapshot_id != state.snapshot_id:
+        raise ValueError("FantasyPros benchmark does not match the league snapshot")
     rosters = tuple(rosters)
-    evidence = tuple(projection_evidence)
+    evidence = _normalize_ros_evidence(
+        tuple(projection_evidence),
+        player_nfl_team_ids,
+        nfl_schedule,
+    )
+    projection_source_manifest.validate_projection_evidence(evidence)
     ecr = tuple(ecr_snapshots)
     eligibility = tuple(eligibilities)
     if not isinstance(ensemble_config, EnsembleConfig):
@@ -130,7 +161,13 @@ def build_weekly_engine(
         rosters=rosters,
         projections=prepared.projections,
         eligibilities=eligibility,
+        nfl_schedule=nfl_schedule,
+        source_manifest=source_manifest,
+        projection_source_manifest=projection_source_manifest,
+        fantasypros_benchmark=fantasypros_benchmark,
+        ensemble_config=ensemble_config,
         scenario_config=scenario_config,
+        strength_formula=strength_formula,
         strength_model=model,
         ecr_snapshots=ecr,
         projection_evidence=evidence,
@@ -160,10 +197,14 @@ def prepare_weekly_model_inputs(
         raise ValueError("ensemble_config must be an EnsembleConfig")
     if not isinstance(nfl_schedule, NflSchedule):
         raise ValueError("nfl_schedule must be an NflSchedule")
+    evidence = _normalize_ros_evidence(
+        tuple(projection_evidence),
+        player_nfl_team_ids,
+        nfl_schedule,
+    )
     ecr = tuple(ecr_snapshots)
     eligibility = tuple(eligibilities)
     positions = _positions(player_positions)
-    evidence = tuple(projection_evidence)
     ensembles = prepare_projection_ensemble(
         state,
         evidence,
@@ -172,28 +213,25 @@ def prepare_weekly_model_inputs(
         nfl_schedule=nfl_schedule,
         ensemble_config=ensemble_config,
     )
-    forecast_providers = tuple(
+    providers = tuple(
         row.provider for row in ensemble_config.provider_weights
-    )
-    power_ensembles = (
-        ensembles
-        if forecast_providers == ("fantasypros",)
-        else prepare_projection_ensemble(
-            state,
-            evidence,
-            player_positions=positions,
-            player_nfl_team_ids=player_nfl_team_ids,
-            nfl_schedule=nfl_schedule,
-            ensemble_config=default_projection_ensemble(
-                ("fantasypros",), minimum_observed_sources=1
-            ),
-        )
     )
     features = build_strength_features(
         ecr,
-        power_ensembles,
+        ensembles,
         eligibility,
-        provider_names=("fantasypros",),
+        provider_names=providers,
+        projection_evidence=evidence,
+        remaining_week_scopes={
+            player_id: tuple(
+                row.week
+                for row in nfl_schedule.team_weeks
+                if row.nfl_team_id == player_nfl_team_ids[player_id]
+                and row.week >= state.first_remaining_week
+                and row.status is NflTeamWeekStatus.SCHEDULED
+            )
+            for player_id in positions
+        },
     )
     return WeeklyModelInputs(ensembles, features)
 
@@ -281,3 +319,28 @@ def _positions(value):
             raise ValueError("player_positions values must be non-empty strings")
         result[player_id.strip()] = normalize_player_position(position)
     return result
+
+
+def _normalize_ros_evidence(rows, player_nfl_team_ids, nfl_schedule):
+    if not isinstance(player_nfl_team_ids, Mapping):
+        raise ValueError("player_nfl_team_ids must be a mapping")
+    if not isinstance(nfl_schedule, NflSchedule):
+        raise ValueError("nfl_schedule must be an NflSchedule")
+    if any(
+        not isinstance(row, (WeeklyProjection, RemainingSeasonProjection))
+        for row in rows
+    ):
+        raise ValueError("projection_evidence must contain normalized projections")
+    result = []
+    for row in rows:
+        player_id = row.canonical_player_id
+        if isinstance(row, RemainingSeasonProjection) and player_id is not None:
+            nfl_team_id = player_nfl_team_ids.get(player_id)
+            if nfl_team_id is not None:
+                row = normalize_ros_active_weeks(
+                    row,
+                    nfl_team_id=nfl_team_id,
+                    nfl_schedule=nfl_schedule,
+                )
+        result.append(row)
+    return tuple(result)

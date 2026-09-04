@@ -12,6 +12,7 @@ from ._capture_task_policy import runtime_path_matches_task
 from .capture_schema import (
     CaptureKind, CapturePlan, CaptureTask, ECRRankingRow, LeagueSource, VisibleTable,
 )
+from .ecr_source import EcrSourceDetails
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,13 +42,17 @@ class BrowserCaptureOptions:
 class ECRCaptureData:
     expert_ids: tuple[str, ...]
     expert_count: int
+    source_scoring: str
     last_updated_text: str
     last_updated_at: str | None
+    source_details: EcrSourceDetails
     rankings: tuple[ECRRankingRow, ...]
 
     def __init__(
-        self, expert_ids: Iterable[str], expert_count: int, last_updated_text: str,
-        last_updated_at: str | None, rankings: Iterable[ECRRankingRow],
+        self, expert_ids: Iterable[str], expert_count: int, source_scoring: str,
+        last_updated_text: str, last_updated_at: str | None,
+        source_details: EcrSourceDetails,
+        rankings: Iterable[ECRRankingRow],
     ) -> None:
         try:
             experts, rows = tuple(expert_ids), tuple(rankings)
@@ -60,16 +65,22 @@ class ECRCaptureData:
             or len(experts) != len(set(experts))
         ):
             raise ValueError("expert_count must equal unique expert_ids")
+        if source_scoring not in {"STD", "HALF", "PPR"}:
+            raise ValueError("source_scoring must be STD, HALF, or PPR")
         if not isinstance(last_updated_text, str) or not last_updated_text.strip():
             raise ValueError("last_updated_text must be non-empty")
         if last_updated_at is not None and not isinstance(last_updated_at, str):
             raise ValueError("last_updated_at must be an RFC3339 string or None")
+        if not isinstance(source_details, EcrSourceDetails):
+            raise ValueError("source_details must be EcrSourceDetails")
         if not rows or any(not isinstance(row, ECRRankingRow) for row in rows):
             raise ValueError("rankings must contain ECRRankingRow values")
         object.__setattr__(self, "expert_ids", tuple(sorted(experts)))
         object.__setattr__(self, "expert_count", expert_count)
+        object.__setattr__(self, "source_scoring", source_scoring)
         object.__setattr__(self, "last_updated_text", last_updated_text)
         object.__setattr__(self, "last_updated_at", last_updated_at)
+        object.__setattr__(self, "source_details", source_details)
         object.__setattr__(self, "rankings", rows)
 
 

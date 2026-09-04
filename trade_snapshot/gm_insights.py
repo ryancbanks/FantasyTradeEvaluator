@@ -6,15 +6,22 @@ from datetime import timezone
 import json
 from statistics import median
 
+from ._bundle_evidence import model_analysis_as_of, model_evidence_ids
 from ._league_history_evidence import captured_transaction_evidence
-from ._league_history_health import capture_is_fresh, latest_physical_injury_ids
+from ._league_history_health import (
+    RECOGNIZED_HEALTH_STATUSES,
+    capture_is_fresh,
+    latest_physical_injury_ids,
+)
 from ._gm_decision_signals import (
     counterparty_value_opportunity,
     deal_accessibility,
     hindsight_value_drift,
 )
 from ._gm_evidence import build_trade_evidence
+from ._gm_model_evidence import FORESIGHT_POWER_STATUS
 from ._gm_statistics import partial_pool
+from ._scenario_random import content_id
 from ._gm_team_profiles import (
     _NEUTRAL_POWER_BAND,
     _acquisition_behavior,
@@ -40,7 +47,7 @@ from .league_history import (
 from .roster_compatibility import build_roster_compatibility
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 def build_gm_insights(
@@ -67,12 +74,22 @@ def build_gm_insights(
     transactions, first_observed_at = captured_transaction_evidence(captures)
     transactions = tuple(row for row in transactions if row.recorded_at <= as_of)
     latest_capture = max(captures, key=lambda row: (row.captured_at, row.capture_id), default=None)
+    latest_roster_capture = max(
+        (row for row in captures if row.roster_complete),
+        key=lambda row: (row.captured_at, row.capture_id),
+        default=None,
+    )
+    latest_lineup_capture = max(
+        (row for row in captures if row.lineup_complete),
+        key=lambda row: (row.captured_at, row.capture_id),
+        default=None,
+    )
     capture_fresh = capture_is_fresh(latest_capture, as_of)
     transaction_complete = bool(
         capture_fresh and latest_capture.transaction_history_complete
     )
-    roster_complete = bool(capture_fresh and latest_capture.roster_complete)
-    lineup_complete = bool(capture_fresh and latest_capture.lineup_complete)
+    roster_complete = capture_is_fresh(latest_roster_capture, as_of)
+    lineup_complete = capture_is_fresh(latest_lineup_capture, as_of)
     observed_weeks = max(0, min(
         bundle.state.first_remaining_week - 1,
         bundle.state.playoff_rules.regular_season_end_week,
@@ -99,11 +116,11 @@ def build_gm_insights(
     league_edges = tuple(
         outcome.relative_power_edge
         for row in valuations
-        if row.methodology_status == "exact"
+        if row.methodology_status == FORESIGHT_POWER_STATUS
         for outcome in row.outcomes
     )
     current_roster_captures = (
-        (latest_capture,)
+        (latest_roster_capture,)
         if roster_complete
         else ()
     )
@@ -113,6 +130,9 @@ def build_gm_insights(
     position_needs = _position_needs(bundle)
     current_injuries = latest_physical_injury_ids(
         current_roster_captures, as_of
+    )
+    current_health_status = _current_health_status(
+        latest_roster_capture, roster_complete
     )
     compatibility_report = build_roster_compatibility(
         bundle,
@@ -153,7 +173,7 @@ def build_gm_insights(
             [
                 outcome.relative_power_edge
                 for valuation, outcome in rows
-                if valuation.methodology_status == "exact"
+                if valuation.methodology_status == FORESIGHT_POWER_STATUS
             ],
             league_edges,
         )) is not None
@@ -278,7 +298,17 @@ def build_gm_insights(
         "bundle_id": bundle.bundle_id,
         "league_history_id": history.history_revision,
         "as_of": _iso(as_of),
+        "analysis_as_of": _iso(as_of),
         "status": status,
+        "evidence": _report_evidence(
+            bundle,
+            history,
+            captures,
+            valuations,
+            valuation_evidence_id=(
+                None if valuation_result is None else valuation_result.evidence_id
+            ),
+        ),
         "scope": {
             "season": history.season,
             "identity_mode": "team_season",
@@ -314,12 +344,26 @@ def build_gm_insights(
             "rosters": {
                 "status": "complete" if roster_complete else "partial",
                 "snapshot_count": len(captures),
+                "current_evidence_capture_id": (
+                    None
+                    if latest_roster_capture is None
+                    else latest_roster_capture.capture_id
+                ),
             },
             "lineups": {
                 "status": "complete_at_capture_times" if lineup_complete else "partial",
                 "snapshot_count": len(captures),
+                "current_evidence_capture_id": (
+                    None
+                    if latest_lineup_capture is None
+                    else latest_lineup_capture.capture_id
+                ),
             },
         },
+        "current_trade_feasibility": _current_trade_feasibility(
+            current_health_status,
+            len(current_injuries),
+        ),
         "methodology": {
             "trade_propensity": (
                 "Completed-trade weeks use a Jeffreys beta posterior; the two-week "
@@ -334,12 +378,14 @@ def build_gm_insights(
             ),
             "current_revaluation": (
                 "The selected current model re-scores the identical traded packages in "
-                "the same reconstructed pre-trade rosters. This is hindsight value drift, "
-                "never a replacement for missing at-time evidence."
+                "the same reconstructed pre-trade rosters. Foresight labels additionally "
+                "require matching formula, methodology fingerprint, input providers, "
+                "scoring basis, and horizons. This is hindsight value drift, never a "
+                "replacement for missing at-time evidence."
             ),
             "decision_dimensions": {
                 "deal_accessibility": "Completed-deal activity, recency, partner breadth, and package variety only.",
-                "counterparty_value_opportunity": "Exactly the negative of exact contemporaneous relative power edge; no activity input.",
+                "counterparty_value_opportunity": "Exactly the negative of blind-holdout-validated contemporaneous relative power edge; no activity input.",
                 "roster_compatibility": "Current positional complement, roster capacity, and mutually positive current power screens only; no behavior input.",
             },
             "value_style_neutral_band": {
@@ -355,6 +401,7 @@ def build_gm_insights(
                 "Older trades without a strictly prior weekly model remain unvalued rather than using today's data.",
                 "Foresight labels exclude trades with captured physical injuries or incomplete weekly health evidence; raw then/current comparisons remain visible.",
                 "Role changes, performance variance, and information learned after a trade can still drive hindsight value drift, so the result is not causal.",
+                "Trade deadlines, transaction processing, player locks, and undroppable lists are not captured, so current trade legality requires host verification.",
             ],
         },
         "league_baselines": {
@@ -379,7 +426,9 @@ def _empty_result(bundle, compatibility_report):
         "bundle_id": bundle.bundle_id,
         "league_history_id": None,
         "as_of": None,
+        "analysis_as_of": _iso(_bundle_analysis_as_of(bundle)),
         "status": "not_collected",
+        "evidence": _report_evidence(bundle, None, (), ()),
         "scope": {
             "season": bundle.state.season,
             "identity_mode": "team_season",
@@ -403,9 +452,20 @@ def _empty_result(bundle, compatibility_report):
                 "current_revaluation_unavailable_reasons": {},
                 "foresight_eligible_trades": None,
             },
-            "rosters": {"status": "not_collected", "snapshot_count": 0},
-            "lineups": {"status": "not_collected", "snapshot_count": 0},
+            "rosters": {
+                "status": "not_collected",
+                "snapshot_count": 0,
+                "current_evidence_capture_id": None,
+            },
+            "lineups": {
+                "status": "not_collected",
+                "snapshot_count": 0,
+                "current_evidence_capture_id": None,
+            },
         },
+        "current_trade_feasibility": _current_trade_feasibility(
+            "history_not_collected", 0
+        ),
         "methodology": {
             "trade_propensity": "Requires a verified completed-transaction ledger.",
             "trade_value": "Requires a weekly model captured before a completed trade.",
@@ -416,7 +476,10 @@ def _empty_result(bundle, compatibility_report):
                 "roster_compatibility": "Requires the selected current weekly bundle.",
             },
             "value_style_neutral_band": {"unit": "power_points_per_trade", "lower": -_NEUTRAL_POWER_BAND, "upper": _NEUTRAL_POWER_BAND, "basis": "the app's one-decimal displayed power precision"},
-            "limitations": ["This imported or older weekly model has no locally bound league activity history."],
+            "limitations": [
+                "This imported or older weekly model has no locally bound league activity history.",
+                "Trade deadlines, transaction processing, player locks, undroppable lists, and current health are not verified.",
+            ],
         },
         "league_baselines": {},
         "teams": [
@@ -458,6 +521,83 @@ def _compatibility_teams(report):
         }
         for row in report["teams"]
     }
+
+
+def _current_health_status(latest_capture, roster_complete):
+    if latest_capture is None:
+        return "history_not_collected"
+    if not roster_complete:
+        return "current_health_unavailable"
+    if any(
+        player.injury_status not in RECOGNIZED_HEALTH_STATUSES
+        for roster in latest_capture.rosters
+        for player in roster.players
+    ):
+        return "partial_or_unrecognized_statuses"
+    return "complete_and_fresh"
+
+
+def _current_trade_feasibility(health_status, physical_injury_count):
+    return {
+        "status": "manual_verification_required",
+        "roster_capacity_and_ownership_modeled": True,
+        "current_health_screen_status": health_status,
+        "known_physical_injury_count": physical_injury_count,
+        "trade_deadline_status": "not_captured",
+        "transaction_processing_rules_status": "not_captured",
+        "player_lock_status": "not_captured",
+        "undroppable_player_status": "not_captured",
+        "host_legality_verified": False,
+    }
+
+
+def _report_evidence(
+    bundle,
+    history,
+    captures,
+    valuations,
+    *,
+    valuation_evidence_id=None,
+):
+    model_ids = model_evidence_ids(bundle)
+    source_models = tuple(
+        sorted(
+            {
+                row.source_model_evidence.evidence_id
+                for row in valuations
+            }
+        )
+    )
+    current_models = tuple(
+        sorted(
+            {
+                row.current_revaluation.model_evidence.evidence_id
+                for row in valuations
+                if row.current_revaluation is not None
+            }
+        )
+    )
+    record = {
+        "analysis_as_of": _iso(
+            history.bundle_captured_at
+            if history is not None
+            else _bundle_analysis_as_of(bundle)
+        ),
+        "host_snapshot_id": bundle.state.snapshot_id,
+        "strength_model_id": bundle.strength_model.model_id,
+        **model_ids,
+        "scenario_config_id": bundle.scenario_config.config_id,
+        "history_revision": None if history is None else history.history_revision,
+        "history_capture_ids": sorted(row.capture_id for row in captures),
+        "historical_model_evidence_ids": list(source_models),
+        "current_model_evidence_ids": list(current_models),
+        "historical_valuation_evidence_id": valuation_evidence_id,
+    }
+    return {**record, "evidence_id": content_id("gm-report-evidence", record)}
+
+
+def _bundle_analysis_as_of(bundle):
+    return model_analysis_as_of(bundle)
 
 
 __all__ = ("build_gm_insights",)

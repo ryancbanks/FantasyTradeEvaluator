@@ -31,7 +31,7 @@ window.GmInsightsEvidenceUi = (() => {
       return panel;
     }
     const method = F.plainText(value.status);
-    if (method) panel.append(statusBadge(method === "exact" ? "Exact method" : `${method.replaceAll("_", " ")} method`));
+    if (method) panel.append(statusBadge(method === "holdout_validated" ? "Holdout-validated method" : `${method.replaceAll("_", " ")} method`));
     const facts = node("dl", "gm-insights-valuation-facts");
     for (const [label, result] of valuationFacts(value)) {
       const wrapper = node("div");

@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -133,11 +134,19 @@ class CompletedDealTimingProfileTests(unittest.TestCase):
 
         self.assertEqual(tuple(result), ("a", "b"))
         for profile in result.values():
+            self.assertEqual(profile["schema_version"], 2)
             self.assertEqual(profile["status"], "unavailable")
             self.assertFalse(profile["manager_acceptance_modeled"])
             self.assertFalse(profile["use_for_personalization"])
             self.assertIsNone(profile["behavioral_label"])
             self.assertEqual(profile["coverage"]["status"], "not_collected")
+            self.assertEqual(
+                profile["coverage"]["incomplete_dimensions"],
+                ["history_not_collected", "transactions", "rosters", "lineups"],
+            )
+            self.assertEqual(
+                profile["trade_legality"]["player_lock_status"], "not_captured"
+            )
 
     def test_first_week_has_no_elapsed_timing_period_to_estimate(self):
         state = league_state(())
@@ -236,7 +245,11 @@ class CompletedDealTimingProfileTests(unittest.TestCase):
             history(
                 capture(
                     (
-                        trade("proposal", 2),
+                        replace(
+                            trade("proposal", 2),
+                            accepted_at=CAPTURED_AT - timedelta(hours=2),
+                            processed_at=CAPTURED_AT - timedelta(hours=1),
+                        ),
                         trade("execution", 4, basis=HistoryTimestampBasis.EXECUTED_AT),
                     )
                 )
@@ -258,6 +271,10 @@ class CompletedDealTimingProfileTests(unittest.TestCase):
         self.assertEqual(
             result["timing_by_timestamp_basis"]["executed_at"]["transaction_count"],
             1,
+        )
+        self.assertEqual(
+            result["evidence"]["source_timestamp_coverage"],
+            {"proposed_at": 2, "accepted_at": 1, "processed_at": 1, "expires_at": 0},
         )
 
     def test_stale_or_partial_coverage_keeps_counts_but_withholds_rates(self):
@@ -291,13 +308,18 @@ class CompletedDealTimingProfileTests(unittest.TestCase):
             ),
             captured_at=future_at,
         )
-        result = build_completed_deal_timing_profiles(
-            self.state, history(before, after)
-        )["a"]
+        snapshot = history(before, after)
+        result = build_completed_deal_timing_profiles(self.state, snapshot)["a"]
 
         self.assertEqual(result["completed_trade_count"], 1)
         self.assertEqual(result["timing"]["active_effective_weeks"], [2])
         self.assertEqual(result["coverage"]["latest_capture_id"], before.capture_id)
+        self.assertEqual(result["evidence"]["history_capture_ids"], [before.capture_id])
+        self.assertEqual(
+            result["evidence"]["completed_trade_transaction_ids"], ["visible"]
+        )
+        self.assertEqual(result["analysis_as_of"], "2026-10-20T12:00:00Z")
+        self.assertEqual(result["evidence"]["history_revision"], snapshot.history_revision)
 
     def test_unusable_completed_matchups_prevent_normalized_context_rates(self):
         state = league_state(

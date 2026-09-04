@@ -26,9 +26,19 @@ from .bundle_summary_cache import (
     save_cached_bundle_summary,
 )
 from .dashboard import build_league_dashboard
+from .data_readiness import (
+    build_bundle_data_readiness,
+    build_data_readiness_snapshot,
+)
 from .draft_service import DraftLabService
-from .engine_bundle import EngineBundle, load_engine_bundle
+from .engine_bundle import (
+    ENGINE_BUNDLE_SCHEMA_VERSION,
+    EngineBundle,
+    UnsupportedEngineBundleSchema,
+    load_engine_bundle,
+)
 from .gm_insights import build_gm_insights
+from .history_readiness import build_history_data_readiness
 from .job_retention import (
     ACTIVE_JOB_STATUSES,
     DEFAULT_TERMINAL_JOB_LIMIT,
@@ -36,7 +46,7 @@ from .job_retention import (
     has_active_jobs,
     prune_terminal_jobs,
 )
-from .league_history import LeagueHistoryStore
+from .league_history import LeagueHistoryStore, LeagueHistoryStoreError
 from .league_search import (
     LeagueSearchOutcome,
     LeagueSearchProgress,
@@ -79,15 +89,17 @@ from .trade_filters import (
 )
 from .trade_impact import PreparedSeasonBaseline, prepare_season_baseline
 from .trade_space import TeamRoster, TradeConstraints, TradeSpace
-from .trade_timing import build_trade_timing
+from .trade_timing import build_trade_timing, trade_timing_scenario_config
 from .weekly_collection import (
     LEAGUE_HISTORY_FILENAME,
     WeeklyCollectionJobs,
     WeeklyCollectionRequest,
     WeeklyCollectionWorkflow,
+    load_weekly_history_attempt,
 )
 from .workbook_model import (
     TradeWorkbookContext,
+    TwoTeamExportProvenance,
     team_outlook_rows,
     workbook_trade_rows,
 )
@@ -100,6 +112,15 @@ _MAX_BASELINE_CACHE_SIZE = 1
 _MAX_RETAINED_SEARCH_JOBS = DEFAULT_TERMINAL_JOB_LIMIT
 _MAX_GM_INSIGHTS_CACHE_SIZE = 4
 _MAX_TRADE_TIMING_CACHE_SIZE = 6
+_INDEPENDENT_NFL_SCHEDULE_ARTIFACT = (
+    "not-retained:independent-nfl-schedule-artifact"
+)
+_INDEPENDENT_ENSEMBLE_CONFIG_ARTIFACT = (
+    "not-retained:independent-ensemble-config-artifact"
+)
+_INDEPENDENT_FORMULA_SOURCE_FIT = (
+    "not-applicable:independent-power-policy-has-no-source-fit"
+)
 
 
 # A full public-catalog outlook can be tens of MiB; one hot bundle avoids
@@ -312,15 +333,17 @@ class LocalAppService:
         self._export_in_progress = False
         self._player_outlook_cache: OrderedDict[str, dict[str, object]] = OrderedDict()
         self._player_outlook_futures: dict[str, Future[dict[str, object]]] = {}
-        self._gm_insights_cache: OrderedDict[
-            tuple[str, str | None], dict[str, object]
-        ] = OrderedDict()
-        self._gm_insights_futures: dict[str, Future[dict[str, object]]] = {}
+        self._gm_insights_cache: OrderedDict[tuple[object, ...], dict[str, object]] = (
+            OrderedDict()
+        )
+        self._gm_insights_futures: dict[
+            tuple[object, ...], Future[dict[str, object]]
+        ] = {}
         self._trade_timing_cache: OrderedDict[
-            tuple[str, str | None, str], dict[str, object]
+            tuple[object, ...], dict[str, object]
         ] = OrderedDict()
         self._trade_timing_futures: dict[
-            tuple[str, str], Future[dict[str, object]]
+            tuple[object, ...], Future[dict[str, object]]
         ] = {}
         self._history_stores: dict[Path, LeagueHistoryStore] = {}
         # Kept as a compatibility view of the most recently opened store.
@@ -559,6 +582,20 @@ class LocalAppService:
                     except BundleSummaryCacheError:
                         pass
                 summaries.setdefault(summary["bundle_id"], summary)
+            except UnsupportedEngineBundleSchema as error:
+                summaries.setdefault(
+                    f"unsupported:{path.name}",
+                    {
+                        "file": path.name,
+                        "status": (
+                            "legacy_requires_rescan"
+                            if error.schema_version < ENGINE_BUNDLE_SCHEMA_VERSION
+                            else "requires_app_update"
+                        ),
+                        "schema_version": error.schema_version,
+                        "error": str(error),
+                    },
+                )
             except ValueError as error:
                 summaries.setdefault(
                     f"invalid:{path.name}",
@@ -650,6 +687,11 @@ class LocalAppService:
 
         try:
             bundle = self._load_bundle(bundle_id)
+            _require_bundle_capability(
+                bundle,
+                "team_outlook_and_exports",
+                "league dashboard",
+            )
             source_config = bundle.scenario_config
             dashboard_config = (
                 source_config
@@ -658,15 +700,19 @@ class LocalAppService:
                     _MAX_DASHBOARD_SCENARIOS,
                     source_config.seed,
                     source_config.loadings,
+                    source_config.player_score_floor,
                 )
             )
             baseline = self._season_baseline(bundle_id, bundle, dashboard_config)
-            dashboard = build_league_dashboard(
+            dashboard = dict(build_league_dashboard(
                 bundle,
                 baseline.season_projection,
                 baseline.scenarios,
                 baseline.iter_baseline_scenarios(),
-            )
+            ))
+            dashboard["data_readiness"] = build_bundle_data_readiness(bundle)[
+                "capabilities"
+            ]["team_outlook_and_exports"]
         except BaseException as error:
             future.set_exception(error)
             raise
@@ -703,7 +749,11 @@ class LocalAppService:
 
         try:
             with self._player_outlook_build_lock:
-                outlook = build_player_outlook(self._load_bundle(bundle_id))
+                bundle = self._load_bundle(bundle_id)
+                outlook = dict(build_player_outlook(bundle))
+            outlook["data_readiness"] = build_bundle_data_readiness(bundle)[
+                "capabilities"
+            ]["player_lab"]
         except BaseException as error:
             future.set_exception(error)
             raise
@@ -723,9 +773,22 @@ class LocalAppService:
     def gm_insights(self, bundle_id: str) -> dict[str, object]:
         """Return evidence-backed team tendencies for one bound league history."""
 
-        self._bundle_path(bundle_id)
+        bundle = self._load_bundle(bundle_id)
+        history, history_store_status, history_attempt = self._history_snapshot(bundle)
+        revision = None if history is None else history.history_revision
+        cache_key = (
+            bundle_id,
+            revision,
+            history_store_status,
+            self._history_attempt_revision(history_attempt),
+            self._loadable_history_engine_revision(history),
+        )
         with self._lock:
-            future = self._gm_insights_futures.get(bundle_id)
+            cached = self._gm_insights_cache.get(cache_key)
+            if cached is not None:
+                self._gm_insights_cache.move_to_end(cache_key)
+                return cached
+            future = self._gm_insights_futures.get(cache_key)
             owns_calculation = future is None
             if owns_calculation:
                 if self.draft_lab.is_busy:
@@ -748,29 +811,22 @@ class LocalAppService:
                         "another General Manager Insights calculation is already running"
                     )
                 future = Future()
-                self._gm_insights_futures[bundle_id] = future
+                self._gm_insights_futures[cache_key] = future
         assert future is not None
         if not owns_calculation:
             return future.result()
 
         try:
-            bundle = self._load_bundle(bundle_id)
-            history = self._league_history_store(bundle_id).snapshot_for_bundle(
-                bundle_id
-            )
-            revision = None if history is None else history.history_revision
-            cache_key = bundle_id, revision
-            with self._lock:
-                cached = self._gm_insights_cache.get(cache_key)
-                if cached is not None:
-                    self._gm_insights_cache.move_to_end(cache_key)
-            if cached is not None:
-                future.set_result(cached)
-                return cached
-            insights = build_gm_insights(
+            insights = dict(build_gm_insights(
                 bundle,
                 history,
                 bundle_loader=self._load_bundle,
+            ))
+            insights["data_readiness"] = build_history_data_readiness(
+                bundle,
+                history,
+                store_status=history_store_status,
+                collection_attempt=history_attempt,
             )
         except BaseException as error:
             future.set_exception(error)
@@ -785,18 +841,32 @@ class LocalAppService:
             return insights
         finally:
             with self._lock:
-                if self._gm_insights_futures.get(bundle_id) is future:
-                    del self._gm_insights_futures[bundle_id]
+                if self._gm_insights_futures.get(cache_key) is future:
+                    del self._gm_insights_futures[cache_key]
 
     def trade_timing(
         self, bundle_id: str, primary_team_id: str
     ) -> dict[str, object]:
         """Return one coalesced, history-aware trade-timing preview."""
 
-        self._bundle_path(bundle_id)
-        request_key = bundle_id, primary_team_id
+        bundle = self._load_bundle(bundle_id)
+        history, history_store_status, history_attempt = self._history_snapshot(bundle)
+        revision = None if history is None else history.history_revision
+        timing_config = trade_timing_scenario_config(bundle)
+        cache_key = (
+            bundle_id,
+            timing_config.config_id,
+            revision,
+            history_store_status,
+            self._history_attempt_revision(history_attempt),
+            primary_team_id,
+        )
         with self._lock:
-            future = self._trade_timing_futures.get(request_key)
+            cached = self._trade_timing_cache.get(cache_key)
+            if cached is not None:
+                self._trade_timing_cache.move_to_end(cache_key)
+                return cached
+            future = self._trade_timing_futures.get(cache_key)
             owns_calculation = future is None
             if owns_calculation:
                 if self.draft_lab.is_busy:
@@ -819,26 +889,31 @@ class LocalAppService:
                         "another Trade Timing calculation is already running"
                     )
                 future = Future()
-                self._trade_timing_futures[request_key] = future
+                self._trade_timing_futures[cache_key] = future
         assert future is not None
         if not owns_calculation:
             return future.result()
 
         try:
-            bundle = self._load_bundle(bundle_id)
-            history = self._league_history_store(bundle_id).snapshot_for_bundle(
-                bundle_id
+            baseline = (
+                None
+                if not bundle.state.remaining_regular_season_weeks
+                else self._season_baseline(bundle_id, bundle, timing_config)
             )
-            revision = None if history is None else history.history_revision
-            cache_key = bundle_id, revision, primary_team_id
-            with self._lock:
-                cached = self._trade_timing_cache.get(cache_key)
-                if cached is not None:
-                    self._trade_timing_cache.move_to_end(cache_key)
-            if cached is not None:
-                future.set_result(cached)
-                return cached
-            timing = build_trade_timing(bundle, history, primary_team_id)
+            timing = dict(
+                build_trade_timing(
+                    bundle,
+                    history,
+                    primary_team_id,
+                    prepared_baseline=baseline,
+                )
+            )
+            timing["data_readiness"] = build_history_data_readiness(
+                bundle,
+                history,
+                store_status=history_store_status,
+                collection_attempt=history_attempt,
+            )
         except BaseException as error:
             future.set_exception(error)
             raise
@@ -852,8 +927,8 @@ class LocalAppService:
             return timing
         finally:
             with self._lock:
-                if self._trade_timing_futures.get(request_key) is future:
-                    del self._trade_timing_futures[request_key]
+                if self._trade_timing_futures.get(cache_key) is future:
+                    del self._trade_timing_futures[cache_key]
 
     def _player_outlook_read_model(
         self, bundle_id: str
@@ -919,9 +994,13 @@ class LocalAppService:
         try:
             bundle, context = self._player_outlook_read_model(bundle_id)
             with self._player_outlook_build_lock:
-                catalog = build_player_outlook_catalog_from_bundle(
-                    bundle, context=context
-                )
+                catalog = dict(build_player_outlook_catalog_from_bundle(
+                    bundle,
+                    context=context,
+                ))
+                catalog["data_readiness"] = build_bundle_data_readiness(bundle)[
+                    "capabilities"
+                ]["player_lab"]
                 with self._lock:
                     self._player_outlook_catalog_cache[bundle_id] = catalog
                     self._player_outlook_catalog_cache.move_to_end(bundle_id)
@@ -968,12 +1047,13 @@ class LocalAppService:
             catalog = self.player_outlook_catalog(bundle_id)
             bundle, context = self._player_outlook_read_model(bundle_id)
             with self._player_outlook_build_lock:
-                detail = build_player_outlook_detail_from_bundle(
+                detail = dict(build_player_outlook_detail_from_bundle(
                     bundle,
                     player_id,
                     catalog=catalog,
                     context=context,
-                )
+                ))
+                detail["data_readiness"] = catalog["data_readiness"]
                 with self._lock:
                     self._player_outlook_detail_cache[cache_key] = detail
                     self._player_outlook_detail_cache.move_to_end(cache_key)
@@ -995,8 +1075,9 @@ class LocalAppService:
 
     def _bundle_readiness(self, bundles) -> dict[str, object]:
         ready_count = sum(row.get("status") == "ready" for row in bundles)
-        exact_count = sum(
-            row.get("status") == "ready" and row.get("power_engine_mode") == "exact"
+        validated_count = sum(
+            row.get("status") == "ready"
+            and row.get("power_engine_mode") == "holdout_validated"
             for row in bundles
         )
         surrogate_count = sum(
@@ -1009,35 +1090,106 @@ class LocalAppService:
             and row.get("power_engine_mode") == "independent"
             for row in bundles
         )
-        invalid_count = len(bundles) - ready_count
+        legacy_count = sum(
+            row.get("status") == "legacy_requires_rescan" for row in bundles
+        )
+        update_count = sum(
+            row.get("status") == "requires_app_update" for row in bundles
+        )
+        invalid_count = sum(row.get("status") == "invalid" for row in bundles)
         if ready_count:
-            message = (
-                f"{exact_count} exact-method, {surrogate_count} SURROGATE, and "
-                f"{independent_count} independent weekly engine(s) are ready. "
+            message_parts = [
+                f"{validated_count} holdout-validated, {surrogate_count} SURROGATE, "
+                f"and {independent_count} independent weekly engine(s) are ready. "
                 "Surrogate use requires explicit acceptance."
-            )
-        elif invalid_count:
-            message = (
-                "Saved weekly data failed validation. Collect this week again or import "
-                "a complete bundle."
-            )
+            ]
+        elif legacy_count or update_count or invalid_count:
+            message_parts = ["No compatible weekly engine is ready."]
         elif self._collections.available:
-            message = "Not ready yet. Collect this week or import a complete bundle."
+            message_parts = [
+                "Not ready yet. Collect this week or import a complete bundle."
+            ]
         else:
-            message = (
+            message_parts = [
                 "Not ready yet. Weekly collection is unavailable in this build; "
                 "import a complete bundle."
+            ]
+        if legacy_count:
+            message_parts.append(
+                f"Older-format saved weekly bundles: {legacy_count}. Scan the league "
+                "again to rebuild them with complete schedule and model evidence."
+            )
+        if update_count:
+            message_parts.append(
+                f"Saved weekly bundles requiring a newer application: {update_count}. "
+                "Update the app before using them."
+            )
+        if invalid_count:
+            message_parts.append(
+                f"Saved weekly bundles that failed validation: {invalid_count}. "
+                "Collect those weeks again or import complete bundles."
             )
         return {
             "ready": ready_count > 0,
             "ready_bundle_count": ready_count,
-            "exact_bundle_count": exact_count,
+            "holdout_validated_bundle_count": validated_count,
             "surrogate_bundle_count": surrogate_count,
             "independent_bundle_count": independent_count,
+            "legacy_bundle_count": legacy_count,
+            "requires_app_update_bundle_count": update_count,
             "invalid_bundle_count": invalid_count,
             "collection_available": self._collections.available,
-            "message": message,
+            "message": " ".join(message_parts),
         }
+
+    def _history_snapshot(self, bundle: EngineBundle):
+        """Load an optional sidecar without making core bundle use depend on it."""
+
+        attempt = None
+        try:
+            data_directory = self._league_workspaces.data_directory_for_bundle(
+                bundle.bundle_id
+            )
+            attempt = load_weekly_history_attempt(
+                data_directory,
+                bundle.bundle_id,
+            )
+            history = self._league_history_store(
+                bundle.bundle_id,
+                data_directory=data_directory,
+            ).snapshot_for_bundle(bundle.bundle_id)
+        except (KeyError, LeagueHistoryStoreError, OSError, RuntimeError, ValueError):
+            return None, "unavailable", attempt
+        if history is not None and (
+            history.league_key != bundle.source_manifest.league_binding_id
+            or history.season != bundle.state.season
+            or history.bundle_id != bundle.bundle_id
+        ):
+            return None, "unavailable", attempt
+        return history, "available", attempt
+
+    @staticmethod
+    def _history_attempt_revision(attempt) -> str | None:
+        if attempt is None:
+            return None
+        return content_id("history-attempt", attempt.to_record())
+
+    def _loadable_history_engine_revision(self, history) -> str | None:
+        """Invalidate GM caches when a formerly missing prior engine appears."""
+
+        if history is None:
+            return None
+        available = tuple(
+            sorted(
+                binding.bundle_id
+                for binding in history.bundle_bindings
+                if BUNDLE_ID_PATTERN.fullmatch(binding.bundle_id)
+                and (
+                    self.bundle_directory / f"{binding.bundle_id}.json"
+                ).is_file()
+            )
+        )
+        return content_id("history-engine-set", {"bundle_ids": list(available)})
 
     def start_weekly_collection(
         self, request: WeeklyCollectionRequest
@@ -1109,6 +1261,7 @@ class LocalAppService:
             raise ValueError("request must be a LocalSearchRequest")
         bundle = self._load_bundle(request.bundle_id)
         _require_surrogate_consent(bundle, request)
+        _require_bundle_capability(bundle, "trade_search", "trade search")
         _search_scope(bundle, request)
         with self._lock:
             if self.draft_lab.is_busy:
@@ -1144,6 +1297,9 @@ class LocalAppService:
             raise ValueError("request must be a LocalSearchRequest")
         bundle = self._load_bundle(request.bundle_id)
         _require_surrogate_consent(bundle, request)
+        readiness = build_bundle_data_readiness(bundle)["capabilities"][
+            "trade_search"
+        ]
         by_team, primary, selected = _search_scope(bundle, request)
         eligible_positions = {
             player_id: player.eligible_positions
@@ -1168,11 +1324,8 @@ class LocalAppService:
                     request.primary_team_id,
                     *request.counterparty_team_ids,
                 ],
-                "free_agent_allocation_policy": (
-                    None
-                    if request.constraints.require_no_drops
-                    else MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
-                ),
+                "free_agent_allocation_policy": MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY,
+                "data_readiness": readiness,
             }
         pairs = tuple(
             {
@@ -1193,6 +1346,7 @@ class LocalAppService:
             "candidate_count": count,
             "candidate_count_text": str(count),
             "pairs": pairs,
+            "data_readiness": readiness,
         }
 
     def job(self, job_id: str) -> dict[str, object]:
@@ -1221,18 +1375,35 @@ class LocalAppService:
             request, outcome, context = job.request, job.outcome, job.context
         bundle = self._load_bundle(request.bundle_id)
         if request.trade_format == "three_team":
-            return three_way_search_result_record(
+            result = three_way_search_result_record(
                 outcome,
                 bundle,
                 context.season_projection,
                 limit,
-                free_agent_allocation_policy=(
-                    None
-                    if request.constraints.require_no_drops
-                    else MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
-                ),
+                free_agent_allocation_policy=MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY,
             )
-        return search_result_record(outcome, bundle, context.season_projection, limit)
+        else:
+            result = search_result_record(
+                outcome, bundle, context.season_projection, limit
+            )
+        search_run_ids = (
+            [outcome.progress.run_id]
+            if request.trade_format == "three_team"
+            else [row.search.progress.run_id for row in outcome.pairs]
+        )
+        return {
+            **result,
+            "bundle_id": request.bundle_id,
+            "request_id": request.request_id,
+            "search_run_id": (
+                search_run_ids[0] if len(search_run_ids) == 1 else None
+            ),
+            "search_run_ids": search_run_ids,
+            "search_request": request.to_record(),
+            "data_readiness": build_bundle_data_readiness(bundle)["capabilities"][
+                "trade_search"
+            ],
+        }
 
     def export_job(self, job_id: str) -> dict[str, object]:
         with self._lock:
@@ -1287,28 +1458,17 @@ class LocalAppService:
                 self.export_directory / filename,
                 _workbook_context(bundle, context.scenario_run_id, request),
                 ThreeWayExportProvenance.from_records(
+                    bundle_id=bundle.bundle_id,
+                    waiver_pool_id=bundle.waiver_pool.waiver_pool_id,
                     request_id=request.request_id,
-                    search_run_id=outcome.progress.run_id,
-                    participant_team_ids=(
-                        request.primary_team_id,
-                        *request.counterparty_team_ids,
-                    ),
+                    request_record=request.to_record(),
+                    search_run_definition=outcome.run_definition,
                     participant_team_names=tuple(
                         team_names[team_id]
-                        for team_id in (
-                            request.primary_team_id,
-                            *request.counterparty_team_ids,
-                        )
+                        for team_id in outcome.run_definition.participant_team_ids
                     ),
-                    total_candidate_count=outcome.progress.total_candidate_count,
-                    seed=request.seed,
-                    trade_constraint_record=request.constraints.to_record(),
-                    power_settings_record=request.settings.to_record(),
-                    free_agent_allocation_policy=(
-                        None
-                        if request.constraints.require_no_drops
-                        else MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
-                    ),
+                    completed_candidate_count=outcome.progress.next_candidate_index,
+                    free_agent_allocation_policy=MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY,
                 ),
                 rows,
                 team_outlook_rows(bundle.state, context.season_projection),
@@ -1324,6 +1484,13 @@ class LocalAppService:
         path = export_trade_workbook(
             self.export_directory / filename,
             _workbook_context(bundle, context.scenario_run_id, request),
+            TwoTeamExportProvenance.from_outcome(
+                bundle_id=bundle.bundle_id,
+                waiver_pool_id=bundle.waiver_pool.waiver_pool_id,
+                request_id=request.request_id,
+                request_record=request.to_record(),
+                outcome=outcome,
+            ),
             rows,
             team_outlook_rows(bundle.state, context.season_projection),
         )
@@ -1343,10 +1510,12 @@ class LocalAppService:
             self._set_job(job, status="running")
             bundle = self._load_bundle(job.request.bundle_id)
             _require_surrogate_consent(bundle, job.request)
+            _require_bundle_capability(bundle, "trade_search", "trade search")
             config = CorrelatedScenarioConfig(
                 job.request.scenario_count,
                 job.request.seed,
                 bundle.scenario_config.loadings,
+                bundle.scenario_config.player_score_floor,
             )
             baseline = self._season_baseline(job.request.bundle_id, bundle, config)
             if job.cancel.is_set():
@@ -1363,10 +1532,10 @@ class LocalAppService:
                         for player_id, player in bundle.strength_model.players.items()
                     },
                 )
-                adjuster = (
-                    None
-                    if job.request.constraints.require_no_drops
-                    else PreparedRosterAdjuster(bundle.strength_model, bundle.rosters)
+                adjuster = PreparedRosterAdjuster(
+                    bundle.strength_model,
+                    bundle.rosters,
+                    forbid_drops=job.request.constraints.require_no_drops,
                 )
                 prepared = PreparedThreeWayTrade(
                     bundle.strength_model,
@@ -1530,12 +1699,20 @@ class LocalAppService:
             load_engine_bundle(self._bundle_path(bundle_id)), bundle_id
         )
 
-    def _league_history_store(self, bundle_id: str) -> LeagueHistoryStore:
+    def _league_history_store(
+        self,
+        bundle_id: str,
+        *,
+        data_directory: Path | None = None,
+    ) -> LeagueHistoryStore:
         """Open optional league history only when a history-aware view needs it."""
 
+        if data_directory is None:
+            data_directory = self._league_workspaces.data_directory_for_bundle(
+                bundle_id
+            )
         history_path = (
-            self._league_workspaces.data_directory_for_bundle(bundle_id)
-            / LEAGUE_HISTORY_FILENAME
+            data_directory / LEAGUE_HISTORY_FILENAME
         )
         with self._lock:
             store = self._history_stores.get(history_path)
@@ -1655,6 +1832,7 @@ class LocalAppService:
         return {
             "job_id": job.job_id,
             "request_id": job.request.request_id,
+            "bundle_id": job.request.bundle_id,
             "status": job.status,
             "error": job.error,
             "trade_format": job.request.trade_format,
@@ -1663,6 +1841,7 @@ class LocalAppService:
                 "primary_team_id": job.request.primary_team_id,
                 "counterparty_team_ids": list(job.request.counterparty_team_ids),
             },
+            "search_request": job.request.to_record(),
             "progress": progress_record,
             "operation": job.timing.snapshot(),
         }
@@ -1677,7 +1856,20 @@ def _workbook_context(
     independent = bundle.methodology_mode == "independent"
     team_names = {row.team_id: row.name for row in bundle.state.teams}
     return TradeWorkbookContext(
+        bundle_id=bundle.bundle_id,
+        waiver_pool_id=bundle.waiver_pool.waiver_pool_id,
         snapshot_id=bundle.state.snapshot_id,
+        scoring_profile_id=bundle.scoring_profile.scoring_profile_id,
+        nfl_schedule_id=(
+            _INDEPENDENT_NFL_SCHEDULE_ARTIFACT
+            if independent
+            else bundle.nfl_schedule.schedule_id
+        ),
+        ensemble_config_id=(
+            _INDEPENDENT_ENSEMBLE_CONFIG_ARTIFACT
+            if independent
+            else bundle.ensemble_config.config_id
+        ),
         strength_model_id=bundle.strength_model.model_id,
         scenario_run_id=scenario_run_id,
         primary_team_id=request.primary_team_id,
@@ -1689,25 +1881,27 @@ def _workbook_context(
         calibration_status=(
             "independent"
             if independent
-            else bundle.strength_model.calibration.status.value
+            else "holdout_validated"
+            if bundle.methodology_mode == "holdout_validated"
+            else "surrogate"
         ),
         methodology_evidence_kind=(
-            "exact_attestation"
-            if bundle.methodology_mode == "exact"
-            else "independent_disclosure"
+            "independent_disclosure"
             if independent
+            else "blind_holdout_attestation"
+            if bundle.methodology_mode == "holdout_validated"
             else "surrogate_disclosure"
         ),
         methodology_record_id=(
-            bundle.methodology_attestation.attestation_id
-            if bundle.methodology_mode == "exact"
-            else bundle.independent_power_disclosure.disclosure_id
+            bundle.independent_power_disclosure.disclosure_id
             if independent
+            else bundle.methodology_attestation.attestation_id
+            if bundle.methodology_mode == "holdout_validated"
             else bundle.surrogate_disclosure.disclosure_id
         ),
         formula_id=(methodology.policy_id if independent else methodology.formula_id),
         formula_source_fit_id=(
-            methodology.disclosure_id
+            _INDEPENDENT_FORMULA_SOURCE_FIT
             if independent
             else methodology.formula_source_fit_id
         ),
@@ -1723,10 +1917,10 @@ def _workbook_context(
         ),
         methodology_current_evidence_id=methodology.current_evidence_id,
         methodology_quality_gate=(
-            "exact_attestation_v1"
-            if bundle.methodology_mode == "exact"
-            else "transparent_independent_v1"
+            "transparent_independent_v1"
             if independent
+            else "blind_holdout_validation_v1"
+            if bundle.methodology_mode == "holdout_validated"
             else SURROGATE_QUALITY_GATE
         ),
         methodology_holdout_count=methodology.current_holdout_count,
@@ -1740,7 +1934,10 @@ def _workbook_context(
             if independent
             else methodology.calibration_diagnostics.display_match_rate
         ),
-        exact_balanced_package_sizes=methodology.validated_balanced_package_sizes,
+        holdout_validated_balanced_package_sizes=(
+            methodology.validated_balanced_package_sizes
+        ),
+        data_readiness=build_data_readiness_snapshot(bundle),
         sources=workbook_sources(bundle),
     )
 
@@ -1756,6 +1953,29 @@ def _require_surrogate_consent(
             "This weekly engine is a SURROGATE approximation. Explicitly accept "
             "surrogate power before counting or running trades."
         )
+
+
+def _require_bundle_capability(
+    bundle: EngineBundle,
+    capability_name: str,
+    feature_name: str,
+) -> None:
+    capability = build_bundle_data_readiness(bundle)["capabilities"].get(
+        capability_name
+    )
+    if not isinstance(capability, Mapping):
+        raise ValueError(f"{feature_name} readiness is unavailable")
+    if capability.get("status") != "not_ready":
+        return
+    missing = capability.get("missing")
+    details = (
+        "; ".join(str(value) for value in missing)
+        if isinstance(missing, list) and missing
+        else "required bundle evidence"
+    )
+    raise ValueError(
+        f"{feature_name} is not ready for this weekly bundle: {details}"
+    )
 
 
 def _payload_filter(

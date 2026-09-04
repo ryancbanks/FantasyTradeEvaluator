@@ -36,7 +36,7 @@ class LeagueCatalogTests(unittest.TestCase):
             "season": 2026,
             "week": 5,
             "team_count": 18,
-            "power_engine_mode": "exact",
+            "power_engine_mode": "holdout_validated",
             "scoring": "PPR",
         }
         values.update(changes)
@@ -282,7 +282,7 @@ class LeagueCatalogTests(unittest.TestCase):
                 "season": 2026,
                 "week": 7,
                 "team_count": 18,
-                "power_engine_mode": "exact",
+                "power_engine_mode": "holdout_validated",
                 "associated_at": first.associated_at,
             },
         )
@@ -415,14 +415,16 @@ class LeagueCatalogTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "newer"):
             LeagueCatalog(newer_path)
 
-    def test_existing_version_two_catalog_receives_pagination_indexes(self):
+    def test_existing_version_two_catalog_migrates_exact_mode_and_indexes(self):
+        profile = self.create(name="Legacy exact")
+        self.associate(profile.profile_id)
         with closing(sqlite3.connect(self.path)) as connection:
             connection.execute("DROP INDEX league_profiles_active_page")
             connection.execute("DROP INDEX league_profiles_all_page")
-            self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0],
-                CATALOG_SCHEMA_VERSION,
+            connection.execute(
+                "UPDATE league_bundles SET power_engine_mode = 'exact'"
             )
+            connection.execute("PRAGMA user_version = 2")
             connection.commit()
 
         LeagueCatalog(self.path)
@@ -438,10 +440,14 @@ class LeagueCatalogTests(unittest.TestCase):
                     "PRAGMA index_list(league_profiles)"
                 ).fetchall()
             }
+            migrated_mode = connection.execute(
+                "SELECT power_engine_mode FROM league_bundles"
+            ).fetchone()[0]
         self.assertTrue(
             {"league_profiles_active_page", "league_profiles_all_page"}
             <= index_names
         )
+        self.assertEqual(migrated_mode, "holdout_validated")
 
     def test_version_one_catalog_migrates_yahoo_source_to_reusable(self):
         legacy_path = Path(self.temporary_directory.name) / "version-one.sqlite3"
@@ -505,7 +511,7 @@ class LeagueCatalogTests(unittest.TestCase):
             season=2026,
             week=1,
             team_count=12,
-            power_engine_mode="exact",
+            power_engine_mode="holdout_validated",
             scoring="PPR",
         )
         with closing(sqlite3.connect(partial_path)) as connection:

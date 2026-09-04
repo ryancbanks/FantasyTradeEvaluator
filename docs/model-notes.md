@@ -49,9 +49,9 @@ No league key, cookie, request header, or private response body is retained in t
 
 ## Validation-gated FantasyPros methodology mode
 
-The local evaluator recomputes an ordinary trade by changing two rosters and solving a small maximum-weight roster-role assignment. It can also apply one simultaneous three-team agreement by moving each selected player from the original owner to either other participant, then rescoring all three resulting rosters. It never calls FantasyPros for a candidate after the role formula is calibrated. A weekly refresh captures current ECR/projections and reapplies the frozen formula to every player locally.
+The local evaluator recomputes an ordinary trade by changing two rosters and solving a small maximum-weight roster-role assignment. It can also apply one simultaneous three-team agreement by moving each selected player from the original owner to either other participant, then rescoring all three resulting rosters. It never calls FantasyPros for a candidate after the role formula is calibrated. A weekly refresh captures current ECR and published projection evidence, then reapplies only the inputs named by the persisted formula. The reliable default formula uses FantasyPros rest-of-season ECR and does not require a nonexistent FantasyPros in-season rest-of-season projection table.
 
-Three-team agreements are outside the current FantasyPros attestation because its held-out analyzer evidence covers two-team packages only. An exact weekly formula therefore labels three-team power as `extrapolated`; a surrogate weekly formula labels it `surrogate_extrapolated`. This limitation is disclosed before a three-team run, not only in its results. Playoff probabilities remain fully local in either case and reuse the same scenario draws for the before and after league states. If roster adjustments are allowed and multiple teams need scarce free agents, teams reserve their locally optimal replacements in ascending team-ID order from the players still available. The app, result payload, and workbook disclose that deterministic allocation policy.
+Three-team agreements are outside the current FantasyPros validation evidence because its held-out analyzer evidence covers two-team packages only. A holdout-validated weekly formula therefore labels three-team power as `extrapolated`; a surrogate weekly formula labels it `surrogate_extrapolated`. This limitation is disclosed before a three-team run, not only in its results. Playoff probabilities remain fully local in either case and reuse the same scenario draws for the before and after league states. If roster adjustments are allowed and multiple teams need scarce free agents, teams reserve their locally optimal replacements in ascending team-ID order from the players still available. The app, result payload, and workbook disclose that deterministic allocation policy.
 
 The initial calibration evidence must contain:
 
@@ -61,7 +61,7 @@ The initial calibration evidence must contain:
 - calibrated assignment scores for each relevant starter and depth role;
 - a frozen validation set of unseen multi-player trades.
 
-Calibration is a designed experiment, not an exhaustive trade run. The default design fits on 250 diverse atomic swaps and reserves 100 deterministic, leakage-safe multi-player packages for blind validation; it never invokes the slow playoff analysis. The holdouts cover every balanced package size the roster and budget can prove (normally 1-for-1 through 13-for-13 for 14-player rosters), with 2-for-2, 3-for-3, and 4-for-4 mandatory. A full-roster exchange is excluded because its after-rosters are already the opposing baseline training anchors. Because the proprietary calculation is server-side, the calibration collector also needs a version fingerprint for the analyzer bundle and response schema. A changed fingerprint invalidates the prior formula until the invariant and held-out tests pass again. An unchanged fingerprint only makes the formula eligible for a bounded weekly revalidation: at least 100 distinct ordinary-power holdouts from the current snapshot must keep maximum raw score and delta error at or below `1e-6` and match every displayed change. The formula and weekly report persist the blind IDs and balanced sizes; imbalanced packages, additions, and drops remain outside the exact claim until separately verified. This check happens once during weekly refresh, never during candidate enumeration.
+Calibration is a designed experiment, not an exhaustive trade run. The default design fits on 250 diverse atomic swaps and reserves 100 deterministic, leakage-safe multi-player packages for blind validation; it never invokes the slow playoff analysis. The holdouts cover every balanced package size the roster and budget can test (normally 1-for-1 through 13-for-13 for 14-player rosters), with 2-for-2, 3-for-3, and 4-for-4 mandatory. A full-roster exchange is excluded because its after-rosters are already the opposing baseline training anchors. Because the proprietary calculation is server-side, the calibration collector also needs a version fingerprint for the analyzer bundle and response schema. A changed fingerprint invalidates the prior formula until the invariant and held-out tests pass again. An unchanged fingerprint only makes the formula eligible for a bounded weekly revalidation: at least 100 distinct ordinary-power holdouts from the current snapshot must keep maximum raw score and delta error at or below `1e-6` and match every displayed change. The formula and weekly report persist the blind IDs and balanced sizes; imbalanced packages, additions, and drops remain outside the holdout-validated scope until separately tested. This check happens once during weekly refresh, never during candidate enumeration.
 
 Still to validate:
 
@@ -71,7 +71,7 @@ Still to validate:
 - whether public projection/ECR fields can replace some black-box observations without losing exactness;
 - formula stability from one NFL week to the next.
 
-Until held-out absolute-score error is below `1e-6` and displayed changes agree exactly, results must be labeled **FantasyPros surrogate**, not exact FantasyPros output. Surrogate publication is an explicit, default-off fallback and is permitted only for a converged, identifiable fit with exact-tolerance training error and the complete diverse blind design. Its separate content-addressed disclosure persists the blind maximum score error, display-match rate, holdout identities/sizes, and `source_fit_id`; that fit ID binds the full solver diagnostics evaluated by the healthy-fit publication gate. Results inside an observed balanced/no-adjustment shape are labeled `surrogate`, while other shapes are `surrogate_extrapolated`. Neither is exact.
+Until held-out absolute-score error is below `1e-6` and displayed changes agree exactly, results must be labeled **FantasyPros surrogate**, not holdout-validated FantasyPros-style output. Surrogate publication is an explicit, default-off fallback and is permitted only for a converged, identifiable fit with tolerance-compliant training error and the complete diverse blind design. Its separate content-addressed disclosure persists the blind maximum score error, display-match rate, holdout identities/sizes, and `source_fit_id`; that fit ID binds the full solver diagnostics evaluated by the healthy-fit publication gate. Results inside an observed balanced/no-adjustment shape are labeled `surrogate`, while other shapes are `surrogate_extrapolated`. Neither has passed the blind holdout gate.
 
 ## Projection aggregation and independent power
 
@@ -85,7 +85,9 @@ For every player and remaining NFL week, retain:
 
 - source-projected fantasy points and raw projected stats when available;
 - opponent, game, kickoff, and bye status;
-- injury/availability semantics and position eligibility;
+- timestamped provider injury/status wording and position eligibility; the
+  wording is retained as an observation, not treated as a certain appearance
+  probability;
 - source publication time when disclosed and retrieval time separately;
 - raw source row and a reviewed cross-source player identity.
 
@@ -104,7 +106,9 @@ The snapshot also needs current standings, every remaining fantasy matchup, poin
 For each simulated season:
 
 1. Optimize every team's legal lineup using projected means.
-2. Simulate player outcomes with predictive uncertainty and shared NFL game/offense effects.
+2. Simulate player outcomes with predictive uncertainty. Apply shared NFL
+   game/offense effects only when the bundle contains nonzero, calibrated
+   factor loadings; the current default uses independent player shocks.
 3. Settle the remaining fantasy schedule using platform score rounding.
 4. Update records and tiebreak state.
 5. Apply the captured qualification and seeding rules.

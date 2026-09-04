@@ -16,7 +16,13 @@ from .bundle_summary_cache import (
 )
 from .engine_bundle import EngineBundle, load_engine_bundle
 from .league_catalog import LeagueCatalog
-from .weekly_collection import WeeklyCollectionRequest
+from .league_history import LeagueHistoryStore, LeagueHistoryStoreError
+from .weekly_collection import (
+    LEAGUE_HISTORY_FILENAME,
+    WeeklyCollectionRequest,
+    load_weekly_history_attempt,
+    save_weekly_history_attempt,
+)
 
 UNASSIGNED_PROFILE_ID = "unassigned"
 _PROFILE_FIELDS = frozenset({
@@ -164,7 +170,17 @@ class LeagueWorkspaceService:
                     raise ValueError(
                         "The weekly bundle no longer matches the league scoring."
                     )
-                record["status"] = "ready"
+                try:
+                    summary = load_cached_bundle_summary(path)
+                except BundleSummaryCacheError:
+                    summary = None
+                if summary is None:
+                    summary = bundle_summary(bundle)
+                    try:
+                        save_cached_bundle_summary(bundle, path)
+                    except BundleSummaryCacheError:
+                        pass
+                record.update(_lean_bundle(summary))
             except (OSError, ValueError):
                 record.update(
                     status="invalid",
@@ -205,6 +221,13 @@ class LeagueWorkspaceService:
 
     def assign_bundle(self, profile_id: str, bundle_id: str) -> dict[str, object]:
         bundle = load_engine_bundle(self._bundle_path(bundle_id))
+        workspace = self._validate_association_target(
+            profile_id,
+            bundle,
+            scoring=_bundle_scoring(bundle),
+            expected_espn_league_id=None,
+        )
+        self._migrate_unassigned_evidence(bundle, workspace)
         association = self.associate_bundle(profile_id, bundle)
         return association.to_record()
 
@@ -297,6 +320,12 @@ class LeagueWorkspaceService:
         if not isinstance(bundle, EngineBundle):
             raise ValueError("bundle must be an EngineBundle")
         scoring = _bundle_scoring(bundle)
+        self._validate_association_target(
+            profile_id,
+            bundle,
+            scoring=scoring,
+            expected_espn_league_id=expected_espn_league_id,
+        )
         return self.catalog.associate_bundle(
             profile_id,
             bundle_id=bundle.bundle_id,
@@ -307,6 +336,89 @@ class LeagueWorkspaceService:
             scoring=scoring,
             expected_espn_league_id=expected_espn_league_id,
         )
+
+    def _validate_association_target(
+        self,
+        profile_id: str,
+        bundle: EngineBundle,
+        *,
+        scoring: str,
+        expected_espn_league_id: str | None,
+    ) -> Path:
+        owner = self.catalog.get_profile(profile_id)
+        if owner.archived:
+            raise ValueError("restore the league profile before adding a bundle")
+        if owner.season != bundle.state.season:
+            raise ValueError("bundle season must match the league profile season")
+        if owner.scoring != scoring:
+            raise ValueError(
+                "bundle reception scoring must match the league profile scoring"
+            )
+        if (
+            expected_espn_league_id is not None
+            and owner.espn_league_id != expected_espn_league_id
+        ):
+            raise ValueError("ESPN league changed while weekly collection was running")
+        existing = self.catalog.bundle_association(bundle.bundle_id)
+        if existing is not None and existing.profile_id != profile_id:
+            raise ValueError("bundle is already associated with another league")
+        workspace = (self.workspace_directory / owner.profile_id).resolve()
+        if workspace.parent != self.workspace_directory:
+            raise ValueError("league workspace path is invalid")
+        workspace.mkdir(parents=True, exist_ok=True)
+        self._seed_legacy_formula(workspace)
+        return workspace
+
+    def _migrate_unassigned_evidence(
+        self,
+        bundle: EngineBundle,
+        workspace: Path,
+    ) -> None:
+        """Move only evidence visible to this exact bundle into its workspace."""
+
+        snapshot = None
+        source_history_path = self.data_directory / LEAGUE_HISTORY_FILENAME
+        if source_history_path.is_file() and not source_history_path.is_symlink():
+            try:
+                snapshot = LeagueHistoryStore(
+                    source_history_path
+                ).snapshot_for_bundle(bundle.bundle_id)
+            except LeagueHistoryStoreError:
+                # Optional evidence that was already unreadable cannot be preserved.
+                snapshot = None
+        if snapshot is not None and (
+            snapshot.bundle_id != bundle.bundle_id
+            or snapshot.league_key != bundle.source_manifest.league_binding_id
+            or snapshot.season != bundle.state.season
+        ):
+            snapshot = None
+        if snapshot is not None:
+            destination = LeagueHistoryStore(workspace / LEAGUE_HISTORY_FILENAME)
+            destination.ingest_snapshot(snapshot)
+
+        try:
+            source_attempt = load_weekly_history_attempt(
+                self.data_directory,
+                bundle.bundle_id,
+            )
+        except (OSError, ValueError):
+            source_attempt = None
+        if source_attempt is None:
+            return
+        destination_attempt = load_weekly_history_attempt(
+            workspace,
+            bundle.bundle_id,
+        )
+        if destination_attempt is not None and destination_attempt != source_attempt:
+            raise ValueError(
+                "league workspace has conflicting history collection evidence"
+            )
+        if destination_attempt is None:
+            save_weekly_history_attempt(
+                workspace,
+                bundle.bundle_id,
+                source_attempt,
+            )
 
     def unassigned_bundle_ids(self) -> tuple[str, ...]:
         associated = self.catalog.associated_bundle_ids()
@@ -368,6 +480,7 @@ def _lean_bundle(summary: Mapping[str, object]) -> dict[str, object]:
         key: summary[key]
         for key in (
             "bundle_id",
+            "data_readiness",
             "status",
             "season",
             "week",

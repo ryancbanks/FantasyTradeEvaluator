@@ -2,7 +2,10 @@ import json
 import unittest
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
+from unittest.mock import patch
 
+import tests.test_engine_bundle as engine_bundle_fixtures
+import tests.test_search_runner as search_runner_fixtures
 from tests.test_engine_bundle import engine_bundle
 from trade_snapshot.local_server import create_local_server
 
@@ -106,7 +109,12 @@ class LeagueUiRuntimeTests(unittest.TestCase):
         self.assertEqual(self.page_errors, [])
 
     def test_multiple_leagues_assignment_saved_team_archive_and_dark_ui(self):
-        self.server.app_service.import_bundle(engine_bundle().to_record())
+        # Give the fixture one equal-value bench exchange so the strict
+        # five-point power gate has a valid row to render end to end.
+        with patch.dict(engine_bundle_fixtures.ALL_POINTS, {"q2": 8.0}), \
+                patch.dict(search_runner_fixtures.PLAYER_POINTS, {"q2": 8.0}):
+            bundle = engine_bundle()
+        self.server.app_service.import_bundle(bundle.to_record())
         self.page.goto(
             self.server.app_url, wait_until="domcontentloaded", timeout=10_000
         )

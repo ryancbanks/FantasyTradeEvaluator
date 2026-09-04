@@ -42,6 +42,8 @@ class ScenarioScoreCacheTests(unittest.TestCase):
 
         expected_bytes = 4 * 2 * 2 * 8
         self.assertEqual(baseline_projection.scenario_count, 4)
+        self.assertEqual(baseline_projection.scenario_run_id, prepared.run_id)
+        self.assertEqual(builder.run_id, prepared.run_id)
         self.assertEqual(builder.max_bytes, DEFAULT_MAX_CACHE_BYTES)
         self.assertEqual(builder.estimated_byte_count, expected_bytes)
         self.assertEqual(cache.cached_byte_count, expected_bytes)
@@ -190,7 +192,7 @@ def make_prepared(
 
 def projection(player_id: str, week: int, points: float) -> EnsembleProjection:
     observation = ProviderObservation(
-        provider="cache-test",
+        provider="espn",
         provider_player_id=f"source-{player_id}",
         status=ProjectionStatus.OBSERVED,
         projected_fantasy_points=points,

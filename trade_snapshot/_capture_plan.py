@@ -8,12 +8,22 @@ from types import MappingProxyType
 from urllib.parse import urlsplit
 
 from ._capture_common import content_id, require_json_int, require_safe_https_url, schema_fingerprint
-from ._capture_dimensions import AnalyzerTradeSpec, ProjectionTableSpec, RankingHorizon
-from ._capture_task_policy import capture_plan_fingerprint, page_task_fingerprint
-from ._capture_task_policy import validate_league_source_task, validate_visible_table_task
+from ._capture_dimensions import (
+    AnalyzerTradeSpec,
+    ProjectionTableSpec,
+    RankingHorizon,
+    fantasypros_ecr_source_scoring,
+)
+from ._capture_task_policy import (
+    canonical_visible_table_task_url,
+    capture_plan_fingerprint,
+    page_task_fingerprint,
+)
+from ._capture_task_policy import validate_league_source_task
 from ._capture_validation import enum_value as _enum_value, exact_fields as _exact_fields
 from ._capture_validation import optional_text_set as _optional_text_set
 from ._capture_validation import text_set as _text_set
+from .ecr_source import FANTASYPROS_LATEST_ECR_POLICY
 
 
 class CaptureProvider(str, Enum):
@@ -85,12 +95,12 @@ ECR_TASK_SCHEMA_FINGERPRINT = schema_fingerprint(
         "fields": [
             "provider", "season", "week", "kind", "horizon", "scoring",
             "position_scope", "expert_ids", "expert_count", "capture_method",
-            "url", "task_id",
+            "expert_selection_policy", "url", "task_id",
         ],
         "horizons": [horizon.value for horizon in RankingHorizon],
         "capture_methods": [method.value for method in ECRCaptureMethod],
         "provider_hosts": sorted(PROVIDER_HOST_ALLOWLISTS[CaptureProvider.FANTASYPROS]),
-        "policy_version": "queryless-bootstrap-provenance-v3",
+        "policy_version": "queryless-bootstrap-latest-ecr-v4",
     },
 )
 CAPTURE_PLAN_SCHEMA_FINGERPRINT = capture_plan_fingerprint(TASK_SCHEMA_FINGERPRINT, ECR_TASK_SCHEMA_FINGERPRINT)
@@ -115,11 +125,11 @@ class PageCaptureTask:
             raise ValueError("ecr_rankings requires FantasyProsECRTask")
         season = require_json_int("season", self.season, minimum=2000, maximum=2200)
         week = require_json_int("week", self.week, minimum=1, maximum=25)
-        url = require_safe_https_url(
-            self.url,
-            allowed_hosts=PROVIDER_HOST_ALLOWLISTS[provider],
-        )
         if kind is CaptureKind.ANALYZER_RESPONSE:
+            url = require_safe_https_url(
+                self.url,
+                allowed_hosts=PROVIDER_HOST_ALLOWLISTS[provider],
+            )
             if provider is not CaptureProvider.FANTASYPROS:
                 raise ValueError("analyzer_response tasks must use FantasyPros")
             parsed = urlsplit(url)
@@ -144,11 +154,20 @@ class PageCaptureTask:
                 raise ValueError("analyzer_trade is only valid for analyzer_response tasks")
             if not isinstance(self.projection, ProjectionTableSpec):
                 raise ValueError("visible_table tasks require ProjectionTableSpec")
-            validate_visible_table_task(provider, url, self.projection)
+            url = canonical_visible_table_task_url(
+                provider,
+                self.url,
+                week=week,
+                projection=self.projection,
+            )
             analyzer_phase = None
             trade = None
             projection = self.projection
         else:
+            url = require_safe_https_url(
+                self.url,
+                allowed_hosts=PROVIDER_HOST_ALLOWLISTS[provider],
+            )
             validate_league_source_task(
                 provider, url,
                 (self.analyzer_phase, self.analyzer_trade, self.projection),
@@ -226,6 +245,7 @@ class FantasyProsECRTask:
     expert_count: int | None
     url: str
     capture_method: ECRCaptureMethod | str = ECRCaptureMethod.VISIBLE_PAGE
+    expert_selection_policy: str = FANTASYPROS_LATEST_ECR_POLICY
     task_id: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -244,6 +264,8 @@ class FantasyProsECRTask:
         if experts and count is not None and count != len(experts):
             raise ValueError("expert_count must equal the number of unique expert_ids")
         method = _enum_value(ECRCaptureMethod, "capture_method", self.capture_method)
+        if self.expert_selection_policy != FANTASYPROS_LATEST_ECR_POLICY:
+            raise ValueError("expert_selection_policy is unsupported")
         url = require_safe_https_url(
             self.url,
             allowed_hosts=PROVIDER_HOST_ALLOWLISTS[CaptureProvider.FANTASYPROS],
@@ -265,6 +287,7 @@ class FantasyProsECRTask:
             ("scoring", scoring), ("position_scope", positions),
             ("expert_ids", experts), ("expert_count", count),
             ("capture_method", method), ("url", url),
+            ("expert_selection_policy", FANTASYPROS_LATEST_ECR_POLICY),
         ):
             object.__setattr__(self, name, value)
         object.__setattr__(self, "task_id", content_id("captask", self._content_record()))
@@ -276,6 +299,10 @@ class FantasyProsECRTask:
     @property
     def kind(self) -> CaptureKind:
         return CaptureKind.ECR_RANKINGS
+
+    @property
+    def source_scoring(self) -> str:
+        return fantasypros_ecr_source_scoring(self.scoring, self.position_scope)
 
     def _content_record(self) -> dict[str, object]:
         return {
@@ -289,6 +316,7 @@ class FantasyProsECRTask:
             "expert_ids": list(self.expert_ids),
             "expert_count": self.expert_count,
             "capture_method": self.capture_method.value,
+            "expert_selection_policy": self.expert_selection_policy,
             "url": self.url,
         }
 
@@ -304,7 +332,7 @@ class FantasyProsECRTask:
         expected = {
             "schema_fingerprint", "provider", "season", "week", "kind", "horizon",
             "scoring", "position_scope", "expert_ids", "expert_count", "capture_method",
-            "url", "task_id",
+            "expert_selection_policy", "url", "task_id",
         }
         _exact_fields(record, expected, "FantasyPros ECR capture task")
         if (
@@ -316,9 +344,16 @@ class FantasyProsECRTask:
         ):
             raise ValueError("FantasyPros ECR capture task header is invalid")
         task = cls(
-            record["season"], record["week"], record["horizon"], record["scoring"],
-            tuple(record["position_scope"]), tuple(record["expert_ids"]),
-            record["expert_count"], record["url"], record["capture_method"],
+            season=record["season"],
+            week=record["week"],
+            horizon=record["horizon"],
+            scoring=record["scoring"],
+            position_scope=tuple(record["position_scope"]),
+            expert_ids=tuple(record["expert_ids"]),
+            expert_count=record["expert_count"],
+            url=record["url"],
+            capture_method=record["capture_method"],
+            expert_selection_policy=record["expert_selection_policy"],
         )
         if record["task_id"] != task.task_id:
             raise ValueError("FantasyPros ECR capture task content does not match task_id")

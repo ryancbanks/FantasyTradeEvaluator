@@ -7,6 +7,7 @@ def build_recommendation(
     *,
     shortlist_is_exhaustive=True,
     alternative_limit=3,
+    skipped_option_count=0,
 ):
     mutual = [row for row in options if row["mutual_playoff_gain"]]
     current = [row for row in mutual if row["effective_week"] == first_week]
@@ -29,6 +30,8 @@ def build_recommendation(
         if options and shortlist_is_exhaustive
         else "no_mutual_gain_in_simulated_shortlist"
         if options
+        else "simulation_incomplete_no_result"
+        if skipped_option_count
         else "no_power_screened_candidate"
     )
     return {
@@ -39,6 +42,10 @@ def build_recommendation(
         "simulated_option_count": len(options),
         "mutual_playoff_gain_option_count": len(mutual),
         "shortlist_is_exhaustive": shortlist_is_exhaustive,
+        "skipped_infeasible_option_count": skipped_option_count,
+        "simulation_coverage_status": (
+            "complete" if not skipped_option_count else "partial_candidate_failures"
+        ),
         "future_plan_is_recommendation": False,
         "future_plan_reason": "league_trade_deadline_not_captured",
     }

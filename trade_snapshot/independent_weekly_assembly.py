@@ -194,7 +194,6 @@ def assemble_independent_weekly_engine(
     projected_points = _remaining_points(preliminary_ensemble)
     required_positions = required_waiver_positions(
         state.roster_rules.starting_lineup_slots,
-        (players[player_id].position for player_id in owned),
     )
     waiver_pool = select_independent_waiver_pool(
         snapshot_id=state.snapshot_id,

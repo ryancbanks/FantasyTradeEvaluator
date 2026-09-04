@@ -264,6 +264,10 @@ def _validate_capture_coverage(
     best_free_agents = set(
         payloads[LeagueSourceKind.ANALYZER_INIT]["best_free_agent_ids"]
     )
+    if not best_free_agents <= known_players:
+        raise ValueError(
+            "best free agents are missing from the captured player identity table"
+        )
     if best_free_agents & roster_players:
         raise ValueError("best free agents cannot already belong to a league roster")
     if payloads[LeagueSourceKind.PROJECTED_STANDINGS]["playoffsTeam"] > team_count:
@@ -303,6 +307,17 @@ def _players(value: object) -> None:
     _rows(value, required, allowed, "players")
     if len(_ids(value, "player_id")) != len(value):
         raise ValueError("players must have unique player_id values")
+    for row in value:
+        if not isinstance(row["name"], str) or not row["name"].strip():
+            raise ValueError("player name must be non-empty text")
+    for field in ("espn_id", "yahoo_id"):
+        ids = [
+            _id(row[field], field)
+            for row in value
+            if row.get(field) is not None
+        ]
+        if len(ids) != len(set(ids)):
+            raise ValueError(f"players must have unique {field} values")
 
 
 def _teams(value: object) -> None:

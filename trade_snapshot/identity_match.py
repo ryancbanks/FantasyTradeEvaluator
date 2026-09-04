@@ -15,7 +15,11 @@ from .identity import (
 from .positions import normalize_player_position
 
 
-__all__ = ("ProviderPlayerRecord", "reconcile_player_identities")
+__all__ = (
+    "ProviderIdentityLink",
+    "ProviderPlayerRecord",
+    "reconcile_player_identities",
+)
 
 
 _TEAM_ALIASES = {"JAC": "JAX", "WAS": "WSH", "LA": "LAR"}
@@ -47,11 +51,48 @@ class ProviderPlayerRecord:
         return _match_key(self.display_name, self.position, self.nfl_team_id)
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderIdentityLink:
+    """A source-published exact crosswalk between stable provider IDs."""
+
+    references: tuple[ProviderReference, ...]
+    evidence: str
+
+    def __post_init__(self) -> None:
+        if isinstance(self.references, (str, bytes)):
+            raise ValueError("references must contain ProviderReference values")
+        try:
+            references = tuple(self.references)
+        except TypeError:
+            raise ValueError(
+                "references must contain ProviderReference values"
+            ) from None
+        if len(references) < 2 or any(
+            not isinstance(reference, ProviderReference) for reference in references
+        ):
+            raise ValueError(
+                "references must contain at least two ProviderReference values"
+            )
+        keys = tuple(reference.key for reference in references)
+        providers = tuple(reference.provider for reference in references)
+        if len(set(keys)) != len(keys) or len(set(providers)) != len(providers):
+            raise ValueError("identity link must contain one unique ID per provider")
+        if not isinstance(self.evidence, str) or not self.evidence.strip():
+            raise ValueError("evidence must be a non-empty string")
+        object.__setattr__(
+            self,
+            "references",
+            tuple(sorted(references, key=lambda reference: reference.key)),
+        )
+        object.__setattr__(self, "evidence", self.evidence.strip())
+
+
 def reconcile_player_identities(
     records: Iterable[ProviderPlayerRecord],
     previous: IdentityRegistry | None = None,
     *,
     anchor_provider: str = "fantasypros",
+    verified_links: Iterable[ProviderIdentityLink] = (),
 ) -> IdentityRegistry:
     """Reuse stable IDs, then accept only unique exact metadata matches."""
 
@@ -65,6 +106,42 @@ def reconcile_player_identities(
         raise ValueError("previous must be an IdentityRegistry or None")
     if not isinstance(anchor_provider, str) or not anchor_provider.strip():
         raise ValueError("anchor_provider must be a non-empty string")
+    if isinstance(verified_links, (str, bytes)):
+        raise ValueError("verified_links must contain ProviderIdentityLink values")
+    try:
+        links = tuple(verified_links)
+    except TypeError:
+        raise ValueError(
+            "verified_links must contain ProviderIdentityLink values"
+        ) from None
+    if any(not isinstance(link, ProviderIdentityLink) for link in links):
+        raise ValueError("verified_links must contain ProviderIdentityLink values")
+    records_by_key = {
+        (row.provider, row.provider_player_id): row for row in rows
+    }
+    linked_keys: dict[tuple[str, str], ProviderIdentityLink] = {}
+    for link in links:
+        anchors = tuple(
+            reference
+            for reference in link.references
+            if reference.provider == anchor_provider
+        )
+        if len(anchors) != 1:
+            raise ValueError(
+                "identity link must contain exactly one anchor-provider ID"
+            )
+        for reference in link.references:
+            if reference.key not in records_by_key:
+                raise ValueError(
+                    f"identity link references missing player record {reference.key!r}"
+                )
+            previous_link = linked_keys.get(reference.key)
+            if previous_link is not None and previous_link != link:
+                raise ValueError(
+                    f"provider player ID appears in conflicting identity links: "
+                    f"{reference.key!r}"
+                )
+            linked_keys[reference.key] = link
 
     previous = previous or IdentityRegistry(())
     players = {row.canonical_player_id: row for row in previous.players}
@@ -93,6 +170,47 @@ def reconcile_player_identities(
         assigned[key] = canonical
         references[canonical] = {row.reference.key: row.reference}
         metadata[canonical] = (row.display_name, row.position, row.nfl_team_id)
+
+    for link in links:
+        anchor_reference = next(
+            reference
+            for reference in link.references
+            if reference.provider == anchor_provider
+        )
+        canonical = assigned[anchor_reference.key]
+        linked_rows = tuple(records_by_key[reference.key] for reference in link.references)
+        anchor_row = records_by_key[anchor_reference.key]
+        if any(
+            row.position != anchor_row.position
+            or row.nfl_team_id != anchor_row.nfl_team_id
+            for row in linked_rows
+        ):
+            raise ValueError(
+                f"identity link metadata conflicts with its anchor: {link.evidence}"
+            )
+        assigned_canonicals = {
+            assigned[reference.key]
+            for reference in link.references
+            if reference.key in assigned
+        }
+        if assigned_canonicals - {canonical}:
+            raise ValueError(
+                f"identity link joins conflicting canonical players: {link.evidence}"
+            )
+        providers = {
+            reference.provider: reference.provider_player_id
+            for reference in references[canonical].values()
+        }
+        for reference in link.references:
+            known_id = providers.get(reference.provider)
+            if known_id is not None and known_id != reference.provider_player_id:
+                raise ValueError(
+                    f"identity link conflicts with an existing provider ID: "
+                    f"{link.evidence}"
+                )
+            assigned[reference.key] = canonical
+            references[canonical][reference.key] = reference
+            providers[reference.provider] = reference.provider_player_id
 
     current_by_canonical = defaultdict(list)
     for row in rows:

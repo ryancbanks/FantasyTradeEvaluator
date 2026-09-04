@@ -22,6 +22,17 @@ from .trade_space import TeamRoster
 _MAX_CONDITIONED_BEFORE_CACHE_SIZE = 64
 
 
+@dataclass(frozen=True, slots=True)
+class _IdentifiedScenarios:
+    """One scenario subset carrying the identity consumed by projection."""
+
+    run_id: str
+    rows: Iterable[ScoreScenario]
+
+    def __iter__(self):
+        return iter(self.rows)
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class PreparedDelayedBaseline:
     """One trusted materialization reused across many delayed roster changes."""
@@ -57,18 +68,21 @@ class PreparedDelayedBaseline:
         if cached is not None:
             self._conditioned_before_cache.move_to_end(scenario_indexes)
             return cached
-        projection = project_remaining_season(
-            self.baseline.state,
-            (self.before_scenarios[index] for index in scenario_indexes),
-            score_decimal_places=self.baseline.score_decimal_places,
-            random_seed=self.baseline.tiebreak_random_seed,
-        )
         run_id = content_id(
             "conditioned-scenario-run",
             {
                 "baseline_run_id": self.baseline.scenarios.run_id,
                 "scenario_indexes": scenario_indexes,
             },
+        )
+        projection = project_remaining_season(
+            self.baseline.state,
+            _IdentifiedScenarios(
+                run_id,
+                (self.before_scenarios[index] for index in scenario_indexes),
+            ),
+            score_decimal_places=self.baseline.score_decimal_places,
+            random_seed=self.baseline.tiebreak_random_seed,
         )
         result = projection, run_id
         self._conditioned_before_cache[scenario_indexes] = result
@@ -189,9 +203,15 @@ class PreparedDelayedRosterChange:
         before_projection,
         before_run_id,
     ):
+        delayed_run_id = self._delayed_run_id(
+            effective_week, before_run_id, scenario_indexes
+        )
         after_projection = project_remaining_season(
             self.baseline.state,
-            self._spliced_scenarios(effective_week, scenario_indexes),
+            _IdentifiedScenarios(
+                delayed_run_id,
+                self._spliced_scenarios(effective_week, scenario_indexes),
+            ),
             score_decimal_places=self.baseline.score_decimal_places,
             random_seed=self.baseline.tiebreak_random_seed,
         )
@@ -207,14 +227,6 @@ class PreparedDelayedRosterChange:
             )
             for team in self.baseline.state.teams
         )
-        delayed_run_id = content_id(
-            "delayed-scenario-run",
-            {
-                "after_run_id": self.after_run_id,
-                "before_run_id": before_run_id,
-                "effective_week": effective_week,
-            },
-        )
         return PairedSeasonProjection(
             before=before_projection,
             after=after_projection,
@@ -222,6 +234,21 @@ class PreparedDelayedRosterChange:
             before_scenario_run_id=before_run_id,
             after_scenario_run_id=delayed_run_id,
             draw_space_id=self.baseline.scenarios.draw_space_id,
+        )
+
+    def _delayed_run_id(self, effective_week, before_run_id, scenario_indexes):
+        if (
+            scenario_indexes is None
+            and effective_week == self.baseline.state.first_remaining_week
+        ):
+            return self.after_run_id
+        return content_id(
+            "delayed-scenario-run",
+            {
+                "after_run_id": self.after_run_id,
+                "before_run_id": before_run_id,
+                "effective_week": effective_week,
+            },
         )
 
     def _effective_weeks(self, effective_weeks):

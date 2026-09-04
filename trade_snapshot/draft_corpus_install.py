@@ -516,7 +516,7 @@ class DraftCorpusInstaller:
             "Accept": "application/json"
             if asset.role == "ffc_adp"
             else "application/octet-stream",
-            "User-Agent": "FantasyTradeEvaluator/0.1 historical-corpus-installer",
+            "User-Agent": "FantasyTradeEvaluator/0.2.0 historical-corpus-installer",
         }
         if start:
             headers["Range"] = f"bytes={start}-"
@@ -587,7 +587,7 @@ def _release_assets(transport, tag):
         _RELEASE_API.format(tag),
         headers={
             "Accept": "application/vnd.github+json",
-            "User-Agent": "FantasyTradeEvaluator/0.1 historical-corpus-installer",
+            "User-Agent": "FantasyTradeEvaluator/0.2.0 historical-corpus-installer",
         },
     )
     try:

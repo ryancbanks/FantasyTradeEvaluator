@@ -7,6 +7,7 @@ from math import isfinite
 from numbers import Real
 from pathlib import Path
 
+from .roster_adjustment import InfeasibleRosterAdjustment
 from .search import PreparedTradePair, TradePowerEvaluation
 from .search_store import (
     MAX_QUALIFIED_RESULT_BATCH_SIZE,
@@ -97,22 +98,22 @@ class TradeSearchOutcome(_TradeSearchOutcomeStorage):
 
     progress: TradeSearchProgress
     results: tuple[QualifiedSearchResult, ...]
+    run_definition: SearchRunDefinition
 
     def __init__(
         self,
         progress: TradeSearchProgress,
         results: Iterable[QualifiedSearchResult],
+        run_definition: SearchRunDefinition,
     ) -> None:
-        if not isinstance(progress, TradeSearchProgress):
-            raise ValueError("progress must be TradeSearchProgress")
         try:
             rows = tuple(results)
         except TypeError:
             raise ValueError("results must be an iterable of qualified results") from None
-        if any(not isinstance(row, QualifiedSearchResult) for row in rows):
-            raise ValueError("results must contain QualifiedSearchResult values")
+        _validate_outcome_contract(progress, run_definition, rows)
         object.__setattr__(self, "progress", progress)
         object.__setattr__(self, "results", rows)
+        object.__setattr__(self, "run_definition", run_definition)
         object.__setattr__(self, "_database_path", None)
 
     @classmethod
@@ -120,9 +121,9 @@ class TradeSearchOutcome(_TradeSearchOutcomeStorage):
         cls,
         progress: TradeSearchProgress,
         database_path: str | Path,
+        run_definition: SearchRunDefinition,
     ) -> "TradeSearchOutcome":
-        if not isinstance(progress, TradeSearchProgress):
-            raise ValueError("progress must be TradeSearchProgress")
+        _validate_outcome_contract(progress, run_definition)
         try:
             path = Path(database_path).resolve()
         except TypeError:
@@ -137,7 +138,14 @@ class TradeSearchOutcome(_TradeSearchOutcomeStorage):
                 expected_result_count=progress.power_qualified_count,
                 maximum_candidate_index=progress.next_candidate_index,
             )
+            _validate_outcome_contract(
+                progress,
+                run_definition,
+                rows,
+                validate_mutual_gain_count=False,
+            )
         object.__setattr__(outcome, "results", rows)
+        object.__setattr__(outcome, "run_definition", run_definition)
         object.__setattr__(outcome, "_database_path", path)
         return outcome
 
@@ -222,7 +230,11 @@ class TradeSearchOutcome(_TradeSearchOutcomeStorage):
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, TradeSearchOutcome):
             return NotImplemented
-        return self.progress == other.progress and self.results == other.results
+        return (
+            self.progress == other.progress
+            and self.run_definition == other.run_definition
+            and self.results == other.results
+        )
 
     def __hash__(self) -> int:
         return hash(self.progress)
@@ -239,7 +251,8 @@ class TradeSearchOutcome(_TradeSearchOutcomeStorage):
         path_summary = "None" if location is None else repr(location)
         return (
             f"TradeSearchOutcome(progress={self.progress!r}, "
-            f"results={result_summary}, database_path={path_summary})"
+            f"results={result_summary}, run_id={self.run_definition.run_id!r}, "
+            f"database_path={path_summary})"
         )
 
     def __copy__(self) -> "TradeSearchOutcome":
@@ -247,6 +260,7 @@ class TradeSearchOutcome(_TradeSearchOutcomeStorage):
             self.progress,
             object.__getattribute__(self, "results"),
             object.__getattribute__(self, "_database_path"),
+            self.run_definition,
         )
 
     def __deepcopy__(self, memo: dict[int, object]) -> "TradeSearchOutcome":
@@ -257,17 +271,19 @@ class TradeSearchOutcome(_TradeSearchOutcomeStorage):
             deepcopy(self.progress, memo),
             deepcopy(object.__getattribute__(self, "results"), memo),
             deepcopy(object.__getattribute__(self, "_database_path"), memo),
+            self.run_definition,
         )
         memo[id(self)] = outcome
         return outcome
 
     def __reduce_ex__(self, _protocol: int):
         return (
-            _restore_trade_search_outcome,
+            _restore_trade_search_outcome_from_record,
             (
                 self.progress,
                 object.__getattribute__(self, "results"),
                 object.__getattribute__(self, "_database_path"),
+                self.run_definition.to_record(),
             ),
         )
 
@@ -276,14 +292,69 @@ def _restore_trade_search_outcome(
     progress: TradeSearchProgress,
     results: tuple[QualifiedSearchResult, ...] | None,
     database_path: Path | None,
+    run_definition: SearchRunDefinition,
 ) -> TradeSearchOutcome:
     """Rebuild an outcome without accidentally resolving its lazy result field."""
 
     outcome = object.__new__(TradeSearchOutcome)
     object.__setattr__(outcome, "progress", progress)
     object.__setattr__(outcome, "results", results)
+    object.__setattr__(outcome, "run_definition", run_definition)
     object.__setattr__(outcome, "_database_path", database_path)
     return outcome
+
+
+def _restore_trade_search_outcome_from_record(
+    progress: TradeSearchProgress,
+    results: tuple[QualifiedSearchResult, ...] | None,
+    database_path: Path | None,
+    run_definition_record: dict[str, object],
+) -> TradeSearchOutcome:
+    """Restore a pickled outcome without serializing immutable mapping proxies."""
+
+    return _restore_trade_search_outcome(
+        progress,
+        results,
+        database_path,
+        SearchRunDefinition.from_record(run_definition_record),
+    )
+
+
+def _validate_outcome_contract(
+    progress: TradeSearchProgress,
+    run_definition: SearchRunDefinition,
+    rows: tuple[QualifiedSearchResult, ...] | None = None,
+    *,
+    validate_mutual_gain_count: bool = True,
+) -> None:
+    if not isinstance(progress, TradeSearchProgress):
+        raise ValueError("progress must be TradeSearchProgress")
+    if not isinstance(run_definition, SearchRunDefinition):
+        raise ValueError("run_definition must be SearchRunDefinition")
+    if (
+        progress.run_id != run_definition.run_id
+        or progress.total_candidate_count != run_definition.total_candidate_count
+    ):
+        raise ValueError("search outcome does not match its run definition")
+    if rows is None:
+        return
+    if any(not isinstance(row, QualifiedSearchResult) for row in rows):
+        raise ValueError("results must contain QualifiedSearchResult values")
+    if len(rows) != progress.power_qualified_count:
+        raise ValueError("search outcome result count does not match progress")
+    indexes = tuple(row.candidate_index for row in rows)
+    if (
+        len(set(indexes)) != len(indexes)
+        or any(index >= progress.next_candidate_index for index in indexes)
+        or sum(row.primary_playoff_before is not None for row in rows)
+        != progress.playoff_evaluated_count
+        or (
+            validate_mutual_gain_count
+            and sum(_is_mutual_gain(row) for row in rows)
+            != progress.mutual_playoff_gain_count
+        )
+    ):
+        raise ValueError("search outcome results do not reconcile to progress")
 
 
 class ResumableTradeSearch:
@@ -310,8 +381,11 @@ class ResumableTradeSearch:
             trade_space.counterparty, prepared_strength.counterparty
         ):
             raise ValueError("trade space and prepared strength teams do not match")
-        if not trade_space.constraints.require_no_drops and prepared_strength.adjuster is None:
-            raise ValueError("trades allowing roster drops require a prepared roster adjuster")
+        adjuster = prepared_strength.adjuster
+        if adjuster is None:
+            raise ValueError("trade searches require a prepared roster adjuster")
+        if adjuster.forbid_drops is not trade_space.constraints.require_no_drops:
+            raise ValueError("roster adjuster drop policy does not match trade constraints")
         baseline_by_team = {
             roster.team_id: roster for roster in season_baseline.scenarios.rosters
         }
@@ -404,10 +478,16 @@ class ResumableTradeSearch:
                     next_index = index
                     cancelled = True
                     break
-                power = self.prepared_strength.evaluate(candidate, candidate_index=index)
+                try:
+                    power = self.prepared_strength.evaluate(
+                        candidate, candidate_index=index
+                    )
+                except InfeasibleRosterAdjustment:
+                    power = None
                 next_index = index + 1
-                qualified = self._power_qualifies(power)
+                qualified = power is not None and self._power_qualifies(power)
                 if qualified:
+                    assert power is not None
                     saved = self._simulate_candidate(power)
                     pending_results.append(saved)
                     qualified_count += 1
@@ -460,7 +540,11 @@ class ResumableTradeSearch:
             )
             if on_progress is not None:
                 on_progress(progress)
-            return TradeSearchOutcome.from_database(progress, store.path)
+            return TradeSearchOutcome.from_database(
+                progress,
+                store.path,
+                self.run_definition,
+            )
 
     def _power_qualifies(self, result: TradePowerEvaluation) -> bool:
         threshold = self.settings.minimum_displayed_power_delta

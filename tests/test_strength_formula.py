@@ -6,8 +6,13 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from tests.test_calibration_fit import corpus, exact_corpus, fit
-from tests.test_feature_engineering import inputs
+from tests.test_feature_engineering import (
+    full_horizon_evidence,
+    grid_feature_kwargs,
+    inputs,
+)
 from trade_snapshot.feature_engineering import build_strength_features
+from trade_snapshot.projections import RemainingSeasonProjection
 from trade_snapshot.strength import CalibrationStatus, RoleDefinition, RoleKind
 from trade_snapshot.strength_calibration import CalibrationMetadata
 from trade_snapshot.strength_formula import (
@@ -37,7 +42,7 @@ def formula(scoring_profile_id="profile-1"):
         scoring_profile_id=scoring_profile_id,
         role_definitions=(role,),
         residual_weights={"presence": 0.5},
-        role_weights={"RB_START_1": {"projection_fantasypros_remaining_points": 1.0}},
+        role_weights={"RB_START_1": {"projection_fantasypros_full_ros_points": 1.0}},
         calibration=metadata(),
     )
 
@@ -72,7 +77,9 @@ class StrengthFormulaTests(unittest.TestCase):
 
     def test_rebuilds_current_player_scores_and_weekly_denominator_locally(self):
         snapshots, projections, eligibility = inputs()
-        features = build_strength_features(snapshots, projections, eligibility)
+        features = build_strength_features(
+            snapshots, projections, eligibility, **grid_feature_kwargs(projections)
+        )
         model = formula().build_model(
             features,
             (
@@ -89,7 +96,9 @@ class StrengthFormulaTests(unittest.TestCase):
 
     def test_rejects_identity_drift_missing_inputs_and_shared_players(self):
         snapshots, projections, eligibility = inputs()
-        features = build_strength_features(snapshots, projections, eligibility)
+        features = build_strength_features(
+            snapshots, projections, eligibility, **grid_feature_kwargs(projections)
+        )
         rosters = (
             TeamRoster("a", ("p1",), 1, 1),
             TeamRoster("b", ("p2",), 1, 1),
@@ -111,12 +120,49 @@ class StrengthFormulaTests(unittest.TestCase):
                 ),
             )
 
+    def test_requires_only_the_full_horizon_sources_used_by_the_formula(self):
+        snapshots, projections, eligibility = inputs()
+        rosters = (
+            TeamRoster("a", ("p1",), 1, 1),
+            TeamRoster("b", ("p2",), 1, 1),
+        )
+
+        def without(provider):
+            return tuple(
+                row
+                for row in full_horizon_evidence(projections)
+                if not (
+                    isinstance(row, RemainingSeasonProjection)
+                    and row.canonical_player_id == "p1"
+                    and row.provider == provider
+                )
+            )
+
+        optional_gap = build_strength_features(
+            snapshots,
+            projections,
+            eligibility,
+            projection_evidence=without("yahoo"),
+            remaining_week_scopes={"p1": (1, 2, 3, 4), "p2": (1, 2, 3, 4)},
+        )
+        formula().build_model(optional_gap, rosters)
+
+        required_gap = build_strength_features(
+            snapshots,
+            projections,
+            eligibility,
+            projection_evidence=without("fantasypros"),
+            remaining_week_scopes={"p1": (1, 2, 3, 4), "p2": (1, 2, 3, 4)},
+        )
+        with self.assertRaisesRegex(ValueError, "required feature.*p1"):
+            formula().build_model(required_gap, rosters)
+
     def test_rejects_non_fantasypros_projection_features(self):
         for feature in (
-            "projection_espn_remaining_points",
-            "projection_yahoo_remaining_points",
-            "projection_ensemble_remaining_points",
-            "projection_sleeper_remaining_points",
+            "projection_espn_full_ros_points",
+            "projection_yahoo_full_ros_points",
+            "projection_ensemble_full_ros_points",
+            "projection_sleeper_full_ros_points",
         ):
             with self.subTest(feature=feature):
                 with self.assertRaisesRegex(ValueError, "FantasyPros projection features"):

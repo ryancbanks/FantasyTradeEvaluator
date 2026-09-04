@@ -1,13 +1,14 @@
 """Small validation and presentation helpers for the localhost app service."""
 
-from collections import Counter
-from collections.abc import Mapping
-from pathlib import Path
 import os
 import re
 import sys
+from collections import Counter
+from collections.abc import Mapping
+from pathlib import Path
 
 from ._scenario_random import content_id
+from .data_readiness import build_bundle_data_readiness
 from .engine_bundle import EngineBundle
 from .independent_power_disclosure import INDEPENDENT_POWER_NOTICE
 from .league_search import LeagueSearchOutcome
@@ -17,9 +18,7 @@ from .roster_adjustment import MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
 from .season import SeasonProjection
 from .surrogate_disclosure import SURROGATE_NOTICE, SURROGATE_QUALITY_GATE
 from .three_way_search import ThreeWaySearchOutcome
-from .workbook_model import WorkbookSource
-from .workbook_model import team_outlook_rows, workbook_trade_rows
-
+from .workbook_model import WorkbookSource, team_outlook_rows, workbook_trade_rows
 
 BUNDLE_ID_PATTERN = re.compile(r"^engine_[0-9a-f]{64}$")
 
@@ -36,8 +35,19 @@ def default_data_directory() -> Path:
 
 def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
     evidence = bundle.methodology_evidence
-    exact = bundle.methodology_attestation is not None
+    attested = bundle.methodology_attestation is not None
     independent = bundle.independent_power_disclosure is not None
+    data_readiness = build_bundle_data_readiness(bundle)
+    binding = bundle.source_manifest
+    if binding is None:
+        league_key = bundle.state.snapshot_id[:12]
+        league_label = f"Independent league snapshot {league_key}"
+    else:
+        league_key = binding.league_binding_id.removeprefix("league_")[:12]
+        league_label = (
+            f"{binding.host_provider.upper()} "
+            f"{binding.league_binding_scope.value} {league_key}"
+        )
     forecast_providers = tuple(sorted({
         observation.provider
         for projection in bundle.projections
@@ -94,7 +104,7 @@ def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
             "quality_gate": "transparent_independent_v1",
             "source_fit_id_binds_full_solver_diagnostics": False,
             "current_holdout_count": 0,
-            "exact_trade_scope": None,
+            "holdout_validated_trade_scope": None,
             "validated_balanced_package_sizes": [],
             "observed_balanced_package_sizes": [],
             "holdout_max_absolute_score_error": None,
@@ -104,10 +114,10 @@ def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
         methodology = {
             "mode": bundle.methodology_mode,
             "attestation_id": (
-                None if not exact else bundle.methodology_attestation.attestation_id
+                None if not attested else bundle.methodology_attestation.attestation_id
             ),
             "surrogate_disclosure_id": (
-                None if exact else bundle.surrogate_disclosure.disclosure_id
+                None if attested else bundle.surrogate_disclosure.disclosure_id
             ),
             "independent_disclosure_id": None,
             "policy_id": None,
@@ -118,19 +128,23 @@ def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
             "current_evidence_id": evidence.current_evidence_id,
             "source_fit_id": evidence.formula_source_fit_id,
             "quality_gate": (
-                "exact_attestation_v1" if exact else SURROGATE_QUALITY_GATE
+                "blind_holdout_validation_v1"
+                if attested
+                else SURROGATE_QUALITY_GATE
             ),
             "source_fit_id_binds_full_solver_diagnostics": True,
             "current_holdout_count": evidence.current_holdout_count,
-            "exact_trade_scope": (
-                "balanced packages with no adds or drops" if exact else None
+            "holdout_validated_trade_scope": (
+                "balanced package shapes with no adds or drops"
+                if attested
+                else None
             ),
             "validated_balanced_package_sizes": list(
                 evidence.validated_balanced_package_sizes
             ),
             "observed_balanced_package_sizes": (
                 list(evidence.validated_balanced_package_sizes)
-                if exact
+                if attested
                 else list(evidence.observed_balanced_package_sizes)
             ),
             "holdout_max_absolute_score_error": (
@@ -142,7 +156,11 @@ def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
         }
     return {
         "bundle_id": bundle.bundle_id,
-        "status": "ready",
+        "league_key": league_key,
+        "league_label": league_label,
+        "status": (
+            "not_ready" if data_readiness["status"] == "not_ready" else "ready"
+        ),
         "season": bundle.state.season,
         "week": bundle.state.first_remaining_week,
         "team_count": len(bundle.state.teams),
@@ -169,25 +187,90 @@ def bundle_summary(bundle: EngineBundle) -> dict[str, object]:
             else "single_source"
         ),
         "power_engine_notice": (
-            "Exact within the attested balanced-package scope; other shapes are extrapolated."
-            if exact
+            "Representative blind holdouts validate the listed balanced-package "
+            "shapes; this is not an exhaustive proof of every combination. Other "
+            "shapes are extrapolated."
+            if attested
             else INDEPENDENT_POWER_NOTICE if independent else SURROGATE_NOTICE
         ),
         "three_team_free_agent_allocation_policy": (
             MULTI_TEAM_FREE_AGENT_ALLOCATION_POLICY
         ),
+        "data_readiness": data_readiness,
         "methodology": methodology,
     }
 
 
 def workbook_sources(bundle: EngineBundle) -> tuple[WorkbookSource, ...]:
     evidence = bundle.methodology_evidence
-    sources = [
-        WorkbookSource(
-            f"FantasyPros ECR ({row.period.value})", row.ecr_id, row.captured_at
+    independent = bundle.methodology_mode == "independent"
+    manifest = bundle.source_manifest
+    if independent:
+        sources = [
+            WorkbookSource(
+                "Independent weekly engine bundle",
+                bundle.bundle_id,
+                evidence.current_evidence_at,
+            ),
+            WorkbookSource(
+                "Independent power policy disclosure",
+                bundle.independent_power_disclosure.disclosure_id,
+                bundle.independent_power_disclosure.captured_at,
+            ),
+        ]
+    else:
+        sources = [
+            WorkbookSource(
+                f"Host league snapshot ({manifest.host_provider})",
+                manifest.host_snapshot_id,
+                manifest.host_captured_at,
+            ),
+            WorkbookSource(
+                f"Opaque league binding ({manifest.league_binding_scope.value})",
+                manifest.league_binding_id,
+                manifest.host_captured_at,
+            ),
+            WorkbookSource(
+                "FantasyPros league artifact",
+                manifest.fantasypros_league_artifact_id,
+                manifest.fantasypros_captured_at,
+            ),
+            WorkbookSource(
+                "FantasyPros comparison benchmark record (comparison only)",
+                bundle.fantasypros_benchmark.benchmark_id,
+                bundle.fantasypros_benchmark.captured_at,
+            ),
+            WorkbookSource(
+                "FantasyPros comparison source artifact (comparison only)",
+                bundle.fantasypros_benchmark.source_artifact_id,
+                bundle.fantasypros_benchmark.captured_at,
+            ),
+        ]
+        sources.extend(
+            WorkbookSource(
+                f"FantasyPros ECR ({row.period.value})", row.ecr_id, row.captured_at
+            )
+            for row in bundle.ecr_snapshots
         )
-        for row in bundle.ecr_snapshots
-    ]
+        sources.append(
+            WorkbookSource(
+                f"NFL schedule ({bundle.nfl_schedule.source_provider})",
+                bundle.nfl_schedule.schedule_id,
+                bundle.nfl_schedule.captured_at,
+            )
+        )
+        projection_sources = bundle.projection_source_manifest.sources
+        projection_attempts = bundle.projection_source_manifest.attempts
+        projection_source_times = tuple(
+            row.captured_at for row in projection_sources
+        ) + tuple(row.attempted_at for row in projection_attempts)
+        sources.append(
+            WorkbookSource(
+                "Projection source manifest",
+                bundle.projection_source_manifest.manifest_id,
+                max(projection_source_times),
+            )
+        )
     by_provider = {}
     forecast_providers = {
         observation.provider
@@ -211,26 +294,19 @@ def workbook_sources(bundle: EngineBundle) -> tuple[WorkbookSource, ...]:
                 max(row.captured_at for row in rows),
             )
         )
-    if bundle.methodology_mode == "independent":
-        sources.append(
-            WorkbookSource(
-                "Independent power policy disclosure",
-                bundle.independent_power_disclosure.disclosure_id,
-                bundle.independent_power_disclosure.captured_at,
-            )
-        )
+    if independent:
         return tuple(sources)
     sources.extend(
         (
             WorkbookSource(
                 (
                     "FantasyPros methodology attestation"
-                    if bundle.methodology_mode == "exact"
+                    if bundle.methodology_mode == "holdout_validated"
                     else "FantasyPros SURROGATE methodology disclosure"
                 ),
                 (
                     bundle.methodology_attestation.attestation_id
-                    if bundle.methodology_mode == "exact"
+                    if bundle.methodology_mode == "holdout_validated"
                     else bundle.surrogate_disclosure.disclosure_id
                 ),
                 evidence.current_evidence_at,
@@ -269,21 +345,37 @@ def search_result_record(
             if bundle.methodology_mode == "surrogate"
             else INDEPENDENT_POWER_NOTICE
             if bundle.methodology_mode == "independent"
-            else "Exact only inside the attested trade scope."
+            else (
+                "Power is blind-holdout validated for representative trades in "
+                "the listed package shapes, not exhaustively proven for every combination."
+            )
         ),
         "team_outlook": _team_outlook_records(outlook),
         "rows": [
             {
+                "candidate_index": str(row.candidate_index),
+                "search_run_id": row.search_run_id,
+                "other_team_id": row.counterparty_team_id,
                 "other_team": row.counterparty_team_name,
+                "give_player_ids": list(row.outgoing_player_ids),
                 "give": list(row.outgoing_player_names),
+                "receive_player_ids": list(row.incoming_player_ids),
                 "receive": list(row.incoming_player_names),
+                "your_add_player_ids": list(row.primary_added_player_ids),
                 "your_adds": list(row.primary_added_player_names),
+                "your_drop_player_ids": list(row.primary_dropped_player_ids),
                 "your_drops": list(row.primary_dropped_player_names),
+                "their_add_player_ids": list(row.counterparty_added_player_ids),
                 "their_adds": list(row.counterparty_added_player_names),
+                "their_drop_player_ids": list(row.counterparty_dropped_player_ids),
                 "their_drops": list(row.counterparty_dropped_player_names),
                 "your_power_delta": row.primary_power_delta,
                 "their_power_delta": row.counterparty_power_delta,
+                "your_playoff_before": row.primary_playoff_before,
+                "your_playoff_after": row.primary_playoff_after,
                 "your_playoff_delta": row.primary_playoff_delta,
+                "their_playoff_before": row.counterparty_playoff_before,
+                "their_playoff_after": row.counterparty_playoff_after,
                 "their_playoff_delta": row.counterparty_playoff_delta,
                 "combined_playoff_delta": row.combined_playoff_delta,
                 "mutual_gain": row.is_mutual_gain,
@@ -359,7 +451,7 @@ def three_way_search_result_record(
                 "combined_playoff_delta": result.combined_playoff_delta / 100,
                 "power_methodology_status": (
                     "extrapolated"
-                    if bundle.methodology_mode == "exact"
+                    if bundle.methodology_mode == "holdout_validated"
                     else "surrogate_extrapolated"
                     if bundle.methodology_mode == "surrogate"
                     else "independent"
@@ -384,7 +476,7 @@ def three_way_search_result_record(
             if bundle.methodology_mode == "surrogate"
             else INDEPENDENT_POWER_NOTICE
             if bundle.methodology_mode == "independent"
-            else "Three-team power is extrapolated beyond the attested two-team scope."
+            else "Three-team power is extrapolated beyond the blind-validated two-team scope."
         ),
         "free_agent_allocation_policy": free_agent_allocation_policy,
         "team_outlook": _team_outlook_records(
@@ -405,7 +497,12 @@ def _team_outlook_records(outlook) -> list[dict[str, object]]:
             "expected_final_wins": row.expected_final_wins,
             "expected_final_losses": row.expected_final_losses,
             "expected_final_ties": row.expected_final_ties,
+            "current_rank": row.current_rank,
+            "expected_final_points_for": row.expected_final_points_for,
+            "expected_final_points_against": row.expected_final_points_against,
             "projected_finish": row.mean_rank,
+            "rank_distribution": list(row.rank_distribution),
+            "seed_distribution": list(row.seed_distribution),
             "playoff_probability": row.playoff_probability,
         }
         for row in outlook

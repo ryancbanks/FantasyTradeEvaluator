@@ -13,7 +13,10 @@ from .espn_league import espn_lineup_slot_name
 from .league_history import (
     HistoryBundleBinding,
     HISTORY_CAPTURE_BINDING_TOLERANCE,
+    HistoryAcquisitionEvidence,
+    HistoryAcquisitionOutcome,
     HistoryRosterPlayer,
+    HistorySkipCount,
     HistoryTeam,
     HistoryTeamRoster,
     HistoryTimestampBasis,
@@ -22,10 +25,10 @@ from .league_history import (
     HistoryTransactionAssetKind,
     HistoryTransactionKind,
     LeagueHistoryCapture,
-    make_league_key,
 )
 from .identity import IdentityRegistry
 from .league_ingest import NormalizedLeagueInputs
+from .source_manifest import LeagueBindingScope
 
 
 _KINDS = {
@@ -62,11 +65,18 @@ def canonicalize_espn_history(
     if not isinstance(bundle, EngineBundle):
         raise ValueError("bundle must be an EngineBundle")
     bound_at = _aware(bundle_captured_at)
+    manifest = bundle.source_manifest
     if (
         league.source_provider != "espn"
         or league.source_league_id != source.source_league_id
         or league.league_state.season != source.season
         or bundle.state.season != source.season
+        or manifest.host_provider != "espn"
+        or manifest.league_binding_scope is not LeagueBindingScope.WORKSPACE
+        or getattr(league.league_state, "snapshot_id", None)
+        != manifest.host_snapshot_id
+        or getattr(league, "captured_at", None) != manifest.host_captured_at
+        or source.captured_at != manifest.host_captured_at
         or source.captured_at > bound_at
         or bound_at - source.captured_at > HISTORY_CAPTURE_BINDING_TOLERANCE
     ):
@@ -114,11 +124,34 @@ def canonicalize_espn_history(
             )
         rosters.append(HistoryTeamRoster(canonical_team, tuple(players)))
 
+    canonical_ownership = {
+        row.team_id: frozenset(player.canonical_player_id for player in row.players)
+        for row in rosters
+    }
+    bundle_ownership = {
+        row.team_id: frozenset(row.player_ids) for row in bundle.rosters
+    }
+    assembled_rosters = getattr(league, "rosters", None)
+    assembled_ownership = (
+        None
+        if assembled_rosters is None
+        else {row.team_id: frozenset(row.player_ids) for row in assembled_rosters}
+    )
+    if canonical_ownership != bundle_ownership or (
+        assembled_ownership is not None
+        and canonical_ownership != assembled_ownership
+    ):
+        raise ValueError(
+            "ESPN activity rosters do not exactly match the selected weekly bundle"
+        )
+
     transactions = []
     for event in source.transactions:
         transactions.append(
             HistoryTransaction(
-                transaction_id=_source_transaction_key(source, event),
+                transaction_id=_source_transaction_key(
+                    manifest.league_binding_id, event
+                ),
                 recorded_at=event.proposed_at,
                 timestamp_basis=HistoryTimestampBasis.ESPN_PROPOSED_DATE,
                 effective_week=event.scoring_period_id,
@@ -133,16 +166,40 @@ def canonicalize_espn_history(
                         ),
                         team_id(item.from_source_team_id),
                         team_id(item.to_source_team_id),
-                        _source_asset_key(source, event, index, item),
+                        _source_asset_key(
+                            manifest.league_binding_id, event, index, item
+                        ),
                         _ASSET_KINDS[item.asset_kind],
                     )
                     for index, item in enumerate(event.items)
                 ),
                 bid_amount=event.bid_amount,
+                accepted_at=event.accepted_at,
+                processed_at=event.processed_at,
+                expires_at=event.expires_at,
             )
         )
 
-    league_key = make_league_key("espn", source.source_league_id)
+    league_key = manifest.league_binding_id
+    acquisition = HistoryAcquisitionEvidence(
+        provider="espn",
+        attempted_at=source.captured_at,
+        outcome=(
+            HistoryAcquisitionOutcome.CAPTURED_COMPLETE
+            if source.transactions_complete
+            else HistoryAcquisitionOutcome.CAPTURED_PARTIAL
+        ),
+        completeness_policy="espn_executed_supported_transactions_v2",
+        normalized_transaction_count=len(transactions),
+        returned_transaction_count=source.returned_transaction_count,
+        transaction_limit=source.transaction_limit,
+        earliest_source_event_at=source.earliest_returned_proposed_at,
+        latest_source_event_at=source.latest_returned_proposed_at,
+        skipped=tuple(
+            HistorySkipCount(row.reason.value, row.count)
+            for row in source.skipped_transactions
+        ),
+    )
     capture = LeagueHistoryCapture(
         league_key=league_key,
         season=source.season,
@@ -155,12 +212,18 @@ def canonicalize_espn_history(
         teams=teams,
         transactions=tuple(transactions),
         rosters=tuple(rosters),
+        host_snapshot_id=manifest.host_snapshot_id,
+        acquisition_evidence=acquisition,
     )
     binding = HistoryBundleBinding(
         league_key,
         source.season,
         bundle.bundle_id,
         bound_at,
+        manifest.host_snapshot_id,
+        manifest.host_captured_at,
+        capture.capture_id,
+        capture.roster_ownership_id,
     )
     return capture, binding
 
@@ -171,13 +234,13 @@ def _aware(value):
     return value.astimezone(timezone.utc)
 
 
-def _source_asset_key(source, event, index, item):
+def _source_asset_key(league_binding_id, event, index, item):
     """Pseudonymize provider asset identity before it crosses history storage."""
 
     payload = "\0".join(
         (
             "espn",
-            source.source_league_id,
+            league_binding_id,
             event.source_transaction_id,
             str(index),
             item.asset_kind.value,
@@ -187,9 +250,9 @@ def _source_asset_key(source, event, index, item):
     return f"source_asset_{sha256(payload).hexdigest()}"
 
 
-def _source_transaction_key(source, event):
+def _source_transaction_key(league_binding_id, event):
     payload = "\0".join(
-        ("espn", source.source_league_id, event.source_transaction_id)
+        ("espn", league_binding_id, event.source_transaction_id)
     ).encode("utf-8")
     return f"espn_event_{sha256(payload).hexdigest()}"
 

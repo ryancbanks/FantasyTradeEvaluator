@@ -18,7 +18,7 @@ from ._strength_formula_evidence import (
     fitted_formula_evidence,
     normalize_formula_evidence,
 )
-from .feature_engineering import StrengthFeatureSet
+from .feature_engineering import StrengthFeatureSet, require_available_features
 from .methodology import _validate_fantasypros_power_features
 from .strength import StrengthModel
 from .strength_calibration import (
@@ -126,6 +126,7 @@ class StrengthFormula:
         if not required.issubset(features.feature_names):
             missing = min(required.difference(features.feature_names))
             raise ValueError(f"weekly features are missing formula input {missing!r}")
+        require_available_features(features, required)
         players = tuple(self._player_strength(row) for row in features.player_features)
         rosters = _baseline_rosters(baseline_rosters, {row.player_id for row in players})
         provisional = StrengthModel(

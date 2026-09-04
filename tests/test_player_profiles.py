@@ -9,7 +9,7 @@ from tests.test_engine_bundle import engine_bundle
 from trade_snapshot._scenario_random import content_id
 from trade_snapshot.identity import ManualMappingProvenance, ProviderReference
 from trade_snapshot.identity import IdentityRegistry, PlayerIdentity
-from trade_snapshot.engine_bundle import EngineBundle
+from trade_snapshot.engine_bundle import EngineBundle, UnsupportedEngineBundleSchema
 from trade_snapshot.player_outlook import build_player_outlook
 from trade_snapshot.player_profile_outlook import profile_catalog_record, profile_record
 from trade_snapshot.player_profile_materialize import (
@@ -443,7 +443,7 @@ class PlayerProfileDomainTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     replace(bundle, player_profiles=conflicting)
 
-    def test_schema_eight_bundle_loads_as_profile_absent(self):
+    def test_schema_eight_bundle_requires_a_fresh_collection(self):
         current = engine_bundle().to_record()
         current.pop("player_profiles")
         current.pop("player_lab_projections")
@@ -455,10 +455,9 @@ class PlayerProfileDomainTests(unittest.TestCase):
         }
         current["bundle_id"] = content_id("engine", legacy_content)
 
-        loaded = EngineBundle.from_record(current)
-
-        self.assertIsNone(loaded.player_profiles)
-        self.assertEqual(loaded.to_record()["schema_version"], 10)
+        with self.assertRaises(UnsupportedEngineBundleSchema) as raised:
+            EngineBundle.from_record(current)
+        self.assertEqual(raised.exception.schema_version, 8)
 
     def test_materializer_uses_exact_ids_and_retains_unmatched_public_players(self):
         public = _public_data(
@@ -926,7 +925,7 @@ class PlayerProfileDomainTests(unittest.TestCase):
         p1 = next(row for row in outlook["players"] if row["player_id"] == "p1")
         availability = p1["profile"]["historical_availability"]
 
-        self.assertEqual(outlook["schema_version"], 2)
+        self.assertEqual(outlook["schema_version"], 5)
         self.assertEqual(outlook["profile_scope"], "captured_public_catalog")
         self.assertEqual(availability["status"], "observed")
         self.assertEqual(availability["out_weeks"], [{"season": 2025, "week": 6}])

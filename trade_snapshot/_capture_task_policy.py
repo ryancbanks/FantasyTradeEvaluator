@@ -1,9 +1,9 @@
 """Small provider-page policies for capture tasks."""
 
-from urllib.parse import parse_qsl, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import re
 
-from ._capture_common import schema_fingerprint
+from ._capture_common import require_safe_https_url, schema_fingerprint
 
 
 VISIBLE_PAGE_PATHS = {
@@ -38,6 +38,71 @@ YAHOO_BOUND_PROJECTION_PATH = (
 YAHOO_BOUND_SETTINGS_PATH = (
     r"/(?:20[0-9]{2}/)?f1/(?P<league>[1-9][0-9]{0,19})/settings/?"
 )
+
+
+def canonical_visible_table_task_url(provider, url: str, *, week: int, projection) -> str:
+    """Validate and canonicalize one provider projection-page URL."""
+
+    name = getattr(provider, "value", provider)
+    if name != "fantasypros":
+        canonical = require_safe_https_url(
+            url,
+            allowed_hosts=VISIBLE_PAGE_HOSTS.get(name, frozenset()),
+        )
+        validate_visible_table_task(provider, canonical, projection)
+        return canonical
+    try:
+        parsed = urlsplit(url)
+    except (TypeError, ValueError):
+        raise ValueError("visible_table task URL is invalid") from None
+    if parsed.fragment:
+        raise ValueError("FantasyPros projection task URL cannot contain a fragment")
+    base = require_safe_https_url(
+        urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")),
+        allowed_hosts=VISIBLE_PAGE_HOSTS["fantasypros"],
+    )
+    parsed = urlsplit(base)
+    positions = getattr(projection, "position_scope", ())
+    if len(positions) != 1:
+        raise ValueError("FantasyPros projection tasks require one exact position")
+    expected_path = f"/nfl/projections/{positions[0].casefold()}.php"
+    horizon = getattr(getattr(projection, "horizon", None), "value", None)
+    scoring = getattr(projection, "scoring", None)
+    expected_query = _fantasypros_projection_query(week, horizon, scoring)
+    actual_query = parse_qsl(urlsplit(url).query, keep_blank_values=True)
+    if parsed.path != expected_path or sorted(actual_query) != sorted(
+        expected_query
+    ) or len(actual_query) != len(expected_query):
+        raise ValueError(
+            "FantasyPros projection task URL must encode its exact position, period, and scoring"
+        )
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(expected_query), ""))
+
+
+def fantasypros_projection_url(position: str, *, week: int, horizon: str, scoring: str) -> str:
+    """Build the exact public FantasyPros URL for one projection dimension set."""
+
+    if not isinstance(position, str) or not re.fullmatch(r"[A-Z]+", position):
+        raise ValueError("FantasyPros projection position is invalid")
+    query = _fantasypros_projection_query(week, horizon, scoring)
+    return urlunsplit((
+        "https",
+        "www.fantasypros.com",
+        f"/nfl/projections/{position.casefold()}.php",
+        urlencode(query),
+        "",
+    ))
+
+
+def _fantasypros_projection_query(week, horizon, scoring):
+    if type(week) is not int or not 1 <= week <= 25:
+        raise ValueError("FantasyPros projection week is invalid")
+    if horizon != "weekly" or scoring not in {"STD", "HALF", "PPR"}:
+        raise ValueError("FantasyPros projection dimensions are invalid")
+    query = [("week", str(week))]
+    if scoring != "HALF":
+        query.append(("scoring", scoring))
+    return query
 
 
 def validate_visible_table_task(provider, url: str, projection=None) -> None:
@@ -192,8 +257,13 @@ def page_task_fingerprint(kinds, analyzer_phases, provider_hosts) -> str:
                 horizon: sorted(positions)
                 for horizon, positions in FFTODAY_POSITION_SCOPES.items()
             },
+            "fantasypros_projection_query": {
+                "weekly": "week=<week>",
+                "ros": "unsupported_without_a_public_visible_source",
+                "scoring": {"HALF": "default", "PPR": "PPR", "STD": "STD"},
+            },
             "league_source_path": "/nfl/myplaybook/trade-analyzer.php",
-            "policy_version": "bound-public-projection-surfaces-v7",
+            "policy_version": "dimension-bound-public-projection-surfaces-v8",
         },
     )
 
@@ -214,7 +284,8 @@ def validate_league_source_task(provider, url: str, attached: tuple[object, ...]
 
 __all__ = (
     "FFTODAY_POSITION_SCOPES", "VISIBLE_PAGE_HOSTS", "VISIBLE_PAGE_PATHS",
-    "capture_plan_fingerprint",
+    "canonical_visible_table_task_url",
+    "capture_plan_fingerprint", "fantasypros_projection_url",
     "page_path_matches_task", "page_task_fingerprint",
     "runtime_path_matches_task",
     "validate_league_source_task",

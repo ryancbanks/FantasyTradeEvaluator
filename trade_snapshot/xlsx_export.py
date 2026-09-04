@@ -6,8 +6,13 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
+from ._data_readiness_policy import (
+    _BOUNDED_WAIVER_POOL_LIMITATION,
+    _HOST_TRADE_LEGALITY_LIMITATION,
+)
 from .workbook_model import (
     TradeWorkbookContext,
+    TwoTeamExportProvenance,
     WorkbookTeamOutlook,
     WorkbookTradeRow,
     WorkbookTradeRows,
@@ -45,12 +50,14 @@ TRADE_HEADERS = (
     "Other Team ID",
     "Candidate Index",
     "Power Method Evidence",
+    "Search Run ID",
 )
 
 
 def export_trade_workbook(
     output_path: str | os.PathLike[str],
     context: TradeWorkbookContext,
+    provenance: TwoTeamExportProvenance,
     trade_rows: Iterable[WorkbookTradeRow],
     team_outlook: Iterable[WorkbookTeamOutlook],
 ) -> Path:
@@ -58,6 +65,8 @@ def export_trade_workbook(
 
     if not isinstance(context, TradeWorkbookContext):
         raise ValueError("context must be a TradeWorkbookContext")
+    if not isinstance(provenance, TwoTeamExportProvenance):
+        raise ValueError("provenance must be a TwoTeamExportProvenance")
     if isinstance(trade_rows, WorkbookTradeRows):
         trades = trade_rows
     else:
@@ -69,6 +78,7 @@ def export_trade_workbook(
         raise ValueError("trade_rows must contain WorkbookTradeRow values")
     if any(not isinstance(row, WorkbookTeamOutlook) for row in outlook):
         raise ValueError("team_outlook must contain WorkbookTeamOutlook values")
+    _validate_export_binding(context, provenance, trades)
     if len(trades) > MAX_EXCEL_DATA_ROWS:
         raise ValueError(
             f"Excel export supports at most {MAX_EXCEL_DATA_ROWS:,} qualified trades"
@@ -79,14 +89,14 @@ def export_trade_workbook(
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.stem}.{uuid4().hex}.tmp.xlsx")
     try:
-        _write_workbook(temporary, context, trades, outlook)
+        _write_workbook(temporary, context, provenance, trades, outlook)
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
     return target.resolve()
 
 
-def _write_workbook(path, context, trades, outlook):
+def _write_workbook(path, context, provenance, trades, outlook):
     try:
         import xlsxwriter
     except ImportError:
@@ -142,8 +152,21 @@ def _write_workbook(path, context, trades, outlook):
             "QualifiedTradesTable",
             use_table=not constant_memory,
         )
-        _outlook_sheet(workbook, outlook, formats, use_table=not constant_memory)
-        _details_sheet(workbook, context, len(trades), mutual_count, formats)
+        write_team_outlook_sheet(
+            workbook,
+            outlook,
+            formats,
+            table_name="TeamOutlookTable",
+            use_table=not constant_memory,
+        )
+        _details_sheet(
+            workbook,
+            context,
+            provenance,
+            len(trades),
+            mutual_count,
+            formats,
+        )
     finally:
         workbook.close()
 
@@ -294,6 +317,7 @@ def _write_trade_row(sheet, row_number, row, formats):
     sheet.write(row_number, 20, row.counterparty_team_id)
     sheet.write_number(row_number, 21, row.candidate_index, formats["integer"])
     sheet.write(row_number, 22, row.power_methodology_status, formats["text"])
+    sheet.write(row_number, 23, row.search_run_id, formats["text"])
 
 
 def _trade_conditional_formats(sheet, first, last, formats):
@@ -306,55 +330,287 @@ def _trade_conditional_formats(sheet, first, last, formats):
 
 
 def _trade_widths(sheet):
-    widths = (20, 30, 30, 24, 24, 24, 24, 9, 10, 11, 13, 13, 17, 17, 15, 18, 18, 16, 13, 19, 16, 13, 22)
+    widths = (20, 30, 30, 24, 24, 24, 24, 9, 10, 11, 13, 13, 17, 17, 15, 18, 18, 16, 13, 19, 16, 13, 22, 26)
     for column, width in enumerate(widths):
         sheet.set_column(column, column, width)
     sheet.set_column(20, 21, None, None, {"hidden": True})
+    sheet.set_column(23, 23, None, None, {"hidden": True})
     sheet.set_default_row(18)
 
 
-def _outlook_sheet(workbook, rows, formats, *, use_table):
+def write_team_outlook_sheet(
+    workbook,
+    rows,
+    formats,
+    *,
+    table_name,
+    use_table=True,
+):
+    """Write the shared 14-field team-outlook contract."""
+
     sheet = workbook.add_worksheet("Team Outlook")
     sheet.hide_gridlines(2)
     sheet.set_row(0, 30)
-    headers = ("Team", "Current W", "Current L", "Current T", "Expected W", "Expected L", "Expected T", "Mean Rank", "Playoff Chance")
+    headers = (
+        "Team", "Current Rank", "Current W", "Current L", "Current T",
+        "Expected W", "Expected L", "Expected T", "Expected PF", "Expected PA",
+        "Mean Rank", "Playoff Chance", "Rank Probabilities", "Seed Probabilities",
+    )
     sheet.merge_range(0, 0, 0, len(headers) - 1, "Projected Standings and Playoff Outlook", formats["title"])
     for column, header in enumerate(headers):
         sheet.write(2, column, header, formats["header"])
     for index, row in enumerate(rows, start=3):
-        values = (row.team_name, row.current_wins, row.current_losses, row.current_ties, row.expected_final_wins, row.expected_final_losses, row.expected_final_ties, row.mean_rank, row.playoff_probability)
+        values = (
+            row.team_name,
+            row.current_rank,
+            row.current_wins,
+            row.current_losses,
+            row.current_ties,
+            row.expected_final_wins,
+            row.expected_final_losses,
+            row.expected_final_ties,
+            row.expected_final_points_for,
+            row.expected_final_points_against,
+            row.mean_rank,
+            row.playoff_probability,
+            _distribution_text(row.rank_distribution),
+            _distribution_text(row.seed_distribution),
+        )
         for column, value in enumerate(values):
-            fmt = formats["text"] if column == 0 else formats["percent"] if column == 8 else formats["decimal"] if column >= 4 else formats["integer"]
-            sheet.write(index, column, value, fmt)
+            fmt = (
+                formats["text"]
+                if column in {0, 12, 13}
+                else formats["percent"]
+                if column == 11
+                else formats["decimal"]
+                if 5 <= column <= 10
+                else formats["integer"]
+            )
+            if value is None:
+                sheet.write_blank(index, column, None, fmt)
+            else:
+                sheet.write(index, column, value, fmt)
     if rows:
         if use_table:
-            sheet.add_table(2, 0, 2 + len(rows), len(headers) - 1, {"name": "TeamOutlookTable", "style": "Table Style Medium 2", "columns": [{"header": value} for value in headers]})
+            sheet.add_table(
+                2,
+                0,
+                2 + len(rows),
+                len(headers) - 1,
+                {
+                    "name": table_name,
+                    "style": "Table Style Medium 2",
+                    "columns": [{"header": value} for value in headers],
+                },
+            )
         else:
             sheet.autofilter(2, 0, 2 + len(rows), len(headers) - 1)
-        sheet.conditional_format(3, 8, 2 + len(rows), 8, {"type": "data_bar", "bar_color": "#2A9D8F"})
+        sheet.conditional_format(
+            3,
+            11,
+            2 + len(rows),
+            11,
+            {"type": "data_bar", "bar_color": "#2A9D8F"},
+        )
     sheet.freeze_panes(3, 1)
     sheet.set_column(0, 0, 24)
-    sheet.set_column(1, 8, 14)
+    sheet.set_column(1, 11, 14)
+    sheet.set_column(12, 13, 34)
 
 
-def _details_sheet(workbook, context, trade_count, mutual_count, formats):
+def _distribution_text(values):
+    return "; ".join(
+        f"{index}: {value:.1%}" for index, value in enumerate(values, 1)
+    )
+
+
+def data_readiness_detail_rows(context):
+    """Return the immutable data coverage and limitation rows for an export."""
+
+    readiness = context.data_readiness
+    rows = (
+        ("Power-Score Readiness", readiness.power_score_status),
+        ("Trade-Search Readiness", readiness.trade_search_status),
+        ("Expected-Standings Readiness", readiness.expected_standings_status),
+        ("Playoff Model Readiness", readiness.playoff_model_status),
+        ("Projection Provider Cells", readiness.provider_cell_count),
+        ("Direct Provider Projection Cells", readiness.direct_provider_cells),
+        (
+            "ROS-Derived Provider Projection Cells",
+            readiness.ros_derived_provider_cells,
+        ),
+        (
+            "Schedule-Derived Availability Cells",
+            readiness.schedule_derived_availability_cells,
+        ),
+        (
+            "Unavailable Provider Projection Cells",
+            readiness.unavailable_provider_cells,
+        ),
+        (
+            "Unattributed Provider Projection Cells",
+            readiness.unattributed_provider_cells,
+        ),
+        ("First-Week Scheduled NFL Games", readiness.first_week_scheduled_games),
+        (
+            "First-Week Games Missing Kickoff Time",
+            readiness.first_week_games_missing_kickoff,
+        ),
+        (
+            "Source Capture Timestamps",
+            readiness.source_capture_timestamp_count,
+        ),
+        (
+            "Earliest Source Capture (UTC)",
+            _utc_timestamp(readiness.earliest_source_capture_at),
+        ),
+        (
+            "Latest Source Capture (UTC)",
+            _utc_timestamp(readiness.latest_source_capture_at),
+        ),
+        (
+            "Source Capture Window (Seconds)",
+            int(
+                (
+                    readiness.latest_source_capture_at
+                    - readiness.earliest_source_capture_at
+                ).total_seconds()
+            ),
+        ),
+        (
+            "FantasyPros Comparison Team Coverage",
+            readiness.fantasypros_comparison_team_count,
+        ),
+        (
+            "Scenario Player-Score Floor",
+            (
+                readiness.scenario_player_score_floor
+                if readiness.scenario_player_score_floor is not None
+                else "UNBOUNDED"
+            ),
+        ),
+        (
+            "FantasyPros Comparison Policy",
+            readiness.fantasypros_comparison_policy,
+        ),
+        ("Projection Source Artifacts", readiness.projection_source_count),
+        (
+            "Projection Source Attempts Captured",
+            readiness.captured_projection_source_attempts,
+        ),
+        (
+            "Projection Source Attempts Not Published",
+            readiness.not_published_projection_source_attempts,
+        ),
+        (
+            "Projection Source Attempts Unavailable",
+            readiness.unavailable_projection_source_attempts,
+        ),
+        (
+            "Provider-Total Projection Sources",
+            readiness.provider_total_projection_sources,
+        ),
+        (
+            "Locally Recomputed Projection Sources",
+            readiness.locally_recomputed_projection_sources,
+        ),
+        (
+            "Base-Format-Only Projection Sources",
+            readiness.base_format_only_projection_sources,
+        ),
+        (
+            "Exact-Host-Rules Projection Sources",
+            readiness.exact_host_rules_projection_sources,
+        ),
+        (
+            "Projection Source Scoring Formats",
+            ", ".join(readiness.projection_source_scoring_formats),
+        ),
+        (
+            "Provider Status Observations",
+            readiness.provider_status_observation_count,
+        ),
+        (
+            "Provider Status Disagreement Scopes",
+            readiness.provider_status_disagreement_scope_count,
+        ),
+        (
+            "Latest Provider Status Observation (UTC)",
+            (
+                "NONE RETAINED"
+                if readiness.latest_provider_status_observed_at is None
+                else _utc_timestamp(readiness.latest_provider_status_observed_at)
+            ),
+        ),
+        ("Player-Availability Limitation", readiness.availability_limitation),
+        ("Outcome-Correlation Limitation", readiness.correlation_limitation),
+        (
+            "Marginal-Uncertainty Limitation",
+            readiness.marginal_uncertainty_limitation,
+        ),
+        (
+            "Championship-Proxy Limitation",
+            readiness.championship_proxy_limitation,
+        ),
+        (
+            "Host-Settlement-Policy Limitation",
+            readiness.host_settlement_policy_limitation,
+        ),
+        ("Bounded-Waiver-Pool Limitation", _BOUNDED_WAIVER_POOL_LIMITATION),
+        ("Host-Trade-Legality Limitation", _HOST_TRADE_LEGALITY_LIMITATION),
+    )
+    if readiness.custom_scoring_limitation:
+        rows = (
+            *rows,
+            ("Custom-Scoring Limitation", readiness.custom_scoring_limitation),
+        )
+    if readiness.as_of_time_limitation:
+        rows = (*rows, ("As-of-Time Limitation", readiness.as_of_time_limitation))
+    if readiness.ros_allocation_limitation:
+        rows = (
+            *rows,
+            ("ROS Weekly-Allocation Limitation", readiness.ros_allocation_limitation),
+        )
+    rows = (
+        *rows,
+        *(
+            (
+                f"Projection Attempts ({provider})",
+                (
+                    f"captured={captured}; not_published={not_published}; "
+                    f"unavailable={unavailable}"
+                ),
+            )
+            for provider, captured, not_published, unavailable in (
+                readiness.projection_source_provider_attempts
+            )
+        ),
+    )
+    return rows
+
+
+def _details_sheet(
+    workbook, context, provenance, trade_count, mutual_count, formats
+):
     sheet = workbook.add_worksheet("Run Details")
     sheet.hide_gridlines(2)
     sheet.set_row(0, 30)
-    sheet.merge_range("A1:C1", "Calculation Provenance", formats["title"])
-    exact = context.power_engine_mode == "exact"
+    sheet.merge_range("A1:D1", "Calculation Provenance", formats["title"])
+    attested = context.power_engine_mode == "holdout_validated"
     independent = context.power_engine_mode == "independent"
-    if exact:
-        mode_label = "EXACT / ATTESTED"
+    if attested:
+        mode_label = "BLIND-HOLDOUT VALIDATED"
         scope = (
-            "balanced, no adds/drops, package sizes "
+            "Representative balanced, no-add/drop holdouts for package sizes "
             + ", ".join(
-                str(value) for value in context.exact_balanced_package_sizes
+                str(value)
+                for value in context.holdout_validated_balanced_package_sizes
             )
         )
         notice = (
-            "Outside the attested scope, FantasyPros-style power is labeled "
-            "extrapolated; playoff projections remain local."
+            "The listed shapes passed representative blind holdouts; this is not "
+            "exhaustive proof for every player combination. Other shapes are "
+            "labeled extrapolated; playoff projections remain local."
         )
     elif independent:
         mode_label = "INDEPENDENT / LOCAL"
@@ -365,7 +621,29 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
         scope = "NONE — this engine is a SURROGATE approximation"
         notice = SURROGATE_NOTICE
     details = (
+        ("Engine Bundle ID", provenance.bundle_id),
+        ("Waiver Pool ID", provenance.waiver_pool_id),
+        ("Search Request ID", provenance.request_id),
+        ("Search Request (Canonical JSON)", provenance.request_json),
+        ("Trade Constraints (Canonical JSON)", provenance.trade_constraints_json),
+        ("Power Settings (Canonical JSON)", provenance.search_settings_json),
+        ("Require No Drops", "YES" if provenance.require_no_drops else "NO"),
+        ("Scenario Seed", provenance.scenario_seed),
+        ("Requested Counterparty Scope", provenance.requested_counterparty_display),
+        (
+            "Resolved Counterparty Team IDs",
+            ", ".join(provenance.resolved_counterparty_team_ids),
+        ),
+        (
+            "Roster Adjustment IDs",
+            ", ".join(provenance.roster_adjustment_ids),
+        ),
+        ("Pair Search Runs", len(provenance.search_runs)),
+        ("Total Search Candidates", provenance.total_candidate_count),
         ("Snapshot ID", context.snapshot_id),
+        ("Scoring Profile ID", context.scoring_profile_id),
+        ("NFL Schedule ID", context.nfl_schedule_id),
+        ("Ensemble Configuration ID", context.ensemble_config_id),
         ("Strength Model ID", context.strength_model_id),
         ("Scenario Run ID", context.scenario_run_id),
         ("Primary Team", context.primary_team_name),
@@ -376,7 +654,7 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
             "Power Engine Mode",
             mode_label,
         ),
-        ("Calibration Status", context.calibration_status),
+        ("Calibration Evidence Status", context.calibration_status),
         ("Methodology Evidence Type", context.methodology_evidence_kind),
         ("Methodology Evidence Record ID", context.methodology_record_id),
         ("Strength Formula / Policy ID", context.formula_id),
@@ -402,13 +680,14 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
             context.methodology_current_evidence_id,
         ),
         (
-            "Exact FantasyPros-Power Scope",
+            "Blind-Validated FantasyPros-Power Scope",
             scope,
         ),
         (
             "Power Accuracy Notice",
             notice,
         ),
+        *data_readiness_detail_rows(context),
         ("Qualified Trades", trade_count),
         ("Mutual Playoff Gains", mutual_count),
     )
@@ -420,12 +699,30 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
         if label == "Blind Display Match Rate" and not independent:
             value_format = formats["percent"]
         elif label == "Power Accuracy Notice":
-            value_format = formats["wrapped_text"] if exact else formats["warning"]
+            value_format = (
+                formats["wrapped_text"] if attested else formats["warning"]
+            )
             sheet.set_row(row, 60)
-        elif label == "Power Engine Mode" and not exact:
+        elif label.endswith(" Limitation"):
+            value_format = formats["warning"]
+            sheet.set_row(row, 60)
+        elif label.endswith(" Policy") or label.endswith("(Canonical JSON)"):
+            value_format = formats["wrapped_text"]
+            sheet.set_row(row, 45)
+        elif label == "Power Engine Mode" and not attested:
             value_format = formats["warning"]
         sheet.write(row, 1, value, value_format)
-    source_row = 4 + len(details)
+    run_row = 4 + len(details)
+    sheet.write(run_row, 0, "Pair Search Definitions", formats["section"])
+    sheet.write_row(
+        run_row + 1,
+        0,
+        ("Counterparty Team ID", "Search Run ID", "Candidates", "Definition JSON"),
+        formats["header"],
+    )
+    for offset, run in enumerate(provenance.search_run_rows, start=run_row + 2):
+        sheet.write_row(offset, 0, run)
+    source_row = run_row + len(provenance.search_runs) + 3
     sheet.write(source_row, 0, "Weekly Sources", formats["section"])
     sheet.write_row(source_row + 1, 0, ("Source", "Evidence ID", "Captured UTC"), formats["header"])
     for offset, source in enumerate(context.sources, start=source_row + 2):
@@ -436,3 +733,57 @@ def _details_sheet(workbook, context, trade_count, mutual_count, formats):
     sheet.set_column(0, 0, 40)
     sheet.set_column(1, 1, 82)
     sheet.set_column(2, 2, 21)
+    sheet.set_column(3, 3, 90)
+
+
+def _validate_export_binding(context, provenance, trades):
+    request = provenance.request_record
+    if context.data_readiness.trade_search_status == "not_ready":
+        raise ValueError("cannot export a search whose data readiness is not_ready")
+    if (
+        provenance.bundle_id != context.bundle_id
+        or provenance.waiver_pool_id != context.waiver_pool_id
+    ):
+        raise ValueError("workbook context does not match bundle provenance")
+    if (
+        request["primary_team_id"] != context.primary_team_id
+        or request["scenario_count"] != context.scenario_count
+        or request["settings"]["minimum_displayed_power_delta"]
+        != context.minimum_power_delta
+    ):
+        raise ValueError("workbook context does not match the search request")
+    by_run = {row.run_id: row for row in provenance.search_runs}
+    for run in provenance.search_runs:
+        definition = run.trade_constraint_record
+        if (
+            run.snapshot_id != context.snapshot_id
+            or run.strength_model_id != context.strength_model_id
+            or definition["scenario_run_id"] != context.scenario_run_id
+        ):
+            raise ValueError("workbook context does not match a pair search run")
+    if isinstance(trades, WorkbookTradeRows):
+        outcome_runs = {
+            pair.search.run_definition.run_id: pair.search.run_definition
+            for pair in trades.outcome.pairs
+        }
+        if outcome_runs != by_run:
+            raise ValueError("workbook rows do not match the pair search provenance")
+        return
+    row_keys = set()
+    for row in trades:
+        run = by_run.get(row.search_run_id)
+        key = (row.search_run_id, row.candidate_index)
+        if (
+            run is None
+            or run.counterparty_team_id != row.counterparty_team_id
+            or row.candidate_index >= run.total_candidate_count
+            or key in row_keys
+        ):
+            raise ValueError("trade row does not match its pair search run")
+        row_keys.add(key)
+
+
+def _utc_timestamp(value):
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )

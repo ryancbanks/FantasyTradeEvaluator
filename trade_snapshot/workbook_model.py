@@ -5,11 +5,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from heapq import heappop, heappush
 from itertools import islice
-from math import isfinite
+from math import fsum, isfinite
 from numbers import Real
 from types import MappingProxyType
 
-from .league_search import LeagueQualifiedTrade, LeagueSearchOutcome
+from ._workbook_provenance import TwoTeamExportProvenance
+from .data_readiness import DataReadinessSnapshot
+from .league_search import LeagueSearchOutcome
 from .league_state import LeagueState
 from .independent_power_disclosure import IndependentPowerDisclosure
 from .methodology_attestation import MethodologyAttestation
@@ -31,7 +33,12 @@ class WorkbookSource:
 
 @dataclass(frozen=True, slots=True)
 class TradeWorkbookContext:
+    bundle_id: str
+    waiver_pool_id: str
     snapshot_id: str
+    scoring_profile_id: str
+    nfl_schedule_id: str
+    ensemble_config_id: str
     strength_model_id: str
     scenario_run_id: str
     primary_team_id: str
@@ -52,12 +59,18 @@ class TradeWorkbookContext:
     methodology_holdout_count: int
     holdout_max_absolute_score_error: float | None
     holdout_display_match_rate: float | None
-    exact_balanced_package_sizes: tuple[int, ...]
+    holdout_validated_balanced_package_sizes: tuple[int, ...]
+    data_readiness: DataReadinessSnapshot
     sources: tuple[WorkbookSource, ...]
 
     def __post_init__(self) -> None:
         for name in (
+            "bundle_id",
+            "waiver_pool_id",
             "snapshot_id",
+            "scoring_profile_id",
+            "nfl_schedule_id",
+            "ensemble_config_id",
             "strength_model_id",
             "scenario_run_id",
             "primary_team_id",
@@ -87,11 +100,15 @@ class TradeWorkbookContext:
             or self.methodology_holdout_count < 0
         ):
             raise ValueError("methodology_holdout_count must be non-negative")
-        if self.power_engine_mode not in {"exact", "surrogate", "independent"}:
+        if self.power_engine_mode not in {
+            "holdout_validated",
+            "surrogate",
+            "independent",
+        }:
             raise ValueError(
-                "power_engine_mode must be exact, surrogate, or independent"
+                "power_engine_mode must be holdout_validated, surrogate, or independent"
             )
-        exact = self.power_engine_mode == "exact"
+        attested = self.power_engine_mode == "holdout_validated"
         independent = self.power_engine_mode == "independent"
         if independent:
             if (
@@ -109,9 +126,17 @@ class TradeWorkbookContext:
             if (
                 self.calibration_status != self.power_engine_mode
                 or self.methodology_evidence_kind
-                != ("exact_attestation" if exact else "surrogate_disclosure")
+                != (
+                    "blind_holdout_attestation"
+                    if attested
+                    else "surrogate_disclosure"
+                )
                 or self.formula_action
-                not in ({"reuse", "recalibrate"} if exact else {"recalibrate"})
+                not in (
+                    {"reuse", "recalibrate"}
+                    if attested
+                    else {"recalibrate"}
+                )
                 or self.methodology_holdout_count < 1
             ):
                 raise ValueError("workbook power-method provenance is inconsistent")
@@ -126,18 +151,25 @@ class TradeWorkbookContext:
                 raise ValueError("workbook holdout quality metrics are invalid")
             object.__setattr__(self, "holdout_max_absolute_score_error", error)
             object.__setattr__(self, "holdout_display_match_rate", rate)
-        sizes = tuple(self.exact_balanced_package_sizes)
+        sizes = tuple(self.holdout_validated_balanced_package_sizes)
         if any(type(value) is not int or value < 1 for value in sizes) or len(
             set(sizes)
         ) != len(sizes):
             raise ValueError(
-                "exact_balanced_package_sizes must contain distinct positive integers"
+                "holdout_validated_balanced_package_sizes must contain distinct "
+                "positive integers"
             )
-        if (self.power_engine_mode == "exact") != bool(sizes):
+        if attested != bool(sizes):
             raise ValueError(
-                "only an exact engine may declare exact balanced package sizes"
+                "only a holdout-validated engine may declare validated package sizes"
             )
-        object.__setattr__(self, "exact_balanced_package_sizes", tuple(sorted(sizes)))
+        object.__setattr__(
+            self,
+            "holdout_validated_balanced_package_sizes",
+            tuple(sorted(sizes)),
+        )
+        if not isinstance(self.data_readiness, DataReadinessSnapshot):
+            raise ValueError("data_readiness must be a DataReadinessSnapshot")
         sources = tuple(self.sources)
         if any(not isinstance(row, WorkbookSource) for row in sources):
             raise ValueError("sources must contain WorkbookSource values")
@@ -163,6 +195,7 @@ class WorkbookTradeRow:
     counterparty_playoff_after: float
     candidate_index: int
     power_methodology_status: str
+    search_run_id: str
     primary_added_player_ids: tuple[str, ...] = ()
     primary_added_player_names: tuple[str, ...] = ()
     primary_dropped_player_ids: tuple[str, ...] = ()
@@ -173,7 +206,11 @@ class WorkbookTradeRow:
     counterparty_dropped_player_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        for name in ("counterparty_team_id", "counterparty_team_name"):
+        for name in (
+            "counterparty_team_id",
+            "counterparty_team_name",
+            "search_run_id",
+        ):
             object.__setattr__(self, name, _text(name, getattr(self, name)))
         for id_name, display_name in (
             ("outgoing_player_ids", "outgoing_player_names"),
@@ -212,15 +249,15 @@ class WorkbookTradeRow:
         if type(self.candidate_index) is not int or self.candidate_index < 0:
             raise ValueError("candidate_index must be a non-negative integer")
         if self.power_methodology_status not in {
-            "exact",
+            "holdout_validated",
             "extrapolated",
             "surrogate",
             "surrogate_extrapolated",
             "independent",
         }:
             raise ValueError(
-                "power_methodology_status must be exact, extrapolated, surrogate, "
-                "surrogate_extrapolated, or independent"
+                "power_methodology_status must be holdout_validated, extrapolated, "
+                "surrogate, surrogate_extrapolated, or independent"
             )
 
     @property
@@ -252,6 +289,11 @@ class WorkbookTeamOutlook:
     expected_final_ties: float
     mean_rank: float
     playoff_probability: float
+    current_rank: int | None = None
+    expected_final_points_for: float | None = None
+    expected_final_points_against: float | None = None
+    rank_distribution: tuple[float, ...] = ()
+    seed_distribution: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "team_id", _text("team_id", self.team_id))
@@ -271,6 +313,26 @@ class WorkbookTeamOutlook:
             if name == "playoff_probability" and not 0 <= value <= 1:
                 raise ValueError("playoff_probability must be between 0 and 1")
             object.__setattr__(self, name, value)
+        if self.current_rank is not None and (
+            type(self.current_rank) is not int or self.current_rank < 1
+        ):
+            raise ValueError("current_rank must be a positive integer or None")
+        for name in ("expected_final_points_for", "expected_final_points_against"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _finite(name, value))
+        rank_distribution = _distribution(
+            "rank_distribution",
+            self.rank_distribution,
+            expected_total=1.0,
+        )
+        seed_distribution = _distribution(
+            "seed_distribution",
+            self.seed_distribution,
+            expected_total=self.playoff_probability,
+        )
+        object.__setattr__(self, "rank_distribution", rank_distribution)
+        object.__setattr__(self, "seed_distribution", seed_distribution)
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -374,6 +436,7 @@ class WorkbookTradeRows(Sequence[WorkbookTradeRow]):
                         self.team_names,
                         self.player_names,
                         self.methodology_evidence,
+                        pair.search.run_definition.run_id,
                     )
                     iterators.append(iterator)
                     first = next(iterator, None)
@@ -411,14 +474,17 @@ def _mapped_trade_rows(
     team_names,
     player_names,
     methodology_evidence,
+    search_run_id,
 ) -> Iterator[WorkbookTradeRow]:
     try:
         for result in results:
             yield _trade_row(
-                LeagueQualifiedTrade(counterparty_team_id, result),
+                counterparty_team_id,
+                result,
                 team_names,
                 player_names,
                 methodology_evidence,
+                search_run_id,
             )
     finally:
         close = getattr(results, "close", None)
@@ -456,13 +522,34 @@ def team_outlook_rows(
 ) -> tuple[WorkbookTeamOutlook, ...]:
     if not isinstance(state, LeagueState) or not isinstance(projection, SeasonProjection):
         raise ValueError("state and projection must be league projection values")
-    if state.snapshot_id != projection.snapshot_id:
-        raise ValueError("state and projection snapshot IDs do not match")
+    if (
+        state.snapshot_id != projection.snapshot_id
+        or state.scoring_profile_id != projection.scoring_profile_id
+    ):
+        raise ValueError("state and projection identities do not match")
     names = {team.team_id: team.name for team in state.teams}
     standings = {row.team_id: row for row in state.standings}
+    projected_rows = tuple(projection.teams)
+    projected_ids = tuple(row.team_id for row in projected_rows)
+    if len(set(projected_ids)) != len(projected_ids) or set(projected_ids) != set(names):
+        raise ValueError("projection teams must exactly cover the league")
     rows = []
-    for projected in projection.teams:
+    for projected in projected_rows:
         standing = standings[projected.team_id]
+        if projected.current_standing != standing:
+            raise ValueError("projected current standing does not match league state")
+        if (
+            len(projected.rank_distribution) != len(names)
+            or len(projected.seed_distribution)
+            != state.playoff_rules.qualifier_count
+        ):
+            raise ValueError("projected distribution dimensions do not match league rules")
+        mean_rank = fsum(
+            rank * probability
+            for rank, probability in enumerate(projected.rank_distribution, 1)
+        )
+        if abs(mean_rank - projected.mean_rank) > 1e-9:
+            raise ValueError("projected mean rank does not match rank distribution")
         rows.append(
             WorkbookTeamOutlook(
                 projected.team_id,
@@ -475,13 +562,24 @@ def team_outlook_rows(
                 projected.expected_final_ties,
                 projected.mean_rank,
                 projected.playoff_probability,
+                current_rank=projected.current_rank,
+                expected_final_points_for=projected.expected_final_points_for,
+                expected_final_points_against=projected.expected_final_points_against,
+                rank_distribution=projected.rank_distribution,
+                seed_distribution=projected.seed_distribution,
             )
         )
     return tuple(sorted(rows, key=lambda row: (row.mean_rank, row.team_name.casefold())))
 
 
-def _trade_row(value, team_names, player_names, methodology_evidence):
-    result = value.result
+def _trade_row(
+    counterparty_team_id,
+    result,
+    team_names,
+    player_names,
+    methodology_evidence,
+    search_run_id,
+):
     odds = (
         result.primary_playoff_before,
         result.primary_playoff_after,
@@ -505,7 +603,7 @@ def _trade_row(value, team_names, player_names, methodology_evidence):
         ),
     )
     try:
-        team_name = team_names[value.counterparty_team_id]
+        team_name = team_names[counterparty_team_id]
         outgoing_names = tuple(player_names[player_id] for player_id in outgoing)
         incoming_names = tuple(player_names[player_id] for player_id in incoming)
         adjustment_names = {
@@ -522,7 +620,7 @@ def _trade_row(value, team_names, player_names, methodology_evidence):
     except KeyError as error:
         raise ValueError(f"missing display name for ID {error.args[0]!r}") from None
     return WorkbookTradeRow(
-        value.counterparty_team_id,
+        counterparty_team_id,
         team_name,
         outgoing,
         outgoing_names,
@@ -536,6 +634,7 @@ def _trade_row(value, team_names, player_names, methodology_evidence):
         odds[3] / 100,
         result.candidate_index,
         power_status,
+        search_run_id,
         primary_added_player_ids=result.primary_added_player_ids,
         primary_added_player_names=adjustment_names["primary_added_player_names"],
         primary_dropped_player_ids=result.primary_dropped_player_ids,
@@ -597,6 +696,26 @@ def _finite(name: str, value: object) -> float:
         raise ValueError(f"{name} must be a finite number") from None
     if not isfinite(result):
         raise ValueError(f"{name} must be a finite number")
+    return result
+
+
+def _distribution(
+    name: str,
+    values: Iterable[float],
+    *,
+    expected_total: float,
+) -> tuple[float, ...]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f"{name} must be an iterable")
+    try:
+        result = tuple(_finite(name, value) for value in values)
+    except TypeError:
+        raise ValueError(f"{name} must be an iterable") from None
+    if any(value < 0 or value > 1 for value in result):
+        raise ValueError(f"{name} values must be between 0 and 1")
+    total = fsum(result)
+    if result and abs(total - expected_total) > 1e-9:
+        raise ValueError(f"{name} values have the wrong probability total")
     return result
 
 

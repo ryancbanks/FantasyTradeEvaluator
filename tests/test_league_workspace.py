@@ -134,10 +134,15 @@ class LeagueWorkspaceServiceTests(unittest.TestCase):
                 "season": 2026,
                 "week": 1,
                 "team_count": 2,
-                "power_engine_mode": "exact",
+                "power_engine_mode": bundle.methodology_mode,
                 "associated_at": profile_rows[0]["associated_at"],
                 "status": "ready",
+                "data_readiness": profile_rows[0]["data_readiness"],
             },),
+        )
+        self.assertNotEqual(
+            profile_rows[0]["data_readiness"]["status"],
+            "not_ready",
         )
         self.assertEqual(unassigned_rows, ())
         self.assertEqual(full_bundle["teams"], imported["teams"])

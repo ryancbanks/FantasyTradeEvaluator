@@ -5,7 +5,7 @@ import unittest
 
 from tests.test_engine_bundle import engine_bundle
 from trade_snapshot._scenario_random import content_id
-from trade_snapshot.engine_bundle import EngineBundle
+from trade_snapshot.engine_bundle import EngineBundle, UnsupportedEngineBundleSchema
 from trade_snapshot.ensemble import EnsembleConfig, ProviderWeight
 from trade_snapshot.player_lab_projection_builder import (
     build_player_lab_projection_snapshot,
@@ -127,7 +127,7 @@ class PlayerLabProjectionSnapshotTests(unittest.TestCase):
                 season=base.state.season,
                 as_of_week=base.state.first_remaining_week,
                 remaining_weeks=base.state.remaining_regular_season_weeks,
-                provider_names=("espn",),
+                provider_names=("fantasypros",),
                 projections=rows,
                 player_names={
                     f"outside-{index}": f"Outside {index}"
@@ -208,7 +208,7 @@ class PlayerLabProjectionSnapshotTests(unittest.TestCase):
 
 
 class EngineBundlePlayerLabProjectionTests(unittest.TestCase):
-    def test_schema_ten_round_trip_and_schema_nine_backward_compatibility(self):
+    def test_schema_ten_round_trip_nested_migration_and_schema_nine_rescan(self):
         base = engine_bundle()
         source = next(row for row in base.projections if row.position == "RB")
         projection = replace(
@@ -218,8 +218,8 @@ class EngineBundlePlayerLabProjectionTests(unittest.TestCase):
             provider_observations=(
                 replace(
                     source.provider_observations[0],
-                    provider="espn",
-                    provider_player_id="espn-outside",
+                    provider="fantasypros",
+                    provider_player_id="fantasypros-outside",
                 ),
             ),
         )
@@ -229,7 +229,7 @@ class EngineBundlePlayerLabProjectionTests(unittest.TestCase):
             season=base.state.season,
             as_of_week=base.state.first_remaining_week,
             remaining_weeks=base.state.remaining_regular_season_weeks,
-            provider_names=("espn",),
+            provider_names=("fantasypros",),
             projections=(projection,),
             player_names={"outside": "OUTSIDE"},
         )
@@ -288,8 +288,9 @@ class EngineBundlePlayerLabProjectionTests(unittest.TestCase):
                 if key not in {"kind", "schema_version", "bundle_id"}
             },
         )
-        restored = EngineBundle.from_record(legacy)
-        self.assertIsNone(restored.player_lab_projections)
+        with self.assertRaises(UnsupportedEngineBundleSchema) as raised:
+            EngineBundle.from_record(legacy)
+        self.assertEqual(raised.exception.schema_version, 9)
 
 
 if __name__ == "__main__":

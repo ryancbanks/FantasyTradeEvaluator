@@ -10,6 +10,7 @@ from ._analyzer_types import BundleFingerprint
 from .ecr import EcrSnapshot
 from .engine_bundle import EngineBundle, save_engine_bundle
 from .ensemble import EnsembleConfig
+from .fantasypros_benchmark import FantasyProsLeagueBenchmark
 from .formula_verification import FormulaVerificationReport
 from .league_state import LeagueState
 from .methodology import PowerMethodology
@@ -22,8 +23,10 @@ from .methodology_reuse import (
 )
 from .nfl_schedule import NflSchedule
 from .projections import RemainingSeasonProjection, WeeklyProjection
+from .projection_source import ProjectionSourceManifest
 from .scenario_config import CorrelatedScenarioConfig, PlayerEligibility
 from .scoring import ScoringProfile
+from .source_manifest import WeeklySourceManifest
 from .strength import CalibrationStatus, RoleDefinition
 from .strength_formula import (
     StrengthFormula,
@@ -67,6 +70,9 @@ class WeeklyRefreshEvidence:
     rosters: tuple[TeamRoster, ...]
     projection_evidence: tuple[WeeklyProjection | RemainingSeasonProjection, ...]
     nfl_schedule: NflSchedule
+    source_manifest: WeeklySourceManifest
+    projection_source_manifest: ProjectionSourceManifest
+    fantasypros_benchmark: FantasyProsLeagueBenchmark
     ecr_snapshots: tuple[EcrSnapshot, ...]
     eligibilities: tuple[PlayerEligibility, ...]
     player_positions: Mapping[str, str]
@@ -98,6 +104,36 @@ class WeeklyRefreshEvidence:
             raise ValueError("nfl_schedule must be an NflSchedule")
         if self.nfl_schedule.season != self.state.season:
             raise ValueError("NFL schedule season does not match league state")
+        if not isinstance(self.source_manifest, WeeklySourceManifest):
+            raise ValueError("source_manifest must be a WeeklySourceManifest")
+        if self.source_manifest.host_snapshot_id != self.state.snapshot_id:
+            raise ValueError("source manifest does not match the league snapshot")
+        if not isinstance(self.projection_source_manifest, ProjectionSourceManifest):
+            raise ValueError(
+                "projection_source_manifest must be a ProjectionSourceManifest"
+            )
+        if (
+            self.projection_source_manifest.evaluation_scoring_profile_id
+            != self.state.scoring_profile_id
+        ):
+            raise ValueError(
+                "projection source manifest does not match the league scoring profile"
+            )
+        self.projection_source_manifest.validate_projection_evidence(evidence)
+        if not isinstance(self.fantasypros_benchmark, FantasyProsLeagueBenchmark):
+            raise ValueError(
+                "fantasypros_benchmark must be a FantasyProsLeagueBenchmark"
+            )
+        if (
+            self.fantasypros_benchmark.snapshot_id != self.state.snapshot_id
+            or self.fantasypros_benchmark.source_artifact_id
+            != self.source_manifest.fantasypros_league_artifact_id
+        ):
+            raise ValueError("FantasyPros benchmark does not match the source manifest")
+        if {row.team_id for row in self.fantasypros_benchmark.teams} != {
+            row.team_id for row in self.state.teams
+        }:
+            raise ValueError("FantasyPros benchmark must cover every league team")
         _rows("ecr_snapshots", self.ecr_snapshots, EcrSnapshot)
         _rows("eligibilities", self.eligibilities, PlayerEligibility)
         _rows("role_definitions", self.role_definitions, RoleDefinition)
@@ -262,7 +298,7 @@ def refresh_weekly_engine(
             progress,
             RefreshStage.REUSING_FORMULA,
             0.3,
-            "Reusing the revalidated FantasyPros scoring method",
+            "Reusing the FantasyPros-style formula after current-week blind-holdout validation",
         )
     else:
         if calibrate is None:
@@ -271,7 +307,7 @@ def refresh_weekly_engine(
             progress,
             RefreshStage.CALIBRATING,
             0.2,
-            "Calibrating the FantasyPros scoring method",
+            "Fitting and blind-testing the FantasyPros-style scoring method",
         )
         _cancel(cancelled)
         formula = calibrate(evidence, fingerprint)
@@ -284,7 +320,7 @@ def refresh_weekly_engine(
             )
             if compatible.action is not FormulaAction.REUSE:
                 raise ValueError(
-                    "calibration did not produce a reusable exact formula: "
+                    "calibration did not produce a reusable holdout-validated formula: "
                     + "; ".join(compatible.reasons)
                 )
         elif (
@@ -306,8 +342,8 @@ def refresh_weekly_engine(
                 )
         else:
             raise ValueError(
-                "calibration did not produce an exact formula; surrogate power "
-                "requires explicit opt-in"
+                "calibration did not pass the holdout-validation gate; SURROGATE "
+                "power requires explicit opt-in"
             )
 
     _cancel(cancelled)
@@ -323,6 +359,9 @@ def refresh_weekly_engine(
         rosters=evidence.rosters,
         projection_evidence=evidence.projection_evidence,
         nfl_schedule=evidence.nfl_schedule,
+        source_manifest=evidence.source_manifest,
+        projection_source_manifest=evidence.projection_source_manifest,
+        fantasypros_benchmark=evidence.fantasypros_benchmark,
         ecr_snapshots=evidence.ecr_snapshots,
         eligibilities=evidence.eligibilities,
         player_positions=evidence.player_positions,
@@ -354,7 +393,7 @@ def refresh_weekly_engine(
     ready_message = (
         "Weekly SURROGATE engine is ready; power results are approximate"
         if formula.calibration.status is CalibrationStatus.SURROGATE
-        else "Weekly exact-method engine is ready"
+        else "Weekly blind-holdout-validated engine is ready"
     )
     _emit(progress, RefreshStage.COMPLETE, 1.0, ready_message)
     return WeeklyRefreshResult(

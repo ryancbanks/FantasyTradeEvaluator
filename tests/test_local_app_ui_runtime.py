@@ -2,8 +2,11 @@ from tempfile import TemporaryDirectory
 from threading import Event, Thread
 import time
 import unittest
+from unittest.mock import patch
 
 from tests.draft_fixtures import small_draft_config, small_historical_corpus
+import tests.test_engine_bundle as engine_bundle_fixtures
+import tests.test_search_runner as search_runner_fixtures
 from tests.test_app_service import payload
 from tests.test_engine_bundle import engine_bundle
 from trade_snapshot.app_service import LocalSearchRequest
@@ -77,7 +80,11 @@ class LocalAppUiRuntimeTests(unittest.TestCase):
     def test_trade_player_dashboard_and_draft_surfaces_work_together(self):
         with TemporaryDirectory() as directory:
             server = create_local_server(directory)
-            bundle = engine_bundle()
+            # Give the fixture one equal-value bench exchange so the strict
+            # five-point power gate has a valid row to render end to end.
+            with patch.dict(engine_bundle_fixtures.ALL_POINTS, {"q2": 8.0}), \
+                    patch.dict(search_runner_fixtures.PLAYER_POINTS, {"q2": 8.0}):
+                bundle = engine_bundle()
             server.app_service.import_bundle(bundle.to_record())
             serving = Thread(
                 target=server.serve_forever,
@@ -149,6 +156,7 @@ class LocalAppUiRuntimeTests(unittest.TestCase):
 
                         page.locator("#maxOutgoing").fill("1")
                         page.locator("#maxIncoming").fill("1")
+                        page.locator("#maxTotal").fill("2")
                         page.locator("#scenarioCount").fill(
                             str(max(100, bundle.scenario_config.scenario_count))
                         )

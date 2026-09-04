@@ -33,7 +33,7 @@ from trade_snapshot.strength_formula import StrengthFormula
 
 METHODOLOGY = PowerMethodology(
     ("ecr_ros_inverse_rank",),
-    ("projection_fantasypros_remaining_points",),
+    ("projection_fantasypros_full_ros_points",),
 )
 
 
@@ -66,7 +66,7 @@ def exact_formula(value):
         role_definitions=value.roles,
         residual_weights={"ecr_ros_inverse_rank": 0.25},
         role_weights={
-            role.role_id: {"projection_fantasypros_remaining_points": 0.75}
+            role.role_id: {"projection_fantasypros_full_ros_points": 0.75}
             for role in value.roles
         },
         calibration=CalibrationMetadata(

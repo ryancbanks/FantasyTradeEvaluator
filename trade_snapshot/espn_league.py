@@ -27,7 +27,7 @@ from .league_state import HeadToHeadPolicy, PlayoffRules, RosterRules, Tiebreake
 from .scoring import ScoringProfile
 
 
-ESPN_LEAGUE_ADAPTER_VERSION = "espn-ffl-v3-h2h-points-v3-typed-rosters"
+ESPN_LEAGUE_ADAPTER_VERSION = "espn-ffl-v4-h2h-points-v3-typed-rosters"
 
 _DEFAULT_POSITION = {
     1: "QB",
@@ -38,7 +38,8 @@ _DEFAULT_POSITION = {
     9: "DL",
     10: "DL",
     11: "LB",
-    14: "DB",
+    12: "DB",
+    13: "DB",
     16: "DST",
 }
 _STARTING_SLOT = {
@@ -64,6 +65,7 @@ _STARTING_SLOT = {
 _NONSTARTING_SLOT = {20: "BENCH", 21: "IR", 25: "ROOKIE_RESERVE"}
 _RESERVE_SLOT = {21: "IR", 25: "ROOKIE_RESERVE"}
 _SUPPORTED_SLOT_IDS = frozenset(_STARTING_SLOT) | frozenset(_NONSTARTING_SLOT)
+_UNMODELED_FINE_GRAINED_IDP_SLOTS = frozenset({8, 9, 12, 13})
 
 
 def espn_lineup_slot_name(slot_id: int) -> str:
@@ -110,6 +112,13 @@ def espn_host_league_snapshot(
     scoring_type = _text("scoringType", scoring_settings.get("scoringType"))
     if scoring_type not in {"H2H_POINTS", "H2H_POINTS_BASED"}:
         raise ValueError("ESPN adapter currently requires H2H points scoring")
+    if scoring_settings.get("allowOutOfPositionScoring") is not False:
+        raise ValueError("ESPN out-of-position scoring is not yet supported exactly")
+    if (
+        scoring_settings.get("matchupTieRule") != "NONE"
+        or scoring_settings.get("matchupTieRuleBy") != 0
+    ):
+        raise ValueError("ESPN regular-season matchup tie rules are not yet supported")
     first_remaining_week = _integer(
         "scoringPeriodId", league.get("scoringPeriodId"), minimum=1
     )
@@ -320,6 +329,7 @@ def espn_host_league_snapshot(
 
 def _source_player(player, pro_teams, configured_starting_slots):
     player_id = _player_identifier("player.id", player.get("id"))
+    display_name = _text("player.fullName", player.get("fullName"))
     position_id = _integer("defaultPositionId", player.get("defaultPositionId"), minimum=1)
     try:
         position = _DEFAULT_POSITION[position_id]
@@ -328,6 +338,12 @@ def _source_player(player, pro_teams, configured_starting_slots):
     pro_team_id = _integer("proTeamId", player.get("proTeamId"), minimum=0)
     if pro_team_id not in pro_teams:
         raise ValueError("ESPN player references an unknown pro team")
+    if pro_team_id == 0:
+        raise ValueError(
+            f"ESPN rostered player {display_name!r} ({player_id}) is an unassigned "
+            "NFL free agent (proTeamId=0); weekly projections and playoff odds "
+            "cannot be calculated safely until the player has an NFL team"
+        )
     eligible = []
     for raw in _array("eligibleSlots", player.get("eligibleSlots")):
         slot_id = _integer("eligible slot", raw, minimum=0)
@@ -341,7 +357,7 @@ def _source_player(player, pro_teams, configured_starting_slots):
     eligible.append(position)
     return SourceLeaguePlayer(
         player_id,
-        _text("player.fullName", player.get("fullName")),
+        display_name,
         position,
         pro_teams[pro_team_id],
         tuple(dict.fromkeys(eligible)),
@@ -468,6 +484,11 @@ def _slot_counts(value):
         count = _integer("lineup slot count", raw_count, minimum=0)
         if count and slot_id not in _SUPPORTED_SLOT_IDS:
             raise ValueError(f"ESPN lineup slot {slot_id} is unsupported")
+        if count and slot_id in _UNMODELED_FINE_GRAINED_IDP_SLOTS:
+            raise ValueError(
+                f"ESPN fine-grained IDP lineup slot {slot_id} is not yet "
+                "supported exactly"
+            )
         result[slot_id] = count
     if not result or not any(result.get(slot_id, 0) for slot_id in _STARTING_SLOT):
         raise ValueError("ESPN lineup slots are incomplete")

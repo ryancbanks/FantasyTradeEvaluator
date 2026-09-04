@@ -4,7 +4,10 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from tests.test_search_runner import league_state, projection
-from trade_snapshot.roster_adjustment import PreparedRosterAdjuster
+from trade_snapshot.roster_adjustment import (
+    InfeasibleRosterAdjustment,
+    PreparedRosterAdjuster,
+)
 from trade_snapshot.scenario_config import (
     CorrelatedScenarioConfig,
     FactorLoadings,
@@ -54,6 +57,99 @@ def rosters():
 
 
 class RosterAdjustmentTests(unittest.TestCase):
+    def test_add_only_mode_fills_post_trade_vacancy_without_dropping(self):
+        value = model()
+        primary = TeamRoster("primary", ("p1", "p2"), 2, 2)
+        other = TeamRoster("other", ("q1", "q2"), 2, 3)
+        adjuster = PreparedRosterAdjuster(
+            value,
+            (primary, other),
+            forbid_drops=True,
+        )
+
+        result = PreparedTradePair(value, primary, other, adjuster).evaluate(
+            TradeCandidate(("p1", "p2"), ("q1",)),
+            candidate_index=0,
+        )
+
+        self.assertEqual(result.roster_adjustment.primary.added_player_ids, ("fa1",))
+        self.assertEqual(result.roster_adjustment.primary.dropped_player_ids, ())
+        self.assertEqual(result.roster_adjustment.counterparty.dropped_player_ids, ())
+        self.assertEqual(
+            set(result.roster_adjustment.primary.roster.player_ids),
+            {"q1", "fa1"},
+        )
+
+    def test_add_only_mode_fails_when_bounded_pool_cannot_fill_vacancy(self):
+        primary = TeamRoster("primary", ("p1", "p2"), 2, 2)
+        other = TeamRoster("other", ("q1", "q2"), 2, 3)
+        reserves = TeamRoster("reserves", ("fa1", "fa2"), 2, 2)
+        adjuster = PreparedRosterAdjuster(
+            model(),
+            (primary, other, reserves),
+            forbid_drops=True,
+        )
+
+        with self.assertRaisesRegex(
+            InfeasibleRosterAdjustment,
+            "waiver pool cannot fill post-trade roster vacancies",
+        ):
+            adjuster.adjust_trade(
+                primary,
+                other,
+                TradeCandidate(("p1", "p2"), ("q1",)),
+            )
+
+    def test_add_only_mode_rejects_overflow_instead_of_forcing_a_drop(self):
+        value = model()
+        primary, other = rosters()
+        adjuster = PreparedRosterAdjuster(
+            value,
+            (primary, other),
+            forbid_drops=True,
+        )
+        drop_enabled = PreparedRosterAdjuster(value, (primary, other))
+
+        with self.assertRaisesRegex(
+            InfeasibleRosterAdjustment,
+            "active roster cap while drops are forbidden",
+        ):
+            adjuster.adjust_trade(
+                primary,
+                other,
+                TradeCandidate(("p1",), ("q1", "q2")),
+            )
+        self.assertNotEqual(adjuster.adjustment_id, drop_enabled.adjustment_id)
+
+    def test_three_team_add_only_adjustment_reserves_a_unique_replacement(self):
+        value = model()
+        primary = TeamRoster("a", ("p1", "p2"), 2, 2)
+        other = TeamRoster("b", ("q1", "q2"), 2, 3)
+        third = TeamRoster("c", ("fa2",), 1, 1)
+        adjuster = PreparedRosterAdjuster(
+            value,
+            (primary, other, third),
+            forbid_drops=True,
+        )
+
+        result = adjuster.adjust_teams(
+            (
+                (primary, ("p1", "p2"), ("q1",)),
+                (other, ("q1",), ("p1", "fa2")),
+                (third, ("fa2",), ("p2",)),
+            )
+        )
+
+        by_team = {row.roster.team_id: row for row in result}
+        self.assertEqual(by_team["a"].added_player_ids, ("fa1",))
+        self.assertTrue(all(not row.dropped_player_ids for row in result))
+        assigned = tuple(
+            player_id
+            for row in result
+            for player_id in row.roster.player_ids
+        )
+        self.assertEqual(len(assigned), len(set(assigned)))
+
     def test_imbalanced_trade_uses_optimal_drop_and_free_agent_replacement(self):
         value = model()
         primary, other = rosters()
@@ -318,6 +414,21 @@ class RosterAdjustmentTests(unittest.TestCase):
             set(result.primary.roster.player_ids),
             {"p1", "q1", "q2"},
         )
+
+    def test_fails_instead_of_silently_underfilling_a_roster(self):
+        primary = TeamRoster("primary", ("p1", "p2"), 2, 2)
+        other = TeamRoster("other", ("q1", "q2", "fa1", "fa2"), 4, 4)
+        adjuster = PreparedRosterAdjuster(model(), (primary, other))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "waiver pool cannot fill post-trade roster vacancies",
+        ):
+            adjuster.adjust_trade(
+                primary,
+                other,
+                TradeCandidate(("p1", "p2"), ("q1",)),
+            )
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from .browser_capture import (
     ECRCaptureData,
     LeagueCaptureData,
     ProjectionCaptureData,
+    ProjectionNotPublished,
     YahooScoringError,
 )
 from .capture_schema import ECRRankingRow, LeagueSource, VisibleTable
@@ -154,10 +155,12 @@ class _WorkerSession:
             "cancelled": BrowserCaptureCancelled,
             "dependency": BrowserCaptureDependencyError,
             "timeout": BrowserCaptureTimeout,
+            "not_published": ProjectionNotPublished,
             "capture": BrowserCaptureError,
             "yahoo_scoring": YahooScoringError,
         }
-        self._terminate(graceful=True)
+        if kind not in {"capture", "not_published", "yahoo_scoring"}:
+            self._terminate(graceful=True)
         raise errors.get(kind, BrowserCaptureError)(message)
 
     def _terminate(self, *, graceful: bool = False) -> None:
@@ -186,24 +189,34 @@ def _worker_main(connection, options) -> None:
         connection.send(("ready", None))
         while True:
             operation, arguments = connection.recv()
-            if operation == "close":
-                session.close(*arguments)
-                connection.send(("ok", None))
-                return
-            method = getattr(session, operation, None)
-            if method is None or operation.startswith("_"):
-                raise BrowserCaptureError("browser worker operation was not allowed")
-            if operation in {
-                "navigate", "finish_analyzer_response_capture", "activate_full_analysis",
-                "capture_analyzer_bundle",
-                "assert_page_provenance", "capture_visible_tables", "capture_ecr_rankings",
-                "capture_league_sources", "read_authenticated_espn_json",
-                "read_yahoo_scoring",
-            }:
-                result = method(*arguments, lambda: False)
-            else:
-                result = method(*arguments)
-            connection.send(("ok", _encode_result(operation, result)))
+            try:
+                if operation == "close":
+                    session.close(*arguments)
+                    connection.send(("ok", None))
+                    return
+                method = getattr(session, operation, None)
+                if method is None or operation.startswith("_"):
+                    raise BrowserCaptureError("browser worker operation was not allowed")
+                if operation in {
+                    "navigate", "finish_analyzer_response_capture", "activate_full_analysis",
+                    "capture_analyzer_bundle",
+                    "assert_page_provenance", "capture_visible_tables", "capture_ecr_rankings",
+                    "capture_league_sources", "read_authenticated_espn_json",
+                    "read_yahoo_scoring",
+                }:
+                    result = method(*arguments, lambda: False)
+                else:
+                    result = method(*arguments)
+                connection.send(("ok", _encode_result(operation, result)))
+            except (BrowserCaptureError, YahooScoringError) as error:
+                kind = "dependency" if isinstance(error, BrowserCaptureDependencyError) else (
+                    "cancelled" if isinstance(error, BrowserCaptureCancelled) else
+                    "timeout" if isinstance(error, BrowserCaptureTimeout) else
+                    "not_published" if isinstance(error, ProjectionNotPublished) else
+                    "yahoo_scoring" if isinstance(error, YahooScoringError) else
+                    "capture"
+                )
+                connection.send(("error", kind, str(error)))
     except EOFError:
         return
     except BaseException as error:
@@ -236,6 +249,8 @@ def _encode_result(operation: str, result: object) -> object:
         return {
             "expert_count": result.expert_count,
             "expert_ids": list(result.expert_ids),
+            "source_scoring": result.source_scoring,
+            "source_details": result.source_details.to_record(),
             "last_updated_at": result.last_updated_at,
             "last_updated_text": result.last_updated_text,
             "rankings": [row.to_record() for row in result.rankings],
@@ -291,18 +306,23 @@ def _decode_result(operation: str, value: object) -> object:
             if not isinstance(value, dict) or set(value) != {
                 "expert_count",
                 "expert_ids",
+                "source_scoring",
+                "source_details",
                 "last_updated_at",
                 "last_updated_text",
                 "rankings",
             } or not isinstance(value["expert_ids"], list) or not isinstance(
                 value["rankings"], list
-            ):
+            ) or not isinstance(value["source_details"], dict):
                 raise ValueError
+            from .ecr_source import EcrSourceDetails
             return ECRCaptureData(
                 tuple(value["expert_ids"]),
                 value["expert_count"],
+                value["source_scoring"],
                 value["last_updated_text"],
                 value["last_updated_at"],
+                EcrSourceDetails.from_record(value["source_details"]),
                 tuple(ECRRankingRow.from_record(row) for row in value["rankings"]),
             )
         if operation == "capture_league_sources":

@@ -20,12 +20,18 @@ class MethodologyTests(unittest.TestCase):
         self.assertEqual(config.residual_feature_names, policy.residual_feature_names)
         self.assertEqual(config.role_feature_names, policy.role_feature_names)
 
+    def test_default_power_does_not_require_unpublished_projection_horizons(self):
+        policy = DEFAULT_POWER_METHODOLOGY
+        required = (*policy.residual_feature_names, *policy.role_feature_names)
+        self.assertFalse(any(name.startswith("projection_") for name in required))
+        self.assertTrue(all(name == "presence" or name.startswith("ecr_ros_") for name in required))
+
     def test_rejects_cross_provider_power_leakage_and_defaults_to_core_ensemble(self):
         for feature in (
-            "projection_espn_remaining_points",
-            "projection_yahoo_remaining_points",
-            "projection_ensemble_remaining_points",
-            "projection_sleeper_remaining_points",
+            "projection_espn_full_ros_points",
+            "projection_yahoo_full_ros_points",
+            "projection_ensemble_full_ros_points",
+            "projection_sleeper_full_ros_points",
         ):
             with self.subTest(feature=feature):
                 with self.assertRaisesRegex(ValueError, "FantasyPros projection features"):

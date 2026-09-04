@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from .weekly_collection import _host_league_url, _yahoo_projection_url
 
-CATALOG_SCHEMA_VERSION = 2
+CATALOG_SCHEMA_VERSION = 3
 _PROFILE_ID = re.compile(r"^league_[0-9a-f]{32}$")
 _BUNDLE_ID = re.compile(r"^engine_[0-9a-f]{64}$")
 _NOT_SET = object()
@@ -448,18 +448,25 @@ class LeagueCatalog:
                 )
                 for statement in statements:
                     connection.execute(statement)
-                connection.execute(
-                    f"PRAGMA user_version = {CATALOG_SCHEMA_VERSION}"
-                )
+                version = 2
             elif version == 1:
                 # Yahoo supplies reusable projection/scoring context; it is not
                 # the host-league identity. Multiple ESPN leagues may therefore
                 # share one Yahoo source in the same season.
                 connection.execute("DROP INDEX IF EXISTS league_profiles_yahoo")
+                version = 2
+            if version == 2:
+                # "exact" was the former display name for an attested power
+                # formula. Preserve those associations under the more precise
+                # holdout-validation terminology used by current bundles.
+                connection.execute(
+                    "UPDATE league_bundles SET power_engine_mode = "
+                    "'holdout_validated' WHERE power_engine_mode = 'exact'"
+                )
                 connection.execute(
                     f"PRAGMA user_version = {CATALOG_SCHEMA_VERSION}"
                 )
-            # These indexes do not change the stored format, so existing v2
+            # These indexes do not change the stored format, so existing
             # catalogs receive the scale optimization without a migration.
             for statement in _PROFILE_PAGE_INDEXES:
                 connection.execute(statement)
@@ -581,9 +588,15 @@ def _bundle_values(
         raise ValueError("week must be an integer from 1 through 25")
     if type(team_count) is not int or not 2 <= team_count <= 10_000:
         raise ValueError("team_count must be an integer from 2 through 10,000")
-    if power_engine_mode not in {"exact", "surrogate", "independent"}:
+    if power_engine_mode == "exact":
+        power_engine_mode = "holdout_validated"
+    if power_engine_mode not in {
+        "holdout_validated",
+        "surrogate",
+        "independent",
+    }:
         raise ValueError(
-            "power_engine_mode must be exact, surrogate, or independent"
+            "power_engine_mode must be holdout_validated, surrogate, or independent"
         )
     return clean_id, clean_season, week, team_count, power_engine_mode
 
