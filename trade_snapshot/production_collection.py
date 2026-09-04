@@ -41,12 +41,14 @@ from .capture_schema import (
 )
 from .engine_bundle import EngineBundle
 from .ensemble import EnsembleConfig
+from .espn_activity import espn_activity_capture
 from .espn_free_read import (
     EspnFreeReadClient,
     EspnFreeReadError,
     EspnUnauthorizedError,
 )
 from .espn_league import espn_host_league_snapshot
+from .history_ingest import canonicalize_espn_history
 from .identity_io import load_identity_registry, save_identity_registry
 from .league_binding import get_or_create_league_binding
 from .nfl_schedule import NFL_REGULAR_SEASON_WEEKS, parse_espn_pro_team_schedule
@@ -72,6 +74,7 @@ from .waiver_pool import required_waiver_positions
 from .weekly_assembly import AssembledWeeklyEvidence, assemble_weekly_refresh_evidence
 from .weekly_collection import (
     WeeklyCollectionError,
+    WeeklyCollectionPublication,
     WeeklyCollectionProgress,
     WeeklyCollectionRequest,
     WeeklyCollectionStage,
@@ -107,11 +110,13 @@ class ProductionWeeklyCollectionWorkflow:
         plan_builder: Callable = build_weekly_source_plan,
         assembler: Callable = assemble_weekly_refresh_evidence,
         refresher: Callable = refresh_weekly_engine,
+        activity_adapter: Callable = espn_activity_capture,
+        history_adapter: Callable = canonicalize_espn_history,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         dependencies = (
             calibration_factory, host_adapter, schedule_adapter,
-            plan_builder, assembler, refresher, now,
+            plan_builder, assembler, refresher, activity_adapter, history_adapter, now,
         )
         if not callable(getattr(sign_in_gate, "is_ready", None)):
             raise ValueError("sign_in_gate must provide interactive readiness confirmation")
@@ -128,6 +133,8 @@ class ProductionWeeklyCollectionWorkflow:
         self._plan_builder = plan_builder
         self._assembler = assembler
         self._refresher = refresher
+        self._activity_adapter = activity_adapter
+        self._history_adapter = history_adapter
         self._now = now
 
     @property
@@ -141,7 +148,7 @@ class ProductionWeeklyCollectionWorkflow:
         data_directory: Path,
         progress: Callable[[WeeklyCollectionProgress], None],
         cancelled: Callable[[], bool],
-    ) -> EngineBundle:
+    ) -> WeeklyCollectionPublication:
         if not isinstance(request, WeeklyCollectionRequest):
             raise ValueError("request must be a WeeklyCollectionRequest")
         if request.yahoo_projection_league_url is None:
@@ -258,6 +265,10 @@ class ProductionWeeklyCollectionWorkflow:
                 collector, request, host_id
             )
         captured_at = self._now()
+        activity = self._activity_adapter(
+            league_payload,
+            captured_at=captured_at,
+        )
         host = self._host_adapter(
             league_payload,
             pro_team_payload,
@@ -386,8 +397,19 @@ class ProductionWeeklyCollectionWorkflow:
         bundle = getattr(result, "bundle", None)
         if not isinstance(bundle, EngineBundle):
             raise ValueError("refresher must return a weekly refresh result")
+        history_capture, history_binding = self._history_adapter(
+            activity,
+            assembled,
+            bundle,
+            bundle_captured_at=self._now(),
+        )
+        publication = WeeklyCollectionPublication(
+            bundle,
+            history_capture,
+            history_binding,
+        )
         save_identity_registry(assembled.identities, root / _IDENTITY_FILE)
-        return bundle
+        return publication
 
     @staticmethod
     def _authenticated_espn_read(collector, request, host_id):

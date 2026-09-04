@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,8 +15,18 @@ from tests.test_engine_bundle import engine_bundle
 from tests.test_three_way_search import components as three_way_components
 from tests.test_surrogate_disclosure import surrogate_bundle
 from trade_snapshot.app_service import LocalAppService, LocalSearchRequest
+from trade_snapshot.league_history import (
+    HistoryBundleBinding,
+    HistoryRosterPlayer,
+    HistoryTeam,
+    HistoryTeamRoster,
+    LeagueHistoryCapture,
+    LeagueHistoryStore,
+    make_league_key,
+)
 from trade_snapshot.three_way_search import ThreeWaySearchOutcome
 from trade_snapshot.trade_impact import prepare_season_baseline
+from trade_snapshot.weekly_collection import LEAGUE_HISTORY_FILENAME
 
 
 def payload(bundle_id):
@@ -128,6 +139,75 @@ class LocalAppServiceTests(unittest.TestCase):
             "Saved weekly bundles that failed validation: 1",
             catalog["readiness"]["message"],
         )
+
+    def test_trade_timing_is_cached_per_primary_team(self):
+        bundle = engine_bundle()
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            first = service.trade_timing(bundle.bundle_id, "primary")
+            with patch(
+                "trade_snapshot.app_service.build_trade_timing",
+                side_effect=AssertionError("cached timing must not be rebuilt"),
+            ):
+                second = service.trade_timing(bundle.bundle_id, "primary")
+
+        self.assertIs(first, second)
+        self.assertEqual(first["primary_team_id"], "primary")
+        self.assertFalse(first["methodology"]["manager_acceptance_modeled"])
+
+    def test_gm_insights_supports_old_bundles_and_refreshes_for_new_history(self):
+        bundle = engine_bundle()
+        captured_at = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        league_key = make_league_key("espn", "test-private-league")
+        names = {team.team_id: team.name for team in bundle.state.teams}
+        capture = LeagueHistoryCapture(
+            league_key=league_key,
+            season=bundle.state.season,
+            captured_at=captured_at,
+            coverage_start=captured_at,
+            coverage_end=captured_at,
+            transaction_history_complete=True,
+            roster_complete=True,
+            lineup_complete=True,
+            teams=tuple(HistoryTeam(team_id, names[team_id]) for team_id in names),
+            transactions=(),
+            rosters=tuple(
+                HistoryTeamRoster(
+                    roster.team_id,
+                    tuple(
+                        HistoryRosterPlayer(player_id, "BENCH")
+                        for player_id in roster.player_ids
+                    ),
+                )
+                for roster in bundle.rosters
+            ),
+        )
+        binding = HistoryBundleBinding(
+            league_key,
+            bundle.state.season,
+            bundle.bundle_id,
+            captured_at,
+        )
+
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(directory)
+            service.import_bundle(bundle.to_record())
+            old_bundle_result = service.gm_insights(bundle.bundle_id)
+            old_timing = service.trade_timing(bundle.bundle_id, "primary")
+            LeagueHistoryStore(
+                Path(directory) / LEAGUE_HISTORY_FILENAME
+            ).ingest(capture, bundle=binding)
+            captured_result = service.gm_insights(bundle.bundle_id)
+            captured_timing = service.trade_timing(bundle.bundle_id, "primary")
+
+        self.assertEqual(old_bundle_result["status"], "not_collected")
+        self.assertEqual(captured_result["status"], "insufficient_sample")
+        self.assertIsNotNone(captured_result["league_history_id"])
+        self.assertEqual(len(captured_result["teams"]), len(bundle.state.teams))
+        self.assertIsNone(old_timing["history_revision"])
+        self.assertIsNotNone(captured_timing["history_revision"])
+        self.assertIsNot(old_timing, captured_timing)
 
     def test_player_outlook_is_available_without_a_search_and_cached(self):
         bundle = engine_bundle()

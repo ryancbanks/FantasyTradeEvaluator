@@ -67,6 +67,17 @@ _SUPPORTED_SLOT_IDS = frozenset(_STARTING_SLOT) | frozenset(_NONSTARTING_SLOT)
 _UNMODELED_FINE_GRAINED_IDP_SLOTS = frozenset({8, 9, 12, 13})
 
 
+def espn_lineup_slot_name(slot_id: int) -> str:
+    """Return the shared semantic name for one supported ESPN lineup slot."""
+
+    if isinstance(slot_id, bool) or not isinstance(slot_id, int):
+        raise ValueError("ESPN lineup slot ID must be an integer")
+    try:
+        return (_STARTING_SLOT | _NONSTARTING_SLOT)[slot_id]
+    except KeyError:
+        raise ValueError(f"ESPN lineup slot {slot_id} is unsupported") from None
+
+
 def espn_host_league_snapshot(
     league_payload: Mapping[str, object],
     pro_team_payload: Mapping[str, object],
