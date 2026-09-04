@@ -64,6 +64,7 @@ from .production_calibration import (
     InteractiveSignInGate,
 )
 from .projection_source_policy import select_projection_sources
+from .projection_archive import save_projection_archive
 from .player_profile_materialize import (
     PlayerProfileMaterializationError,
     materialize_player_profiles,
@@ -455,6 +456,24 @@ class ProductionWeeklyCollectionWorkflow:
             request.scoring,
             require_ecr=request.use_fantasypros,
         )
+        previous = _previous_identities(root / _IDENTITY_FILE)
+        validation.stage = "full projection archive publication"
+        try:
+            archive_path = save_projection_archive(
+                root / "projection-archives",
+                projections,
+                known_registry=previous,
+            )
+        except (OSError, ValueError) as error:
+            raise ValueError(
+                "the complete sanitized projection archive could not be saved"
+            ) from error
+        _emit(
+            progress,
+            WeeklyCollectionStage.NORMALIZING,
+            .64,
+            f"Saved the complete projection tables locally as {archive_path.name}",
+        )
         if request.use_broad_consensus:
             completion_stage = WeeklyCollectionStage.COLLECTING_PUBLIC
         elif request.use_fantasypros:
@@ -472,7 +491,6 @@ class ProductionWeeklyCollectionWorkflow:
             request, root, cancelled, progress
         )
 
-        previous = _previous_identities(root / _IDENTITY_FILE)
         validation.stage = "cross-source identity and weekly evidence assembly"
         _emit(progress, WeeklyCollectionStage.NORMALIZING, .7,
               "Matching player identities and validating complete weekly evidence")

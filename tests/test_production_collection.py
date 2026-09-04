@@ -68,6 +68,7 @@ from trade_snapshot.production_collection import (
     _yahoo_projection_task,
     create_production_weekly_collection_workflow,
 )
+from trade_snapshot.projection_archive import projection_archive_catalog
 from trade_snapshot.weekly_assembly import AssembledWeeklyEvidence
 from trade_snapshot.weekly_collection import (
     WeeklyCollectionError,
@@ -199,8 +200,17 @@ class ProductionWeeklyCollectionTests(unittest.TestCase):
                 progress=progress.append, cancelled=lambda: False,
             )
             self.assertEqual(load_identity_registry(identity_path), assembled.identities)
+            archive_catalog = projection_archive_catalog(
+                Path(directory) / "projection-archives"
+            )
 
         self.assertIsInstance(result, WeeklyCollectionPublication)
+        self.assertEqual(len(archive_catalog), 1)
+        self.assertEqual(archive_catalog[0]["status"], "ready")
+        self.assertEqual(
+            archive_catalog[0]["providers"],
+            ["espn", "fantasypros", "yahoo"],
+        )
         self.assertEqual(
             result.bundle.player_lab_projections,
             assembled.player_lab_projections,
@@ -1297,8 +1307,9 @@ def _artifact(task):
         "yahoo": "https://sports.yahoo.com/nfl/players/301/",
     }
     table = VisibleTable((
-        (VisibleTableCell("PLAYER"), VisibleTableCell("FPTS")),
+        tuple(VisibleTableCell(value) for value in ("PLAYER", "TEAM", "POS", "FPTS")),
         (VisibleTableCell("Player One", (links[task.provider.value],)),
+         VisibleTableCell("ARI"), VisibleTableCell("RB"),
          VisibleTableCell("12.0")),
     ))
     return GenericTableArtifact(
