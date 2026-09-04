@@ -106,8 +106,6 @@ class PreparedTradePair:
 
         index = _candidate_index(candidate_index)
         outgoing, incoming = self._validated_packages(candidate)
-        outgoing_set = set(outgoing)
-        incoming_set = set(incoming)
         normalized_candidate = TradeCandidate(outgoing, incoming)
 
         adjustment = (

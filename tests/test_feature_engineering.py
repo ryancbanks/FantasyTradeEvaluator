@@ -2,7 +2,9 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from math import sqrt
 import unittest
+from unittest.mock import patch
 
+import trade_snapshot.feature_engineering as feature_module
 from trade_snapshot.ecr import EcrPeriod, EcrPlayerRanking, EcrSnapshot
 from trade_snapshot._ensemble_math import weighted_metrics
 from trade_snapshot.ensemble import EnsembleProjection, ProviderObservation
@@ -108,6 +110,18 @@ def inputs(scoring_profile_id="profile-1"):
 
 
 class StrengthFeatureEngineeringTests(unittest.TestCase):
+    def test_snapshot_rank_totals_are_computed_once_per_feature_set(self):
+        snapshots, projections, eligibility = inputs()
+
+        with patch(
+            "trade_snapshot.feature_engineering._ecr_total",
+            wraps=feature_module._ecr_total,
+        ) as total:
+            result = build_strength_features(snapshots, projections, eligibility)
+
+        self.assertEqual(total.call_count, 2)
+        self.assertEqual(len(result.player_features), len(eligibility))
+
     def test_preserves_provider_and_ecr_signals_with_explicit_missingness(self):
         snapshots, projections, eligibility = inputs()
         result = build_strength_features(snapshots, projections, eligibility)
@@ -128,6 +142,38 @@ class StrengthFeatureEngineeringTests(unittest.TestCase):
         self.assertEqual(p2["ecr_weekly_available"], 0)
         self.assertEqual(p2["ecr_weekly_inverse_rank"], 0)
         self.assertEqual(p2["projection_yahoo_current_available"], 1)
+
+    def test_unpublished_provider_is_excluded_from_remaining_projection_totals(self):
+        snapshots, projections, eligibility = inputs()
+        observations = (
+            *projections[1].provider_observations[:2],
+            replace(
+                projections[1].provider_observations[2],
+                status=ProjectionStatus.NOT_PUBLISHED,
+                projected_fantasy_points=None,
+            ),
+        )
+        mean, disagreement, predictive = weighted_metrics(observations, 0)
+        unpublished = replace(
+            projections[1],
+            provider_observations=observations,
+            projected_fantasy_points=mean,
+            between_provider_stddev=disagreement,
+            predictive_stddev=predictive,
+        )
+
+        result = build_strength_features(
+            snapshots,
+            (projections[0], unpublished, *projections[2:]),
+            eligibility,
+        )
+        p1 = next(
+            row.values for row in result.player_features if row.player_id == "p1"
+        )
+
+        self.assertEqual(p1["projection_yahoo_observed_week_fraction"], 0.5)
+        self.assertEqual(p1["projection_yahoo_remaining_points"], 14)
+        self.assertEqual(p1["projection_ensemble_remaining_points"], 33)
 
     def test_input_order_does_not_change_feature_identity(self):
         snapshots, projections, eligibility = inputs()

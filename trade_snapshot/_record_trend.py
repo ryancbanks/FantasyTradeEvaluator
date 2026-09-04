@@ -1,7 +1,6 @@
 """Shared robust slope semantics for cumulative fantasy records."""
 
 from collections.abc import Iterable
-from statistics import median
 
 
 RECORD_SLOPE_WINDOW = 4
@@ -15,16 +14,24 @@ def trailing_record_slope(
 ) -> float | None:
     """Return a Theil-Sen slope for the latest record observations."""
 
-    rows = tuple(points)[-window:]
+    rows = points[-window:] if type(points) in (list, tuple) else tuple(points)[-window:]
     if len(rows) < 3:
         return None
-    slopes = tuple(
+    slopes = [
         (right_value - left_value) / (right_week - left_week)
         for index, (left_week, left_value) in enumerate(rows)
         for right_week, right_value in rows[index + 1 :]
         if right_week != left_week
+    ]
+    if not slopes:
+        return None
+    slopes.sort()
+    middle = len(slopes) // 2
+    return (
+        slopes[middle]
+        if len(slopes) % 2
+        else (slopes[middle - 1] + slopes[middle]) / 2
     )
-    return median(slopes) if slopes else None
 
 
 def record_slope_direction(

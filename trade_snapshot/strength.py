@@ -1,11 +1,11 @@
 """Whole-roster scoring with immutable calibrated starter/depth roles."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import fsum, isfinite
 from types import MappingProxyType
 from typing import Iterable, Mapping, Sequence
 
-from .lineup import LineupPlayer, LineupResult, optimize_lineup
+from .lineup import LineupPlayer, LineupResult, _optimize_prepared_lineup
 from .strength_calibration import (
     CalibrationMetadata,
     CalibrationStatus,
@@ -63,6 +63,10 @@ class StrengthModel:
     normalization_denominator: float
     calibration: CalibrationMetadata
     model_id: str
+    _lineup_players: Mapping[str, LineupPlayer] = field(
+        repr=False, compare=False
+    )
+    _scored_roster_roles: tuple[str, ...] = field(repr=False, compare=False)
 
     def __init__(
         self,
@@ -125,10 +129,27 @@ class StrengthModel:
         object.__setattr__(self, "normalization_denominator", denominator)
         object.__setattr__(self, "calibration", calibration)
         object.__setattr__(self, "model_id", _content_id("strength", model_record))
+        object.__setattr__(
+            self,
+            "_lineup_players",
+            MappingProxyType(
+                {
+                    player_id: LineupPlayer(
+                        player_id, player.assignment_score_by_role
+                    )
+                    for player_id, player in player_map.items()
+                }
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_scored_roster_roles",
+            tuple(role.role_id for role in roles),
+        )
 
     @property
     def scored_roster_roles(self) -> tuple[str, ...]:
-        return tuple(role.role_id for role in self.role_definitions)
+        return self._scored_roster_roles
 
     def to_record(self) -> dict[str, object]:
         return {
@@ -204,12 +225,9 @@ class StrengthModel:
             "roster residual scores",
             (row.residual_score for row in rows),
         )
-        role_assignment = optimize_lineup(
-            self.scored_roster_roles,
-            tuple(
-                LineupPlayer(row.player_id, row.assignment_score_by_role)
-                for row in rows
-            ),
+        role_assignment = _optimize_prepared_lineup(
+            self._scored_roster_roles,
+            tuple(self._lineup_players[row.player_id] for row in rows),
         )
         absolute_score = _finite_sum(
             "roster strength",

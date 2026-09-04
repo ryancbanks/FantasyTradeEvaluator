@@ -8,7 +8,7 @@ import re
 from ._calibration_inputs import PlayerFeatureVector
 from ._scenario_random import content_id
 from .ecr import EcrPeriod, EcrPlayerRanking, EcrSnapshot
-from .ensemble import EnsembleProjection, ProviderObservation
+from .ensemble import EnsembleProjection
 from .projections import ProjectionStatus
 from .scenario_config import PlayerEligibility
 
@@ -140,12 +140,16 @@ def build_strength_features(
     )
     weekly_ranks = {row.canonical_player_id: row for row in weekly.rankings}
     ros_ranks = {row.canonical_player_id: row for row in ros.rankings}
+    weekly_total = _ecr_total(weekly)
+    ros_total = _ecr_total(ros)
     vectors = []
     for player_id in sorted(eligibility):
         player_projections = tuple(projection_rows[(player_id, week)] for week in weeks)
         values = {"presence": 1.0}
-        values.update(_ecr_features("ecr_weekly", weekly_ranks.get(player_id), weekly))
-        values.update(_ecr_features("ecr_ros", ros_ranks.get(player_id), ros))
+        values.update(
+            _ecr_features("ecr_weekly", weekly_ranks.get(player_id), weekly_total)
+        )
+        values.update(_ecr_features("ecr_ros", ros_ranks.get(player_id), ros_total))
         values.update(_projection_features(player_projections, providers))
         vectors.append(
             PlayerFeatureVector(
@@ -231,6 +235,7 @@ def _projection_grid(values, *, player_ids, providers, identity, as_of_week):
         raise ValueError("projections must be an iterable") from None
     if not rows or any(not isinstance(row, EnsembleProjection) for row in rows):
         raise ValueError("projections must contain EnsembleProjection values")
+    provider_set = frozenset(providers)
     grid = {}
     for row in rows:
         if (row.snapshot_id, row.scoring_profile_id, row.season) != identity:
@@ -238,7 +243,7 @@ def _projection_grid(values, *, player_ids, providers, identity, as_of_week):
         if row.week < as_of_week:
             raise ValueError("projections cannot include an elapsed week")
         observed_providers = tuple(item.provider for item in row.provider_observations)
-        missing = set(providers).difference(observed_providers)
+        missing = provider_set.difference(observed_providers)
         if missing:
             raise ValueError(
                 f"projection is missing explicit provider evidence for {min(missing)!r}"
@@ -256,11 +261,14 @@ def _projection_grid(values, *, player_ids, providers, identity, as_of_week):
     return grid, weeks
 
 
-def _ecr_features(prefix: str, row: EcrPlayerRanking | None, snapshot: EcrSnapshot):
+def _ecr_total(snapshot: EcrSnapshot) -> int:
+    return max(len(snapshot.rankings), max(row.rank_ecr for row in snapshot.rankings))
+
+
+def _ecr_features(prefix: str, row: EcrPlayerRanking | None, total: int):
     metrics = {metric: 0.0 for metric in ECR_METRICS}
     if row is None:
         return {f"{prefix}_{name}": value for name, value in metrics.items()}
-    total = max(len(snapshot.rankings), max(item.rank_ecr for item in snapshot.rankings))
     metrics.update(
         {
             "available": 1.0,
@@ -278,12 +286,29 @@ def _ecr_features(prefix: str, row: EcrPlayerRanking | None, snapshot: EcrSnapsh
 
 def _projection_features(rows, providers):
     result = {}
+    observed_counts = dict.fromkeys(providers, 0)
+    remaining_points = dict.fromkeys(providers, 0.0)
+    current_by_provider = {
+        item.provider: item for item in rows[0].provider_observations
+    }
+    ensemble_count = 0
+    ensemble_points = 0.0
+    ensemble_uncertainty_squared = 0.0
+    for row in rows:
+        for item in row.provider_observations:
+            if (
+                item.provider in observed_counts
+                and item.status is ProjectionStatus.OBSERVED
+            ):
+                observed_counts[item.provider] += 1
+                remaining_points[item.provider] += item.projected_fantasy_points
+        if row.status is ProjectionStatus.OBSERVED:
+            ensemble_count += 1
+            ensemble_points += row.projected_fantasy_points
+            ensemble_uncertainty_squared += row.predictive_stddev**2
+
     for provider in providers:
-        observations = tuple(_observation(row, provider) for row in rows)
-        observed = tuple(
-            item for item in observations if item.status is ProjectionStatus.OBSERVED
-        )
-        current = observations[0]
+        current = current_by_provider[provider]
         prefix = f"projection_{provider}"
         result.update(
             {
@@ -293,34 +318,24 @@ def _projection_features(rows, providers):
                 f"{prefix}_current_points": (
                     current.projected_fantasy_points or 0.0
                 ),
-                f"{prefix}_observed_week_fraction": len(observed) / len(rows),
-                f"{prefix}_remaining_points": sum(
-                    item.projected_fantasy_points for item in observed
-                ),
+                f"{prefix}_observed_week_fraction": observed_counts[provider]
+                / len(rows),
+                f"{prefix}_remaining_points": remaining_points[provider],
             }
         )
-    ensemble_observed = tuple(
-        row for row in rows if row.status is ProjectionStatus.OBSERVED
-    )
     current = rows[0]
-    uncertainties = tuple(row.predictive_stddev for row in ensemble_observed)
-    points = tuple(row.projected_fantasy_points for row in ensemble_observed)
     result.update(
         {
             "projection_ensemble_current_available": float(
                 current.status is ProjectionStatus.OBSERVED
             ),
             "projection_ensemble_current_points": current.projected_fantasy_points or 0.0,
-            "projection_ensemble_observed_week_fraction": len(ensemble_observed) / len(rows),
-            "projection_ensemble_remaining_mean": sum(points) / len(rows),
-            "projection_ensemble_remaining_points": sum(points),
+            "projection_ensemble_observed_week_fraction": ensemble_count / len(rows),
+            "projection_ensemble_remaining_mean": ensemble_points / len(rows),
+            "projection_ensemble_remaining_points": ensemble_points,
             "projection_ensemble_remaining_uncertainty": sqrt(
-                sum(value * value for value in uncertainties)
+                ensemble_uncertainty_squared
             ),
         }
     )
     return result
-
-
-def _observation(row: EnsembleProjection, provider: str) -> ProviderObservation:
-    return next(item for item in row.provider_observations if item.provider == provider)

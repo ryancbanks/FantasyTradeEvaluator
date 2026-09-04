@@ -10,7 +10,7 @@ from .draft_brain import DraftBrain
 from .draft_config import DraftLeagueConfig
 from .draft_history import HistoricalCorpus
 from .draft_season import _prepare_scoring_context, simulate_historical_season
-from .draft_simulation import simulate_snake_draft
+from .draft_simulation import _new_simulation_cache, simulate_snake_draft
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +85,7 @@ def compare_to_regression_baseline(
         season.season: [] for season in seasons
     }
     scoring_contexts = {}
+    simulation_caches = {}
     wins = ties = losses = 0
 
     for trial in range(trials):
@@ -96,6 +97,10 @@ def compare_to_regression_baseline(
         if scoring_context is None:
             scoring_context = _prepare_scoring_context(season, config)
             scoring_contexts[season_index] = scoring_context
+        simulation_cache = simulation_caches.get(season_index)
+        if simulation_cache is None:
+            simulation_cache = _new_simulation_cache(season, config)
+            simulation_caches[season_index] = simulation_cache
         trial_seed = seed + trial * 7_919
         opponents = _paired_opponents(
             brain, baseline, config.team_count, seat, seed, trial, season.season
@@ -105,12 +110,14 @@ def compare_to_regression_baseline(
         reference_draft = simulate_snake_draft(
             season, config, tuple(reference_brains),
             seed=trial_seed, candidate_window=candidate_window, should_cancel=should_cancel,
+            _simulation_cache=simulation_cache,
         )
         candidate_brains = list(opponents)
         candidate_brains[seat] = brain
         candidate_draft = simulate_snake_draft(
             season, config, tuple(candidate_brains),
             seed=trial_seed, candidate_window=candidate_window, should_cancel=should_cancel,
+            _simulation_cache=simulation_cache,
         )
         reference = simulate_historical_season(
             reference_draft.rosters, season, config, _prepared=scoring_context

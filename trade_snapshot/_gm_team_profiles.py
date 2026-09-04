@@ -1,9 +1,11 @@
 """Cohesive team-level calculations for General Manager Insights."""
 
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from statistics import fmean, median
+from types import MappingProxyType
 
 from ._league_history_evidence import transaction_executed_by
 from ._gm_statistics import (
@@ -36,17 +38,43 @@ class _TeamFacts:
     drops: tuple
     acquisition_positions: Counter
     roster_snapshots: tuple
-    first_observed_at: dict[str, datetime]
+    first_observed_at: Mapping[str, datetime]
 
 
-def _team_facts(
-    team_id,
-    transactions,
-    captures,
-    positions,
-    first_observed_at,
+def _team_facts_by_team(
+    team_ids, transactions, captures, positions, first_observed_at
 ):
-    trades = tuple(row for row in transactions if row.kind is HistoryTransactionKind.TRADE and team_id in row.participant_team_ids)
+    ordered_team_ids = tuple(team_ids)
+    known_teams = frozenset(ordered_team_ids)
+    transactions_by_team = defaultdict(list)
+    for transaction in transactions:
+        for team_id in transaction.participant_team_ids:
+            if team_id in known_teams:
+                transactions_by_team[team_id].append(transaction)
+    rosters_by_team = defaultdict(list)
+    for capture in captures:
+        if not capture.roster_complete:
+            continue
+        for roster in capture.rosters:
+            if roster.team_id in known_teams:
+                rosters_by_team[roster.team_id].append((capture, roster))
+    observed = MappingProxyType(dict(first_observed_at))
+    return {
+        team_id: _team_facts(
+            team_id,
+            transactions_by_team[team_id],
+            rosters_by_team[team_id],
+            positions,
+            observed,
+        )
+        for team_id in ordered_team_ids
+    }
+
+
+def _team_facts(team_id, transactions, roster_snapshots, positions, first_observed_at):
+    trades = tuple(
+        row for row in transactions if row.kind is HistoryTransactionKind.TRADE
+    )
     partners = Counter()
     sent_sizes, received_sizes = [], []
     sent_positions, received_positions = Counter(), Counter()
@@ -60,12 +88,17 @@ def _team_facts(
         received_sizes.append(len(received))
         sent_positions.update(_asset_positions(sent, positions))
         received_positions.update(_asset_positions(received, positions))
-    waiver_events = tuple(row for row in transactions if row.kind is HistoryTransactionKind.WAIVER and team_id in row.participant_team_ids)
-    free_events = tuple(row for row in transactions if row.kind in {HistoryTransactionKind.FREE_AGENT, HistoryTransactionKind.DROP} and team_id in row.participant_team_ids)
+    waiver_events = tuple(
+        row for row in transactions if row.kind is HistoryTransactionKind.WAIVER
+    )
+    free_events = tuple(
+        row
+        for row in transactions
+        if row.kind in {HistoryTransactionKind.FREE_AGENT, HistoryTransactionKind.DROP}
+    )
     acquisition_events = (*waiver_events, *free_events)
     additions = tuple((event, asset) for event in acquisition_events for asset in event.assets if asset.to_team_id == team_id and asset.from_team_id != team_id)
     drops = tuple((event, asset) for event in acquisition_events for asset in event.assets if asset.from_team_id == team_id and asset.to_team_id != team_id)
-    roster_snapshots = tuple((capture, roster) for capture in captures if capture.roster_complete for roster in capture.rosters if roster.team_id == team_id)
     return _TeamFacts(
         team_id,
         trades,
@@ -79,7 +112,7 @@ def _team_facts(
         drops,
         Counter(_asset_positions((asset for _, asset in additions), positions)),
         roster_snapshots,
-        dict(first_observed_at),
+        first_observed_at,
     )
 
 

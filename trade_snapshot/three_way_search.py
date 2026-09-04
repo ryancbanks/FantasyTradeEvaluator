@@ -1,7 +1,8 @@
 """Prepared power evaluation and resumable execution for three-team trades."""
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 from .analyzer_contract import PowerRankingChange
@@ -30,6 +31,7 @@ from .trade_space import TeamRoster
 
 
 THREE_WAY_SEARCH_ALGORITHM = "local-three-way-power-paired-playoffs-v1"
+_TEAM_RESULT_CACHE_SIZE = 512
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +58,12 @@ class PreparedThreeWayTrade:
     rosters: tuple[TeamRoster, TeamRoster, TeamRoster]
     before_strengths: tuple[RosterStrength, RosterStrength, RosterStrength]
     adjuster: PreparedRosterAdjuster | None
+    _power_change: Callable[[str, float, tuple[str, ...]], PowerRankingChange] = field(
+        init=False, repr=False, compare=False
+    )
+    _pure_adjustment: Callable[
+        [TeamRoster, tuple[str, ...], tuple[str, ...]], TeamRosterAdjustment
+    ] | None = field(init=False, repr=False, compare=False)
 
     def __init__(
         self,
@@ -80,6 +88,33 @@ class PreparedThreeWayTrade:
         )
         object.__setattr__(self, "adjuster", adjuster)
 
+        def power_change(
+            team_id: str, before_power: float, player_ids: tuple[str, ...]
+        ) -> PowerRankingChange:
+            after_power = model.score_roster(player_ids).power_score
+            return PowerRankingChange(team_id, before_power, after_power)
+
+        object.__setattr__(
+            self,
+            "_power_change",
+            lru_cache(maxsize=_TEAM_RESULT_CACHE_SIZE)(power_change),
+        )
+        if adjuster is None:
+
+            def pure_adjustment(
+                before: TeamRoster,
+                outgoing: tuple[str, ...],
+                incoming: tuple[str, ...],
+            ) -> TeamRosterAdjustment:
+                return _pure_adjustment(before, outgoing, incoming, model)
+
+            cached_adjustment = lru_cache(maxsize=_TEAM_RESULT_CACHE_SIZE)(
+                pure_adjustment
+            )
+        else:
+            cached_adjustment = None
+        object.__setattr__(self, "_pure_adjustment", cached_adjustment)
+
     def evaluate(
         self,
         candidate: ThreeWayTradeCandidate,
@@ -101,16 +136,20 @@ class PreparedThreeWayTrade:
             )
             for roster in self.rosters
         )
-        adjustments = (
-            self.adjuster.adjust_teams(changes)
-            if self.adjuster is not None
-            else _pure_adjustments(changes, self.model)
-        )
+        if self.adjuster is not None:
+            adjustments = self.adjuster.adjust_teams(changes)
+        else:
+            if self._pure_adjustment is None:
+                raise AssertionError("pure trade evaluation cache is unavailable")
+            adjustments = tuple(
+                self._pure_adjustment(roster, outgoing, incoming)
+                for roster, outgoing, incoming in changes
+            )
         power_changes = tuple(
-            PowerRankingChange(
+            self._power_change(
                 roster.team_id,
                 before.power_score,
-                self.model.score_roster(adjustment.roster.player_ids).power_score,
+                adjustment.roster.player_ids,
             )
             for roster, before, adjustment in zip(
                 self.rosters, self.before_strengths, adjustments
@@ -244,9 +283,13 @@ class ResumableThreeWayTradeSearch:
                     pending_results, next_candidate_index=next_index
                 )
                 pending_results.clear()
-            final = store.resume()
+            final = store.persisted_summary()
             if final.next_candidate_index != next_index:
                 raise AssertionError("search checkpoint did not advance as expected")
+            if final.qualified_result_count != qualified_count:
+                raise AssertionError("search result count did not match persisted results")
+            if final.all_playoff_gain_count != gain_count:
+                raise AssertionError("all-team gain count did not match persisted results")
             progress = self._progress(
                 next_index,
                 final.qualified_result_count,
@@ -330,26 +373,21 @@ def _run_definition(space, prepared, baseline, settings):
     )
 
 
-def _pure_adjustments(changes, model):
-    adjustments = []
-    for before, outgoing, incoming in changes:
-        outgoing_set = set(outgoing)
-        players = tuple(
-            player_id
-            for player_id in before.player_ids
-            if player_id not in outgoing_set
-        ) + tuple(incoming)
-        if not set(players).issubset(model.players):
-            raise ValueError("trade contains a player absent from the strength model")
-        exempt = before.capacity_exempt_player_ids.difference(outgoing_set)
-        adjustments.append(
-            TeamRosterAdjustment(
-                TeamRoster(
-                    before.team_id, players, len(players), before.roster_cap, exempt
-                )
-            )
+def _pure_adjustment(before, outgoing, incoming, model):
+    outgoing_set = set(outgoing)
+    players = tuple(
+        player_id
+        for player_id in before.player_ids
+        if player_id not in outgoing_set
+    ) + tuple(incoming)
+    if not set(players).issubset(model.players):
+        raise ValueError("trade contains a player absent from the strength model")
+    exempt = before.capacity_exempt_player_ids.difference(outgoing_set)
+    return TeamRosterAdjustment(
+        TeamRoster(
+            before.team_id, players, len(players), before.roster_cap, exempt
         )
-    return tuple(adjustments)
+    )
 
 
 def _validate_three_rosters(rows, model):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from math import fsum, isfinite, sqrt
 
 from .draft_brain import DraftBrain, FeatureSchema, RegressionBaseline
@@ -22,6 +23,16 @@ _POSITIONS = tuple(sorted(CANONICAL_PLAYER_POSITIONS))
 _MAX_REGRESSION_PASSES = 64
 _RIDGE_PENALTY = 1.0
 _PROJECTION_PROVIDERS = ("fantasypros", "espn", "yahoo")
+
+
+@dataclass(slots=True)
+class _CandidateFeatureContext:
+    config: DraftLeagueConfig
+    common: dict[str, float]
+    roster_groups: tuple[tuple[str, ...], ...]
+    roster_counts: Counter[str]
+    supply: Counter[str]
+    filled: int
 
 
 def resolve_preseason_projection(
@@ -65,21 +76,22 @@ def candidate_feature_values(
     roster_player_eligibilities: Sequence[Sequence[str]] | None = None,
     available_position_counts: Mapping[str, int],
     picks_until_next: int,
+    _prepared: _CandidateFeatureContext | None = None,
 ) -> dict[str, float | None]:
     """Return only anonymous preseason and current-draft numeric information."""
 
     if not isinstance(player, PreseasonPlayer):
         raise ValueError("player must be a PreseasonPlayer")
-    if not isinstance(config, DraftLeagueConfig):
-        raise ValueError("config must be a DraftLeagueConfig")
-    _integer("round_number", round_number, 1, config.total_rounds)
-    _integer("overall_pick", overall_pick, 1, config.team_count * config.total_rounds)
-    _integer("picks_until_next", picks_until_next, 0, config.team_count * 2)
-    roster = _positions("roster_player_positions", roster_player_positions)
-    if len(roster) >= config.roster_size:
-        raise ValueError("roster must have room for the candidate")
-    supply = _supply(available_position_counts)
-
+    prepared = _prepared or _prepare_candidate_feature_context(
+        config,
+        round_number,
+        overall_pick,
+        roster_player_positions,
+        roster_player_eligibilities,
+        available_position_counts,
+        picks_until_next,
+    )
+    config = prepared.config
     fields: dict[str, float | None] = {
         f"preseason.{_preseason_name(name)}": value
         for name, value in player.preseason_features.items()
@@ -95,49 +107,82 @@ def candidate_feature_values(
             "bio.experience_years": float(player.nfl_experience_years),
             "bio.rookie": float(player.rookie),
             "bio.first_year_on_team": float(player.first_year_on_team),
+            **prepared.common,
+            "context.starter_need": float(
+                _filled_slots(
+                    (*prepared.roster_groups, tuple(player.eligible_positions)),
+                    config,
+                )
+                > prepared.filled
+            ),
+            "context.candidate_position_count": float(
+                prepared.roster_counts[player.position]
+            ),
+            "context.candidate_limit_remaining": float(
+                max(
+                    0,
+                    _position_limit(config, player.position)
+                    - prepared.roster_counts[player.position],
+                )
+            ),
+            "context.candidate_supply": float(prepared.supply[player.position]),
         }
     )
+    return fields
+
+
+def _prepare_candidate_feature_context(
+    config,
+    round_number,
+    overall_pick,
+    roster_player_positions,
+    roster_player_eligibilities,
+    available_position_counts,
+    picks_until_next,
+):
+    if not isinstance(config, DraftLeagueConfig):
+        raise ValueError("config must be a DraftLeagueConfig")
+    _integer("round_number", round_number, 1, config.total_rounds)
+    _integer("overall_pick", overall_pick, 1, config.team_count * config.total_rounds)
+    _integer("picks_until_next", picks_until_next, 0, config.team_count * 2)
+    roster = _positions("roster_player_positions", roster_player_positions)
+    if len(roster) >= config.roster_size:
+        raise ValueError("roster must have room for the candidate")
+    supply = _supply(available_position_counts)
 
     roster_groups = _eligibility_groups(
         roster_player_eligibilities, roster
     )
     filled = _filled_slots(roster_groups, config)
-    with_candidate = _filled_slots(
-        (*roster_groups, tuple(player.eligible_positions)), config
-    )
     roster_counts = Counter(roster)
     total_picks = config.team_count * config.total_rounds
-    fields.update(
-        {
-            "context.round_number": float(round_number),
-            "context.round_fraction": round_number / config.total_rounds,
-            "context.overall_pick": float(overall_pick),
-            "context.pick_fraction": overall_pick / total_picks,
-            "context.picks_until_next": float(picks_until_next),
-            "context.roster_count": float(len(roster)),
-            "context.roster_fraction": len(roster) / config.roster_size,
-            "context.roster_slots_left": float(config.roster_size - len(roster)),
-            "context.unfilled_starters": float(len(config.starting_slots) - filled),
-            "context.starter_need": float(with_candidate > filled),
-            "context.candidate_position_count": float(roster_counts[player.position]),
-            "context.candidate_limit_remaining": float(
-                max(0, _position_limit(config, player.position) - roster_counts[player.position])
-            ),
-            "context.candidate_supply": float(supply[player.position]),
-        }
-    )
+    common = {
+        "context.round_number": float(round_number),
+        "context.round_fraction": round_number / config.total_rounds,
+        "context.overall_pick": float(overall_pick),
+        "context.pick_fraction": overall_pick / total_picks,
+        "context.picks_until_next": float(picks_until_next),
+        "context.roster_count": float(len(roster)),
+        "context.roster_fraction": len(roster) / config.roster_size,
+        "context.roster_slots_left": float(config.roster_size - len(roster)),
+        "context.unfilled_starters": float(len(config.starting_slots) - filled),
+    }
     for position in _POSITIONS:
         current = roster_counts[position]
         generic_filled = _filled_slots((*roster_groups, (position,)), config)
         suffix = position.lower()
-        fields[f"context.roster.{suffix}"] = float(current)
-        fields[f"context.need.{suffix}"] = float(generic_filled > filled)
-        fields[f"context.limit_remaining.{suffix}"] = float(
+        common[f"context.roster.{suffix}"] = float(current)
+        common[f"context.need.{suffix}"] = float(generic_filled > filled)
+        common[f"context.limit_remaining.{suffix}"] = float(
             max(0, _position_limit(config, position) - current)
         )
-        fields[f"context.supply.{suffix}"] = float(supply[position])
-        fields[f"context.supply_per_team.{suffix}"] = supply[position] / config.team_count
-    return fields
+        common[f"context.supply.{suffix}"] = float(supply[position])
+        common[f"context.supply_per_team.{suffix}"] = (
+            supply[position] / config.team_count
+        )
+    return _CandidateFeatureContext(
+        config, common, roster_groups, roster_counts, supply, filled
+    )
 
 
 def fit_feature_schema(

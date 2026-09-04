@@ -240,6 +240,29 @@ class ThreeWayEvaluationTests(unittest.TestCase):
         self.assertEqual(tuple(row.team_id for row in result.changes), ("a", "b", "c"))
         self.assertEqual(result.candidate_index, 7)
 
+    def test_prepared_evaluation_reuses_identical_final_roster_scores(self):
+        strength = model()
+        rows = league_rosters()[:3]
+        space = ThreeWayTradeSpace(rows, TradeConstraints(require_no_drops=True))
+        candidate = next(iter(space))
+        original = StrengthModel.score_roster
+        scored_rosters = []
+
+        def counted_score(model_instance, player_ids):
+            scored_rosters.append(tuple(player_ids))
+            return original(model_instance, player_ids)
+
+        with patch.object(StrengthModel, "score_roster", counted_score):
+            prepared = PreparedThreeWayTrade(strength, rows)
+            first = prepared.evaluate(candidate, candidate_index=0)
+            second = prepared.evaluate(candidate, candidate_index=0)
+
+        self.assertEqual(second, first)
+        self.assertEqual(len(scored_rosters), 6)
+        self.assertEqual(len(set(scored_rosters[3:])), 3)
+        self.assertEqual(prepared._power_change.cache_info().maxsize, 512)
+        self.assertEqual(prepared._pure_adjustment.cache_info().maxsize, 512)
+
     def test_adjusted_trade_uses_globally_unique_additions_and_valid_drops(self):
         points = {
             **{key: value for key, value in POINTS.items() if not key.startswith("d")},
@@ -498,6 +521,10 @@ class ThreeWayStoreTests(unittest.TestCase):
                     ThreeWaySearchStoreError, "checkpoint"
                 ):
                     store.resume()
+                with self.assertRaisesRegex(
+                    ThreeWaySearchStoreError, "checkpoint"
+                ):
+                    store.persisted_summary()
 
     def test_checkpoint_reader_holds_an_old_snapshot_after_later_results(self):
         definition = run_definition()
@@ -619,6 +646,27 @@ class ThreeWayStoreTests(unittest.TestCase):
         self.assertEqual(state.next_candidate_index, 9)
         self.assertEqual(state.qualified_result_count, 2)
         self.assertEqual({row.candidate_index for row in rows}, {2, 5})
+
+    def test_persisted_summary_does_not_redecode_results_just_written(self):
+        definition = run_definition()
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.sqlite3"
+            with ThreeWaySearchStore(path, definition) as store:
+                store.upsert_qualified_results(
+                    (saved_result(2), saved_result(5, gains=(1, -1, 2))),
+                    next_candidate_index=6,
+                )
+                store.resume()
+                with patch.object(
+                    three_way_store_module,
+                    "_decode_result",
+                    side_effect=AssertionError("trusted summary must stay aggregate"),
+                ):
+                    summary = store.persisted_summary()
+
+        self.assertEqual(summary.next_candidate_index, 6)
+        self.assertEqual(summary.qualified_result_count, 2)
+        self.assertEqual(summary.all_playoff_gain_count, 1)
 
     def test_batch_validates_every_row_and_rejects_duplicates_before_writes(self):
         definition = run_definition()

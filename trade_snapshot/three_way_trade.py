@@ -1,7 +1,8 @@
 """Exact, seekable enumeration of fully directed three-team trades."""
 
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Iterator
 
 from .positions import normalize_player_position
@@ -12,13 +13,14 @@ from .trade_filters import (
     TradePackageFilter,
     iter_trade_filter_leaves,
 )
-from .trade_filter_compiler import CompiledTradeFilter, compile_trade_filter
+from .trade_filter_compiler import compile_trade_filter
 from .trade_space import TeamRoster, TradeConstraints
 
 
 PlayerId = str
 _Counts = tuple[int, int, int]
 _State = tuple[int, _Counts, _Counts, _Counts, int, int]
+_FILTER_EVIDENCE_CACHE_SIZE = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +124,9 @@ class _PackageRule:
     forbidden_player_ids: frozenset[PlayerId]
     coverage_by_player: Mapping[PlayerId, int]
     target_coverage: int
-    compiled_filter: CompiledTradeFilter | None = None
+    compiled_match: Callable[[int], bool] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def permits(self, player_id: PlayerId, selected: bool) -> bool:
         if selected:
@@ -130,8 +134,8 @@ class _PackageRule:
         return player_id not in self.required_player_ids
 
     def matches(self, evidence: int) -> bool:
-        if self.compiled_filter is not None:
-            return self.compiled_filter.matches(evidence)
+        if self.compiled_match is not None:
+            return self.compiled_match(evidence)
         return evidence & self.target_coverage == self.target_coverage
 
 
@@ -404,7 +408,7 @@ class ThreeWayTradeSpace:
                     player.player_id
                 )
         transfers = tuple(
-            TradeTransfer(
+            _enumerated_transfer(
                 self.rosters[source].team_id,
                 self.rosters[destination].team_id,
                 tuple(routes[(source, destination)]),
@@ -413,7 +417,33 @@ class ThreeWayTradeSpace:
             for destination in range(3)
             if (source, destination) in routes
         )
-        return ThreeWayTradeCandidate(self.participant_team_ids, transfers)
+        return _enumerated_candidate(self.participant_team_ids, transfers)
+
+
+def _enumerated_transfer(
+    source_team_id: str,
+    destination_team_id: str,
+    player_ids: tuple[PlayerId, ...],
+) -> TradeTransfer:
+    """Build a transfer already proven valid by the enumeration state machine."""
+
+    transfer = object.__new__(TradeTransfer)
+    object.__setattr__(transfer, "source_team_id", source_team_id)
+    object.__setattr__(transfer, "destination_team_id", destination_team_id)
+    object.__setattr__(transfer, "player_ids", player_ids)
+    return transfer
+
+
+def _enumerated_candidate(
+    participant_team_ids: tuple[str, str, str],
+    transfers: tuple[TradeTransfer, ...],
+) -> ThreeWayTradeCandidate:
+    """Build a canonical candidate already proven valid by enumeration."""
+
+    candidate = object.__new__(ThreeWayTradeCandidate)
+    object.__setattr__(candidate, "participant_team_ids", participant_team_ids)
+    object.__setattr__(candidate, "transfers", transfers)
+    return candidate
 
 
 def _rosters(values: Iterable[TeamRoster]) -> tuple[TeamRoster, TeamRoster, TeamRoster]:
@@ -466,7 +496,7 @@ def _compile_rule(
             frozenset(),
             compiled.evidence_by_player,
             0,
-            compiled,
+            lru_cache(maxsize=_FILTER_EVIDENCE_CACHE_SIZE)(compiled.matches),
         )
     if not isinstance(rule, TradePackageFilter):
         raise ValueError(
@@ -623,9 +653,13 @@ def _participants(values: object) -> tuple[str, str, str]:
 
 
 def _increment(values: _Counts, index: int, amount: int) -> _Counts:
-    result = list(values)
-    result[index] += amount
-    return tuple(result)
+    if index == 0:
+        return values[0] + amount, values[1], values[2]
+    if index == 1:
+        return values[0], values[1] + amount, values[2]
+    if index == 2:
+        return values[0], values[1], values[2] + amount
+    raise IndexError("three-team count index is outside 0..2")
 
 
 def _team_id(name: str, value: object) -> str:

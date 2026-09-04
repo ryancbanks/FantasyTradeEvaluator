@@ -9,11 +9,19 @@ from .draft_matching import maximum_group_slot_fill
 from .positions import CANONICAL_PLAYER_POSITIONS
 
 
+_MAX_FILLED_COUNT_CACHE_SIZE = 4_096
+
+
 @dataclass(slots=True)
 class FeasibilityCache:
     config_id: str
     filled_counts: dict[tuple[tuple[str, ...], ...], int] = field(default_factory=dict)
     strategy_permissions: dict[tuple[DraftStrategy, str, int], bool] = field(
+        default_factory=dict
+    )
+    roster_eligibilities: tuple[tuple[str, ...], ...] = ()
+    completion_slots: tuple[tuple[int, tuple[str, ...]], ...] = ()
+    future_rounds: dict[int, tuple[tuple[int, ...], ...]] = field(
         default_factory=dict
     )
 
@@ -73,24 +81,35 @@ def prepare_completion(
     pending_team,
     cache,
 ):
-    bench_eligibility = tuple(sorted(CANONICAL_PLAYER_POSITIONS))
-    roster_eligibilities = (
-        *(config.slot_eligibility[slot] for slot in config.starting_slots),
-        *((bench_eligibility,) * config.bench_slots),
-    )
-    slots = tuple(
-        (team, allowed)
-        for team in range(config.team_count)
-        for allowed in roster_eligibilities
-    )
-    future_rounds = tuple(
-        tuple(
-            (pick - 1) // config.team_count + 1
-            for pick in range(overall_pick + 1, config.team_count * config.roster_size + 1)
-            if _drafter_number(pick, config.team_count) == team + 1
+    if not cache.roster_eligibilities:
+        bench_eligibility = tuple(sorted(CANONICAL_PLAYER_POSITIONS))
+        cache.roster_eligibilities = (
+            *(config.slot_eligibility[slot] for slot in config.starting_slots),
+            *((bench_eligibility,) * config.bench_slots),
         )
-        for team in range(config.team_count)
-    )
+        cache.completion_slots = tuple(
+            (team, allowed)
+            for team in range(config.team_count)
+            for allowed in cache.roster_eligibilities
+        )
+    roster_eligibilities = cache.roster_eligibilities
+    slots = cache.completion_slots
+    if not cache.future_rounds:
+        cache.future_rounds = _future_round_schedule(config)
+    future_rounds = cache.future_rounds.get(overall_pick)
+    if future_rounds is None:
+        future_rounds = tuple(
+            tuple(
+                (pick - 1) // config.team_count + 1
+                for pick in range(
+                    overall_pick + 1,
+                    config.team_count * config.roster_size + 1,
+                )
+                if _drafter_number(pick, config.team_count) == team + 1
+            )
+            for team in range(config.team_count)
+        )
+        cache.future_rounds[overall_pick] = future_rounds
     roster_players = tuple(
         tuple(players[player_id] for player_id in roster) for roster in rosters
     )
@@ -117,7 +136,7 @@ def prepare_completion(
     owned_groups = Counter()
     for team, roster in enumerate(roster_players):
         for player in roster:
-            edges = _owned_slot_edges(player, team, slots)
+            edges = _owned_slot_edges(player, team, roster_eligibilities)
             if edges:
                 owned_groups[edges] += 1
     available_groups = Counter()
@@ -173,7 +192,7 @@ def completion_after_pick(problem, player) -> bool:
         if not available_groups[available_key]:
             del available_groups[available_key]
     owned_groups = problem.owned_groups.copy()
-    edges = _owned_slot_edges(player, team, problem.slots)
+    edges = _problem_owned_slot_edges(problem, player, team)
     if edges:
         owned_groups[edges] += 1
     capacities = problem.position_capacities.copy()
@@ -210,11 +229,22 @@ def _completion_group_is_surplus(problem, player) -> bool:
     if key is None:
         return False
     primary, eligible, round_limits = key
+    eligible = set(eligible)
+    shared_eligibilities = problem.cache.roster_eligibilities
+    shared_compatible_slots = (
+        sum(not eligible.isdisjoint(allowed) for allowed in shared_eligibilities)
+        if shared_eligibilities
+        else None
+    )
     total_demand = 0
     for team, round_limit in enumerate(round_limits):
-        compatible_slots = sum(
-            slot_team == team and bool(set(eligible).intersection(allowed))
-            for slot_team, allowed in problem.slots
+        compatible_slots = (
+            shared_compatible_slots
+            if shared_compatible_slots is not None
+            else sum(
+                slot_team == team and not eligible.isdisjoint(allowed)
+                for slot_team, allowed in problem.slots
+            )
         )
         if team == problem.pending_team:
             raw_remaining = problem.position_remaining.get((team, primary), 0)
@@ -269,6 +299,8 @@ def filled_count(players, config, cache) -> int:
     groups.pop((), None)
     result = maximum_group_slot_fill(groups, Counter(), slots, {})
     cache.filled_counts[key] = result
+    while len(cache.filled_counts) > _MAX_FILLED_COUNT_CACHE_SIZE:
+        del cache.filled_counts[next(iter(cache.filled_counts))]
     return result
 
 
@@ -325,12 +357,25 @@ def _available_group_key(player, strategies, future_rounds, config, cache):
     return (player.position, player.eligible_positions, limits) if any(limits) else None
 
 
-def _owned_slot_edges(player, team, slots):
+def _owned_slot_edges(player, team, roster_eligibilities):
+    eligible = set(player.eligible_positions)
+    start = team * len(roster_eligibilities)
+    return tuple(
+        start + index
+        for index, allowed in enumerate(roster_eligibilities)
+        if not eligible.isdisjoint(allowed)
+    )
+
+
+def _problem_owned_slot_edges(problem, player, team):
+    roster_eligibilities = problem.cache.roster_eligibilities
+    if roster_eligibilities:
+        return _owned_slot_edges(player, team, roster_eligibilities)
     eligible = set(player.eligible_positions)
     return tuple(
         index
-        for index, (slot_team, allowed) in enumerate(slots)
-        if slot_team == team and eligible.intersection(allowed)
+        for index, (slot_team, allowed) in enumerate(problem.slots)
+        if slot_team == team and not eligible.isdisjoint(allowed)
     )
 
 
@@ -385,6 +430,23 @@ def _strategy_allows(strategy, position, round_number, config, cache):
 def _drafter_number(overall_pick, team_count):
     round_index, offset = divmod(overall_pick - 1, team_count)
     return offset + 1 if round_index % 2 == 0 else team_count - offset
+
+
+def _future_round_schedule(config):
+    """Precompute future picks while sharing unchanged team schedules."""
+
+    total_picks = config.team_count * config.roster_size
+    future = tuple(() for _ in range(config.team_count))
+    result = {total_picks: future}
+    for overall_pick in range(total_picks - 1, -1, -1):
+        next_pick = overall_pick + 1
+        team = _drafter_number(next_pick, config.team_count) - 1
+        round_number = (next_pick - 1) // config.team_count + 1
+        updated = list(future)
+        updated[team] = (round_number, *future[team])
+        future = tuple(updated)
+        result[overall_pick] = future
+    return result
 
 
 __all__ = (

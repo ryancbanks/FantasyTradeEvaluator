@@ -68,10 +68,11 @@ def _compress_slots(slots, owned_groups):
     indexes = {}
     index_map = []
     owned_signatures = tuple(sorted(owned_groups))
+    owned_sets = tuple(frozenset(edges) for edges in owned_signatures)
     for slot_index, (team, allowed) in enumerate(slots):
         ownership = tuple(
             group_index
-            for group_index, edges in enumerate(owned_signatures)
+            for group_index, edges in enumerate(owned_sets)
             if slot_index in edges
         )
         signature = team, tuple(allowed), ownership

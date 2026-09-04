@@ -16,9 +16,10 @@ from ._dashboard_validation import (
 )
 from ._season_ranking import (
     _add_score_adjustment,
+    clone_records,
     new_records,
+    prepared_score_rounder,
     rank_teams,
-    round_score,
     select_playoff_seeds,
     settle_remaining_matchups,
     validate_tiebreaker_inputs,
@@ -260,15 +261,17 @@ def _scenario_summaries(bundle, baseline, scenarios, power_scores):
     win_points = {(team_id, week): 0.0 for team_id in team_ids for week in weeks}
     title_totals = {team_id: 0.0 for team_id in team_ids}
     standings = {row.team_id: row for row in state.standings}
+    initial_records = new_records(standings)
     uses_history = validate_tiebreaker_inputs(state)
     quantum = Decimal(1).scaleb(-baseline.score_decimal_places)
+    score_rounder = prepared_score_rounder(quantum)
 
     for scenario in scenarios:
         score_map = {
-            (score.team_id, score.week): round_score(score.score, quantum)
+            (score.team_id, score.week): score_rounder(score.score)
             for score in scenario.scores
         }
-        records = new_records(standings)
+        records = clone_records(initial_records)
         simulated = settle_remaining_matchups(
             state, records, score_map, uses_history
         )

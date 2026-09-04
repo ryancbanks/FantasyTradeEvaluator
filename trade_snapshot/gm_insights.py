@@ -25,7 +25,7 @@ from ._gm_team_profiles import (
     _proposal_guidance,
     _roster_outlooks,
     _summary,
-    _team_facts,
+    _team_facts_by_team,
     _trade_activity,
     _trade_style,
     _trade_value_summary,
@@ -79,16 +79,9 @@ def build_gm_insights(
     ))
     team_names = {team.team_id: team.name for team in bundle.state.teams}
     positions = _player_positions(bundle)
-    facts = {
-        team_id: _team_facts(
-            team_id,
-            transactions,
-            captures,
-            positions,
-            first_observed_at,
-        )
-        for team_id in team_names
-    }
+    facts = _team_facts_by_team(
+        team_names, transactions, captures, positions, first_observed_at
+    )
 
     valuation_result = None
     if bundle_loader is not None:

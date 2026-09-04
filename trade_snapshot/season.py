@@ -10,9 +10,10 @@ from .league_state import LeagueState, TeamId, TeamStanding
 from ._season_ranking import (
     UnresolvedTieError,
     UnsupportedTiebreakerError,
+    clone_records,
     new_records,
+    prepared_score_rounder,
     rank_teams,
-    round_score,
     select_playoff_seeds,
     settle_remaining_matchups,
     validate_tiebreaker_inputs,
@@ -137,6 +138,7 @@ def project_remaining_season(
         for team_id in team_ids
     }
     quantum = Decimal(1).scaleb(-score_decimal_places)
+    score_rounder = prepared_score_rounder(quantum)
     expected_scores = {
         (team_id, week)
         for team_id in team_ids
@@ -147,10 +149,10 @@ def project_remaining_season(
 
     for scenario in scenarios:
         score_map = _validate_scenario(
-            state, scenario, expected_scores, seen_scenario_ids, quantum
+            state, scenario, expected_scores, seen_scenario_ids, score_rounder
         )
         count += 1
-        records = new_records(standings)
+        records = clone_records(current_records)
         simulated = settle_remaining_matchups(
             state, records, score_map, uses_matchup_history
         )
@@ -230,7 +232,7 @@ def _validate_scenario(
     scenario: ScoreScenario,
     expected: set[tuple[TeamId, int]],
     seen_ids: set[str],
-    quantum: Decimal,
+    score_rounder,
 ) -> dict[tuple[TeamId, int], Decimal]:
     if not isinstance(scenario, ScoreScenario):
         raise ValueError("scenarios must contain ScoreScenario values")
@@ -251,7 +253,7 @@ def _validate_scenario(
             f"(missing={len(expected - actual)}, extra={len(actual - expected)})"
         )
     return {
-        (score.team_id, score.week): round_score(score.score, quantum)
+        (score.team_id, score.week): score_rounder(score.score)
         for score in scenario.scores
     }
 

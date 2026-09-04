@@ -2,7 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP, localcontext
+from decimal import Decimal, ROUND_HALF_UP, getcontext, localcontext
 from fractions import Fraction
 import hashlib
 from itertools import combinations
@@ -102,12 +102,36 @@ def new_records(standings: dict[TeamId, TeamStanding]) -> dict[TeamId, SeasonRec
     }
 
 
-def round_score(score: float, quantum: Decimal) -> Decimal:
-    value = as_decimal(score)
+def clone_records(
+    records: Mapping[TeamId, SeasonRecord],
+) -> dict[TeamId, SeasonRecord]:
+    """Copy one validated standings baseline without reconverting its decimals."""
+
+    return {
+        team_id: SeasonRecord(
+            row.wins,
+            row.losses,
+            row.ties,
+            row.points_for,
+            row.points_against,
+        )
+        for team_id, row in records.items()
+    }
+
+
+def prepared_score_rounder(quantum: Decimal):
+    """Return a per-run rounder without rebuilding a decimal context per score."""
+
     places = max(0, -quantum.as_tuple().exponent)
-    with localcontext() as context:
+    context = getcontext().copy()
+    context.rounding = ROUND_HALF_UP
+
+    def prepared(score: float) -> Decimal:
+        value = as_decimal(score)
         context.prec = max(28, value.adjusted() + places + 1)
-        return value.quantize(quantum, rounding=ROUND_HALF_UP)
+        return context.quantize(value, quantum)
+
+    return prepared
 
 
 def settle_remaining_matchups(
@@ -137,9 +161,9 @@ def settle_remaining_matchups(
 
 
 def _add_score_adjustment(score: Decimal, adjustment: Real) -> Decimal:
-    value = as_decimal(adjustment)
-    if value.is_zero():
+    if not isinstance(adjustment, bool) and adjustment == 0:
         return score
+    value = as_decimal(adjustment)
     minimum_exponent = min(score.as_tuple().exponent, value.as_tuple().exponent)
     fractional_places = max(0, -minimum_exponent)
     integer_digits = max(1, score.adjusted() + 1, value.adjusted() + 1)

@@ -120,8 +120,11 @@ class TradePackagePool:
                 self._compiled_package_cache[key] = packages
             yield from packages
             return
+        check_active = _needs_active_check(
+            package_size, minimum_active, self._capacity_exempt_ids
+        )
         for package in combinations(self._available_ids, package_size):
-            if sum(
+            if check_active and sum(
                 player_id not in self._capacity_exempt_ids for player_id in package
             ) < minimum_active:
                 continue
@@ -132,8 +135,11 @@ class TradePackagePool:
     ) -> Iterable[tuple[PlayerId, ...]]:
         if self._compiled_filter is None:
             raise AssertionError("a compiled package scan requires an expression")
+        check_active = _needs_active_check(
+            package_size, minimum_active, self._capacity_exempt_ids
+        )
         for package in combinations(self._available_ids, package_size):
-            if sum(
+            if check_active and sum(
                 player_id not in self._capacity_exempt_ids for player_id in package
             ) < minimum_active:
                 continue
@@ -260,12 +266,15 @@ class _LegacyTradePackagePool:
             or minimum_active > package_size
         ):
             return
+        check_active = _needs_active_check(
+            package_size, minimum_active, self._capacity_exempt_ids
+        )
         for optional in combinations(self._optional_ids, optional_count):
             selected = self._required_set.union(optional)
             package = tuple(
                 player_id for player_id in self._allowed_ids if player_id in selected
             )
-            if sum(
+            if check_active and sum(
                 player_id not in self._capacity_exempt_ids for player_id in package
             ) < minimum_active:
                 continue
@@ -363,6 +372,16 @@ def _count_by_active(
         * comb(exempt_count, package_size - active)
         for active in range(lower, upper + 1)
     )
+
+
+def _needs_active_check(
+    package_size: int,
+    minimum_active: int,
+    capacity_exempt_player_ids: frozenset[PlayerId],
+) -> bool:
+    """Return whether any package could contain too few active players."""
+
+    return len(capacity_exempt_player_ids) > package_size - minimum_active
 
 
 def _coverage(

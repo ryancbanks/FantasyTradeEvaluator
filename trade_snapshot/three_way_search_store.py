@@ -16,6 +16,7 @@ from .three_way_search_records import (
     ThreeWayQualifiedResult,
     ThreeWaySearchRunDefinition,
     _decimal_integer,
+    _nonnegative_integer,
 )
 
 
@@ -185,6 +186,38 @@ class ThreeWaySearchStore:
                 f"stored three-way result is invalid: {error}"
             ) from None
         return ThreeWayResumeState(next_index, qualified_count, gain_count)
+
+    def persisted_summary(self) -> ThreeWayResumeState:
+        """Read trusted aggregate progress after this writer commits a batch."""
+
+        connection = self._require_open()
+        stored, next_index = _load_run(connection)
+        if stored != self.run:
+            raise ThreeWaySearchRunMismatchError(
+                "three-way search store is bound to a different run"
+            )
+        try:
+            checkpoint_text = str(next_index)
+            row = connection.execute(
+                "SELECT COUNT(*), COALESCE(SUM(all_teams_gain), 0), "
+                "COALESCE(SUM(CASE WHEN LENGTH(candidate_index_text) > ? "
+                "OR (LENGTH(candidate_index_text) = ? "
+                "AND candidate_index_text >= ?) THEN 1 ELSE 0 END), 0) "
+                "FROM qualified_result",
+                (len(checkpoint_text), len(checkpoint_text), checkpoint_text),
+            ).fetchone()
+            summary = ThreeWayResumeState(
+                next_index,
+                _nonnegative_integer("stored qualified result count", row[0]),
+                _nonnegative_integer("stored all-team gain count", row[1]),
+            )
+            if _nonnegative_integer("stored uncheckpointed result count", row[2]):
+                raise ValueError("stored result is at or beyond the search checkpoint")
+            return summary
+        except (ValueError, TypeError, sqlite3.Error) as error:
+            raise ThreeWaySearchStoreError(
+                f"stored three-way progress is invalid: {error}"
+            ) from None
 
     def results(
         self, limit: int | None = None

@@ -1,6 +1,8 @@
 from dataclasses import FrozenInstanceError, replace
+from decimal import Decimal, InvalidOperation, getcontext
 import math
 import unittest
+from unittest.mock import patch
 
 from trade_snapshot.league_state import (
     CompletedFantasyMatchup,
@@ -13,6 +15,7 @@ from trade_snapshot.league_state import (
     TeamStanding,
     Tiebreaker,
 )
+from trade_snapshot._season_ranking import _add_score_adjustment
 from trade_snapshot.season import (
     ScoreScenario,
     TeamWeekScore,
@@ -71,6 +74,26 @@ class SeasonProjectionTests(unittest.TestCase):
         self.assertEqual(teams["b"].expected_final_points_for, 390.0)
         self.assertEqual(teams["c"].expected_final_points_against, 370.0)
 
+    def test_prepares_one_decimal_context_for_the_scenario_stream(self):
+        state = make_state(standings=empty_standings())
+        outcomes = tuple(
+            scenario(
+                state,
+                f"stream-{index}",
+                {team_id: 100.004 + index / 100 for team_id in "abcd"},
+            )
+            for index in range(4)
+        )
+
+        with patch(
+            "trade_snapshot._season_ranking.getcontext",
+            return_value=getcontext(),
+        ) as current_context:
+            result = project_remaining_season(state, outcomes)
+
+        self.assertEqual(result.scenario_count, len(outcomes))
+        current_context.assert_called_once_with()
+
     def test_team1_score_adjustment_is_applied_after_rounding_and_flips_tie(self):
         state = make_state(standings=empty_standings())
         state = replace(
@@ -121,6 +144,10 @@ class SeasonProjectionTests(unittest.TestCase):
 
         self.assertEqual(teams["a"].expected_final_points_for, 99.5)
         self.assertEqual(teams["d"].expected_final_points_against, 99.5)
+
+    def test_zero_adjustment_fast_path_does_not_accept_a_boolean(self):
+        with self.assertRaises(InvalidOperation):
+            _add_score_adjustment(Decimal("100.00"), False)
 
     def test_division_winners_receive_guaranteed_top_seeds(self):
         standings = (

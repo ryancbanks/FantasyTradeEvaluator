@@ -263,6 +263,31 @@ class ThreeWayTradeSpaceTests(unittest.TestCase):
             "fully directed routing must include split packages, not only cycles",
         )
 
+    def test_enumerated_candidates_equal_strict_public_reconstruction(self):
+        space = ThreeWayTradeSpace(
+            (
+                roster("A", ("a1", "a2")),
+                roster("B", ("b1", "b2")),
+                roster("C", ("c1", "c2")),
+            ),
+            TradeConstraints(max_outgoing=2, max_incoming=2, max_total_players=4),
+        )
+
+        for enumerated in space:
+            reconstructed = ThreeWayTradeCandidate(
+                enumerated.participant_team_ids,
+                tuple(
+                    TradeTransfer(
+                        transfer.source_team_id,
+                        transfer.destination_team_id,
+                        transfer.player_ids,
+                    )
+                    for transfer in enumerated.transfers
+                ),
+            )
+            self.assertEqual(enumerated, reconstructed)
+            self.assertEqual(signature(enumerated), signature(reconstructed))
+
     def test_iter_from_seeks_to_every_candidate_boundary(self):
         space = ThreeWayTradeSpace(
             (
@@ -463,6 +488,10 @@ class ThreeWayTradeSpaceTests(unittest.TestCase):
             enumeration_record["incoming_filter_expression"],
             incoming_filter.to_record(),
         )
+        for rule in (space._outgoing_rule, space._incoming_rule):
+            cache = rule.compiled_match.cache_info()
+            self.assertEqual(cache.maxsize, 256)
+            self.assertGreater(cache.hits, cache.misses)
 
     def test_wrapping_a_legacy_filter_preserves_three_way_results(self):
         rows = (

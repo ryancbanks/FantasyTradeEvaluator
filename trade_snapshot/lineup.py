@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite, ldexp
 from numbers import Real
 from types import MappingProxyType
@@ -15,6 +15,9 @@ class LineupPlayer:
 
     player_id: Hashable
     slot_weights: Mapping[str, float]
+    _exact_nonnegative_weights: Mapping[str, int] = field(
+        init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         try:
@@ -42,6 +45,17 @@ class LineupPlayer:
             self,
             "slot_weights",
             MappingProxyType(normalized_weights),
+        )
+        object.__setattr__(
+            self,
+            "_exact_nonnegative_weights",
+            MappingProxyType(
+                {
+                    slot: _weight_units(weight)
+                    for slot, weight in normalized_weights.items()
+                    if weight >= 0
+                }
+            ),
         )
 
 
@@ -78,15 +92,25 @@ def optimize_lineup(
     earlier players are assigned to earlier lineup positions first.
     """
 
-    lineup_slots = _normalize_slots(slots)
-    lineup_players = _normalize_players(players)
+    return _optimize_prepared_lineup(
+        _normalize_slots(slots),
+        _normalize_players(players),
+    )
+
+
+def _optimize_prepared_lineup(
+    lineup_slots: tuple[str, ...],
+    lineup_players: tuple[LineupPlayer, ...],
+) -> LineupResult:
+    """Optimize inputs already normalized by their immutable owner."""
+
     player_count = len(lineup_players)
     used_slots = set(lineup_slots)
     exact_weights = tuple(
         {
-            slot: _weight_units(weight)
-            for slot, weight in player.slot_weights.items()
-            if slot in used_slots and weight >= 0
+            slot: weight
+            for slot, weight in player._exact_nonnegative_weights.items()
+            if slot in used_slots
         }
         for player in lineup_players
     )

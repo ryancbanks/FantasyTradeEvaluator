@@ -18,7 +18,11 @@ from .draft_season import (
     _prepare_scoring_context,
     simulate_historical_season,
 )
-from .draft_simulation import DraftResult, simulate_snake_draft
+from .draft_simulation import (
+    DraftResult,
+    _new_simulation_cache,
+    simulate_snake_draft,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,13 +386,17 @@ def run_training_batch(
             return resume
 
     latest = resume
-    scoring_contexts = tuple(
-        _prepare_scoring_context(season, config) for season in seasons
-    )
+    scoring_contexts = []
+    simulation_caches = []
+    for season in seasons:
+        if should_cancel():
+            raise InterruptedError("draft brain training was cancelled")
+        scoring_contexts.append(_prepare_scoring_context(season, config))
+        simulation_caches.append(_new_simulation_cache(season, config))
     for generation in range(generation_start, evolution.generations + 1):
         performances, summary, showcase = _evaluate_population(
-            population, baseline, scoring_contexts, config, evolution, generation,
-            should_cancel, on_arena,
+            population, baseline, scoring_contexts, simulation_caches,
+            config, evolution, generation, should_cancel, on_arena,
         )
         ranked = sorted(
             range(len(population)),
@@ -412,8 +420,8 @@ def run_training_batch(
 
 
 def _evaluate_population(
-    population, baseline, scoring_contexts, config, evolution, generation,
-    should_cancel, on_arena,
+    population, baseline, scoring_contexts, simulation_caches, config,
+    evolution, generation, should_cancel, on_arena,
 ):
     totals = [[0.0, 0, 0, 0, 0.0, 0.0] for _ in population]
     strategy_scores = {strategy.value: {} for strategy in DraftStrategy}
@@ -431,6 +439,7 @@ def _evaluate_population(
     for appearance in range(evolution.appearances_per_generation):
         for season_index, scoring_context in enumerate(scoring_contexts):
             season = scoring_context.season
+            simulation_cache = simulation_caches[season_index]
             # A step coprime to every population size visits distinct seats
             # instead of aliasing at sizes such as 31.
             exposure = (
@@ -467,6 +476,7 @@ def _evaluate_population(
                 draft = simulate_snake_draft(
                     season, config, brains, seed=arena_seed,
                     candidate_window=evolution.candidate_window, should_cancel=should_cancel,
+                    _simulation_cache=simulation_cache,
                 )
                 trace = simulate_historical_season(
                     draft.rosters, season, config, _prepared=scoring_context
@@ -476,6 +486,7 @@ def _evaluate_population(
                     seed=arena_seed,
                     candidate_window=evolution.candidate_window,
                     should_cancel=should_cancel,
+                    _simulation_cache=simulation_cache,
                 )
                 control_trace = simulate_historical_season(
                     control_draft.rosters, season, config,

@@ -8,9 +8,10 @@ from math import ceil, fsum
 
 from ._season_ranking import (
     _add_score_adjustment,
+    clone_records,
     new_records,
+    prepared_score_rounder,
     rank_teams,
-    round_score,
     select_playoff_seeds,
     settle_remaining_matchups,
     validate_tiebreaker_inputs,
@@ -127,7 +128,9 @@ def _build_season_trajectory(
         {key: 0 for key in trigger_keys} if collect_triggers else None
     )
     quantum = Decimal(1).scaleb(-score_decimal_places)
+    score_rounder = prepared_score_rounder(quantum)
     standings = {row.team_id: row for row in state.standings}
+    initial_records = new_records(standings)
     expected_score_keys = {
         (team_id, week) for team_id in team_ids for week in weeks
     }
@@ -137,10 +140,10 @@ def _build_season_trajectory(
     for scenario_index, scenario in enumerate(scenario_rows):
         _validate_scenario(state, scenario, expected_score_keys, seen_scenario_ids)
         score_map = {
-            (row.team_id, row.week): round_score(row.score, quantum)
+            (row.team_id, row.week): score_rounder(row.score)
             for row in scenario.scores
         }
-        records = new_records(standings)
+        records = clone_records(initial_records)
         simulated = settle_remaining_matchups(state, records, score_map, uses_history)
         played_games = (*state.completed_matchups, *simulated) if uses_history else ()
         order = rank_teams(
@@ -266,6 +269,7 @@ def build_loss_and_downward_scenario_index(
     standings = {row.team_id: row for row in state.standings}
     expected_score_keys = {(team_id, week) for team_id in team_ids for week in weeks}
     quantum = Decimal(1).scaleb(-score_decimal_places)
+    score_rounder = prepared_score_rounder(quantum)
     seen_scenario_ids: set[str] = set()
 
     for scenario_index, scenario in enumerate(scenario_rows):
@@ -273,7 +277,7 @@ def build_loss_and_downward_scenario_index(
             state, scenario, expected_score_keys, seen_scenario_ids
         )
         score_map = {
-            (row.team_id, row.week): round_score(row.score, quantum)
+            (row.team_id, row.week): score_rounder(row.score)
             for row in scenario.scores
         }
         outcomes = _future_outcomes(state, score_map)

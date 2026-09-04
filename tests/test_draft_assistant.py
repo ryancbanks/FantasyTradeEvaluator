@@ -17,6 +17,7 @@ from trade_snapshot.draft_assistant import (
     undo_assistant_pick,
 )
 from trade_snapshot.draft_features import build_baseline_brain
+from trade_snapshot.draft_brain import FeatureSchema
 from trade_snapshot.draft_history import DraftPlayerBoard
 from trade_snapshot.draft_persistence import DraftModelArtifact
 
@@ -98,6 +99,39 @@ class DraftAssistantTests(unittest.TestCase):
         self.assertEqual(validate.call_count, 1)
         self.assertEqual(second["feasibility"]["status"], "ready")
 
+    def test_recommendations_reuse_the_bounded_board_encoding_cache(self):
+        session = create_assistant_session(
+            self.model, self.board, user_drafter_number=1,
+            session_id="9" * 32,
+        )
+        with draft_assistant_module._ASSISTANT_RANK_CACHE_LOCK:
+            draft_assistant_module._ASSISTANT_RANK_CACHE.clear()
+        original_encode = FeatureSchema.encode
+
+        with patch.object(
+            FeatureSchema,
+            "encode",
+            autospec=True,
+            side_effect=original_encode,
+        ) as encode:
+            first = assistant_status(session, self.model, self.board)
+            first_encode_count = encode.call_count
+            second = assistant_status(session, self.model, self.board)
+            second_encode_count = encode.call_count - first_encode_count
+            replacement_board = replace(self.board)
+            replacement = assistant_status(session, self.model, replacement_board)
+
+        self.assertEqual(first["recommendations"], second["recommendations"])
+        self.assertEqual(first["recommendations"], replacement["recommendations"])
+        self.assertLess(second_encode_count, first_encode_count)
+        with draft_assistant_module._ASSISTANT_RANK_CACHE_LOCK:
+            self.assertLessEqual(
+                len(draft_assistant_module._ASSISTANT_RANK_CACHE),
+                draft_assistant_module._MAX_ASSISTANT_RANK_CACHE_SIZE,
+            )
+            entry = next(iter(draft_assistant_module._ASSISTANT_RANK_CACHE.values()))
+            self.assertIs(entry[0].season, replacement_board)
+
     def test_reconciliation_is_idempotent_and_conflicts_fail(self):
         session = create_assistant_session(
             self.model, self.board, user_drafter_number=2, session_id="b" * 32
@@ -106,7 +140,7 @@ class DraftAssistantTests(unittest.TestCase):
         observed = [(1, players[0]), (2, players[1])]
         once = reconcile_assistant_picks(session, self.model, self.board, observed)
         twice = reconcile_assistant_picks(once, self.model, self.board, observed)
-        self.assertEqual(once, twice)
+        self.assertIs(once, twice)
         with self.assertRaisesRegex(ValueError, "conflicts at pick 1"):
             reconcile_assistant_picks(once, self.model, self.board, [(1, players[2])])
 

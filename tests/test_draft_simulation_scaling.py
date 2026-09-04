@@ -1,6 +1,8 @@
 from collections import Counter
 from collections.abc import ValuesView
 from dataclasses import replace
+import hashlib
+import json
 from unittest.mock import patch
 import unittest
 
@@ -21,9 +23,20 @@ from trade_snapshot.draft_config import (
     default_slot_eligibility,
 )
 from trade_snapshot.draft_features import build_baseline_brain, candidate_feature_values
-from trade_snapshot.draft_feasibility import filled_count
+from trade_snapshot.draft_feasibility import (
+    CompletionProblem,
+    FeasibilityCache,
+    _MAX_FILLED_COUNT_CACHE_SIZE,
+    completion_after_pick,
+    filled_count,
+    prepare_completion,
+)
 from trade_snapshot.draft_matching import maximum_group_slot_fill
-from trade_snapshot.draft_simulation import rank_draft_candidates, simulate_snake_draft
+from trade_snapshot.draft_simulation import (
+    _new_simulation_cache,
+    rank_draft_candidates,
+    simulate_snake_draft,
+)
 
 
 def _config(slots, *, limits=None, strategies=None, bench=0):
@@ -253,6 +266,136 @@ class DraftCompletionScalingTests(unittest.TestCase):
         self.assertEqual(len(available_inputs), len(result.picks))
         self.assertTrue(all(isinstance(value, ValuesView) for value in available_inputs))
         self.assertTrue(all(value is roster_inputs[0] for value in roster_inputs))
+
+    def test_shared_simulation_cache_preserves_exact_rankings_and_static_encodings(self):
+        corpus = small_historical_corpus()
+        season = corpus.seasons[0]
+        config = small_draft_config()
+        baseline = build_baseline_brain(corpus, config, (2025,))
+        brain = initialize_genome(
+            baseline.schema, baseline.baseline, config.config_id,
+            seed=7, genome_index=1,
+        )
+        cache = _new_simulation_cache(season, config)
+        original_encode = FeatureSchema.encode
+
+        with patch.object(
+            FeatureSchema,
+            "encode",
+            autospec=True,
+            side_effect=original_encode,
+        ) as encode:
+            first = simulate_snake_draft(
+                season, config, (brain,) * config.team_count,
+                seed=11, candidate_window=4, _simulation_cache=cache,
+            )
+            first_encode_count = encode.call_count
+            second = simulate_snake_draft(
+                season, config, (brain,) * config.team_count,
+                seed=11, candidate_window=4, _simulation_cache=cache,
+            )
+            second_encode_count = encode.call_count - first_encode_count
+
+        uncached = simulate_snake_draft(
+            season, config, (brain,) * config.team_count,
+            seed=11, candidate_window=4,
+        )
+        payload = [
+            (pick.overall_pick, pick.drafter_number, pick.player_id, pick.utility)
+            for pick in first.picks
+        ]
+
+        self.assertEqual(first, second)
+        self.assertEqual(first, uncached)
+        self.assertLess(second_encode_count, first_encode_count)
+        self.assertEqual(
+            hashlib.sha256(
+                json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+            "6336cc5fdab58b6f3ce8beb985725142f4370a74c69735e49449f79de368f7cc",
+        )
+
+        other_season = replace(season)
+        with self.assertRaisesRegex(ValueError, "simulation cache"):
+            simulate_snake_draft(
+                other_season, config, (brain,) * config.team_count,
+                _simulation_cache=cache,
+            )
+        with self.assertRaisesRegex(ValueError, "simulation cache"):
+            rank_draft_candidates(
+                other_season,
+                config,
+                brain,
+                DraftStrategy.NONE,
+                roster_player_ids=(),
+                available_players=other_season.players,
+                round_number=1,
+                overall_pick=1,
+                drafter_number=1,
+                _simulation_cache=cache,
+            )
+
+    def test_feasibility_cache_is_bounded_and_legacy_problem_fallback_is_exact(self):
+        config = small_draft_config()
+        season = small_historical_corpus().seasons[0]
+        strategies = (DraftStrategy.NONE,) * config.team_count
+        players = {player.player_id: player for player in season.players}
+        rosters = tuple(() for _ in range(config.team_count))
+        cache = FeasibilityCache(config.config_id)
+        problem = prepare_completion(
+            rosters,
+            season.players,
+            strategies,
+            players,
+            config,
+            1,
+            pending_team=0,
+            cache=cache,
+        )
+        legacy = CompletionProblem(
+            problem.config,
+            problem.slots,
+            problem.roster_players,
+            problem.future_rounds,
+            problem.owned_groups,
+            problem.available_groups,
+            problem.available_keys,
+            problem.position_remaining,
+            problem.position_capacities,
+            FeasibilityCache(config.config_id),
+            problem.pending_team,
+            problem.blocked,
+        )
+        candidate = season.players[0]
+
+        self.assertEqual(
+            completion_after_pick(problem, candidate),
+            completion_after_pick(legacy, candidate),
+        )
+        self.assertEqual(
+            len(cache.future_rounds),
+            config.team_count * config.roster_size + 1,
+        )
+        self.assertTrue(
+            all(
+                sum(left is not right for left, right in zip(
+                    cache.future_rounds[pick], cache.future_rounds[pick + 1]
+                )) == 1
+                for pick in range(config.team_count * config.roster_size)
+            )
+        )
+
+        bounded = FeasibilityCache(config.config_id)
+        bounded.filled_counts.update(
+            {
+                ((f"synthetic-{index}",),): 0
+                for index in range(_MAX_FILLED_COUNT_CACHE_SIZE)
+            }
+        )
+        filled_count((), config, bounded)
+        self.assertLessEqual(
+            len(bounded.filled_counts), _MAX_FILLED_COUNT_CACHE_SIZE
+        )
 
     def test_global_completion_replaces_only_the_redundant_local_proof(self):
         corpus = small_historical_corpus()

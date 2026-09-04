@@ -13,13 +13,16 @@ from .draft_config import DraftStrategy
 from .draft_feasibility import validate_player_supply
 from .draft_history import DraftPlayerBoard
 from .draft_persistence import DraftModelArtifact
-from .draft_simulation import rank_draft_candidates
+from .draft_simulation import _new_simulation_cache, rank_draft_candidates
 
 
 _SESSION_ID = re.compile(r"^[0-9a-f]{32}$")
 _MAX_BOARD_COVERAGE_CACHE_SIZE = 128
 _BOARD_COVERAGE_CACHE = OrderedDict()
 _BOARD_COVERAGE_CACHE_LOCK = RLock()
+_MAX_ASSISTANT_RANK_CACHE_SIZE = 1
+_ASSISTANT_RANK_CACHE = OrderedDict()
+_ASSISTANT_RANK_CACHE_LOCK = RLock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,20 +246,34 @@ def _append_assistant_pick(
     player_id: str,
     drafter_number: int,
 ) -> DraftAssistantSession:
-    if len(session.picks) >= model.league_config.team_count * model.league_config.roster_size:
-        raise ValueError("draft is already complete")
-    overall = len(session.picks) + 1
-    expected = drafter_for_pick(overall, model.league_config.team_count)
-    if drafter_number != expected:
-        raise ValueError(f"pick {overall} belongs to Drafter #{expected}")
-    if player_id not in {row.player_id for row in board.players}:
-        raise ValueError("player is not on the current draft board")
-    if player_id in {row.player_id for row in session.picks}:
-        raise ValueError("player has already been drafted")
+    pick = _validated_new_pick(
+        model.league_config,
+        len(session.picks),
+        {row.player_id for row in board.players},
+        {row.player_id for row in session.picks},
+        player_id,
+        drafter_number,
+    )
     return replace(
         session,
-        picks=(*session.picks, AssistantPick(overall, drafter_number, player_id)),
+        picks=(*session.picks, pick),
     )
+
+
+def _validated_new_pick(
+    config, pick_count, board_ids, drafted_ids, player_id, drafter_number
+):
+    if pick_count >= config.team_count * config.roster_size:
+        raise ValueError("draft is already complete")
+    overall = pick_count + 1
+    expected = drafter_for_pick(overall, config.team_count)
+    if drafter_number != expected:
+        raise ValueError(f"pick {overall} belongs to Drafter #{expected}")
+    if player_id not in board_ids:
+        raise ValueError("player is not on the current draft board")
+    if player_id in drafted_ids:
+        raise ValueError("player has already been drafted")
+    return AssistantPick(overall, drafter_number, player_id)
 
 
 def undo_assistant_pick(session: DraftAssistantSession) -> DraftAssistantSession:
@@ -275,17 +292,33 @@ def reconcile_assistant_picks(
 
     _validate_session(session, model, board)
     _session_board_coverage(session, model, board)
-    result = session
+    result = None
+    board_ids = None
+    drafted_ids = None
     for index, (drafter_number, player_id) in enumerate(picks):
         if index < len(session.picks):
             existing = session.picks[index]
             if (existing.drafter_number, existing.player_id) != (drafter_number, player_id):
                 raise ValueError(f"observed draft conflicts at pick {index + 1}")
             continue
-        result = _append_assistant_pick(
-            result, model, board, player_id=player_id, drafter_number=drafter_number
-        )
-    return result
+        if board_ids is None or drafted_ids is None:
+            result = list(session.picks)
+            board_ids = {player.player_id for player in board.players}
+            drafted_ids = {pick.player_id for pick in result}
+        if result is None:
+            raise AssertionError("assistant reconciliation append state is unavailable")
+        result.append(_validated_new_pick(
+            model.league_config,
+            len(result),
+            board_ids,
+            drafted_ids,
+            player_id,
+            drafter_number,
+        ))
+        drafted_ids.add(player_id)
+    if result is None:
+        return session
+    return replace(session, picks=tuple(result))
 
 
 def assistant_status(
@@ -307,25 +340,41 @@ def assistant_status(
     round_number = None if complete else (next_pick - 1) // config.team_count + 1
     players = {row.player_id: row for row in board.players}
     rosters = [[] for _ in range(config.team_count)]
+    drafted_ids = set()
     for pick in session.picks:
         rosters[pick.drafter_number - 1].append(pick.player_id)
-    available = tuple(row for row in board.players if row.player_id not in {
-        pick.player_id for pick in session.picks
-    })
+        drafted_ids.add(pick.player_id)
+    available = tuple(
+        row for row in board.players if row.player_id not in drafted_ids
+    )
     recommendations = []
     if not complete and next_drafter == session.user_drafter_number:
-        ranked = rank_draft_candidates(
-            board, config, model.brain, session.strategy,
-            roster_player_ids=rosters[next_drafter - 1], available_players=available,
-            round_number=round_number, overall_pick=next_pick,
-            drafter_number=next_drafter, candidate_window=0,
-            all_roster_player_ids=tuple(tuple(row) for row in rosters),
-            all_strategies=tuple(
-                session.strategy if index == session.user_drafter_number - 1
-                else DraftStrategy.NONE
-                for index in range(config.team_count)
-            ),
-        )
+        cache_key = model.model_id, board.board_id
+        with _ASSISTANT_RANK_CACHE_LOCK:
+            cache_entry = _ASSISTANT_RANK_CACHE.get(cache_key)
+            if cache_entry is None or cache_entry[0].season is not board:
+                cache_entry = (_new_simulation_cache(board, config), RLock())
+                _ASSISTANT_RANK_CACHE[cache_key] = cache_entry
+                while len(_ASSISTANT_RANK_CACHE) > _MAX_ASSISTANT_RANK_CACHE_SIZE:
+                    _ASSISTANT_RANK_CACHE.popitem(last=False)
+            else:
+                _ASSISTANT_RANK_CACHE.move_to_end(cache_key)
+        cache, cache_lock = cache_entry
+        with cache_lock:
+            ranked = rank_draft_candidates(
+                board, config, model.brain, session.strategy,
+                roster_player_ids=rosters[next_drafter - 1],
+                available_players=available,
+                round_number=round_number, overall_pick=next_pick,
+                drafter_number=next_drafter, candidate_window=0,
+                all_roster_player_ids=tuple(tuple(row) for row in rosters),
+                all_strategies=tuple(
+                    session.strategy if index == session.user_drafter_number - 1
+                    else DraftStrategy.NONE
+                    for index in range(config.team_count)
+                ),
+                _simulation_cache=cache,
+            )
         for rank, row in enumerate(ranked[:recommendation_limit], 1):
             player = players[row.player_id]
             recommendations.append({

@@ -9,6 +9,7 @@ from trade_snapshot._scenario_random import content_id
 from trade_snapshot.draft_config import score_raw_stats
 from trade_snapshot.draft_history import ActualWeekStatus
 from trade_snapshot.draft_season import _prepare_scoring_context
+from trade_snapshot.draft_simulation import _new_simulation_cache
 from trade_snapshot.draft_training import (
     EvolutionConfig,
     GenerationSummary,
@@ -55,10 +56,15 @@ class DraftTrainingTests(unittest.TestCase):
                 "trade_snapshot.draft_season.score_raw_stats",
                 wraps=score_raw_stats,
             ) as score,
+            patch(
+                "trade_snapshot.draft_training._new_simulation_cache",
+                wraps=_new_simulation_cache,
+            ) as simulation_cache,
         ):
             run_training_batch(corpus, small_draft_config(), settings)
 
         self.assertEqual(prepare.call_count, 1)
+        self.assertEqual(simulation_cache.call_count, 1)
         self.assertEqual(score.call_count, played_week_count)
 
     def test_runs_evolution_retains_champion_showcase_and_round_trips(self):

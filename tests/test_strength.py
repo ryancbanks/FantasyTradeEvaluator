@@ -4,6 +4,7 @@ import copy
 import json
 import math
 import unittest
+from unittest.mock import patch
 
 from trade_snapshot.strength import (
     CalibrationMetadata,
@@ -117,6 +118,29 @@ class StrengthModelTests(unittest.TestCase):
             ),
             ("rb", "dual"),
         )
+
+    def test_repeated_roster_scores_reuse_model_normalized_lineup_players(self):
+        model = make_model(
+            ("QB", "FLEX"),
+            (
+                player("qb", 20, {"QB": 8}),
+                player("starter", 15, {"FLEX": 6}),
+                player("bench", 5, {"FLEX": 2}),
+            ),
+            normalization_denominator=54,
+        )
+        expected = model.score_roster(("qb", "starter", "bench"))
+
+        with patch(
+            "trade_snapshot.strength.LineupPlayer",
+            side_effect=AssertionError("lineup players must be normalized once"),
+        ):
+            results = tuple(
+                model.score_roster(("qb", "starter", "bench"))
+                for _ in range(25)
+            )
+
+        self.assertTrue(all(result == expected for result in results))
 
     def test_trade_uses_one_fixed_pre_trade_normalization_denominator(self):
         model = make_model(

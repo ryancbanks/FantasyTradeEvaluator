@@ -8,7 +8,11 @@ import json
 
 from .draft_brain import DraftBrain
 from .draft_config import DraftLeagueConfig, DraftStrategy
-from .draft_features import candidate_feature_values, resolve_preseason_projection
+from .draft_features import (
+    _prepare_candidate_feature_context,
+    candidate_feature_values,
+    resolve_preseason_projection,
+)
 from .draft_feasibility import (
     FeasibilityCache,
     candidate_preserves_starter_deadline,
@@ -87,8 +91,21 @@ class RankedDraftCandidate:
 @dataclass(slots=True)
 class _SimulationCache:
     feasibility: FeasibilityCache
+    season: HistoricalSeason | DraftPlayerBoard | None = None
     players_by_id: dict[str, PreseasonPlayer] | None = None
     projection_hints: dict[str, float] = field(default_factory=dict)
+    # The immutable coordinates are reused; every context coordinate is
+    # replaced from the current pick before this vector reaches a brain.
+    encoded_features: dict[tuple[str, str], tuple[float, ...]] = field(
+        default_factory=dict
+    )
+    context_indexes: dict[str, tuple[int, ...]] = field(default_factory=dict)
+
+
+def _new_simulation_cache(season, config):
+    return _SimulationCache(
+        FeasibilityCache(config.config_id), season, _player_index(season.players)
+    )
 
 
 def simulate_snake_draft(
@@ -100,6 +117,7 @@ def simulate_snake_draft(
     seed: int = 0,
     candidate_window: int = 0,
     should_cancel=lambda: False,
+    _simulation_cache: _SimulationCache | None = None,
 ) -> DraftResult:
     """Complete one legal draft; actual weekly outcomes are never inspected."""
 
@@ -107,10 +125,14 @@ def simulate_snake_draft(
     if type(candidate_window) is not int or not 0 <= candidate_window <= 4096:
         raise ValueError("candidate_window must be an integer from zero through 4096")
     assigned = _strategy_assignment(config, strategies, seed)
-    players_by_id = _player_index(season.players)
-    cache = _SimulationCache(
-        FeasibilityCache(config.config_id), players_by_id=players_by_id
-    )
+    cache = _simulation_cache or _new_simulation_cache(season, config)
+    if (
+        cache.season is not season
+        or cache.feasibility.config_id != config.config_id
+        or cache.players_by_id is None
+    ):
+        raise ValueError("simulation cache does not match the season and league")
+    players_by_id = cache.players_by_id
     rosters: list[list[str]] = [[] for _ in range(config.team_count)]
     available = dict(players_by_id)
     required = config.team_count * config.roster_size
@@ -194,18 +216,20 @@ def rank_draft_candidates(
         raise ValueError("draft brain is not compatible with this league configuration")
     if not isinstance(strategy, DraftStrategy):
         raise ValueError("strategy must be a DraftStrategy")
-    cache = _simulation_cache or _SimulationCache(FeasibilityCache(config.config_id))
+    cache = _simulation_cache or _new_simulation_cache(season, config)
+    if (
+        cache.season is not season
+        or cache.feasibility.config_id != config.config_id
+        or cache.players_by_id is None
+    ):
+        raise ValueError("simulation cache does not match the season and league")
     players = cache.players_by_id
-    if players is None:
-        players = _player_index(season.players)
     if any(player_id not in players for player_id in roster_player_ids):
         raise ValueError("roster contains a player outside the selected season")
     available = tuple(available_players)
     if len({player.player_id for player in available}) != len(available):
         raise ValueError("available players contain duplicates")
     roster = tuple(players[player_id] for player_id in roster_player_ids)
-    if cache.feasibility.config_id != config.config_id:
-        raise ValueError("simulation cache does not match the league configuration")
     roster_counts = Counter(player.position for player in roster)
     counts = Counter(player.position for player in available)
     picks_left_after = config.roster_size - len(roster) - 1
@@ -290,6 +314,27 @@ def rank_draft_candidates(
             ]
     ranked = []
     feature_templates = {}
+    encoded_contexts = {}
+    schema = brain.schema
+    schema_id = schema.feature_schema_id
+    context_indexes = cache.context_indexes.get(schema_id)
+    if context_indexes is None:
+        context_indexes = tuple(
+            index for index, name in enumerate(schema.names)
+            if name.startswith("context.")
+        )
+        cache.context_indexes[schema_id] = context_indexes
+    roster_positions = tuple(row.position for row in roster)
+    roster_eligibilities = tuple(row.eligible_positions for row in roster)
+    prepared_features = _prepare_candidate_feature_context(
+        config,
+        round_number,
+        overall_pick,
+        roster_positions,
+        roster_eligibilities,
+        counts,
+        next_pick,
+    )
     for player in legal:
         signature = (player.position, player.eligible_positions)
         template = feature_templates.get(signature)
@@ -299,31 +344,46 @@ def rank_draft_candidates(
                 config=config,
                 round_number=round_number,
                 overall_pick=overall_pick,
-                roster_player_positions=tuple(row.position for row in roster),
-                roster_player_eligibilities=tuple(row.eligible_positions for row in roster),
+                roster_player_positions=roster_positions,
+                roster_player_eligibilities=roster_eligibilities,
                 available_position_counts=counts,
                 picks_until_next=next_pick,
+                _prepared=prepared_features,
             )
             template = {
                 name: value for name, value in complete.items()
                 if not name.startswith("preseason.") and not name.startswith("bio.")
             }
             feature_templates[signature] = template
-        features = dict(template)
-        features.update(
-            (f"preseason.{name}", value)
-            for name, value in player.preseason_features.items()
-        )
-        features.update({
-            "bio.bye_week": float(player.bye_week),
-            "bio.experience_years": float(player.nfl_experience_years),
-            "bio.rookie": float(player.rookie),
-            "bio.first_year_on_team": float(player.first_year_on_team),
-        })
-        baseline, utility = brain.score_parts(
-            {name: features.get(name) for name in brain.schema.names}
-        )
-        need = float(features.get("context.starter_need", 0.0) or 0.0)
+        feature_key = schema_id, player.player_id
+        encoded = cache.encoded_features.get(feature_key)
+        current_context = encoded_contexts.get(signature)
+        if encoded is None or current_context is None:
+            features = dict(template)
+            features.update(
+                (f"preseason.{name}", value)
+                for name, value in player.preseason_features.items()
+            )
+            features.update({
+                "bio.bye_week": float(player.bye_week),
+                "bio.experience_years": float(player.nfl_experience_years),
+                "bio.rookie": float(player.rookie),
+                "bio.first_year_on_team": float(player.first_year_on_team),
+            })
+            current = schema.encode({name: features.get(name) for name in schema.names})
+            if encoded is None:
+                encoded = current
+                cache.encoded_features[feature_key] = encoded
+            if current_context is None:
+                current_context = tuple(current[index] for index in context_indexes)
+                encoded_contexts[signature] = current_context
+        if context_indexes:
+            vector = list(encoded)
+            for index, value in zip(context_indexes, current_context):
+                vector[index] = value
+            encoded = tuple(vector)
+        baseline, utility = brain._score_validated_parts(encoded)
+        need = float(template.get("context.starter_need", 0.0) or 0.0)
         # The baseline is a regression ranker with minimal roster construction
         # discipline.  The neural residual is free to refine this policy.
         construction = 0.05 * abs(baseline) * need
@@ -394,7 +454,7 @@ def _can_complete(roster, picks_left, pool_can_fill, config, cache) -> bool:
 
 
 def _filled_starter_count(roster_ids, season, config, cache) -> int:
-    players = {row.player_id: row for row in season.players}
+    players = cache.players_by_id or _player_index(season.players)
     return filled_count(
         tuple(players[player_id] for player_id in roster_ids),
         config,
