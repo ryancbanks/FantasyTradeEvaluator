@@ -102,6 +102,9 @@ class LeagueWorkspaceServiceTests(unittest.TestCase):
             imported = service.import_bundle(
                 bundle.to_record(), profile_id=profile["profile_id"]
             )
+            owning_data_directory = service.data_directory_for_bundle(
+                bundle.bundle_id
+            )
             profile_rows = service.bundle_rows(profile["profile_id"])
             unassigned_rows = service.bundle_rows(UNASSIGNED_PROFILE_ID)
             full_bundle = service.full_bundle(bundle.bundle_id)
@@ -119,6 +122,10 @@ class LeagueWorkspaceServiceTests(unittest.TestCase):
             summary_cache_exists = summary_cache.is_file()
 
         self.assertEqual(imported["bundle_id"], bundle.bundle_id)
+        self.assertEqual(
+            owning_data_directory,
+            (Path(directory) / "leagues" / profile["profile_id"]).resolve(),
+        )
         self.assertEqual(
             profile_rows,
             ({
@@ -200,7 +207,7 @@ class LeagueWorkspaceServiceTests(unittest.TestCase):
                 "https://fantasy.espn.com/football/league?leagueId=123"
             ))
             self.assertEqual(plan.request.yahoo_projection_league_url, (
-                "https://football.fantasysports.yahoo.com/2026/f1/456/"
+                "https://football.fantasysports.yahoo.com/f1/456/"
                 "players?status=ALL"
             ))
             self.assertTrue(plan.request.use_fantasypros)

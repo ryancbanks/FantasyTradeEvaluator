@@ -219,7 +219,7 @@ window.PlayerLabProfileUi = (() => {
   }
 
   function appendAffectedAreas(container, history) {
-    const affected = array(history.affected_body_areas);
+    const affected = array(history?.affected_body_areas);
     if (!affected.length) return;
     const list = affected.slice(0, 5).map(value => {
       const label = value.label || value.body_area || value.area || "Unspecified";
@@ -247,7 +247,7 @@ window.PlayerLabProfileUi = (() => {
   }
 
   function appendAvailabilityEvidence(container, history) {
-    const evidence = array(history.weekly_evidence).slice().sort((left, right) =>
+    const evidence = array(history?.weekly_evidence).slice().sort((left, right) =>
       (finite(right.season) ?? 0) - (finite(left.season) ?? 0)
       || (finite(right.week) ?? 0) - (finite(left.week) ?? 0)
     );

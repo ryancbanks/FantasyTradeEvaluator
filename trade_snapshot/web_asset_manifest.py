@@ -28,6 +28,7 @@ WEB_ASSET_ROUTES = MappingProxyType(
             "gm_insights_ui.js",
             "text/javascript; charset=utf-8",
         ),
+        "/league_ui.js": ("league_ui.js", "text/javascript; charset=utf-8"),
         "/player_lab.css": ("player_lab.css", "text/css; charset=utf-8"),
         "/player_lab_catalog_ui.js": (
             "player_lab_catalog_ui.js",
@@ -39,6 +40,11 @@ WEB_ASSET_ROUTES = MappingProxyType(
         ),
         "/player_lab_ui.js": (
             "player_lab_ui.js",
+            "text/javascript; charset=utf-8",
+        ),
+        "/progress_ui.js": ("progress_ui.js", "text/javascript; charset=utf-8"),
+        "/results_workbench.js": (
+            "results_workbench.js",
             "text/javascript; charset=utf-8",
         ),
         "/styles.css": ("styles.css", "text/css; charset=utf-8"),

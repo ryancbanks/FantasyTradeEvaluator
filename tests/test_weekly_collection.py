@@ -1,18 +1,17 @@
 import http.client
 import json
+import time
+import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
-import time
-import unittest
 from unittest.mock import patch
 
 from tests.test_app_service import payload, wait_for_job
 from tests.test_engine_bundle import engine_bundle
 from trade_snapshot.app_service import LocalAppService, LocalSearchRequest
 from trade_snapshot.engine_bundle import load_engine_bundle, save_engine_bundle
-from trade_snapshot.local_server import create_local_server
 from trade_snapshot.league_history import (
     HistoryBundleBinding,
     HistoryRosterPlayer,
@@ -22,12 +21,14 @@ from trade_snapshot.league_history import (
     LeagueHistoryStore,
     make_league_key,
 )
+from trade_snapshot.local_server import create_local_server
+from trade_snapshot.operation_timing import OperationTiming
 from trade_snapshot.weekly_collection import (
     LEAGUE_HISTORY_FILENAME,
     WeeklyCollectionError,
     WeeklyCollectionJobs,
-    WeeklyCollectionPublication,
     WeeklyCollectionProgress,
+    WeeklyCollectionPublication,
     WeeklyCollectionRequest,
     WeeklyCollectionStage,
 )
@@ -116,6 +117,116 @@ class InteractiveWorkflow(SuccessfulWorkflow):
         self.pending = None
         self.confirmed.append(provider)
         return provider
+
+
+class _TimedSignInGate:
+    def __init__(self):
+        self.pending = None
+        self.confirmed = []
+        self.listeners = []
+
+    def subscribe_wait_state(self, listener):
+        self.listeners.append(listener)
+
+        def unsubscribe():
+            if listener in self.listeners:
+                self.listeners.remove(listener)
+
+        return unsubscribe
+
+    def begin_wait(self):
+        self.pending = "fantasypros"
+        for listener in tuple(self.listeners):
+            listener(True)
+
+    def status(self):
+        return {
+            "pending_provider": self.pending,
+            "confirmed_providers": list(self.confirmed),
+        }
+
+    def confirm(self):
+        if self.pending is None:
+            raise ValueError("no provider sign-in is waiting for confirmation")
+        provider = self.pending
+        self.pending = None
+        self.confirmed.append(provider)
+        for listener in tuple(self.listeners):
+            listener(False)
+        return provider
+
+
+class TimedInteractiveWorkflow(SuccessfulWorkflow):
+    def __init__(self):
+        super().__init__()
+        self.sign_in_gate = _TimedSignInGate()
+        self.waiting_for_sign_in = Event()
+        self.continued_after_sign_in = Event()
+        self.finish_work = Event()
+
+    def __call__(self, request, *, data_directory, progress, cancelled):
+        self.sign_in_gate.begin_wait()
+        self.waiting_for_sign_in.set()
+        while self.sign_in_gate.pending is not None and not cancelled():
+            time.sleep(0.001)
+        self.continued_after_sign_in.set()
+        if not self.finish_work.wait(1):
+            raise RuntimeError("test did not release post-sign-in work")
+        return super().__call__(
+            request,
+            data_directory=data_directory,
+            progress=progress,
+            cancelled=cancelled,
+        )
+
+
+class TerminalRaceGate(_TimedSignInGate):
+    def __init__(self):
+        super().__init__()
+        self.waiting_for_sign_in = Event()
+        self.confirmation_dispatched = Event()
+        self.release_confirmation = Event()
+
+    def begin_wait(self):
+        super().begin_wait()
+        self.waiting_for_sign_in.set()
+
+    def confirm(self):
+        if self.pending is None:
+            raise ValueError("no provider sign-in is waiting for confirmation")
+        provider = self.pending
+        self.pending = None
+        self.confirmed.append(provider)
+        dispatched = tuple(self.listeners)
+        self.confirmation_dispatched.set()
+        if not self.release_confirmation.wait(1):
+            raise RuntimeError("test did not release confirmation")
+        for listener in dispatched:
+            listener(False)
+        return provider
+
+
+class TerminalRaceWorkflow:
+    def __init__(self):
+        self.sign_in_gate = TerminalRaceGate()
+        self.fail = Event()
+
+    def __call__(self, request, *, data_directory, progress, cancelled):
+        self.sign_in_gate.begin_wait()
+        if not self.fail.wait(1):
+            raise RuntimeError("test did not release workflow failure")
+        raise WeeklyCollectionError("forced collection failure")
+
+
+class FakeClock:
+    def __init__(self):
+        self.value = 0.0
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
 
 
 class HistoryWorkflow(SuccessfulWorkflow):
@@ -290,6 +401,145 @@ class WeeklyCollectionRequestTests(unittest.TestCase):
 
 
 class WeeklyCollectionJobTests(unittest.TestCase):
+    def test_scoped_workspace_is_used_and_associated_only_after_publication(self):
+        workflow = SuccessfulWorkflow()
+        observed = {}
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "leagues" / ("league_" + "a" * 32)
+            bundle_directory = root / "bundles"
+            jobs = WeeklyCollectionJobs(directory, bundle_directory, workflow)
+
+            def published(bundle):
+                observed["bundle_id"] = bundle.bundle_id
+                observed["bundle_exists"] = (
+                    bundle_directory / f"{bundle.bundle_id}.json"
+                ).is_file()
+
+            started = jobs.start(
+                valid_request(),
+                data_directory=workspace,
+                on_published=published,
+            )
+            finished = wait_for_collection(jobs.job, started["job_id"])
+
+        self.assertEqual(finished["status"], "complete")
+        self.assertEqual(workflow.calls[0][1], workspace.resolve())
+        self.assertEqual(observed["bundle_id"], finished["bundle_id"])
+        self.assertTrue(observed["bundle_exists"])
+
+    def test_scoped_workspace_and_publication_callback_are_validated(self):
+        with TemporaryDirectory() as directory, TemporaryDirectory() as outside:
+            jobs = WeeklyCollectionJobs(
+                directory,
+                Path(directory) / "bundles",
+                SuccessfulWorkflow(),
+            )
+            with self.assertRaisesRegex(ValueError, "inside application data"):
+                jobs.start(valid_request(), data_directory=outside)
+            with self.assertRaisesRegex(ValueError, "on_published"):
+                jobs.start(valid_request(), on_published="not callable")
+
+    def test_bound_history_is_kept_in_the_selected_league_workspace(self):
+        workflow = HistoryWorkflow()
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "leagues" / ("league_" + "b" * 32)
+            jobs = WeeklyCollectionJobs(directory, root / "bundles", workflow)
+            started = jobs.start(valid_request(), data_directory=workspace)
+            finished = wait_for_collection(jobs.job, started["job_id"])
+            scoped = LeagueHistoryStore(
+                workspace / LEAGUE_HISTORY_FILENAME
+            ).snapshot_for_bundle(finished["bundle_id"])
+            global_history_exists = (root / LEAGUE_HISTORY_FILENAME).exists()
+
+        self.assertEqual(finished["status"], "complete")
+        self.assertIsNotNone(scoped)
+        self.assertFalse(global_history_exists)
+
+    def test_failed_workspace_association_leaves_a_visible_unassigned_bundle(self):
+        def broken_association(_bundle):
+            raise RuntimeError("private catalog detail")
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs = WeeklyCollectionJobs(
+                directory,
+                root / "bundles",
+                SuccessfulWorkflow(),
+            )
+            started = jobs.start(
+                valid_request(),
+                data_directory=root / "leagues" / ("league_" + "c" * 32),
+                on_published=broken_association,
+            )
+            finished = wait_for_collection(jobs.job, started["job_id"])
+            bundle_exists = (
+                root / "bundles" / f"{finished['bundle_id']}.json"
+            ).is_file()
+
+        self.assertEqual(finished["status"], "failed")
+        self.assertTrue(bundle_exists)
+        self.assertIn("Unassigned imports", finished["error"])
+        self.assertNotIn("private catalog detail", finished["error"])
+
+    def test_sign_in_wait_is_excluded_without_polling_and_later_work_is_counted(self):
+        workflow = TimedInteractiveWorkflow()
+        clock = FakeClock()
+        with TemporaryDirectory() as directory:
+            jobs = WeeklyCollectionJobs(
+                directory,
+                Path(directory) / "bundles",
+                workflow,
+                timing_factory=lambda: OperationTiming(clock=clock),
+            )
+            started = jobs.start(valid_request())
+            self.assertTrue(workflow.waiting_for_sign_in.wait(1))
+
+            # The gate transition, not a UI poll, pauses active-time accounting.
+            clock.advance(120)
+            jobs.confirm_sign_in(started["job_id"])
+            self.assertTrue(workflow.continued_after_sign_in.wait(1))
+
+            clock.advance(4.25)
+            workflow.finish_work.set()
+            finished = wait_for_collection(jobs.job, started["job_id"])
+
+        self.assertEqual(finished["status"], "complete")
+        self.assertEqual(finished["operation"]["activity"], "terminal")
+        self.assertEqual(finished["operation"]["elapsed_seconds"], 4.25)
+
+    def test_in_flight_confirmation_is_harmless_after_job_terminalizes(self):
+        workflow = TerminalRaceWorkflow()
+        confirmation = []
+        errors = []
+        with TemporaryDirectory() as directory:
+            jobs = WeeklyCollectionJobs(
+                directory, Path(directory) / "bundles", workflow
+            )
+            started = jobs.start(valid_request())
+            self.assertTrue(workflow.sign_in_gate.waiting_for_sign_in.wait(1))
+
+            def confirm():
+                try:
+                    confirmation.append(jobs.confirm_sign_in(started["job_id"]))
+                except Exception as error:
+                    errors.append(error)
+
+            thread = Thread(target=confirm)
+            thread.start()
+            self.assertTrue(workflow.sign_in_gate.confirmation_dispatched.wait(1))
+            workflow.fail.set()
+            finished = wait_for_collection(jobs.job, started["job_id"])
+            workflow.sign_in_gate.release_confirmation.set()
+            thread.join(1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(confirmation[0]["confirmed_provider"], "fantasypros")
+        self.assertEqual(finished["status"], "failed")
+        self.assertEqual(finished["operation"]["activity"], "terminal")
+
     def test_active_catalog_tracks_only_the_single_running_collection(self):
         entered = Event()
 
@@ -345,7 +595,10 @@ class WeeklyCollectionJobTests(unittest.TestCase):
             )
             first = jobs.start(valid_request())
             wait_for_collection(jobs.job, first["job_id"])
-            self.assertEqual(jobs.recoverable_job()["job_id"], first["job_id"])
+            recovered_first = jobs.recoverable_job()
+            self.assertEqual(recovered_first["job_id"], first["job_id"])
+            self.assertEqual(recovered_first["operation"]["status"], "complete")
+            self.assertEqual(recovered_first["operation"]["activity"], "terminal")
 
             second = jobs.start(valid_request())
             wait_for_collection(jobs.job, second["job_id"])
@@ -536,6 +789,9 @@ class WeeklyCollectionJobTests(unittest.TestCase):
 
         self.assertEqual(finished["status"], "cancelled")
         self.assertIsNone(finished["error"])
+        self.assertTrue(finished["operation"]["cancel_requested"])
+        self.assertEqual(finished["operation"]["status"], "cancelled")
+        self.assertEqual(finished["operation"]["activity"], "terminal")
         self.assertEqual(files, ())
 
     def test_unexpected_failure_is_fail_closed_and_does_not_leak_details(self):
@@ -550,10 +806,84 @@ class WeeklyCollectionJobTests(unittest.TestCase):
 
         self.assertEqual(finished["status"], "failed")
         self.assertNotIn("private-value", finished["error"])
+        self.assertEqual(finished["operation"]["status"], "failed")
+        self.assertEqual(finished["operation"]["activity"], "terminal")
         self.assertEqual(files, ())
 
 
 class WeeklyCollectionServiceTests(unittest.TestCase):
+    def test_yahoo_only_profile_can_collect_with_fantasypros(self):
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(
+                directory,
+                weekly_collection_workflow=SuccessfulWorkflow(),
+            )
+            profile = service.create_league_profile({
+                "name": "FantasyPros League",
+                "season": 2026,
+                "scoring": "PPR",
+                "host_league_url": "",
+                "yahoo_projection_league_url": (
+                    "https://football.fantasysports.yahoo.com/f1/456/players"
+                ),
+            })
+            readiness = service.league_bundle_catalog(
+                profile["profile_id"]
+            )["readiness"]
+
+        self.assertTrue(readiness["collection_available"])
+        self.assertTrue(readiness["fantasypros_collection_available"])
+        self.assertFalse(readiness["independent_collection_available"])
+        self.assertIn("FantasyPros-assisted collection is available", readiness["message"])
+
+    def test_profile_collection_uses_its_workspace_and_registers_the_week(self):
+        workflow = HistoryWorkflow()
+        with TemporaryDirectory() as directory:
+            service = LocalAppService(
+                directory,
+                weekly_collection_workflow=workflow,
+            )
+            profile = service.create_league_profile({
+                "name": "Home League",
+                "season": 2026,
+                "scoring": "PPR",
+                "host_league_url": (
+                    "https://fantasy.espn.com/football/team?"
+                    "leagueId=123&teamId=6&seasonId=2026"
+                ),
+                "yahoo_projection_league_url": (
+                    "https://football.fantasysports.yahoo.com/f1/456/players"
+                ),
+            })
+            started = service.start_profile_weekly_collection(
+                profile["profile_id"],
+                {
+                    "week": 1,
+                    "include_future_weekly": False,
+                    "allow_surrogate_power": False,
+                    "use_fantasypros": True,
+                    "use_broad_consensus": True,
+                    "refresh_public_player_data": False,
+                },
+            )
+            finished = wait_for_collection(
+                service.weekly_collection,
+                started["job_id"],
+            )
+            catalog = service.league_bundle_catalog(profile["profile_id"])
+            workspace = Path(directory) / "leagues" / profile["profile_id"]
+            history = service._league_history_store(
+                finished["bundle_id"]
+            ).snapshot_for_bundle(finished["bundle_id"])
+
+        self.assertEqual(finished["status"], "complete")
+        self.assertEqual(workflow.calls[0][1], workspace.resolve())
+        self.assertEqual(
+            [row["bundle_id"] for row in catalog["bundles"]],
+            [finished["bundle_id"]],
+        )
+        self.assertIsNotNone(history)
+
     def test_collection_registers_bundle_and_search_does_not_call_collection_workflow(self):
         workflow = SuccessfulWorkflow()
         bundle = engine_bundle()
@@ -664,7 +994,7 @@ class WeeklyCollectionHTTPTests(unittest.TestCase):
         page = response.read().decode("utf-8")
         connection.close()
         self.assertEqual(response.status, 200)
-        self.assertIn("Scan league &amp; collect", page)
+        self.assertIn("Scan selected league &amp; collect", page)
         self.assertNotIn('id="expectedTeamCount"', page)
         self.assertIn("League size, every team, and every roster are detected", page)
         self.assertIn('id="hostLeagueUrl"', page)

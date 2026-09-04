@@ -53,7 +53,7 @@ class LeagueProfile:
         if self.yahoo_league_id is None:
             return None
         return (
-            f"https://football.fantasysports.yahoo.com/{self.season}/f1/"
+            "https://football.fantasysports.yahoo.com/f1/"
             f"{self.yahoo_league_id}/players?status=ALL"
         )
 

@@ -24,6 +24,7 @@ from .league_history import (
     LeagueHistoryCapture,
     LeagueHistoryStore,
 )
+from .operation_timing import OperationTiming
 
 LEAGUE_HISTORY_FILENAME = "league-history.sqlite3"
 _PUBLICATION_STAGING_DIRECTORY = ".weekly-publications"
@@ -219,6 +220,9 @@ class _CollectionJob:
     error: str | None = None
     bundle_id: str | None = None
     cancel: Event = field(default_factory=Event)
+    data_directory: Path | None = None
+    on_published: Callable[[EngineBundle], None] | None = None
+    timing: OperationTiming = field(default_factory=OperationTiming)
 
 
 class WeeklyCollectionJobs:
@@ -229,7 +233,11 @@ class WeeklyCollectionJobs:
         data_directory: str | Path,
         bundle_directory: str | Path,
         workflow: WeeklyCollectionWorkflow | None,
+        *,
+        timing_factory: Callable[[], OperationTiming] = OperationTiming,
     ) -> None:
+        if not callable(timing_factory):
+            raise ValueError("timing_factory must be callable")
         self._data_directory = Path(data_directory).resolve()
         self._bundle_directory = Path(bundle_directory).resolve()
         self._publication_staging_directory = (
@@ -240,6 +248,7 @@ class WeeklyCollectionJobs:
                 "weekly publication staging path is outside the bundle directory"
             )
         self._workflow = workflow
+        self._timing_factory = timing_factory
         self._lock = RLock()
         self._jobs: dict[str, _CollectionJob] = {}
         self._pending_terminal_job_id: str | None = None
@@ -293,7 +302,13 @@ class WeeklyCollectionJobs:
                 self._pending_terminal_job_id = None
             return {"job_id": job_id, "acknowledged": acknowledged}
 
-    def start(self, request: WeeklyCollectionRequest) -> dict[str, object]:
+    def start(
+        self,
+        request: WeeklyCollectionRequest,
+        *,
+        data_directory: str | Path | None = None,
+        on_published: Callable[[EngineBundle], None] | None = None,
+    ) -> dict[str, object]:
         if not isinstance(request, WeeklyCollectionRequest):
             raise ValueError("request must be a WeeklyCollectionRequest")
         if self._workflow is None:
@@ -301,10 +316,32 @@ class WeeklyCollectionJobs:
                 "Weekly collection is not available in this build. "
                 "Import a complete weekly bundle instead."
             )
+        workspace = (
+            self._data_directory
+            if data_directory is None
+            else Path(data_directory).resolve()
+        )
+        if (
+            workspace != self._data_directory
+            and self._data_directory not in workspace.parents
+        ):
+            raise ValueError("collection data_directory must stay inside application data")
+        if on_published is not None and not callable(on_published):
+            raise ValueError("on_published must be callable")
+        workspace.mkdir(parents=True, exist_ok=True)
         with self._lock:
             if self.is_running:
                 raise RuntimeError("another weekly collection is already running")
-            job = _CollectionJob(uuid4().hex, request)
+            timing = self._timing_factory()
+            if not isinstance(timing, OperationTiming):
+                raise TypeError("timing_factory must return an OperationTiming")
+            job = _CollectionJob(
+                uuid4().hex,
+                request,
+                data_directory=workspace,
+                on_published=on_published,
+                timing=timing,
+            )
             self._pending_terminal_job_id = None
             self._jobs[job.job_id] = job
             Thread(target=self._run, args=(job,), name="weekly-collection", daemon=True).start()
@@ -339,10 +376,13 @@ class WeeklyCollectionJobs:
             job = self._require(job_id)
             if job.status in ACTIVE_JOB_STATUSES:
                 job.cancel.set()
+                job.timing.request_cancel()
             return self._record(job)
 
     def _run(self, job: _CollectionJob) -> None:
+        unsubscribe_wait_state: Callable[[], None] | None = None
         try:
+            job.timing.start(WeeklyCollectionStage.PREPARING.value)
             self._update(
                 job,
                 status="running",
@@ -352,12 +392,14 @@ class WeeklyCollectionJobs:
                     "Preparing the connected browser extension",
                 ),
             )
+            unsubscribe_wait_state = self._subscribe_sign_in_timing(job)
             if job.cancel.is_set():
+                job.timing.cancel()
                 self._update(job, status="cancelled")
                 return
             result = self._workflow(
                 job.request,
-                data_directory=self._data_directory,
+                data_directory=job.data_directory or self._data_directory,
                 progress=lambda value: self._progress(job, value),
                 cancelled=job.cancel.is_set,
             )
@@ -372,8 +414,10 @@ class WeeklyCollectionJobs:
                     "weekly collection workflow did not return an EngineBundle publication"
                 )
             if job.cancel.is_set():
+                job.timing.cancel()
                 self._update(job, status="cancelled")
                 return
+            job.timing.begin_phase(WeeklyCollectionStage.PUBLISHING.value)
             self._update(
                 job,
                 progress=WeeklyCollectionProgress(
@@ -385,11 +429,29 @@ class WeeklyCollectionJobs:
             if publication is None:
                 save_bundle_with_summary(bundle, self._bundle_path(bundle.bundle_id))
             else:
-                self._publish_bound_publication(publication)
+                self._publish_bound_publication(
+                    publication,
+                    job.data_directory or self._data_directory,
+                )
+            self._update(job, bundle_id=bundle.bundle_id)
+            if job.on_published is not None:
+                try:
+                    job.on_published(bundle)
+                except Exception:
+                    job.timing.fail()
+                    self._update(
+                        job,
+                        status="failed",
+                        error=(
+                            "The weekly engine was saved under Unassigned imports "
+                            "because its league workspace could not be updated."
+                        ),
+                    )
+                    return
+            job.timing.finish()
             self._update(
                 job,
                 status="complete",
-                bundle_id=bundle.bundle_id,
                 progress=WeeklyCollectionProgress(
                     WeeklyCollectionStage.READY,
                     1,
@@ -403,16 +465,25 @@ class WeeklyCollectionJobs:
                 job,
                 "Weekly collection stopped unexpectedly. No new weekly bundle was published.",
             )
+        finally:
+            if unsubscribe_wait_state is not None:
+                try:
+                    unsubscribe_wait_state()
+                except Exception:
+                    # Timing cleanup cannot change an already settled collection.
+                    pass
 
     def _publish_bound_publication(
-        self, publication: WeeklyCollectionPublication
+        self,
+        publication: WeeklyCollectionPublication,
+        data_directory: Path,
     ) -> None:
         """Keep a validated recovery copy until binding and final save both succeed."""
 
         staged_path = self._staged_bundle_path(publication.bundle.bundle_id)
         staged_bundle = self._stage_exact_bundle(publication.bundle, staged_path)
         LeagueHistoryStore(
-            self._data_directory / LEAGUE_HISTORY_FILENAME
+            data_directory / LEAGUE_HISTORY_FILENAME
         ).ingest(
             publication.history_capture,
             bundle=publication.history_binding,
@@ -459,12 +530,6 @@ class WeeklyCollectionJobs:
             return
         if not staged_paths:
             return
-        try:
-            history = LeagueHistoryStore(
-                self._data_directory / LEAGUE_HISTORY_FILENAME
-            )
-        except RuntimeError:
-            return
         for staged_path in staged_paths:
             if staged_path.is_symlink() or not _ENGINE_BUNDLE_ID.fullmatch(
                 staged_path.stem
@@ -474,12 +539,34 @@ class WeeklyCollectionJobs:
                 bundle = load_engine_bundle(staged_path)
                 if staged_path.name != self._bundle_path(bundle.bundle_id).name:
                     continue
-                if history.snapshot_for_bundle(bundle.bundle_id) is None:
+                if not self._has_history_binding(bundle.bundle_id):
                     continue
                 self._publish_staged_bundle(bundle, staged_path)
             except (OSError, RuntimeError, ValueError):
                 # Invalid, unbound, or temporarily unpublishable stages remain private.
                 continue
+
+    def _has_history_binding(self, bundle_id: str) -> bool:
+        roots = [self._data_directory]
+        league_root = self._data_directory / "leagues"
+        try:
+            roots.extend(
+                path
+                for path in league_root.iterdir()
+                if path.is_dir() and not path.is_symlink()
+            )
+        except OSError:
+            pass
+        for root in roots:
+            path = root / LEAGUE_HISTORY_FILENAME
+            if not path.is_file():
+                continue
+            try:
+                if LeagueHistoryStore(path).snapshot_for_bundle(bundle_id) is not None:
+                    return True
+            except (OSError, RuntimeError, ValueError):
+                continue
+        return False
 
     def _bundle_path(self, bundle_id: str) -> Path:
         if not isinstance(bundle_id, str) or not _ENGINE_BUNDLE_ID.fullmatch(
@@ -507,12 +594,16 @@ class WeeklyCollectionJobs:
                 raise ValueError("collection progress cannot move backwards")
             if value.fraction >= 0.99:
                 raise ValueError("workflow progress must leave room for atomic publishing")
+            if previous is None or value.stage != previous.stage:
+                job.timing.begin_phase(value.stage.value)
             job.progress = value
 
     def _finish_error(self, job: _CollectionJob, message: str) -> None:
         if job.cancel.is_set():
+            job.timing.cancel()
             self._update(job, status="cancelled", error=None)
         else:
+            job.timing.fail()
             visible = message.strip() if isinstance(message, str) else ""
             self._update(
                 job,
@@ -532,6 +623,35 @@ class WeeklyCollectionJobs:
                 if not was_terminal:
                     self._pending_terminal_job_id = job.job_id
                 prune_terminal_jobs(self._jobs, _MAX_RETAINED_COLLECTION_JOBS)
+
+    def _subscribe_sign_in_timing(
+        self, job: _CollectionJob
+    ) -> Callable[[], None] | None:
+        gate = getattr(self._workflow, "sign_in_gate", None)
+        subscribe = getattr(gate, "subscribe_wait_state", None)
+        if not callable(subscribe):
+            return None
+
+        def waiting_changed(waiting: bool) -> None:
+            if not isinstance(waiting, bool):
+                raise ValueError("sign-in wait state must be a boolean")
+            if job.timing.snapshot()["status"] != "running":
+                return
+            try:
+                if waiting:
+                    job.timing.pause()
+                else:
+                    job.timing.resume()
+            except RuntimeError:
+                # Terminalization can win a race with a dispatched notification.
+                if job.timing.snapshot()["status"] != "running":
+                    return
+                raise
+
+        unsubscribe = subscribe(waiting_changed)
+        if not callable(unsubscribe):
+            raise TypeError("sign-in wait subscription must be removable")
+        return unsubscribe
 
     def _require(self, job_id: str) -> _CollectionJob:
         try:
@@ -577,6 +697,7 @@ class WeeklyCollectionJobs:
                 "fraction": progress.fraction,
                 "message": progress.message,
             },
+            "operation": job.timing.snapshot(),
         }
 
 

@@ -3,9 +3,13 @@
 const token = document.querySelector('meta[name="app-token"]').content;
 const browserClientId = crypto.randomUUID();
 const $ = id => document.getElementById(id);
+let bundleRows = [];
+let activeBundle = null;
 let bundles = [];
 let activeJob = null;
 let activeCollection = null;
+let activeCollectionClock = null;
+let activeSearchClock = null;
 let collectionLaunching = false;
 let collectionAvailable = false;
 let extensionConnected = false;
@@ -17,6 +21,13 @@ let threeTeamEstimateSignature = null;
 let searchRunning = false;
 let activeSearchFormat = "two_team";
 let activeSearchTeamIds = [];
+let loadedResults = null;
+let loadedResultTeamIds = [];
+let loadedResultJobId = null;
+let loadedResultBundle = null;
+let bundleLoadGeneration = 0;
+let bundleCatalogGeneration = 0;
+let resultLoadGeneration = 0;
 let activeInsight = null;
 let dashboardBundleId = null;
 let gmInsightsBundleId = null;
@@ -216,13 +227,14 @@ function syncCollectionMode() {
       ? "Forecasts use the established FantasyPros, ESPN, and Yahoo core ensemble."
       : "Forecasts use the independent ESPN and Yahoo core ensemble.";
   $("collectionModeHelp").textContent = useFantasyPros
-    ? `FantasyPros supplies ECR and calibration evidence; ESPN supplies league rules, rosters, standings, and schedules; Yahoo supplies league-scored projections. ${projectionText} Only numeric league identifiers are retained.`
+    ? `FantasyPros supplies ECR and calibration evidence; the saved ESPN connection supplies league rules, rosters, standings, and schedules; the saved Yahoo connection supplies league-scored projections. ${projectionText} Only numeric league identifiers are retained.`
     : `FantasyPros will not be opened or required. ESPN supplies the league, custom lineup/IR rules, standings, and schedules; Yahoo supplies league-scored projections. ${projectionText} Power is produced by the transparent independent model.`;
+  updateActivityControls();
   scheduleSourceDebugRefresh();
 }
 
 function currentBundle() {
-  return bundles.find(item => item.bundle_id === $("bundleSelect").value) || null;
+  return activeBundle?.bundle_id === $("bundleSelect").value ? activeBundle : null;
 }
 
 function tradeFormat() {
@@ -297,7 +309,7 @@ function renderExtensionStatus(status) {
   $("extensionDot").classList.toggle("connected", extensionConnected);
   $("extensionStatus").textContent = statusText;
   $("extensionHelp").textContent = helpText;
-  $("connectExtensionButton").disabled = extensionConnected || pairing;
+  $("connectExtensionButton").disabled = ProgressUi.isBusy() || extensionConnected || pairing;
   $("connectExtensionButton").textContent = buttonText;
   const pairCode = $("extensionPairCode");
   const showPairCode = pairing && typeof extensionPairHint === "string";
@@ -369,14 +381,57 @@ async function connectExtension() {
 }
 
 async function refreshBundles(selectId = null) {
-  const response = await api("/api/bundles");
-  const previous = $("bundleSelect").value;
-  bundles = response.bundles.filter(item => item.status === "ready");
+  const generation = ++bundleCatalogGeneration;
+  const path = LeagueUi.bundleCatalogPath();
+  const select = $("bundleSelect");
+  const previous = select.value;
+  ++bundleLoadGeneration;
+  ++resultLoadGeneration;
+  bundleRows = [];
+  activeBundle = null;
+  bundles = [];
+  activeJob = null;
+  loadedResults = null;
+  loadedResultTeamIds = [];
+  loadedResultJobId = null;
+  loadedResultBundle = null;
+  collectionAvailable = false;
+  select.replaceChildren(new Option(
+    path ? "Loading weekly history…" : "No league selected",
+    ""
+  ));
+  select.disabled = true;
+  $("collectButton").disabled = true;
+  $("progressPanel").classList.add("hidden");
+  $("resultsPanel").classList.add("hidden");
+  renderBundle();
+  const response = path
+    ? await ProgressUi.run(
+        "bundle-catalog",
+        "Checking this league's weekly history",
+        () => api(path)
+      )
+    : {
+        bundles: [],
+        readiness: {
+          ready: false,
+          collection_available: false,
+          message: "Add or choose a league workspace to begin."
+        }
+      };
+  if (generation !== bundleCatalogGeneration) return;
+  bundleRows = response.bundles.filter(item => item.status === "ready");
   collectionAvailable = response.readiness.collection_available;
   renderReadiness(response.readiness);
-  const select = $("bundleSelect");
-  select.replaceChildren(new Option(bundles.length ? "Choose a ready week" : "No weekly bundle yet", ""));
-  for (const bundle of bundles) {
+  select.replaceChildren(new Option(
+    bundleRows.length
+      ? "Choose a ready week"
+      : path
+        ? "No weekly bundle yet"
+        : "No league selected",
+    ""
+  ));
+  for (const bundle of bundleRows) {
     const mode = bundle.power_engine_mode === "surrogate"
       ? " · SURROGATE"
       : bundle.power_engine_mode === "independent"
@@ -385,20 +440,51 @@ async function refreshBundles(selectId = null) {
     const option = new Option(`${bundle.season} · Week ${bundle.week} · ${bundle.team_count} teams${mode}`, bundle.bundle_id);
     select.add(option);
   }
-  select.disabled = bundles.length === 0;
+  select.disabled = bundleRows.length === 0;
   select.value = selectId || previous;
-  if (!select.value && bundles.length === 1 && bundles[0].power_engine_mode !== "surrogate") {
-    select.value = bundles[0].bundle_id;
+  if (
+    !select.value
+    && bundleRows.length === 1
+    && bundleRows[0].power_engine_mode !== "surrogate"
+  ) {
+    select.value = bundleRows[0].bundle_id;
   }
-  $("collectButton").disabled = !collectionAvailable || !extensionConnected || Boolean(activeCollection);
-  $("collectButton").title = collectionAvailable ? "" : "Import a complete weekly bundle in this build.";
-  changeBundle();
+  const profile = LeagueUi.selectedProfile();
+  $("collectButton").title = collectionAvailable
+    ? ""
+    : profile?.archived
+      ? "Restore this league before collecting a new week."
+      : profile && !profile.yahoo_league_id
+        ? "Add the Yahoo connection in League settings."
+        : profile && !profile.espn_league_id
+          ? "Add the ESPN connection in League settings for independent mode."
+          : "Choose an active league workspace to collect a new week.";
+  renderLeagueCollectionSummary();
+  await changeBundle();
 }
 
 function renderReadiness(readiness) {
   const row = $("readiness");
   row.textContent = readiness.message;
   row.className = `readiness ${readiness.ready ? "ready" : "not-ready"}`;
+}
+
+function renderLeagueCollectionSummary() {
+  const profile = LeagueUi.selectedProfile();
+  if (profile) {
+    $("collectionLeagueName").textContent = profile.name;
+    const connections = [
+      profile.espn_league_id ? "ESPN saved" : "ESPN not connected",
+      profile.yahoo_league_id ? "Yahoo saved" : "Yahoo not connected"
+    ].join(" · ");
+    $("collectionLeagueDetails").textContent = `${profile.season} · ${profile.scoring} scoring · ${connections}${profile.archived ? " · archived, view only" : ""}`;
+  } else if (LeagueUi.isUnassigned()) {
+    $("collectionLeagueName").textContent = "Unassigned imports";
+    $("collectionLeagueDetails").textContent = "Choose or add a league to scan a new week.";
+  } else {
+    $("collectionLeagueName").textContent = "Choose a league workspace";
+    $("collectionLeagueDetails").textContent = "Its saved season, scoring, ESPN, and Yahoo connections will be used.";
+  }
 }
 
 function renderBundle() {
@@ -417,6 +503,7 @@ function renderBundle() {
     threeTeamEstimateSignature = null;
     ThreeWayUi.syncPartnerOptions(null, "");
     ThreeWayUi.syncFormatControls(null);
+    $("assignBundleControls").classList.add("hidden");
     $("skipSmall").disabled = false;
     $("skipSmall").title = "";
     populatePackageFilters();
@@ -426,6 +513,10 @@ function renderBundle() {
   for (const team of bundle.teams) {
     primary.add(new Option(team.name, team.team_id));
     others.add(new Option(team.name, team.team_id));
+  }
+  const savedTeam = LeagueUi.selectedProfile()?.my_team_id;
+  if (savedTeam && [...primary.options].some(option => option.value === savedTeam)) {
+    primary.value = savedTeam;
   }
   const surrogate = bundle.power_engine_mode === "surrogate";
   const independent = bundle.power_engine_mode === "independent";
@@ -460,21 +551,51 @@ function renderBundle() {
     ? "The independent engine has no FantasyPros small-trade exclusion."
     : "";
   $("estimateButton").disabled = Boolean(activeCollection);
+  const canAssign = LeagueUi.isUnassigned()
+    && $("assignLeagueSelect").options.length > 1;
+  $("assignBundleControls").classList.toggle("hidden", !canAssign);
   syncCounterparties();
   ThreeWayUi.syncFormatControls(bundle);
   updateSearchStartButton();
 }
 
 function changeBundle() {
+  return loadSelectedBundle().catch(showError);
+}
+
+async function loadSelectedBundle() {
   clearError();
+  const generation = ++bundleLoadGeneration;
+  const bundleId = $("bundleSelect").value;
   recoveredSearchScopeOnly = false;
+  activeBundle = null;
+  bundles = [];
   activeJob = null;
+  loadedResults = null;
+  loadedResultTeamIds = [];
+  loadedResultJobId = null;
+  loadedResultBundle = null;
+  ++resultLoadGeneration;
   $("progressPanel").classList.add("hidden");
   $("resultsPanel").classList.add("hidden");
   $("progressBar").style.width = "0%";
   $("progressStats").textContent = "";
   $("estimate").textContent = "Choose a ready week, then count the combinations.";
   threeTeamEstimateSignature = null;
+  renderBundle();
+  if (bundleId) {
+    const loaded = await ProgressUi.run(
+      "bundle-load",
+      "Loading the selected weekly engine",
+      () => api(`/api/bundles/${encodeURIComponent(bundleId)}`)
+    );
+    if (
+      generation !== bundleLoadGeneration
+      || $("bundleSelect").value !== bundleId
+    ) return;
+    activeBundle = loaded;
+    bundles = [loaded];
+  }
   renderBundle();
   dashboardBundleId = null;
   gmInsightsBundleId = null;
@@ -505,7 +626,7 @@ function updateActivityControls() {
   const tradeBusy = searchRunning || collectionLaunching || Boolean(activeCollection) || Boolean(activeInsight) || exportBusy;
   const busy = tradeBusy || draftWorkBusy;
   $("bundleFile").disabled = busy;
-  $("bundleSelect").disabled = bundles.length === 0 || busy;
+  $("bundleSelect").disabled = bundleRows.length === 0 || busy;
   $("dashboardLoadButton").disabled = !bundle || busy;
   $("gmInsightsLoadButton").disabled = !bundle || busy;
   $("tradeTimingLoadButton").disabled = !bundle || busy;
@@ -519,12 +640,29 @@ function updateActivityControls() {
   $("playerLabLoadButton").textContent =
     bundle && playerLabBundleId === bundle.bundle_id ? "Refresh Player Lab" : "Open Player Lab";
   $("collectButton").disabled =
-    !collectionAvailable || !extensionConnected || busy;
+    !collectionAvailable || !extensionConnected || !LeagueUi.canCollect() || busy;
+  LeagueUi.setBusy(tradeBusy);
   window.TradeAppBusy = tradeBusy;
   if (publishedTradeBusy !== tradeBusy) {
     publishedTradeBusy = tradeBusy;
     window.dispatchEvent(new CustomEvent("tradeactivitychange", {detail: {busy: tradeBusy}}));
   }
+}
+
+function setSearchRunning(running) {
+  searchRunning = running;
+  for (const element of $("searchForm").elements) {
+    if (element.id === "cancelButton") continue;
+    if (running && element.dataset.disabledBeforeSearch === undefined) {
+      element.dataset.disabledBeforeSearch = element.disabled ? "true" : "false";
+      element.disabled = true;
+    } else if (!running && element.dataset.disabledBeforeSearch !== undefined) {
+      element.disabled = element.dataset.disabledBeforeSearch === "true";
+      delete element.dataset.disabledBeforeSearch;
+    }
+  }
+  $("cancelButton").disabled = !running;
+  updateSearchStartButton();
 }
 
 function jobIsActive(job) {
@@ -540,16 +678,11 @@ function restoreSearchScope(search) {
     ...(Array.isArray(request.counterparty_team_ids) ? request.counterparty_team_ids : [])
   ].filter(Boolean);
 
-  const bundle = bundles.find(item => item.bundle_id === request.bundle_id);
-  if (!bundle) {
-    $("bundleSelect").value = "";
+  const bundle = currentBundle();
+  if (!bundle || bundle.bundle_id !== request.bundle_id) {
     renderBundle();
-    $("estimate").textContent = "Recovered a saved search, but its weekly bundle is no longer available in the selector. Its status and retained results remain attached.";
+    $("estimate").textContent = "Recovered a saved search, but its league workspace is not selected. Its status and retained results remain attached.";
     return;
-  }
-  if ($("bundleSelect").value !== bundle.bundle_id) {
-    $("bundleSelect").value = bundle.bundle_id;
-    renderBundle();
   }
 
   const teamIds = new Set(bundle.teams.map(team => team.team_id));
@@ -585,8 +718,7 @@ async function restoreActiveWork(activity) {
   const restoreCollection = collection && !collectionLaunching && !activeCollection;
   const restoreSearch = search && !searchRunning && !activeJob;
   if (restoreSearch && jobIsActive(search)) {
-    searchRunning = true;
-    updateSearchStartButton();
+    setSearchRunning(true);
   }
 
   if (restoreCollection) {
@@ -600,14 +732,19 @@ async function restoreActiveWork(activity) {
   if (restoreSearch) {
     restoreSearchScope(search);
     activeJob = search.job_id;
-    searchRunning = jobIsActive(search);
+    setSearchRunning(jobIsActive(search));
     $("progressPanel").classList.remove("hidden");
     $("resultsPanel").classList.add("hidden");
     $("cancelButton").classList.toggle("hidden", !searchRunning);
     renderProgress(search);
     updateSearchStartButton();
-    if (searchRunning) void pollJob().catch(showError);
-    else void finishSearch(search).catch(showError);
+    const context = {
+      jobId: search.job_id,
+      teamIds: [...activeSearchTeamIds],
+      bundle: currentBundle()
+    };
+    if (searchRunning) void pollJob(context).catch(showError);
+    else void finishSearch(search, context).catch(showError);
   }
 
   updateSearchStartButton();
@@ -737,14 +874,20 @@ function invalidateSearchEstimate() {
 }
 
 function collectionPayload() {
-  const hostLeagueUrl = $("hostLeagueUrl").value.trim();
-  const yahooProjectionUrl = $("yahooProjectionUrl").value.trim();
+  const profile = LeagueUi.selectedProfile();
+  if (!profile) throw new Error("Choose a league workspace first.");
+  const hostLeagueUrl = profile.espn_league_id
+    ? `https://fantasy.espn.com/football/league?leagueId=${profile.espn_league_id}&seasonId=${profile.season}`
+    : null;
+  const yahooProjectionUrl = profile.yahoo_league_id
+    ? `https://football.fantasysports.yahoo.com/f1/${profile.yahoo_league_id}/players?status=ALL`
+    : null;
   return {
-    season: numberValue("collectionSeason"),
+    season: profile.season,
     week: numberValue("collectionWeek"),
-    scoring: $("collectionScoring").value,
-    host_league_url: hostLeagueUrl || null,
-    yahoo_projection_league_url: yahooProjectionUrl || null,
+    scoring: profile.scoring,
+    host_league_url: hostLeagueUrl,
+    yahoo_projection_league_url: yahooProjectionUrl,
     include_future_weekly: $("includeFutureWeekly").checked,
     allow_surrogate_power: $("allowSurrogatePower").checked,
     use_fantasypros: $("useFantasyPros").checked,
@@ -757,13 +900,27 @@ async function startCollection(event) {
   event.preventDefault();
   if (collectionLaunching || activeCollection || draftWorkBusy) return;
   clearError();
-  collectionLaunching = true;
-  setCollectionRunning(true);
   try {
     if (!extensionConnected) throw new Error("Connect the browser extension before scanning the league.");
+    const payload = LeagueUi.collectionPayload();
+    activeCollectionClock = ProgressUi.startHistory("weekly-collection");
+    collectionLaunching = true;
+    setCollectionRunning(true);
+    $("collectionProgress").classList.remove("hidden");
+    ProgressUi.setBar(
+      $("collectionProgress").querySelector(".progress-track"),
+      $("collectionProgressBar"),
+      null,
+      "Validating the selected league workspace"
+    );
+    $("collectionProgressText").textContent = "Validating the selected league workspace…";
+    $("collectionTiming").textContent = ProgressUi.describeTiming(
+      null,
+      activeCollectionClock
+    );
     const job = await api("/api/weekly-collections", {
       method: "POST",
-      body: JSON.stringify(collectionPayload())
+      body: JSON.stringify(payload)
     });
     activeCollection = job.job_id;
     collectionLaunching = false;
@@ -771,6 +928,8 @@ async function startCollection(event) {
     renderCollectionProgress(job);
     await pollCollection();
   } catch (error) {
+    ProgressUi.finishHistory(activeCollectionClock, false);
+    activeCollectionClock = null;
     collectionLaunching = false;
     if (!activeCollection) setCollectionRunning(false);
     showError(error);
@@ -787,18 +946,25 @@ async function pollCollection() {
       ));
       return;
     }
+    const terminal = !jobIsActive(job);
+    if (terminal) {
+      ProgressUi.finishHistory(activeCollectionClock, job.status === "complete");
+    }
     renderCollectionProgress(job);
-    if (!jobIsActive(job)) {
+    if (terminal) {
       await finishCollection(job);
       return;
     }
     await new Promise(resolve => setTimeout(resolve, 500));
   }
+  ProgressUi.finishHistory(activeCollectionClock, false);
+  activeCollectionClock = null;
   activeCollection = null;
   setCollectionRunning(false);
 }
 
 async function finishCollection(job) {
+  activeCollectionClock = null;
   activeCollection = null;
   setCollectionRunning(false);
   if (job.status === "complete") {
@@ -820,12 +986,24 @@ async function finishCollection(job) {
 function renderCollectionProgress(job) {
   $("collectionProgress").classList.remove("hidden");
   const progress = job.progress;
-  const pct = progress ? Math.min(100, progress.fraction * 100) : 0;
-  $("collectionProgressBar").style.width = `${pct}%`;
+  const fraction = job.operation?.progress?.determinate
+    ? job.operation.progress.fraction
+    : progress?.fraction ?? null;
+  ProgressUi.setBar(
+    $("collectionProgress").querySelector(".progress-track"),
+    $("collectionProgressBar"),
+    fraction,
+    progress?.message || "Weekly collection is waiting to start"
+  );
   $("collectionProgressText").textContent = progress
-    ? `${progress.message} · ${pct.toFixed(0)}%`
+    ? progress.message
     : "Weekly collection is waiting to start…";
   const pending = job.sign_in && job.sign_in.pending_provider;
+  ProgressUi.pauseHistory(activeCollectionClock, Boolean(pending));
+  $("collectionTiming").textContent = ProgressUi.describeTiming(
+    job.operation,
+    activeCollectionClock
+  );
   const labels = {
     fantasypros: "FantasyPros",
     espn: "ESPN",
@@ -842,11 +1020,17 @@ function renderCollectionProgress(job) {
 }
 
 function setCollectionRunning(running) {
-  $("cancelCollectionButton").classList.toggle("hidden", !running);
+  $("cancelCollectionButton").classList.toggle(
+    "hidden",
+    !running || !activeCollection
+  );
   for (const element of $("collectionForm").elements) {
     if (element.id !== "cancelCollectionButton") element.disabled = running;
   }
-  $("collectButton").disabled = running || !collectionAvailable || !extensionConnected;
+  $("collectButton").disabled = running
+    || !collectionAvailable
+    || !extensionConnected
+    || !LeagueUi.canCollect();
   $("estimateButton").disabled = running || !$("bundleSelect").value;
   updateSearchStartButton();
   if (!running) {
@@ -881,10 +1065,18 @@ async function cancelCollection() {
 
 async function estimate() {
   clearError();
+  $("estimateButton").disabled = true;
   try {
     const payload = requestPayload();
     const signature = searchConfigurationSignature(payload);
-    const value = await api("/api/searches/estimate", {method: "POST", body: JSON.stringify(payload)});
+    const value = await ProgressUi.run(
+      "candidate-count",
+      "Counting valid trade combinations",
+      () => api("/api/searches/estimate", {
+        method: "POST",
+        body: JSON.stringify(payload)
+      })
+    );
     const candidateCount = ThreeWayUi.exactCandidateCount(value);
     if (signature !== searchConfigurationSignature()) {
       updateSearchStartButton();
@@ -908,6 +1100,8 @@ async function estimate() {
     threeTeamEstimateSignature = null;
     updateSearchStartButton();
     showError(error);
+  } finally {
+    updateSearchStartButton();
   }
 }
 
@@ -915,77 +1109,129 @@ async function startSearch(event) {
   event.preventDefault();
   if (searchRunning || draftWorkBusy) return;
   clearError();
+  let jobAccepted = false;
   try {
     const payload = requestPayload();
     if (payload.trade_format === "three_team" && threeTeamEstimateSignature !== searchConfigurationSignature(payload)) {
       throw new Error("Count this specific three-team search before starting it.");
     }
-    searchRunning = true;
+    activeSearchClock = ProgressUi.startHistory("trade-search");
     activeSearchFormat = payload.trade_format;
     activeSearchTeamIds = [payload.primary_team_id, ...payload.counterparty_team_ids];
-    updateSearchStartButton();
-    const job = await api("/api/searches", {method: "POST", body: JSON.stringify(payload)});
-    activeJob = job.job_id;
+    const searchBundle = currentBundle();
+    setSearchRunning(true);
     $("progressPanel").classList.remove("hidden");
     $("resultsPanel").classList.add("hidden");
+    $("cancelButton").classList.add("hidden");
+    ProgressUi.setBar(
+      $("progressPanel").querySelector(".progress-track"),
+      $("progressBar"),
+      null,
+      "Validating the search and preparing the season simulation"
+    );
+    $("progressText").textContent = "Validating the search and preparing the shared season simulation…";
+    $("progressStats").textContent = "Exact combination progress will appear when the search phase begins.";
+    $("searchTiming").textContent = ProgressUi.describeTiming(null, activeSearchClock);
+    const job = await api("/api/searches", {method: "POST", body: JSON.stringify(payload)});
+    activeJob = job.job_id;
+    jobAccepted = true;
     $("cancelButton").classList.remove("hidden");
-    $("collectButton").disabled = true;
-    $("bundleSelect").disabled = true;
-    await pollJob();
+    await pollJob({
+      jobId: job.job_id,
+      teamIds: [...activeSearchTeamIds],
+      bundle: searchBundle
+    });
   } catch (error) {
-    searchRunning = false;
-    updateSearchStartButton();
+    ProgressUi.finishHistory(activeSearchClock, false);
+    activeSearchClock = null;
+    setSearchRunning(false);
+    if (!jobAccepted) {
+      $("progressPanel").classList.add("hidden");
+      $("resultsPanel").classList.toggle("hidden", !loadedResults);
+    }
     showError(error);
   }
 }
 
-async function pollJob() {
-  while (activeJob) {
+async function pollJob(context) {
+  while (activeJob === context.jobId) {
     let job;
-    try { job = await api(`/api/searches/${activeJob}`); }
+    try { job = await api(`/api/searches/${context.jobId}`); }
     catch (error) {
-      updateSearchStartButton();
+      $("cancelButton").classList.add("hidden");
       showError(new Error(
         `${error.message} The search may still be running locally; refresh this page to reconnect.`
       ));
       return;
     }
+    if (activeJob !== context.jobId) return;
+    const terminal = !jobIsActive(job);
+    if (terminal) {
+      ProgressUi.finishHistory(activeSearchClock, job.status === "complete");
+    }
     renderProgress(job);
-    if (!jobIsActive(job)) {
-      await finishSearch(job);
-      break;
+    if (terminal) {
+      await finishSearch(job, context);
+      return;
     }
     await new Promise(resolve => setTimeout(resolve, 500));
   }
+  if (activeJob === null && searchRunning) {
+    ProgressUi.finishHistory(activeSearchClock, false);
+    activeSearchClock = null;
+    setSearchRunning(false);
+    $("cancelButton").classList.add("hidden");
+  }
 }
 
-async function finishSearch(job) {
-  searchRunning = false;
-  updateSearchStartButton();
+async function finishSearch(job, context) {
   $("cancelButton").classList.add("hidden");
-  if (job.status === "complete") {
-    await loadResults();
-  } else if (job.status === "failed") {
-    $("progressText").textContent = "Search failed.";
-    showError(job.error || "The search failed.");
-  } else {
-    $("progressText").textContent = "Stopped safely. Start again later to resume from this checkpoint.";
-  }
   try {
-    await api(`/api/searches/${job.job_id}/activity-ack`, {method: "POST", body: ""});
-  } catch (_) {
-    /* Keep the retained result recoverable if acknowledgement is interrupted. */
+    if (job.status === "complete") {
+      await loadResults(context);
+    } else if (job.status === "failed") {
+      $("progressText").textContent = "Search failed.";
+      showError(job.error || "The search failed.");
+    } else {
+      $("progressText").textContent = "Stopped safely. Start again later to resume from this checkpoint.";
+    }
+  } finally {
+    try {
+      await api(`/api/searches/${job.job_id}/activity-ack`, {method: "POST", body: ""});
+    } catch (_) {
+      /* Keep the retained result recoverable if acknowledgement is interrupted. */
+    }
+    activeSearchClock = null;
+    if (activeJob === context.jobId) activeJob = null;
+    setSearchRunning(false);
   }
 }
 
 function renderProgress(job) {
   const progress = job.progress;
+  const operationFraction = job.operation?.progress?.determinate
+    ? job.operation.progress.fraction
+    : progress?.completion_fraction ?? null;
+  ProgressUi.setBar(
+    $("progressPanel").querySelector(".progress-track"),
+    $("progressBar"),
+    operationFraction,
+    job.operation?.phase === "preparing_season_simulation"
+      ? "Preparing the shared season simulation"
+      : "Searching trade combinations"
+  );
+  $("searchTiming").textContent = ProgressUi.describeTiming(
+    job.operation,
+    activeSearchClock
+  );
   if (!progress) {
-    $("progressText").textContent = "Preparing the shared season simulation…";
+    $("progressText").textContent = job.operation?.cancel_requested
+      ? "Stopping safely after the current simulation step…"
+      : "Preparing the shared season simulation…";
+    $("progressStats").textContent = "The search will show exact combination progress as soon as preparation finishes.";
     return;
   }
   const pct = Math.min(100, progress.completion_fraction * 100);
-  $("progressBar").style.width = `${pct}%`;
   const threeTeam = activeSearchFormat === "three_team";
   const current = threeTeam
     ? " · selected three-team agreement"
@@ -1047,8 +1293,18 @@ function renderTwoTeamTradeRows(rows) {
   }
 }
 
-async function loadResults() {
-  const value = await api(`/api/searches/${activeJob}/results`);
+async function loadResults(context) {
+  const generation = ++resultLoadGeneration;
+  const value = await ProgressUi.run(
+    "result-preview",
+    "Preparing the result preview",
+    () => api(`/api/searches/${context.jobId}/results`)
+  );
+  if (generation !== resultLoadGeneration || activeJob !== context.jobId) return;
+  loadedResults = value;
+  loadedResultTeamIds = [...context.teamIds];
+  loadedResultJobId = context.jobId;
+  loadedResultBundle = context.bundle;
   const outlookBody = $("outlookBody");
   outlookBody.replaceChildren();
   for (const row of value.team_outlook) {
@@ -1070,27 +1326,49 @@ async function loadResults() {
     });
     outlookBody.append(tr);
   }
+  renderLoadedResults();
+  $("resultsPanel").classList.remove("hidden");
+}
+
+function resultWorkbenchControls() {
+  return ResultsWorkbench.readControlValues({
+    onlyAllParticipantsImprove: $("onlyMutualResults").checked,
+    minimumPlayoffGainPoints: $("minimumResultGain").value.trim(),
+    sortBy: $("resultSort").value
+  });
+}
+
+function renderLoadedResults() {
+  if (!loadedResults) return;
+  const value = loadedResults;
+  const threeTeam = value.trade_format === "three_team";
+  const rows = ResultsWorkbench.filterAndSort(
+    value.rows,
+    {
+      tradeFormat: threeTeam ? "three_team" : "two_team",
+      primaryTeamId: loadedResultTeamIds[0]
+    },
+    resultWorkbenchControls()
+  );
   const body = $("resultsBody");
   body.replaceChildren();
-  const threeTeam = value.trade_format === "three_team";
   if (threeTeam) {
     ThreeWayUi.renderTradeRows(
-      value.rows,
-      activeSearchTeamIds,
-      currentBundle(),
+      rows,
+      loadedResultTeamIds,
+      loadedResultBundle,
       {signed, percent}
     );
   }
-  else renderTwoTeamTradeRows(value.rows);
+  else renderTwoTeamTradeRows(rows);
   const powerNotice = value.power_engine_mode === "exact"
     ? (threeTeam ? ` POWER NOTICE: ${value.power_engine_notice}` : "")
     : ` ${value.power_engine_mode.toUpperCase()} POWER: ${value.power_engine_notice}`;
-  const gainLabel = threeTeam ? "trades improving all three teams first" : "mutual gains first";
   const adjustmentPolicy = value.free_agent_allocation_policy
     ? ` Automatic roster adjustment policy: ${value.free_agent_allocation_policy}`
     : "";
-  $("resultsNote").textContent = `Showing ${compactNumber(value.shown_count)} of ${compactNumber(value.total_count_text ?? value.total_count)} qualified trades, with ${gainLabel}.${powerNotice}${adjustmentPolicy}`;
-  $("resultsPanel").classList.remove("hidden");
+  $("workbenchCount").textContent = `${compactNumber(rows.length)} of ${compactNumber(value.rows.length)} loaded results shown`;
+  $("resultsNote").textContent = `The workbench is filtering the ${compactNumber(value.shown_count)} loaded preview rows from ${compactNumber(value.total_count_text ?? value.total_count)} qualified trades. The Excel workbook still contains the full qualified result set.${powerNotice}${adjustmentPolicy}`;
 }
 
 async function cancelSearch() {
@@ -1106,8 +1384,22 @@ async function exportWorkbook() {
   $("exportButton").disabled = true;
   updateSearchStartButton();
   try {
-    const result = await api(`/api/searches/${activeJob}/export`, {method: "POST", body: ""});
-    const blob = await api(`/api/exports/${encodeURIComponent(result.filename)}`);
+    const jobId = loadedResultJobId;
+    if (!jobId) throw new Error("Run a trade search before exporting its results.");
+    const [result, blob] = await ProgressUi.run(
+      "excel-export",
+      "Building and downloading the Excel workbook",
+      async () => {
+        const created = await api(`/api/searches/${jobId}/export`, {
+          method: "POST",
+          body: ""
+        });
+        return [
+          created,
+          await api(`/api/exports/${encodeURIComponent(created.filename)}`)
+        ];
+      }
+    );
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
     link.download = result.filename;
@@ -1154,14 +1446,33 @@ $("bundleFile").addEventListener("change", async event => {
     if (file.size > 256 * 1024 * 1024) {
       throw new Error("Weekly bundle files must be 256 MB or smaller.");
     }
-    const record = JSON.parse(await file.text());
-    const summary = await api("/api/bundles/import", {method: "POST", body: JSON.stringify(record)});
-    await refreshBundles(summary.bundle_id);
+    const hadProfile = Boolean(LeagueUi.selectedProfile());
+    await ProgressUi.run(
+      "bundle-import",
+      "Validating and importing weekly data",
+      async () => {
+        const recordText = await file.text();
+        JSON.parse(recordText);
+        const summary = await api(LeagueUi.importPath(), {
+          method: "POST",
+          body: recordText
+        });
+        if (!hadProfile) {
+          await LeagueUi.refresh(LeagueUi.UNASSIGNED, {notify: false});
+        }
+        await refreshBundles(summary.bundle_id);
+      }
+    );
   } catch (error) { showError(error); }
+  finally { event.target.value = ""; }
 });
 $("bundleSelect").addEventListener("change", changeBundle);
 $("primaryTeam").addEventListener("change", () => {
   syncCounterparties();
+  LeagueUi.saveMyTeam(
+    $("primaryTeam").value,
+    $("bundleSelect").value
+  ).catch(showError);
   GmInsightsUi.setPrimaryTeam($("primaryTeam").value);
   if (tradeTimingBundleId !== null) {
     tradeTimingBundleId = null;
@@ -1197,6 +1508,30 @@ $("searchForm").addEventListener("change", searchConfigurationChanged);
 $("searchForm").addEventListener("submit", startSearch);
 $("cancelButton").addEventListener("click", cancelSearch);
 $("exportButton").addEventListener("click", exportWorkbook);
+$("assignBundleButton").addEventListener("click", () => {
+  const bundle = currentBundle();
+  if (bundle) LeagueUi.assignBundle(bundle.bundle_id).catch(showError);
+});
+for (const id of ["onlyMutualResults", "minimumResultGain", "resultSort"]) {
+  $(id).addEventListener("input", () => {
+    try {
+      clearError();
+      renderLoadedResults();
+    } catch (error) {
+      showError(error);
+    }
+  });
+}
+
+LeagueUi.bind({
+  api,
+  onSelection: async () => {
+    clearError();
+    await refreshBundles();
+    scheduleSourceDebugRefresh();
+  },
+  onError: showError
+});
 
 (async () => {
   try {
@@ -1208,6 +1543,7 @@ $("exportButton").addEventListener("click", exportWorkbook);
     const activity = await api("/api/activity");
     draftWorkBusy = jobIsActive(activity.draft);
     await refreshExtensionStatus();
+    await LeagueUi.refresh(null, {notify: false});
     await refreshBundles(activity.search?.request?.bundle_id || null);
     await restoreActiveWork(activity);
     setInterval(refreshExtensionStatus, 5000);

@@ -69,7 +69,7 @@ class LeagueCatalogTests(unittest.TestCase):
                 "espn_collection_url": ESPN_123,
                 "yahoo_league_id": "456",
                 "yahoo_collection_url": (
-                    "https://football.fantasysports.yahoo.com/2026/f1/456/"
+                    "https://football.fantasysports.yahoo.com/f1/456/"
                     "players?status=ALL"
                 ),
                 "my_team_id": None,

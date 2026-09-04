@@ -316,6 +316,18 @@ class LeagueWorkspaceService:
             if BUNDLE_ID_PATTERN.fullmatch(path.stem) and path.stem not in associated
         ))
 
+    def data_directory_for_bundle(self, bundle_id: str) -> Path:
+        """Return the private workspace that owns a bundle's mutable evidence."""
+
+        self._bundle_path(bundle_id)
+        association = self.catalog.bundle_association(bundle_id)
+        if association is None:
+            return self.data_directory
+        workspace = (self.workspace_directory / association.profile_id).resolve()
+        if workspace.parent != self.workspace_directory:
+            raise ValueError("league workspace path is invalid")
+        return workspace
+
     def _bundle_path(self, bundle_id: str) -> Path:
         if not isinstance(bundle_id, str) or not BUNDLE_ID_PATTERN.fullmatch(bundle_id):
             raise ValueError("bundle_id is invalid")

@@ -42,6 +42,8 @@ from .league_search import (
     LeagueSearchProgress,
     ResumableLeagueTradeSearch,
 )
+from .league_workspace import UNASSIGNED_PROFILE_ID, LeagueWorkspaceService
+from .operation_timing import OperationTiming
 from .player_outlook import build_player_outlook
 from .player_outlook_detail import build_player_outlook_detail_from_bundle
 from .player_outlook_lazy import (
@@ -76,8 +78,8 @@ from .trade_filters import (
     parse_trade_filter,
 )
 from .trade_impact import PreparedSeasonBaseline, prepare_season_baseline
-from .trade_timing import build_trade_timing
 from .trade_space import TeamRoster, TradeConstraints, TradeSpace
+from .trade_timing import build_trade_timing
 from .weekly_collection import (
     LEAGUE_HISTORY_FILENAME,
     WeeklyCollectionJobs,
@@ -264,6 +266,7 @@ class _SearchJob:
     outcome: LeagueSearchOutcome | ThreeWaySearchOutcome | None = None
     context: "_CompletedSearchContext | None" = None
     cancel: Event = field(default_factory=Event)
+    timing: OperationTiming = field(default_factory=OperationTiming)
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +295,10 @@ class LocalAppService:
         self._lock = RLock()
         self._baseline_build_lock = Lock()
         self._jobs: dict[str, _SearchJob] = {}
+        self._league_workspaces = LeagueWorkspaceService(
+            self.data_directory,
+            self.bundle_directory,
+        )
         self._bundle_cache: OrderedDict[str, EngineBundle] = OrderedDict()
         self._dashboard_cache: OrderedDict[str, dict[str, object]] = OrderedDict()
         self._dashboard_futures: dict[str, Future[dict[str, object]]] = {}
@@ -315,6 +322,8 @@ class LocalAppService:
         self._trade_timing_futures: dict[
             tuple[str, str], Future[dict[str, object]]
         ] = {}
+        self._history_stores: dict[Path, LeagueHistoryStore] = {}
+        # Kept as a compatibility view of the most recently opened store.
         self._history_store: LeagueHistoryStore | None = None
         self._player_outlook_catalog_cache: OrderedDict[
             str, dict[str, object]
@@ -447,12 +456,90 @@ class LocalAppService:
                     "weekly collection, trade search, export, league dashboard, Player Lab, General Manager Insights, or Trade Timing must finish before Draft Lab starts"
                 )
 
-    def import_bundle(self, record: Mapping[str, object]) -> dict[str, object]:
-        bundle = EngineBundle.from_record(record)
-        path = self.bundle_directory / f"{bundle.bundle_id}.json"
-        save_bundle_with_summary(bundle, path)
-        self._remember_bundle(bundle)
-        return bundle_summary(bundle)
+    def import_bundle(
+        self,
+        record: Mapping[str, object],
+        *,
+        league_profile_id: str | None = None,
+    ) -> dict[str, object]:
+        summary = self._league_workspaces.import_bundle(
+            record,
+            profile_id=league_profile_id,
+        )
+        self._load_bundle(summary["bundle_id"])
+        if league_profile_id is not None:
+            self._invalidate_history_views(summary["bundle_id"])
+        return summary
+
+    def bundle(self, bundle_id: str) -> dict[str, object]:
+        return bundle_summary(self._load_bundle(bundle_id))
+
+    def league_profiles(
+        self,
+        *,
+        include_archived: bool = False,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> dict[str, object]:
+        record = self._league_workspaces.profiles(
+            include_archived=include_archived,
+            limit=limit,
+            cursor=cursor,
+        )
+        record["collection_available"] = self._collections.available
+        return record
+
+    def create_league_profile(
+        self, payload: Mapping[str, object]
+    ) -> dict[str, object]:
+        return self._league_workspaces.create_profile(payload)
+
+    def update_league_profile(
+        self,
+        profile_id: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        return self._league_workspaces.update_profile(profile_id, payload)
+
+    def archive_league_profile(self, profile_id: str) -> dict[str, object]:
+        return self._league_workspaces.archive_profile(profile_id)
+
+    def restore_league_profile(self, profile_id: str) -> dict[str, object]:
+        return self._league_workspaces.restore_profile(profile_id)
+
+    def save_league_team(
+        self,
+        profile_id: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        if not isinstance(payload, Mapping) or set(payload) != {
+            "bundle_id",
+            "team_id",
+        }:
+            raise ValueError("saved league team fields are invalid")
+        return self._league_workspaces.save_my_team(
+            profile_id,
+            bundle_id=payload["bundle_id"],
+            team_id=payload["team_id"],
+        )
+
+    def assign_bundle_to_league(
+        self,
+        profile_id: str,
+        bundle_id: str,
+    ) -> dict[str, object]:
+        association = self._league_workspaces.assign_bundle(profile_id, bundle_id)
+        self._invalidate_history_views(bundle_id)
+        return association
+
+    def _invalidate_history_views(self, bundle_id: str) -> None:
+        with self._lock:
+            for key in tuple(self._gm_insights_cache):
+                if key[0] == bundle_id:
+                    del self._gm_insights_cache[key]
+            for key in tuple(self._trade_timing_cache):
+                if key[0] == bundle_id:
+                    del self._trade_timing_cache[key]
 
     def list_bundles(self) -> tuple[dict[str, object], ...]:
         summaries = OrderedDict()
@@ -485,6 +572,46 @@ class LocalAppService:
     def bundle_catalog(self) -> dict[str, object]:
         bundles = self.list_bundles()
         return {"bundles": bundles, "readiness": self._bundle_readiness(bundles)}
+
+    def league_bundle_catalog(self, profile_id: str) -> dict[str, object]:
+        bundles = self._league_workspaces.bundle_rows(profile_id)
+        readiness = self._bundle_readiness(bundles)
+        if profile_id == UNASSIGNED_PROFILE_ID:
+            readiness["collection_available"] = False
+            if not readiness["ready"]:
+                readiness["message"] = (
+                    "No unassigned weekly data remains. Choose a league workspace or "
+                    "import a portable weekly bundle."
+                )
+        else:
+            profile = self._league_workspaces.profile(profile_id)
+            base_collection_available = bool(
+                self._collections.available
+                and not profile["archived"]
+                and profile["yahoo_league_id"] is not None
+            )
+            readiness["collection_available"] = base_collection_available
+            readiness["fantasypros_collection_available"] = (
+                base_collection_available
+            )
+            readiness["independent_collection_available"] = bool(
+                base_collection_available
+                and profile["espn_league_id"] is not None
+            )
+            if not readiness["ready"] and profile["archived"]:
+                readiness["message"] = (
+                    "This league is archived. Restore it before collecting a new week."
+                )
+            elif not readiness["ready"] and profile["yahoo_league_id"] is None:
+                readiness["message"] = (
+                    "Add this league's Yahoo connection before collecting a week."
+                )
+            elif not readiness["ready"] and profile["espn_league_id"] is None:
+                readiness["message"] = (
+                    "FantasyPros-assisted collection is available. Add this league's "
+                    "ESPN connection only if you also want independent collection."
+                )
+        return {"bundles": bundles, "readiness": readiness}
 
     def league_dashboard(self, bundle_id: str) -> dict[str, object]:
         """Return one deterministic league outlook, cached by immutable bundle ID."""
@@ -628,7 +755,9 @@ class LocalAppService:
 
         try:
             bundle = self._load_bundle(bundle_id)
-            history = self._league_history_store().snapshot_for_bundle(bundle_id)
+            history = self._league_history_store(bundle_id).snapshot_for_bundle(
+                bundle_id
+            )
             revision = None if history is None else history.history_revision
             cache_key = bundle_id, revision
             with self._lock:
@@ -697,7 +826,9 @@ class LocalAppService:
 
         try:
             bundle = self._load_bundle(bundle_id)
-            history = self._league_history_store().snapshot_for_bundle(bundle_id)
+            history = self._league_history_store(bundle_id).snapshot_for_bundle(
+                bundle_id
+            )
             revision = None if history is None else history.history_revision
             cache_key = bundle_id, revision, primary_team_id
             with self._lock:
@@ -912,25 +1043,52 @@ class LocalAppService:
         self, request: WeeklyCollectionRequest
     ) -> dict[str, object]:
         with self._lock:
-            if self.draft_lab.is_busy:
-                raise RuntimeError("Draft Lab training or benchmark must finish before collecting")
-            if self._export_in_progress:
-                raise RuntimeError("trade export must finish before collecting")
-            if self._dashboard_futures or self._player_lab_is_busy():
-                raise RuntimeError(
-                    "league dashboard or Player Lab calculation must finish before collecting"
-                )
-            if self._gm_insights_futures:
-                raise RuntimeError(
-                    "General Manager Insights calculation must finish before collecting"
-                )
-            if self._trade_timing_futures:
-                raise RuntimeError(
-                    "Trade Timing calculation must finish before collecting"
-                )
-            if has_active_jobs(self._jobs):
-                raise RuntimeError("stop the local trade search before collecting a new week")
+            self._require_collection_capacity_locked()
             return self._collections.start(request)
+
+    def start_profile_weekly_collection(
+        self,
+        profile_id: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        plan = self._league_workspaces.collection_plan(profile_id, payload)
+
+        def associate_published(bundle: EngineBundle) -> None:
+            self._league_workspaces.associate_bundle(
+                profile_id,
+                bundle,
+                expected_espn_league_id=plan.espn_league_id,
+            )
+            self._remember_bundle(bundle)
+            self._invalidate_history_views(bundle.bundle_id)
+
+        with self._lock:
+            self._require_collection_capacity_locked()
+            return self._collections.start(
+                plan.request,
+                data_directory=plan.workspace,
+                on_published=associate_published,
+            )
+
+    def _require_collection_capacity_locked(self) -> None:
+        if self.draft_lab.is_busy:
+            raise RuntimeError(
+                "Draft Lab training or benchmark must finish before collecting"
+            )
+        if self._export_in_progress:
+            raise RuntimeError("trade export must finish before collecting")
+        if self._dashboard_futures or self._player_lab_is_busy():
+            raise RuntimeError(
+                "league dashboard or Player Lab calculation must finish before collecting"
+            )
+        if self._gm_insights_futures:
+            raise RuntimeError(
+                "General Manager Insights calculation must finish before collecting"
+            )
+        if self._trade_timing_futures:
+            raise RuntimeError("Trade Timing calculation must finish before collecting")
+        if has_active_jobs(self._jobs):
+            raise RuntimeError("stop the local trade search before collecting a new week")
 
     def weekly_collection(self, job_id: str) -> dict[str, object]:
         return self._collections.job(job_id)
@@ -1046,6 +1204,7 @@ class LocalAppService:
             job = self._require_job(job_id)
             if job.status in {"queued", "running"}:
                 job.cancel.set()
+                job.timing.request_cancel()
             return self._job_record(job)
 
     def job_results(self, job_id: str, *, limit: int = 500) -> dict[str, object]:
@@ -1180,6 +1339,7 @@ class LocalAppService:
 
     def _run_search(self, job: _SearchJob) -> None:
         try:
+            job.timing.start("preparing_season_simulation")
             self._set_job(job, status="running")
             bundle = self._load_bundle(job.request.bundle_id)
             _require_surrogate_consent(bundle, job.request)
@@ -1189,6 +1349,10 @@ class LocalAppService:
                 bundle.scenario_config.loadings,
             )
             baseline = self._season_baseline(job.request.bundle_id, bundle, config)
+            if job.cancel.is_set():
+                job.timing.cancel()
+                self._set_job(job, status="cancelled")
+                return
             if job.request.trade_format == "three_team":
                 by_team, primary, selected = _search_scope(bundle, job.request)
                 space = ThreeWayTradeSpace(
@@ -1215,11 +1379,16 @@ class LocalAppService:
                     baseline,
                     job.request.settings,
                 )
+                job.timing.begin_phase(
+                    "searching_trade_combinations",
+                    completed_units=0,
+                    total_units=space.candidate_count,
+                )
                 run_directory = self.search_directory / job.request.request_id
                 run_directory.mkdir(parents=True, exist_ok=True)
                 outcome = search.run(
                     run_directory / "three-team.sqlite3",
-                    on_progress=lambda progress: self._set_job(job, progress=progress),
+                    on_progress=lambda progress: self._search_progress(job, progress),
                     should_cancel=job.cancel.is_set,
                 )
             else:
@@ -1232,12 +1401,24 @@ class LocalAppService:
                     job.request.settings,
                     counterparty_team_ids=(job.request.counterparty_team_ids or None),
                 )
+                job.timing.begin_phase(
+                    "searching_trade_combinations",
+                    completed_units=0,
+                    total_units=sum(
+                        runner.run_definition.total_candidate_count
+                        for _, runner in search.runners
+                    ),
+                )
                 outcome = search.run(
                     self.search_directory / job.request.request_id,
-                    on_progress=lambda progress: self._set_job(job, progress=progress),
+                    on_progress=lambda progress: self._search_progress(job, progress),
                     should_cancel=job.cancel.is_set,
                 )
             status = "cancelled" if outcome.progress.cancelled else "complete"
+            if status == "cancelled":
+                job.timing.cancel()
+            else:
+                job.timing.finish()
             self._set_job(
                 job,
                 status=status,
@@ -1253,7 +1434,22 @@ class LocalAppService:
                 ),
             )
         except Exception as error:
+            job.timing.fail()
             self._set_job(job, status="failed", error=str(error))
+
+    def _search_progress(
+        self,
+        job: _SearchJob,
+        progress: LeagueSearchProgress | ThreeWaySearchProgress,
+    ) -> None:
+        completed = (
+            progress.next_candidate_index
+            if isinstance(progress, ThreeWaySearchProgress)
+            else progress.examined_candidate_count
+        )
+        total = progress.total_candidate_count
+        job.timing.observe(completed, total)
+        self._set_job(job, progress=progress)
 
     def _set_job(self, job, **changes) -> None:
         with self._lock:
@@ -1334,15 +1530,20 @@ class LocalAppService:
             load_engine_bundle(self._bundle_path(bundle_id)), bundle_id
         )
 
-    def _league_history_store(self) -> LeagueHistoryStore:
+    def _league_history_store(self, bundle_id: str) -> LeagueHistoryStore:
         """Open optional league history only when a history-aware view needs it."""
 
+        history_path = (
+            self._league_workspaces.data_directory_for_bundle(bundle_id)
+            / LEAGUE_HISTORY_FILENAME
+        )
         with self._lock:
-            if self._history_store is None:
-                self._history_store = LeagueHistoryStore(
-                    self.data_directory / LEAGUE_HISTORY_FILENAME
-                )
-            return self._history_store
+            store = self._history_stores.get(history_path)
+            if store is None:
+                store = LeagueHistoryStore(history_path)
+                self._history_stores[history_path] = store
+            self._history_store = store
+            return store
 
     def _canonicalize_migrated_bundle(
         self, legacy_path: Path, bundle: EngineBundle
@@ -1463,6 +1664,7 @@ class LocalAppService:
                 "counterparty_team_ids": list(job.request.counterparty_team_ids),
             },
             "progress": progress_record,
+            "operation": job.timing.snapshot(),
         }
 
 

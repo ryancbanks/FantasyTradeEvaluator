@@ -34,12 +34,47 @@
   <div id="tradeLabPanel" class="app-surface" role="tabpanel" aria-labelledby="tradeLabTab" tabindex="0">
   <main>
     <div id="errorBanner" class="error-banner hidden" role="alert"></div>
+    <section id="operationProgress" class="operation-progress hidden">
+      <div id="operationProgressTrack" class="progress-track" aria-label="Current operation progress"><div id="operationProgressBar" class="progress-bar"></div></div>
+      <p id="operationProgressText">Working locally…</p>
+    </section>
 
     <section class="panel source-panel">
       <div class="section-heading">
         <div><span class="step">1</span><h2>Weekly data</h2></div>
         <p>Collect each source once. Every trade search afterward stays on this computer.</p>
       </div>
+
+      <div class="league-workspace">
+        <div class="league-toolbar">
+          <label><span>League workspace</span><select id="leagueSelect"><option value="">Loading saved leagues…</option></select></label>
+          <div class="league-actions">
+            <button id="addLeagueButton" type="button" class="primary">+ Add league</button>
+            <button id="editLeagueButton" type="button" class="secondary" disabled>League settings</button>
+            <button id="archiveLeagueButton" type="button" class="secondary" disabled>Archive league</button>
+          </div>
+        </div>
+        <div class="league-meta-row">
+          <p id="leagueMeta">Loading your league workspaces…</p>
+          <label class="check compact-check"><input id="showArchivedLeagues" type="checkbox"><span>Show archived leagues</span></label>
+        </div>
+      </div>
+
+      <form id="leagueEditor" class="league-editor hidden">
+        <div class="subsection-heading"><h3 id="leagueEditorTitle">Add a league</h3><p>Saved once, reused every week.</p></div>
+        <div class="collection-grid">
+          <label><span>League name</span><input id="leagueName" type="text" maxlength="120" placeholder="Home league" required></label>
+          <label><span>Season</span><input id="collectionSeason" type="number" min="2012" max="9999" required></label>
+          <label><span>Scoring</span><select id="collectionScoring"><option value="PPR">PPR</option><option value="HALF">Half PPR</option><option value="STD">Standard</option></select></label>
+          <span aria-hidden="true"></span>
+          <label class="wide-field"><span>ESPN league link <small id="espnLinkRequirement">(recommended)</small></span><input id="hostLeagueUrl" type="url" placeholder="Paste any page inside this ESPN Fantasy Football league"></label>
+          <label class="wide-field"><span>Yahoo league or player-list link</span><input id="yahooProjectionUrl" type="url" placeholder="League home, numeric team, Players, or Player List page" required></label>
+        </div>
+        <div class="action-row compact-actions">
+          <button id="saveLeagueButton" type="submit" class="primary">Save league</button>
+          <button id="cancelLeagueEditButton" type="button" class="secondary">Cancel</button>
+        </div>
+      </form>
 
       <div class="browser-bridge" aria-live="polite">
         <div>
@@ -66,11 +101,8 @@
 
       <form id="collectionForm" class="collection-form">
         <div class="collection-grid">
-          <label><span>Season</span><input id="collectionSeason" type="number" min="2012" max="9999" required></label>
           <label><span>Current week</span><input id="collectionWeek" type="number" min="1" max="25" value="1" required></label>
-          <label><span>Scoring</span><select id="collectionScoring"><option value="PPR">PPR</option><option value="HALF">Half PPR</option><option value="STD">Standard</option></select></label>
-          <label class="wide-field"><span>ESPN league link <small id="espnLinkRequirement">(recommended)</small></span><input id="hostLeagueUrl" type="url" placeholder="Paste any page inside this ESPN Fantasy Football league"></label>
-          <label class="wide-field"><span>Yahoo league or player-list link</span><input id="yahooProjectionUrl" type="url" placeholder="League home, numeric team, Players, or Player List page" required></label>
+          <div class="collection-profile-summary"><strong id="collectionLeagueName">Choose a league workspace</strong><span id="collectionLeagueDetails">Its saved season, scoring, ESPN, and Yahoo connections will be used.</span></div>
         </div>
         <div class="collection-actions">
           <div class="collection-options">
@@ -81,11 +113,11 @@
             <label class="check surrogate-consent"><input id="allowSurrogatePower" type="checkbox"><span>If exact FantasyPros replication fails, publish a <strong>SURROGATE</strong> weekly engine. Its power scores are approximations and will never be labeled exact.</span></label>
           </div>
           <div class="action-row compact-actions">
-            <button id="collectButton" type="submit" class="primary">Scan league &amp; collect</button>
+            <button id="collectButton" type="submit" class="primary">Scan selected league &amp; collect</button>
             <button id="cancelCollectionButton" type="button" class="danger hidden">Stop collection</button>
           </div>
         </div>
-        <p id="collectionModeHelp" class="field-help">League size, every team, and every roster are detected automatically, including custom lineup slots and IR capacity. Paste one ESPN league link and one Yahoo league or player-list link; CBS, FFToday, and FantasySharks pages are selected automatically when broad consensus is on. Only numeric league IDs are retained. The extension reuses one scan tab in your regular browser and closes it when collection finishes.</p>
+        <p id="collectionModeHelp" class="field-help">League size, every team, and every roster are detected automatically, including custom lineup slots and IR capacity. The selected workspace supplies its saved ESPN and Yahoo connections. The extension reuses one scan tab in your regular browser and closes it when collection finishes.</p>
       </form>
 
       <details id="sourceDebug" class="source-debug">
@@ -94,9 +126,10 @@
         <div id="sourceDebugList" class="source-debug-list" aria-live="polite"></div>
       </details>
 
-      <div id="collectionProgress" class="collection-progress hidden" aria-live="polite">
-        <div class="progress-track"><div id="collectionProgressBar" class="progress-bar"></div></div>
+      <div id="collectionProgress" class="collection-progress hidden">
+        <div class="progress-track" aria-label="Weekly data collection progress"><div id="collectionProgressBar" class="progress-bar"></div></div>
         <p id="collectionProgressText">Preparing weekly collection…</p>
+        <p id="collectionTiming" class="timing-text">Estimating time remaining…</p>
         <div id="signInPrompt" class="sign-in-prompt hidden">
           <span id="signInPromptText">Finish signing in on the extension’s scan tab.</span>
           <button id="confirmSignInButton" type="button" class="secondary">I’m signed in — continue</button>
@@ -116,6 +149,10 @@
         <div>
           <div id="readiness" class="readiness not-ready" aria-live="polite">Checking weekly readiness…</div>
           <div id="bundleSummary" class="bundle-summary">Import or collect a weekly bundle to begin.</div>
+          <div id="assignBundleControls" class="assign-bundle hidden">
+            <label><span>Assign this older week to</span><select id="assignLeagueSelect"><option value="">Choose a league</option></select></label>
+            <button id="assignBundleButton" type="button" class="secondary">Assign week</button>
+          </div>
         </div>
       </div>
     </section>
@@ -521,7 +558,8 @@
         <div><span class="step">7</span><h2>Search progress</h2></div>
         <p id="progressText">Preparing the shared season simulation…</p>
       </div>
-      <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
+      <div class="progress-track" aria-label="Trade search progress"><div id="progressBar" class="progress-bar"></div></div>
+      <p id="searchTiming" class="timing-text">Estimating time remaining…</p>
       <div id="progressStats" class="stat-row"></div>
     </section>
 
@@ -531,6 +569,12 @@
         <button id="exportButton" class="primary">Download Excel workbook</button>
       </div>
       <p id="resultsNote" class="results-note"></p>
+      <div class="results-workbench" aria-label="Result filters and sorting">
+        <label class="check"><input id="onlyMutualResults" type="checkbox"><span>Only trades where every team’s playoff chance improves</span></label>
+        <label><span>Minimum playoff gain for every team <small>(percentage points)</small></span><input id="minimumResultGain" type="number" min="0" step="0.1" placeholder="No minimum"></label>
+        <label><span>Sort results by</span><select id="resultSort"><option value="combined_playoff_gain">Combined playoff gain</option><option value="my_playoff_gain">My playoff gain</option><option value="weakest_participant_gain">Weakest team’s playoff gain</option><option value="combined_power_gain">Combined power gain</option><option value="fewest_moved_players">Fewest players moved</option></select></label>
+        <strong id="workbenchCount" class="workbench-count"></strong>
+      </div>
       <h3 class="table-title">League outlook before any trade</h3>
       <div class="table-wrap outlook-table">
         <table>
@@ -787,6 +831,8 @@
   </section>
 
   <footer>All candidate scoring, season simulation, and manager analysis run on this computer. Weekly engines and league history stay local.</footer>
+  <script src="/progress_ui.js" defer></script>
+  <script src="/league_ui.js" defer></script>
   <script src="/dashboard_charts.js" defer></script>
   <script src="/dashboard_ui.js" defer></script>
   <script src="/gm_insights_format.js" defer></script>
@@ -798,6 +844,7 @@
   <script src="/player_lab_profile_ui.js" defer></script>
   <script src="/player_lab_catalog_ui.js" defer></script>
   <script src="/player_lab_ui.js" defer></script>
+  <script src="/results_workbench.js" defer></script>
   <script src="/app.js" defer></script>
   <script src="/app_tabs.js" defer></script>
   <script src="/draft_lab.js" defer></script>
