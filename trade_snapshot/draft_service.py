@@ -30,6 +30,7 @@ from .draft_config import (
     DraftStrategy,
     config_from_engine_bundle,
 )
+from .draft_corpus_install import CorpusInstallCancelled, DraftCorpusInstaller
 from .draft_espn_live import (
     EspnDraftObservation,
     EspnDraftSyncError,
@@ -78,6 +79,7 @@ class DraftLabService:
         heavy_work_guard=lambda: None,
         activity_lock=None,
         espn_draft_adapter=None,
+        corpus_installer=None,
     ) -> None:
         self.data_directory = Path(data_directory).resolve()
         self.bundle_directory = Path(bundle_directory).resolve()
@@ -101,6 +103,15 @@ class DraftLabService:
         )
         if not callable(getattr(self._espn_draft_adapter, "poll", None)):
             raise ValueError("espn_draft_adapter must provide poll()")
+        self._corpus_installer = (
+            DraftCorpusInstaller(self.data_directory, store=self.store)
+            if corpus_installer is None
+            else corpus_installer
+        )
+        if not all(callable(getattr(self._corpus_installer, name, None)) for name in (
+            "install", "catalog", "recoverable_state",
+        )):
+            raise ValueError("corpus_installer must provide install(), catalog(), and recoverable_state()")
 
     @property
     def is_busy(self) -> bool:
@@ -154,6 +165,8 @@ class DraftLabService:
             "checkpoints": self.store.list_checkpoints(),
             "assistant_sessions": self._session_catalog(),
             "league_presets": self._league_presets(),
+            "starter_corpus_installs": self._corpus_installer.catalog(),
+            "starter_corpus_install_state": self._corpus_installer.recoverable_state(),
             "supported_training_seasons": [
                 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025
             ],
@@ -183,6 +196,28 @@ class DraftLabService:
     def import_model(self, record):
         return self.store.import_model(record)
 
+    def start_corpus_install(self, payload: Mapping[str, object] | None = None):
+        """Start or resume the bounded public starter-corpus installation."""
+
+        payload = {} if payload is None else payload
+        _exact_keys("starter corpus install", payload, set())
+        with self._activity_lock:
+            self._heavy_work_guard()
+            with self._lock:
+                if self.is_busy:
+                    raise RuntimeError("another Draft Lab background job is running")
+                job = _DraftJob(uuid4().hex, "corpus_install")
+                job.progress = {"phase": "manifest"}
+                self._pending_terminal_job_id = None
+                self._jobs[job.job_id] = job
+        Thread(
+            target=self._run_corpus_install,
+            args=(job,),
+            name=f"draft-corpus-install-{job.job_id[:8]}",
+            daemon=True,
+        ).start()
+        return self._job_record(job)
+
     def estimate_training(self, payload: Mapping[str, object]) -> dict[str, object]:
         corpus, config, evolution, _ = self._training_inputs(payload)
         return training_estimate(corpus, config, evolution)
@@ -192,13 +227,13 @@ class DraftLabService:
             self._heavy_work_guard()
             with self._lock:
                 if self.is_busy:
-                    raise RuntimeError("another Draft Lab training or benchmark job is running")
+                    raise RuntimeError("another Draft Lab background job is running")
             corpus, config, evolution, resume = self._training_inputs(payload)
             with self._recommendation_lock:
                 with self._lock:
                     if self.is_busy:
                         raise RuntimeError(
-                            "another Draft Lab training or benchmark job is running"
+                            "another Draft Lab background job is running"
                         )
                     job = _DraftJob(uuid4().hex, "training")
                     job.progress = {
@@ -221,7 +256,7 @@ class DraftLabService:
             self._heavy_work_guard()
             with self._lock:
                 if self.is_busy:
-                    raise RuntimeError("another Draft Lab training or benchmark job is running")
+                    raise RuntimeError("another Draft Lab background job is running")
             checkpoint = TrainingCheckpoint.from_record(
                 self.store.load_checkpoint(checkpoint_job_id)
             )
@@ -256,14 +291,14 @@ class DraftLabService:
             self._heavy_work_guard()
             with self._lock:
                 if self.is_busy:
-                    raise RuntimeError("another Draft Lab training or benchmark job is running")
+                    raise RuntimeError("another Draft Lab background job is running")
             model = self._load_model(payload["model_id"])
             corpus = self._load_corpus(model.corpus_id)
             with self._recommendation_lock:
                 with self._lock:
                     if self.is_busy:
                         raise RuntimeError(
-                            "another Draft Lab training or benchmark job is running"
+                            "another Draft Lab background job is running"
                         )
                     job = _DraftJob(uuid4().hex, "benchmark")
                     job.progress = {"trial": 0, "trial_count": options["trials"]}
@@ -460,6 +495,32 @@ class DraftLabService:
             self.store.save_model(artifact)
             self._remember_asset(self._model_cache, artifact.model_id, artifact)
             return artifact.summary()
+
+    def _run_corpus_install(self, job):
+        try:
+            self._set_job(job, status="running")
+            receipt = self._corpus_installer.install(
+                should_cancel=job.cancel.is_set,
+                on_progress=lambda progress: self._set_job(
+                    job, progress=dict(progress)
+                ),
+            )
+            corpus_id = receipt["corpus_id"]
+            with self._lock:
+                self._corpus_cache.pop(corpus_id, None)
+            self._set_job(
+                job,
+                status="complete",
+                result={"install": receipt, "corpus": receipt["summary"]},
+            )
+        except CorpusInstallCancelled:
+            self._set_job(
+                job,
+                status="cancelled",
+                error="Starter corpus installation paused safely and can be resumed.",
+            )
+        except Exception as error:
+            self._set_job(job, status="failed", error=str(error))
 
     def _run_training(self, job, corpus, config, evolution, resume):
         try:
@@ -751,7 +812,7 @@ class DraftLabService:
             if self.is_busy:
                 raise RuntimeError(
                     "Draft assistant recommendations are unavailable while a Draft "
-                    "Lab training or benchmark job is running"
+                    "Lab background job is running"
                 )
 
     def _require_job(self, job_id):

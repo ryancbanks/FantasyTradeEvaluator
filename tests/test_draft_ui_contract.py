@@ -28,7 +28,10 @@ class DraftUiContractTests(unittest.TestCase):
 
     def test_draft_lab_exposes_the_complete_workflow(self):
         required_ids = (
-            "draftCorpusFile", "draftModelFile", "draftBoardFile",
+            "draftInstallCorpusButton", "draftInstallCorpusCancelButton",
+            "draftInstallCorpusStatus", "draftInstallCorpusProgress",
+            "draftInstallCorpusProgressBar", "draftInstallCorpusProgressText",
+            "draftInstallCorpusCoverage", "draftCorpusFile", "draftModelFile", "draftBoardFile",
             "draftPreset", "draftPresetNotice", "draftTeamCount", "draftStarterSlots",
             "draftBenchSlots", "draftScoringWeights", "draftRegularWeeks",
             "draftPlayoffWeeks", "draftPlayoffTeams", "draftPopulation",
@@ -53,8 +56,27 @@ class DraftUiContractTests(unittest.TestCase):
         for label in (
             "Copy supported league structure", "Did it get worse?", "100 paired scenarios",
             "Last batch", "Autosaved", "Manual draft assistant",
+            "Install 2015–2019 and 2021–2025 starter corpus",
         ):
             self.assertIn(label, self.page)
+
+    def test_starter_corpus_installer_is_transparent_resumable_and_job_backed(self):
+        for disclosure in (
+            "Fantasy Football Calculator 12-team PPR ADP",
+            "nflverse under CC-BY-4.0",
+            "does not claim historical ESPN, Yahoo, or FantasyPros projections",
+            "one fixed preseason bye",
+            "player-season is excluded",
+            "portable standard scoring rules",
+        ):
+            self.assertIn(disclosure, self.page)
+        self.assertIn('launchJob("/api/draft/corpus/install", {}, "corpus_install")', self.draft)
+        self.assertIn("renderStarterCorpusCatalog", self.draft)
+        self.assertIn("renderCorpusInstallProgress", self.draft)
+        self.assertIn("Ready with gaps", self.draft)
+        self.assertIn("Incompatible", self.draft)
+        self.assertIn("catalog.starter_corpus_installs", self.draft)
+        self.assertIn("catalog.starter_corpus_install_state", self.draft)
 
     def test_training_years_and_strategies_are_explicit_and_safe(self):
         for year in (*range(2015, 2020), *range(2021, 2026)):

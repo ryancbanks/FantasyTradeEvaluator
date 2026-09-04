@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 from threading import Thread
 import time
 import unittest
+from unittest.mock import patch
 
 from tests.draft_fixtures import small_draft_config, small_historical_corpus
 import trade_snapshot.local_server as local_server
@@ -135,6 +136,33 @@ class DraftLocalServerTests(unittest.TestCase):
         connection.request("GET", "/api/draft/catalog")
         response = connection.getresponse(); response.read(); connection.close()
         self.assertEqual(response.status, 403)
+
+    def test_starter_corpus_install_route_starts_a_draft_job(self):
+        expected = {
+            "job_id": "a" * 32,
+            "kind": "corpus_install",
+            "status": "queued",
+        }
+        with patch.object(
+            self.server.app_service.draft_lab,
+            "start_corpus_install",
+            return_value=expected,
+        ) as start:
+            status, _, response = self.request(
+                "POST", "/api/draft/corpus/install", {}
+            )
+
+        self.assertEqual(status, 202)
+        self.assertEqual(response, expected)
+        start.assert_called_once_with({})
+
+    def test_starter_corpus_install_route_rejects_unknown_options(self):
+        status, _, response = self.request(
+            "POST", "/api/draft/corpus/install", {"years": [2025]}
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("starter corpus install", response["error"])
 
     def test_current_board_upload_uses_the_bounded_draft_data_limit(self):
         original = local_server._MAX_DRAFT_DATA_BYTES

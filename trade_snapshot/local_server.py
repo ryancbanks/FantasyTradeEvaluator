@@ -388,6 +388,14 @@ class LocalAppRequestHandler(BaseHTTPRequestHandler):
             summary = self.server.app_service.import_bundle(self._read_json())
             self._json(HTTPStatus.CREATED, summary)
             return
+        if path == "/api/draft/corpus/install":
+            self._json(
+                HTTPStatus.ACCEPTED,
+                self.server.app_service.draft_lab.start_corpus_install(
+                    self._read_json(max_bytes=1024)
+                ),
+            )
+            return
         if path == "/api/draft/corpora/import":
             self._json(
                 HTTPStatus.CREATED,

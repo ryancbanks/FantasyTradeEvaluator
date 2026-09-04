@@ -551,8 +551,31 @@
     <section class="panel" aria-labelledby="draftSourcesHeading">
       <div class="section-heading draft-heading">
         <div><span class="step">1</span><h2 id="draftSourcesHeading">Draft data</h2></div>
-        <p>Import each JSON file once. Corpora, current boards, and deployable models stay on this machine.</p>
+        <p>Install the starter history or import your own files. Corpora, current boards, and deployable models stay on this machine.</p>
       </div>
+      <article class="draft-corpus-installer" aria-labelledby="draftStarterCorpusHeading">
+        <div class="draft-corpus-installer-copy">
+          <p class="draft-kicker">ONE-CLICK STARTER HISTORY</p>
+          <h3 id="draftStarterCorpusHeading">Build the historical training library</h3>
+          <p>Downloads public preseason ADP and completed NFL results once, verifies each file, then builds the corpus locally. Interrupted downloads can resume.</p>
+        </div>
+        <div class="draft-corpus-installer-actions">
+          <button id="draftInstallCorpusButton" class="primary" type="button">Install 2015–2019 and 2021–2025 starter corpus</button>
+          <button id="draftInstallCorpusCancelButton" class="danger hidden" type="button">Pause installation safely</button>
+          <strong id="draftInstallCorpusStatus" class="draft-install-status" role="status" aria-live="polite">Checking this device…</strong>
+        </div>
+        <div id="draftInstallCorpusProgress" class="draft-install-progress hidden" aria-live="polite">
+          <div class="progress-track"><div id="draftInstallCorpusProgressBar" class="progress-bar"></div></div>
+          <p id="draftInstallCorpusProgressText">Preparing the source manifest…</p>
+        </div>
+        <div id="draftInstallCorpusCoverage" class="draft-install-coverage hidden" aria-label="Starter corpus coverage"></div>
+        <details class="draft-install-disclosure">
+          <summary>What this starter corpus includes</summary>
+          <p>Preseason features come from Fantasy Football Calculator 12-team PPR ADP. Weekly rosters, schedules, and realized outcomes come from nflverse under CC-BY-4.0. It does not claim historical ESPN, Yahoo, or FantasyPros projections.</p>
+          <p>Identity matches are exact—never fuzzy. Draft Lab uses one fixed preseason bye; a player-season is excluded if actual play appears during that team’s original bye. The starter corpus is for the portable standard scoring rules; review coverage before using custom scoring.</p>
+        </details>
+      </article>
+      <h3 class="draft-import-heading">Or import your own validated files</h3>
       <div class="draft-import-grid">
         <label class="file-card">
           <span>Historical corpus JSON</span>

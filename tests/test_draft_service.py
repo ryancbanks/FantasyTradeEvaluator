@@ -40,6 +40,26 @@ class _EspnDraftAdapterStub:
         return self.observation
 
 
+class _CorpusInstallerStub:
+    def __init__(self):
+        self.calls = 0
+
+    def install(self, *, should_cancel, on_progress):
+        self.calls += 1
+        on_progress({"phase": "download", "asset_index": 1, "asset_count": 2})
+        return {
+            "corpus_id": "draft_corpus_" + "a" * 64,
+            "summary": {"corpus_id": "draft_corpus_" + "a" * 64},
+            "status": "ready_with_gaps",
+        }
+
+    def catalog(self):
+        return ({"status": "ready_with_gaps"},)
+
+    def recoverable_state(self):
+        return {"status": "paused", "completed_assets": 1, "asset_count": 2}
+
+
 class DraftLabServiceTests(unittest.TestCase):
     def setUp(self):
         self.directory = TemporaryDirectory()
@@ -125,6 +145,30 @@ class DraftLabServiceTests(unittest.TestCase):
         self.assertEqual(
             self.service.job_result(resumed["job_id"])["model"]["generation"], 2
         )
+
+    def test_starter_corpus_install_uses_the_shared_background_job_gate(self):
+        installer = _CorpusInstallerStub()
+        service = DraftLabService(
+            self.directory.name,
+            self.directory.name + "/bundles",
+            espn_draft_adapter=self.espn,
+            corpus_installer=installer,
+        )
+        started = service.start_corpus_install({})
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            status = service.job(started["job_id"])
+            if status["status"] == "complete":
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("starter corpus install did not finish")
+
+        self.assertEqual(installer.calls, 1)
+        self.assertEqual(service.job_result(started["job_id"])["install"]["status"], "ready_with_gaps")
+        catalog = service.catalog()
+        self.assertEqual(catalog["starter_corpus_installs"][0]["status"], "ready_with_gaps")
+        self.assertEqual(catalog["starter_corpus_install_state"]["status"], "paused")
 
     def test_terminal_job_results_are_bounded_without_evicting_active_work(self):
         active = _DraftJob("f" * 32, "training", status="running")

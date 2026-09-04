@@ -4,7 +4,7 @@ Draft Lab is the local workspace for training, checking, and using a fantasy-foo
 
 ## The five-step workflow
 
-1. **Import honest data.** Import a historical corpus for training. You may also import a previously exported model and a current preseason board.
+1. **Install or import honest data.** Use **Install 2015–2019 and 2021–2025 starter corpus** for the built-in public pack, or import your own strict historical corpus. You may also import a previously exported model and a current preseason board.
 2. **Configure the arena.** Start from the built-in PPR preset or a league preset created from one of your synced league bundles, then edit the teams, roster, scoring, schedule, playoff, and strategy settings.
 3. **Estimate and train.** Choose the historical years and training budget, inspect the local-work estimate, and start the background job. Every completed generation is autosaved.
 4. **Inspect and benchmark.** Review the captured showcase roster, weekly results, standings, and playoff bracket, then run paired scenarios against the non-neural regression baseline.
@@ -14,7 +14,15 @@ Draft Lab is the local workspace for training, checking, and using a fantasy-foo
 
 Historical training accepts only **2015–2019 and 2021–2025**. The 2020 season is intentionally excluded. A 2015 pack is valid only when it contains a genuine 2015 preseason snapshot—not rankings reconstructed after games were played.
 
-Draft Lab does not include or claim access to complete historical ESPN or Yahoo projection archives. It does not download a training corpus for you. Import only data that you obtained lawfully and whose provenance you can describe.
+Draft Lab does not include or claim access to complete historical ESPN, Yahoo, or FantasyPros projection archives. Its optional starter-corpus installer uses only public Fantasy Football Calculator 12-team PPR ADP snapshots and CC-BY-4.0 nflverse schedules, weekly rosters, and weekly statistics. You may instead import data that you obtained lawfully and whose provenance you can describe.
+
+### One-click starter corpus
+
+The starter installer downloads one bounded file at a time over an HTTPS host allowlist. nflverse release sizes and SHA-256 digests are pinned when published; every downloaded file also receives a local SHA-256 receipt. Interrupted downloads remain as `.part` files and resume with a validated byte range. A completed manifest, transform version, and identical file hashes reuse the existing content-addressed corpus without rebuilding it.
+
+The installer never invents an ESPN, Yahoo, or FantasyPros historical projection. Fantasy Football Calculator players join to the nflverse Week 1 roster only through a unique normalized name + position + NFL-team match; no fuzzy identity match is accepted. nflverse schedules supply kickoff dates and byes, prior-season rosters supply team-tenure evidence, and actual weekly statistics remain outcome-only fields. Because Draft Lab v1 models one fixed bye per player-season, a player is excluded when nflverse records actual play during the preseason team's bye, as can happen after an in-season team change.
+
+The receipt shows source URLs, licenses, byte sizes, SHA-256 hashes, exact-match coverage, exclusions, and limited samples for every gap. **Ready with gaps** is usable and means at least one source row could not be joined without guessing. **Incompatible** means a source, schema, checksum, season, or minimum draft-pool invariant failed closed. Installation and corpus construction remain sequential to minimize memory and CPU pressure.
 
 Each historical season keeps two kinds of data separate:
 
@@ -114,14 +122,14 @@ For a public ESPN snake draft, enter its numeric league ID and matching season, 
 
 ## Local files and privacy
 
-Corpus, board, checkpoint, model, and assistant-session files stay in the application's local data directory. Draft Lab performs training, simulation, benchmarking, ranking, and persistence locally; it makes no per-pick or per-simulation web request. The only optional draft-day network read is the public ESPN poll described above. The browser interface talks to the app through its private loopback session.
+Corpus, source downloads and receipts, board, checkpoint, model, and assistant-session files stay in the application's local data directory. Draft Lab performs corpus transformation, training, simulation, benchmarking, ranking, and persistence locally; it makes no per-pick or per-simulation web request. Network access occurs only while you explicitly install the starter corpus or use the optional public ESPN draft poll described above. The browser interface talks to the app through its private loopback session.
 
 An exported model contains its feature schema, learned parameters, league rules, corpus content ID, training years, and aggregate metrics. It does not embed the historical corpus rows, weekly outcomes, player names, or player IDs. Corpus and current-board JSON remain separate local files unless you choose to copy them elsewhere.
 
 ## Current limitations
 
-- Historical data packs and current player boards must be supplied as strict JSON; Draft Lab does not scrape or license them.
-- There is no supported claim of complete ESPN or Yahoo historical projection archives.
+- Custom historical data packs and current player boards must be supplied as strict JSON. The built-in starter corpus contains FFC ADP plus nflverse facts, not complete historical projections.
+- There is no supported claim of complete ESPN, Yahoo, or FantasyPros historical projection archives.
 - Drafts are fixed-order snake drafts without pick trading, auctions, keepers, or third-round reversal.
 - Historical seasons use generated round-robin matchups and do not simulate waivers, free-agent moves, trades, or manager-specific lineup decisions.
 - Weekly scoring is only as complete and accurate as the imported raw stats and configured scoring weights.

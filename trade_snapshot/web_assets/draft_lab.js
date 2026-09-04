@@ -3,7 +3,11 @@
 window.DraftLab = (() => {
   const $ = id => document.getElementById(id);
   const STRATEGIES = ["none", "streaming_qb", "streaming_te", "streaming_dst", "late_round_qb"];
-  let catalog = {corpora: [], boards: [], models: [], checkpoints: [], assistant_sessions: [], league_presets: []};
+  let catalog = {
+    corpora: [], boards: [], models: [], checkpoints: [], assistant_sessions: [],
+    league_presets: [], starter_corpus_installs: [],
+    starter_corpus_install_state: {status: "not_installed", phase: "manifest"}
+  };
   let activeJob = null, jobLaunching = false, promotionBusy = false, assistantBusy = false;
   let pendingRecoveredJob = null;
   let assistantSyncBusy = false, assistantSyncTimer = null;
@@ -191,6 +195,58 @@ window.DraftLab = (() => {
     if ([...select.options].some(option => option.value === previous)) select.value = previous;
   }
 
+  function renderStarterCorpusCoverage(coverage) {
+    const container = $("draftInstallCorpusCoverage");
+    container.replaceChildren();
+    const seasons = Array.isArray(coverage?.seasons) ? coverage.seasons : [];
+    if (!seasons.length) {
+      container.classList.add("hidden");
+      return;
+    }
+    const summary = element(
+      "p", "draft-install-coverage-summary",
+      `${Number(coverage.player_seasons || 0).toLocaleString()} player-seasons · ${Number(coverage.gap_count || 0).toLocaleString()} documented coverage gaps`
+    );
+    const list = element("div", "draft-install-season-list");
+    for (const row of seasons) {
+      const item = element("span", row.status === "ready" ? "ready" : "has-gaps");
+      item.textContent = `${row.season}: ${Number(row.installed_players || 0).toLocaleString()} players · ${Number(row.gap_count || 0).toLocaleString()} gaps`;
+      list.append(item);
+    }
+    container.append(summary, list);
+    container.classList.remove("hidden");
+  }
+
+  function renderStarterCorpusCatalog() {
+    const installs = Array.isArray(catalog.starter_corpus_installs)
+      ? catalog.starter_corpus_installs.filter(row => row && ["ready", "ready_with_gaps"].includes(row.status))
+      : [];
+    const receipt = installs.sort((left, right) => String(right.installed_at || "").localeCompare(String(left.installed_at || "")))[0];
+    const state = catalog.starter_corpus_install_state || {status: "not_installed", phase: "manifest"};
+    const status = $("draftInstallCorpusStatus");
+    status.classList.remove("ready", "warning", "error");
+    if (receipt) {
+      const label = receipt.status_label || (receipt.status === "ready" ? "Ready" : "Ready with gaps");
+      status.textContent = `${label} · ${Number(receipt.coverage?.season_count || 0)} seasons installed on this device`;
+      status.classList.add(receipt.status === "ready" ? "ready" : "warning");
+      renderStarterCorpusCoverage(receipt.coverage);
+      return;
+    }
+    renderStarterCorpusCoverage(null);
+    if (state.status === "incompatible") {
+      status.textContent = `Incompatible · ${state.error || "the saved installer state could not be validated"}`;
+      status.classList.add("error");
+    } else if (state.status === "paused") {
+      status.textContent = `Paused safely · ${Number(state.completed_assets || 0)} of ${Number(state.asset_count || 0)} source files verified. Use Install to resume.`;
+      status.classList.add("warning");
+    } else if (state.status === "failed") {
+      status.textContent = `Download needs attention · ${state.error || "use Install to retry safely"}`;
+      status.classList.add("warning");
+    } else {
+      status.textContent = "Not installed · source files are downloaded only when you choose Install.";
+    }
+  }
+
   function applyPreset() {
     const preset = catalog.league_presets.find(row => row.preset_id === $("draftPreset").value);
     if (!preset) return;
@@ -245,10 +301,12 @@ window.DraftLab = (() => {
     updateSavedControls();
   }
 
-  async function refreshCatalog({selectModelId = "", selectBoardId = "", selectSessionId = "", selectCheckpointId = ""} = {}) {
+  async function refreshCatalog({selectCorpusId = "", selectModelId = "", selectBoardId = "", selectSessionId = "", selectCheckpointId = ""} = {}) {
     const previousCorpusId = $("draftCorpus").value; catalog = await api("/api/draft/catalog");
     catalog.checkpoints ||= [];
     catalog.assistant_sessions ||= [];
+    catalog.starter_corpus_installs ||= [];
+    catalog.starter_corpus_install_state ||= {status: "not_installed", phase: "manifest"};
     fillSelect("draftCorpus", catalog.corpora, "corpus_id", "corpus", "Import a corpus first");
     fillSelect("draftBenchmarkModel", catalog.models, "model_id", "model", "Train or import a model first");
     fillSelect("assistantModel", catalog.models, "model_id", "model", "Train or import a model first");
@@ -275,11 +333,13 @@ window.DraftLab = (() => {
       $("draftBenchmarkModel").value = selectModelId;
       $("assistantModel").value = selectModelId;
     }
+    if (selectCorpusId) $("draftCorpus").value = selectCorpusId;
     if (selectBoardId) $("assistantBoard").value = selectBoardId;
     if (selectSessionId) $("assistantSession").value = selectSessionId;
     if (selectCheckpointId) $("draftCheckpoint").value = selectCheckpointId;
     updateSavedControls();
     $("draftCatalogSummary").textContent = `${catalog.corpora.length} corpora · ${catalog.models.length} models · ${catalog.boards.length} current boards · ${catalog.checkpoints.length} autosaves · ${catalog.assistant_sessions.length} rooms`;
+    renderStarterCorpusCatalog();
     $("draftYearNotice").textContent = catalog.year_notice;
     if ($("draftCorpus").value !== previousCorpusId) syncTrainingYears();
     return catalog;
@@ -315,10 +375,13 @@ window.DraftLab = (() => {
 
   function setJobRunning(running, kind = "") {
     const blocked = running || externalWorkBusy;
+    const corpusInstall = kind === "corpus_install";
+    $("draftInstallCorpusButton").disabled = blocked;
     $("draftEstimateButton").disabled = blocked;
     $("draftStartButton").disabled = blocked;
     $("draftBenchmarkButton").disabled = blocked;
-    $("draftCancelButton").classList.toggle("hidden", !running || !activeJob);
+    $("draftInstallCorpusCancelButton").classList.toggle("hidden", !running || !activeJob || !corpusInstall);
+    $("draftCancelButton").classList.toggle("hidden", !running || !activeJob || corpusInstall);
     $("draftCancelButton").textContent = kind === "benchmark" ? "Stop benchmark" : "Stop and keep last autosave";
     updateSavedControls();
     publishDraftActivity();
@@ -338,6 +401,10 @@ window.DraftLab = (() => {
   }
 
   function renderJob(job) {
+    if (job.kind === "corpus_install") {
+      renderCorpusInstallProgress(job);
+      return;
+    }
     const progress = job.progress || {};
     const training = job.kind === "training";
     const done = training ? progress.generation || 0 : progress.trial || 0;
@@ -354,6 +421,35 @@ window.DraftLab = (() => {
       : training ? "Autosaved after every completed generation" : "Benchmark results are published when all paired trials finish";
   }
 
+  function renderCorpusInstallProgress(job) {
+    const progress = job.progress || {};
+    const phase = progress.phase || "manifest";
+    let fraction = 0.02;
+    let message = progress.message || "Checking the public source manifest…";
+    if (phase === "download") {
+      const index = Number(progress.asset_index || 1);
+      const count = Number(progress.asset_count || 1);
+      fraction = 0.05 + 0.75 * Math.max(0, Math.min(1, (index - 1) / count));
+      const downloaded = progress.downloaded_bytes == null ? "" : ` · ${formatBytes(progress.downloaded_bytes)} received`;
+      message = `Verifying source file ${index} of ${count}${progress.asset_key ? ` · ${progress.asset_key}` : ""}${downloaded}`;
+    } else if (phase === "build") {
+      const completed = Number(progress.completed_seasons || 0);
+      const count = Number(progress.season_count || 10);
+      fraction = 0.80 + 0.18 * Math.max(0, Math.min(1, completed / count));
+      message = progress.season
+        ? `Building season ${progress.season} · ${completed} of ${count} seasons complete`
+        : `Building the verified source files into ${count} historical seasons…`;
+    } else if (phase === "complete") {
+      fraction = 1;
+      message = `${progress.status_label || "Ready"} · ${Number(progress.gap_count || 0).toLocaleString()} documented coverage gaps`;
+    }
+    $("draftInstallCorpusProgressBar").style.width = `${(fraction * 100).toFixed(1)}%`;
+    $("draftInstallCorpusProgressText").textContent = message;
+    $("draftInstallCorpusProgress").classList.remove("hidden");
+    $("draftInstallCorpusStatus").textContent = phase === "complete"
+      ? (progress.status_label || "Ready") : "Installing on this device…";
+  }
+
   async function acknowledgeJobActivity(jobId) {
     try {
       await api(`/api/draft/jobs/${jobId}/activity-ack`, {method: "POST", body: ""});
@@ -365,7 +461,8 @@ window.DraftLab = (() => {
   async function monitorJob(job) {
     activeJob = {jobId: job.job_id, kind: job.kind};
     setJobRunning(true, job.kind);
-    $("draftProgress").classList.remove("hidden");
+    if (job.kind === "corpus_install") $("draftInstallCorpusProgress").classList.remove("hidden");
+    else $("draftProgress").classList.remove("hidden");
     renderJob(job);
     while (activeJob?.jobId === job.job_id) {
       const current = await api(`/api/draft/jobs/${job.job_id}`);
@@ -377,12 +474,34 @@ window.DraftLab = (() => {
         if (current.status === "complete") {
           const result = await api(`/api/draft/jobs/${job.job_id}/result`);
           if (current.kind === "training") await renderTrainingResult(result);
-          else renderBenchmarkResult(result);
+          else if (current.kind === "benchmark") renderBenchmarkResult(result);
+          else if (current.kind === "corpus_install") {
+            const corpusId = result.corpus?.corpus_id || result.install?.corpus_id || "";
+            await refreshCatalog({selectCorpusId: corpusId});
+            renderCorpusInstallProgress({kind: current.kind, progress: {
+              phase: "complete",
+              status_label: result.install?.status_label,
+              gap_count: result.install?.coverage?.gap_count
+            }});
+            syncTrainingYears();
+          }
         } else if (current.status === "failed") {
-          $("draftProgressText").textContent = "Draft Lab job failed.";
+          if (current.kind === "corpus_install") {
+            $("draftInstallCorpusStatus").textContent = "Incompatible · installation stopped before any corpus was activated.";
+            $("draftInstallCorpusStatus").classList.add("error");
+            $("draftInstallCorpusProgressText").textContent = current.error || "Starter corpus installation failed.";
+            await refreshCatalog();
+          } else {
+            $("draftProgressText").textContent = "Draft Lab job failed.";
+          }
           reportError(new Error(current.error || "Draft Lab job failed."));
         } else {
-          $("draftProgressText").textContent = current.error || "Stopped safely.";
+          if (current.kind === "corpus_install") {
+            $("draftInstallCorpusProgressText").textContent = current.error || "Paused safely. Install again to resume.";
+            await refreshCatalog();
+          } else {
+            $("draftProgressText").textContent = current.error || "Stopped safely.";
+          }
         }
         await acknowledgeJobActivity(job.job_id);
         return;
@@ -461,6 +580,12 @@ window.DraftLab = (() => {
     clearDraftError();
     try { await launchJob("/api/draft/trainings", trainingPayload(), "training"); }
     catch (error) { reportError(error); }
+  }
+
+  async function installStarterCorpus() {
+    clearDraftError();
+    $("draftInstallCorpusStatus").textContent = "Starting the verified download…";
+    await launchJob("/api/draft/corpus/install", {}, "corpus_install");
   }
 
   async function resumeTraining() {
@@ -827,6 +952,8 @@ window.DraftLab = (() => {
     $("assistantSession").addEventListener("change", updateSavedControls);
     $("draftTeamCount").addEventListener("input", updateStrategyTotal);
     for (const input of document.querySelectorAll("[data-strategy]")) input.addEventListener("input", updateStrategyTotal);
+    $("draftInstallCorpusButton").addEventListener("click", () => void installStarterCorpus());
+    $("draftInstallCorpusCancelButton").addEventListener("click", cancelJob);
     $("draftCorpusFile").addEventListener("change", event => void importJson(event.target, "/api/draft/corpora/import", "draftCorpusStatus", "corpus"));
     $("draftModelFile").addEventListener("change", event => void importJson(event.target, "/api/draft/models/import", "draftModelStatus", "model"));
     $("draftBoardFile").addEventListener("change", event => void importJson(event.target, "/api/draft/boards/import", "draftBoardStatus", "board"));

@@ -15,6 +15,25 @@
 .draft-hero p:last-child { max-width: 720px; margin: 9px 0 0; color: var(--text-secondary); }
 .draft-catalog-summary { flex: none; max-width: 280px; border: 1px solid var(--success-border); border-radius: 12px; background: var(--success-surface); color: var(--success); padding: 12px 14px; font-weight: 750; }
 .draft-heading { margin-bottom: 20px; }
+.draft-corpus-installer { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, auto); align-items: center; gap: 16px 24px; margin-bottom: 18px; border: 1px solid var(--accent); border-radius: 14px; background: linear-gradient(135deg, var(--accent-surface), var(--surface-inset) 62%); padding: 18px; }
+.draft-corpus-installer-copy h3 { margin: 3px 0 7px; font: 700 20px/1.2 Georgia, serif; }
+.draft-corpus-installer-copy > p:last-child { max-width: 700px; margin: 0; color: var(--text-secondary); }
+.draft-corpus-installer-actions { display: grid; justify-items: stretch; gap: 8px; min-width: min(380px, 100%); }
+.draft-corpus-installer-actions button { white-space: normal; }
+.draft-install-status { color: var(--text-secondary); font-size: 12px; line-height: 1.45; }
+.draft-install-status.ready { color: var(--success); }
+.draft-install-status.warning { color: var(--warning); }
+.draft-install-status.error { color: var(--danger); }
+.draft-install-progress, .draft-install-coverage, .draft-install-disclosure { grid-column: 1 / -1; }
+.draft-install-progress { border-top: 1px solid var(--border); padding-top: 14px; }
+.draft-install-progress p, .draft-install-coverage-summary { margin: 8px 0 0; color: var(--text-secondary); font-size: 13px; }
+.draft-install-season-list { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 7px; margin-top: 9px; }
+.draft-install-season-list span { border: 1px solid var(--success-border); border-radius: 8px; background: var(--success-surface); color: var(--success); padding: 7px 8px; font-size: 11px; text-align: center; }
+.draft-install-season-list span.has-gaps { border-color: var(--warning-border, var(--border-strong)); background: var(--warning-surface, var(--surface-hover)); color: var(--warning); }
+.draft-install-disclosure { border-top: 1px solid var(--border); padding-top: 12px; color: var(--text-secondary); font-size: 13px; }
+.draft-install-disclosure summary { color: var(--accent); font-weight: 800; cursor: pointer; }
+.draft-install-disclosure p { margin: 9px 0 0; }
+.draft-import-heading { margin: 0 0 11px; color: var(--text-secondary); font-size: 14px; }
 .draft-import-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
 .draft-file-status { display: block; margin-top: 8px; color: var(--text-secondary); font-size: 12px; }
 .draft-file-status.ready { color: var(--success); }
@@ -93,6 +112,7 @@
   .draft-import-grid, .draft-json-grid, .draft-fields-four, .draft-fields-five { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .draft-check-grid { grid-template-columns: repeat(5, minmax(58px, 1fr)); }
   .draft-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .draft-install-season-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .assistant-pick-grid { grid-template-columns: 1fr 1fr; }
 }
 
@@ -101,7 +121,9 @@
   .app-tab-list { display: grid; width: 100%; }
   .draft-hero, .draft-block-title, .draft-progress-copy, .draft-inspector-toolbar, .assistant-clock { align-items: stretch; flex-direction: column; }
   .draft-catalog-summary, .draft-preset, .draft-inspector-toolbar label { max-width: none; width: 100%; }
-  .draft-import-grid, .draft-json-grid, .draft-fields-four, .draft-fields-five, .draft-inspector-grid, .draft-benchmark-controls, .draft-restore, .draft-checkpoint-actions, .draft-live-controls, .assistant-pick-grid, .assistant-grid, .draft-metrics { grid-template-columns: 1fr; }
+  .draft-corpus-installer, .draft-import-grid, .draft-json-grid, .draft-fields-four, .draft-fields-five, .draft-inspector-grid, .draft-benchmark-controls, .draft-restore, .draft-checkpoint-actions, .draft-live-controls, .assistant-pick-grid, .assistant-grid, .draft-metrics { grid-template-columns: 1fr; }
+  .draft-corpus-installer-actions { min-width: 0; }
+  .draft-install-season-list { grid-template-columns: 1fr; }
   .draft-span-two, .draft-card-wide { grid-column: auto; }
   .draft-check-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .assistant-clock > p { text-align: left; }
